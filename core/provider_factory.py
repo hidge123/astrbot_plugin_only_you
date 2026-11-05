@@ -685,6 +685,14 @@ class ProviderFactory:
                 return ""
             inst_map[self.MAIN_PROVIDER_ID] = instance
             self._main_instance = instance
+            meta = self._safe_meta(instance)
+            logger.info(
+                "[OnlyYou] Registered plugin-built main provider as %s "
+                "(type=%s, model=%s)",
+                self.MAIN_PROVIDER_ID,
+                meta.get("type") or "?",
+                meta.get("model") or getattr(instance, "model_name", "") or "?",
+            )
             return self.MAIN_PROVIDER_ID
         except Exception as exc:
             logger.warning(f"[OnlyYou] register_main failed: {exc}")
