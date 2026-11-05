@@ -1,0 +1,27 @@
+# Sensitive files & credentials
+.env
+.env.*
+*.pem
+*.key
+ssh-key*
+AGENTS.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+ENV/
+
+# Database & local test artifacts
+*.db
+*.sqlite
+*.sqlite3
+test_data/
+.pytest_cache/
+
+# OS
+.DS_Store

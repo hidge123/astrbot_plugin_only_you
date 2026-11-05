@@ -69,7 +69,13 @@ astrbot_plugin_only_you/
 │   ├── context_budget.py        # 🛡️ 简易上下文与Token预算管理器 (截断冗长历史 + 限制注入记忆字数)
 │   ├── model_hub.py             # 🔌 多模型统一调度网关 (Main/Small/Vision/Embedding/Rerank/TTS/T2I 继承与回退)
 │   ├── platform_bridge.py       # 🤝 AstrBot 平台配置协同桥 (复用平台白名单、原生分段回复 segmented_reply、流式与TTS)
+│   ├── web_api.py               # 🖥️ 注册 AstrBot Plugin Pages 所需的后端 Web API (context.register_web_api)
 │   └── atmosphere_reader.py     # 群聊主战场：防抖等待窗口、多人对话“解线团”、五维读空气器
+├── views/                       # 🎨 AstrBot 插件自定义页面 (Plugin Pages / Views，兼容 pages/)
+│   └── console/                 # 可视化工作台（导入人格、管理 Soul ID、编辑三态行动卡池、关系与记忆管理）
+│       ├── index.html
+│       ├── app.js
+│       └── style.css
 ├── surfing/
 │   ├── pipeline.py              # 📱 赛博冲浪主控流水线（仅在 IDLE 空闲状态下运行）
 │   ├── video_vision.py          # 多模态视频预处理器（短视频流直传 / FFmpeg 3x3 时间戳九宫格抽帧）
@@ -438,7 +444,11 @@ class ModelHub:
 
 ---
 
-## 六、 插件可视化配置架构 (`_conf_schema.json` v2.4)
+## 六、 配置体系架构：极简 `_conf_schema.json` + 全功能 `Pages` 可视化控制台
+
+> **设计原则**：由于导入原生人格、增删改查 `Soul ID`、可视化编辑三态行动卡片池（`StateEventCard`）、查看实时日程与管理 L1/L2/L3 关系网无法通过普通静态表单完成，本插件采用 **“双层配置架构”**：
+> 1. **`views/console/`（AstrBot Plugin Pages 可视化工作台）**：承担所有与角色卡、行动卡片池、今日三态日程、用户关系与分级记忆相关的动态交互管理（详见 **[docs/WEBUI_DESIGN.md](file:///Users/mac/Desktop/Project/OnlyYou/docs/WEBUI_DESIGN.md)**）。
+> 2. **`_conf_schema.json`（全局基础设施与默认阈值配置）**：仅保留全局模型网关绑定、算法默认阈值与冲浪 API 基础设置。
 
 ```json
 {

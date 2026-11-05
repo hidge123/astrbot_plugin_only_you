@@ -1,0 +1,170 @@
+{
+  "roguelite_schedule_config": {
+    "description": "🎲 Roguelite 随机日程引擎与三态微调设置",
+    "type": "object",
+    "items": {
+      "enable_roguelite_schedule": {
+        "description": "开启每日 Roguelite 随机日程构筑（自动排布 休息中/繁忙中/空闲中 三态与今日奇遇卡）",
+        "type": "bool",
+        "default": true
+      },
+      "daily_encounter_count": {
+        "description": "每日随机抽取的【奇遇谈资卡】数量（作为当天短时记忆增加主动聊天话题）",
+        "type": "int",
+        "default": 2
+      },
+      "max_mutations_per_day": {
+        "description": "每日日程最大微调次数上限（根据收到的消息或刷到的视频临时改变状态的次数上限）",
+        "type": "int",
+        "default": 2
+      },
+      "mutation_cooldown_minutes": {
+        "description": "日程状态微调后的冷却锁定时间（分钟，防止频繁横跳）",
+        "type": "int",
+        "default": 120
+      },
+      "allow_l3_wake_from_resting": {
+        "description": "允许 ★L3核心用户 在【休息中】状态下通过私聊唤醒 Bot",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "relationship_config": {
+    "description": "💖 三级用户关系设置 (普通L1 / 重要用户L2 / 核心用户L3)",
+    "type": "object",
+    "items": {
+      "core_user_ids": {
+        "description": "★ L3 核心用户 (管理员) 账号列表",
+        "type": "list",
+        "items": { "type": "string" },
+        "default": []
+      },
+      "important_user_ids": {
+        "description": "◆ 初始指定的 L2 重要用户列表（繁忙状态下依然会回复的对象）",
+        "type": "list",
+        "items": { "type": "string" },
+        "default": []
+      },
+      "enable_auto_promotion_l2": {
+        "description": "允许普通用户(L1)通过群聊良性互动自动晋升为重要用户(L2)",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "atmosphere_config": {
+    "description": "🌬️ 群聊主战场：解线团与“读空气”引擎设置",
+    "type": "object",
+    "items": {
+      "takeover_group_chat": {
+        "description": "全面接管群聊（结合当前三态与读空气决定是否回复）",
+        "type": "bool",
+        "default": true
+      },
+      "debounce_seconds": {
+        "description": "群聊听话防抖等待窗口（秒）",
+        "type": "float",
+        "default": 4.0
+      }
+    }
+  },
+  "surfing_config": {
+    "description": "📱 赛博冲浪：空闲状态下刷 B站 & 抖音设置",
+    "type": "object",
+    "items": {
+      "enable_bili_surfing": {
+        "description": "在【空闲中】状态下主动刷哔哩哔哩 (Bilibili)",
+        "type": "bool",
+        "default": true
+      },
+      "bili_cookie": {
+        "description": "B站 Cookie (选填)",
+        "type": "text",
+        "secret": true,
+        "default": ""
+      },
+      "enable_douyin_surfing": {
+        "description": "在【空闲中】状态下主动刷抖音 (Douyin)",
+        "type": "bool",
+        "default": true
+      },
+      "douyin_api_base": {
+        "description": "抖音解析 API 服务地址",
+        "type": "string",
+        "default": "https://api.douyin.wtf"
+      },
+      "send_raw_video": {
+        "description": "优先直发无水印视频文件",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "memory_and_context_config": {
+    "description": "🧠 精简版分级记忆、自动遗忘与上下文预算控制",
+    "type": "object",
+    "items": {
+      "enable_tiered_memory": {
+        "description": "开启分级记忆与每日自动遗忘清理 (Forgetting GC)",
+        "type": "bool",
+        "default": true,
+        "hint": "自动提炼核心记忆(永久)与近期记忆(随时间衰减并由定时程序自动清理不重要记忆)。"
+      },
+      "sliding_window_size": {
+        "description": "单会话短期滑动窗口保留消息条数（清空平台 req.contexts 后由插件注入的近期消息上限，滑出窗口即送去提炼记忆）",
+        "type": "int",
+        "default": 15
+      },
+      "extract_every_n_messages": {
+        "description": "滑出窗口每累计多少条有效消息触发一次后台小脑记忆提炼",
+        "type": "int",
+        "default": 15
+      },
+      "max_injected_memories": {
+        "description": "单次对话最多允许插入的记忆条数上限",
+        "type": "int",
+        "default": 6
+      },
+      "max_memory_chars_budget": {
+        "description": "单次对话插入记忆的最大总字数预算（汉字数，防止费用过高）",
+        "type": "int",
+        "default": 400
+      }
+    }
+  },
+  "model_hub_config": {
+    "description": "🔌 多模型统一调度网关 (留空则自动继承当前会话所属 AstrBot 配置文件的模型)",
+    "type": "object",
+    "items": {
+      "main_llm_provider_id": {
+        "description": "1. 对话主模型 (留空则自动继承平台当前会话模型)",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider"
+      },
+      "small_llm_provider_id": {
+        "description": "2. 小脑轻量文本模型 (用于读空气、日程微调与记忆提炼，建议选 Flash/Mini 模型；留空回退至主模型)",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider"
+      },
+      "vision_llm_provider_id": {
+        "description": "3. 多模态视觉模型 (用于后台看B站/抖音视频九宫格；留空优先继承平台默认识图模型 default_image_caption_provider_id 或主模型)",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider"
+      },
+      "embedding_provider_id": {
+        "description": "4. 向量嵌入模型 Embedding (选填，用于记忆语义召回；留空自动继承平台配置或降级为关键词检索)",
+        "type": "string",
+        "default": ""
+      },
+      "rerank_provider_id": {
+        "description": "5. 重排模型 Rerank (选填，用于记忆召回精排；留空自动继承平台配置或跳过重排)",
+        "type": "string",
+        "default": ""
+      }
+    }
+  }
+}

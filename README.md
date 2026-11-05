@@ -51,4 +51,5 @@
 | :--- | :--- | :--- |
 | **[docs/PRD.md](file:///Users/mac/Desktop/Project/OnlyYou/docs/PRD.md)** | **产品需求文档 (PRD v2.3)** | 详述 **三态模型（休息/繁忙/空闲）× 两大行为（回消息/刷视频）**、Roguelite 随机日程与奇遇谈资卡、输入驱动状态微调、**分级记忆与定时遗忘 + 简易上下文预算管理**。 |
 | **[docs/ARCHITECTURE.md](file:///Users/mac/Desktop/Project/OnlyYou/docs/ARCHITECTURE.md)** | **技术架构与 AstrBot 实现方案 (v2.3)** | 定义 `BotState` 三态门禁拦截器、受限状态微调算法、**`MemoryManager` 活力衰减与物理清理实现**、**`ContextBudgetManager` 裁剪逻辑**及 `_conf_schema.json`。 |
+| **[docs/WEBUI_DESIGN.md](file:///Users/mac/Desktop/Project/OnlyYou/docs/WEBUI_DESIGN.md)** | **WebUI 可视化控制台方案 (Pages)** | 基于 AstrBot `views/` (`window.AstrBotPluginPage`) 与 `register_web_api`，设计**导入原生人格、管理 `Soul ID`、可视化编辑三态行动卡片池、监控今日日程及关系/记忆管理**的专属面板。 |
 | **[docs/PROMPTS_AND_FLOWS.md](file:///Users/mac/Desktop/Project/OnlyYou/docs/PROMPTS_AND_FLOWS.md)** | **Prompt 工程与交互时序 (v2.3)** | 包含三态事件卡与奇遇卡生成 Prompt、受限状态微调 Prompt、**对话记忆提炼与重要度分级 Prompt** 以及完整时序图。 |
