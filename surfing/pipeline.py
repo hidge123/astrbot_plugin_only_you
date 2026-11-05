@@ -1,5 +1,7 @@
 """Main cyber surfing pipeline (active ONLY when BotState == IDLE)."""
 
+import json
+import time
 from typing import Any, Optional
 
 from .adapters.base import VideoItem
@@ -47,21 +49,27 @@ class CyberSurfingPipeline:
         soul: SoulProfile,
         current_state: BotState,
         umo: Optional[str] = None,
+        platform_filter: Optional[str] = None,
+        ignore_state_gate: bool = False,
     ) -> Optional[VideoReviewResult]:
         """
-        Execute one surfing cycle if and only if `current_state == BotState.IDLE`.
+        Execute one surfing cycle if `current_state == BotState.IDLE` (or `ignore_state_gate=True`).
         """
-        if not StateController.can_surf_video(current_state):
+        if not ignore_state_gate and not StateController.can_surf_video(current_state):
             return None
 
+        p_filter = (platform_filter or "").strip().lower()
         candidates: list[VideoItem] = []
-        if self.cfg.get("enable_bili_surfing", True):
+
+        if p_filter == "bilibili" or (not p_filter and self.cfg.get("enable_bili_surfing", True)):
             bili = BilibiliAdapter(cookie=str(self.cfg.get("bili_cookie") or ""))
             candidates.extend(
                 await bili.fetch_recommend_feed(preferences=soul.surfing_preferences, limit=4)
             )
 
-        if not candidates and self.cfg.get("enable_douyin_surfing", True):
+        if p_filter == "douyin" or (
+            not candidates and not p_filter and self.cfg.get("enable_douyin_surfing", True)
+        ):
             douyin = DouyinAdapter(
                 api_base=str(self.cfg.get("douyin_api_base") or "https://api.douyin.wtf")
             )
@@ -97,6 +105,37 @@ class CyberSurfingPipeline:
             memory_tier=MemoryTier.EPHEMERAL,
         )
 
+        # Persist to `surfing_history` table for WebUI Console Module 5
+        try:
+            await self.memory_manager.db.execute(
+                """
+                INSERT INTO surfing_history (
+                    soul_id, video_id, platform, title, author, cover_url, share_url,
+                    tags_json, hot_comments_json, visual_notes, score, commentary,
+                    worth_sharing, watched_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    soul.soul_id,
+                    chosen.video_id,
+                    chosen.platform,
+                    chosen.title,
+                    chosen.author,
+                    chosen.cover_url,
+                    chosen.share_url,
+                    json.dumps(chosen.tags, ensure_ascii=False),
+                    json.dumps(chosen.hot_comments, ensure_ascii=False),
+                    review.visual_notes,
+                    int(review.score),
+                    review.commentary,
+                    1 if review.score >= 70 else 0,
+                    int(time.time()),
+                ),
+            )
+        except Exception:
+            pass
+
         # Check Scenario 4 (刷片上头 >= 88): trigger bounded schedule mutation
         await self.schedule_mutator.on_video_input(
             soul=soul,
@@ -106,3 +145,59 @@ class CyberSurfingPipeline:
         )
 
         return review
+
+    async def list_history(
+        self, soul_id: Optional[str] = None, limit: int = 30
+    ) -> list[dict[str, Any]]:
+        """List surfed video records from SQLite `surfing_history` table."""
+        if soul_id:
+            rows = await self.memory_manager.db.fetchall(
+                "SELECT * FROM surfing_history WHERE soul_id = ? ORDER BY watched_at DESC, id DESC LIMIT ?",
+                (soul_id, int(limit)),
+            )
+        else:
+            rows = await self.memory_manager.db.fetchall(
+                "SELECT * FROM surfing_history ORDER BY watched_at DESC, id DESC LIMIT ?",
+                (int(limit),),
+            )
+        items: list[dict[str, Any]] = []
+        for r in rows:
+            try:
+                tags = json.loads(r.get("tags_json") or "[]")
+            except Exception:
+                tags = []
+            try:
+                hot_comments = json.loads(r.get("hot_comments_json") or "[]")
+            except Exception:
+                hot_comments = []
+            items.append(
+                {
+                    "id": int(r["id"]),
+                    "soul_id": str(r["soul_id"]),
+                    "video_id": str(r["video_id"]),
+                    "platform": str(r["platform"]),
+                    "title": str(r["title"]),
+                    "author": str(r["author"]),
+                    "cover_url": str(r.get("cover_url") or ""),
+                    "share_url": str(r.get("share_url") or ""),
+                    "tags": tags,
+                    "hot_comments": hot_comments,
+                    "visual_notes": str(r.get("visual_notes") or ""),
+                    "score": int(r.get("score") or 80),
+                    "commentary": str(r.get("commentary") or ""),
+                    "worth_sharing": bool(r.get("worth_sharing", 1)),
+                    "watched_at": int(r.get("watched_at") or 0),
+                }
+            )
+        return items
+
+    async def delete_history_item(self, item_id: Optional[int] = None, video_id: Optional[str] = None) -> None:
+        """Delete a video from `surfing_history` by row `id` or `video_id`."""
+        if item_id is not None:
+            await self.memory_manager.db.execute(
+                "DELETE FROM surfing_history WHERE id = ?", (int(item_id),)
+            )
+        elif video_id:
+            await self.memory_manager.db.execute(
+                "DELETE FROM surfing_history WHERE video_id = ?", (str(video_id),)
+            )

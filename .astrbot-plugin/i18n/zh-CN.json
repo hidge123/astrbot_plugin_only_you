@@ -1,0 +1,15 @@
+{
+  "metadata": {
+    "display_name": "OnlyYou (只有你)"
+  },
+  "views": {
+    "console": {
+      "title": "OnlyYou 可视化工作台"
+    }
+  },
+  "pages": {
+    "console": {
+      "title": "OnlyYou 可视化工作台"
+    }
+  }
+}

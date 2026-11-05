@@ -1,0 +1,15 @@
+{
+  "metadata": {
+    "display_name": "OnlyYou"
+  },
+  "views": {
+    "console": {
+      "title": "OnlyYou Console"
+    }
+  },
+  "pages": {
+    "console": {
+      "title": "OnlyYou Console"
+    }
+  }
+}

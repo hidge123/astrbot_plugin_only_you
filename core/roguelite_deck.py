@@ -579,18 +579,25 @@ class RogueliteDeckEngine:
         new_state: BotState,
         new_title: Optional[str] = None,
         armor: Optional[int] = None,
+        slot_key: Optional[str] = None,
         now_dt: Optional[datetime] = None,
     ) -> SlotInstance:
-        """Manually override the current slot's state & title (for debugging/commands)."""
+        """Manually override the current (or specified `slot_key`) slot's state & title."""
         run, current_slot, _ = await self.get_current_and_next_slot(
             soul_id=soul_id, now_dt=now_dt
         )
-        current_slot.state = new_state
+        target_slot = current_slot
+        if slot_key:
+            found = next((s for s in run.slots if s.slot_key == slot_key), None)
+            if found is not None:
+                target_slot = found
+
+        target_slot.state = new_state
         if new_title:
-            current_slot.title = new_title
+            target_slot.title = new_title
         if armor is not None:
-            current_slot.armor = armor
-        current_slot.mutated = False
-        current_slot.mutation_monologue = ""
+            target_slot.armor = max(0, min(100, int(armor)))
+        target_slot.mutated = False
+        target_slot.mutation_monologue = ""
         await self.save_run(run)
-        return current_slot
+        return target_slot

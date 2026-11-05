@@ -20,6 +20,19 @@ class UserProfile:
     interaction_count: int = 0
     affinity: float = 0.0
     platform_ids: list[str] = field(default_factory=list)
+    nickname: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "global_uid": self.global_uid,
+            "display_name": self.display_name,
+            "nickname": self.nickname,
+            "tier": int(self.tier.value),
+            "tier_label": self.tier.label,
+            "interaction_count": self.interaction_count,
+            "affinity": round(float(self.affinity), 1),
+            "platform_ids": list(self.platform_ids),
+        }
 
 
 class UserRelationManager:
@@ -118,6 +131,18 @@ class UserRelationManager:
             row = await self.db.fetchone(
                 "SELECT * FROM users WHERE global_uid = ?", (uid,)
             )
+            if not row:
+                # Check if `uid` was merged into another `global_uid` via `platform_ids_json`
+                all_rows = await self.db.fetchall("SELECT * FROM users")
+                for r in all_rows:
+                    try:
+                        pids = json.loads(r.get("platform_ids_json") or "[]")
+                    except Exception:
+                        pids = []
+                    if uid in pids:
+                        row = r
+                        uid = str(r["global_uid"])
+                        break
             if row:
                 raw_tier = int(row.get("tier", 1))
                 tier = (
@@ -136,6 +161,7 @@ class UserRelationManager:
                     interaction_count=int(row.get("interaction_count", 0)),
                     affinity=float(row.get("affinity", 0.0)),
                     platform_ids=pids,
+                    nickname=str(row.get("nickname") or ""),
                 )
             else:
                 profile = UserProfile(
@@ -145,6 +171,7 @@ class UserRelationManager:
                     interaction_count=0,
                     affinity=0.0,
                     platform_ids=[uid],
+                    nickname="",
                 )
 
         if name and name != uid:
@@ -182,14 +209,17 @@ class UserRelationManager:
     async def save_user(self, profile: UserProfile) -> None:
         """Persist UserProfile to SQLite and memory cache."""
         self._cache[profile.global_uid] = profile
+        for pid in profile.platform_ids:
+            self._cache[pid] = profile
         await self.db.execute(
             """
             INSERT INTO users (
-                global_uid, display_name, tier, interaction_count, affinity, platform_ids_json, updated_at
+                global_uid, display_name, nickname, tier, interaction_count, affinity, platform_ids_json, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(global_uid) DO UPDATE SET
                 display_name = excluded.display_name,
+                nickname = excluded.nickname,
                 tier = excluded.tier,
                 interaction_count = excluded.interaction_count,
                 affinity = excluded.affinity,
@@ -199,6 +229,7 @@ class UserRelationManager:
             (
                 profile.global_uid,
                 profile.display_name,
+                profile.nickname,
                 int(profile.tier.value),
                 profile.interaction_count,
                 profile.affinity,
@@ -206,3 +237,116 @@ class UserRelationManager:
                 int(time.time()),
             ),
         )
+
+    async def list_users(self, tier_filter: Optional[int] = None) -> list[UserProfile]:
+        """List all known users (seeding configured L3/L2 IDs if not yet in SQLite)."""
+        for cid in self.cfg.get("core_user_ids") or []:
+            if str(cid).strip():
+                await self.get_or_create_user(str(cid).strip())
+        for iid in self.cfg.get("important_user_ids") or []:
+            if str(iid).strip():
+                await self.get_or_create_user(str(iid).strip())
+
+        if tier_filter in (1, 2, 3):
+            rows = await self.db.fetchall(
+                "SELECT * FROM users WHERE tier = ? ORDER BY tier DESC, affinity DESC, interaction_count DESC",
+                (int(tier_filter),),
+            )
+        else:
+            rows = await self.db.fetchall(
+                "SELECT * FROM users ORDER BY tier DESC, affinity DESC, interaction_count DESC"
+            )
+
+        users: list[UserProfile] = []
+        for r in rows:
+            raw_tier = int(r.get("tier", 1))
+            t = UserTier(raw_tier) if raw_tier in (1, 2, 3) else UserTier.L1_NORMAL
+            try:
+                pids = json.loads(r.get("platform_ids_json") or "[]")
+            except Exception:
+                pids = [str(r["global_uid"])]
+            u = UserProfile(
+                global_uid=str(r["global_uid"]),
+                display_name=str(r.get("display_name") or r["global_uid"]),
+                tier=t,
+                interaction_count=int(r.get("interaction_count", 0)),
+                affinity=float(r.get("affinity", 0.0)),
+                platform_ids=pids,
+                nickname=str(r.get("nickname") or ""),
+            )
+            self._cache[u.global_uid] = u
+            users.append(u)
+        return users
+
+    async def update_user_details(
+        self,
+        global_uid: str,
+        display_name: Optional[str] = None,
+        nickname: Optional[str] = None,
+        tier: Optional[int] = None,
+        affinity: Optional[float] = None,
+        platform_ids: Optional[list[str]] = None,
+    ) -> UserProfile:
+        """Create or update a user's tier, affinity, nickname, display_name, and platform_ids."""
+        profile = await self.get_or_create_user(
+            user_id=global_uid, display_name=display_name or ""
+        )
+        if display_name is not None and display_name.strip():
+            profile.display_name = display_name.strip()
+        if nickname is not None:
+            profile.nickname = nickname.strip()
+        if tier in (1, 2, 3):
+            profile.tier = UserTier(int(tier))
+        if affinity is not None:
+            profile.affinity = max(0.0, min(100.0, float(affinity)))
+        if platform_ids is not None:
+            cleaned = [str(p).strip() for p in platform_ids if str(p).strip()]
+            if profile.global_uid not in cleaned:
+                cleaned.insert(0, profile.global_uid)
+            profile.platform_ids = cleaned
+        await self.save_user(profile)
+        return profile
+
+    async def merge_users(self, primary_uid: str, secondary_uid: str) -> UserProfile:
+        """
+        Merge `secondary_uid` into `primary_uid` (`GlobalUser` unification across platforms):
+        - Combine `platform_ids`, sum `interaction_count`, take max `tier` & `affinity`
+        - Re-link `memories.user_id` from `secondary_uid` to `primary_uid`
+        - Delete `secondary_uid` row from `users`
+        """
+        p_id = (primary_uid or "").strip()
+        s_id = (secondary_uid or "").strip()
+        if not p_id or not s_id or p_id == s_id:
+            raise ValueError("请选择两个不同的账号进行跨平台合并")
+
+        primary = await self.get_or_create_user(p_id)
+        secondary = await self.get_or_create_user(s_id)
+
+        merged_pids = list(primary.platform_ids)
+        for pid in [s_id] + list(secondary.platform_ids):
+            if pid and pid not in merged_pids:
+                merged_pids.append(pid)
+
+        primary.platform_ids = merged_pids
+        if secondary.tier.value > primary.tier.value:
+            primary.tier = secondary.tier
+        primary.interaction_count += secondary.interaction_count
+        primary.affinity = min(100.0, max(primary.affinity, secondary.affinity) + secondary.affinity * 0.5)
+        if not primary.nickname and secondary.nickname:
+            primary.nickname = secondary.nickname
+
+        await self.save_user(primary)
+        await self.db.execute(
+            "UPDATE memories SET user_id = ? WHERE user_id = ?", (p_id, s_id)
+        )
+        await self.db.execute("DELETE FROM users WHERE global_uid = ?", (s_id,))
+        self._cache[s_id] = primary
+        return primary
+
+    async def delete_user(self, global_uid: str) -> None:
+        """Delete a user record by `global_uid`."""
+        uid = (global_uid or "").strip()
+        if not uid:
+            return
+        self._cache.pop(uid, None)
+        await self.db.execute("DELETE FROM users WHERE global_uid = ?", (uid,))

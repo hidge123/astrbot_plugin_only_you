@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OnlyYou (只有你) — 可视化工作台</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- Top Global Soul ID Bar & Live 3-State Status Strip -->
+  <header class="top-header">
+    <div class="top-row">
+      <div class="brand-group">
+        <div class="brand-logo">🌟 OnlyYou 控制台</div>
+        <div class="soul-selector-wrap">
+          <label for="global-soul-select">🧬 当前管理角色 (Soul ID):</label>
+          <select id="global-soul-select" onchange="app.onSwitchSoul(this.value)"></select>
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-primary btn-sm" onclick="app.openImportPersonaModal()">📥 从AstrBot导入人格</button>
+          <button class="btn btn-sm" onclick="app.openRenameSoulModal()">✏️ 修改ID</button>
+          <button class="btn btn-sm" onclick="app.openCreateSoulModal()">➕ 新建角色</button>
+          <button class="btn btn-danger btn-sm" onclick="app.deleteCurrentSoul()">🗑️ 删除</button>
+        </div>
+      </div>
+      <div class="btn-group">
+        <button class="btn btn-sm" onclick="app.refreshCurrentWorkspace()">🔄 刷新数据</button>
+        <button class="btn btn-sm" onclick="app.toggleTheme()">🌗 切换主题</button>
+      </div>
+    </div>
+
+    <div class="status-strip">
+      <div class="status-left">
+        <span>🚦 实时状态:</span>
+        <span id="live-state-badge" class="state-pill state-IDLE">☕ 空闲中</span>
+        <strong id="live-slot-title">加载中...</strong>
+        <span id="live-armor-chip" class="meta-chip">🛡️ 护甲: --</span>
+        <span id="live-vigor-chip" class="meta-chip">🎲 今日基调: --</span>
+        <span id="live-mutation-chip" class="meta-chip">⚡ 今日微调: 0/2</span>
+      </div>
+      <div class="btn-group">
+        <button class="btn btn-sm" onclick="app.openForceStateModal()">⚡ 强制切状态</button>
+        <button class="btn btn-primary btn-sm" onclick="app.rerollTodaySchedule()">🎲 重抽今日日程</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Workspace Layout: Left 5-Tab Sidebar + Right Content Area -->
+  <div class="workspace-layout">
+    <nav class="sidebar">
+      <button class="nav-item active" data-tab="tab-soul" onclick="app.switchTab('tab-soul')">
+        🗂️ 1. 角色与人格
+      </button>
+      <button class="nav-item" data-tab="tab-schedule" onclick="app.switchTab('tab-schedule')">
+        🃏 2. 行动卡与日程
+      </button>
+      <button class="nav-item" data-tab="tab-users" onclick="app.switchTab('tab-users')">
+        💖 3. 用户关系网
+      </button>
+      <button class="nav-item" data-tab="tab-memories" onclick="app.switchTab('tab-memories')">
+        🧠 4. 分级记忆库
+      </button>
+      <button class="nav-item" data-tab="tab-surfing" onclick="app.switchTab('tab-surfing')">
+        📱 5. 冲浪视频池
+      </button>
+    </nav>
+
+    <main class="main-content">
+      <!-- ================================================================== -->
+      <!-- MODULE 1: 🗂️ 角色灵魂与人格导入 (Soul & Persona Studio)             -->
+      <!-- ================================================================== -->
+      <section id="tab-soul" class="tab-pane active">
+        <div class="panel-card">
+          <div class="panel-header">
+            <div>
+              <div class="panel-title">🗂️ 角色灵魂档案编辑器 (Soul Profile Studio)</div>
+              <div class="panel-subtitle">查看或编辑当前 Soul 的网名、社交定位、说话口癖与 B站/抖音冲浪偏好标签</div>
+            </div>
+            <div class="btn-group">
+              <button class="btn btn-sm" onclick="app.openRenameSoulModal()">✏️ 修改 Soul ID</button>
+              <button class="btn btn-primary" onclick="app.saveSoulProfile()">💾 保存角色档案</button>
+            </div>
+          </div>
+
+          <div class="form-grid">
+            <div class="form-group">
+              <label>当前 Soul ID (唯一标识)</label>
+              <input type="text" id="soul-id-input" readonly />
+              <span class="form-hint">点击上方“✏️ 修改 Soul ID”可事务级联更新关联卡片与记忆</span>
+            </div>
+            <div class="form-group">
+              <label>角色自称 / 网名 (name)</label>
+              <input type="text" id="soul-name-input" placeholder="如：星野 / 小星" />
+            </div>
+            <div class="form-group">
+              <label>社交人设定位 (archetype)</label>
+              <input type="text" id="soul-archetype-input" placeholder="如：喜欢熬夜刷B站分享搞笑视频的大学网友" />
+            </div>
+            <div class="form-group">
+              <label>口癖与语言规范 (speaking_style)</label>
+              <input type="text" id="soul-style-input" placeholder="如：口语化短句，像微信好友一样自然随性，爱用hhh" />
+            </div>
+            <div class="form-group full-width">
+              <label>📱 B站 / 抖音冲浪偏好标签 (surfing_preferences)</label>
+              <div class="tags-container" id="soul-prefs-tags"></div>
+              <div style="display:flex; gap:8px; margin-top:6px;">
+                <input type="text" id="new-pref-tag-input" placeholder="输入冲浪喜好标签，如：搞笑整活、猫咪、游戏实况..." style="flex:1;" onkeydown="if(event.key==='Enter'){event.preventDefault();app.addPrefTag();}" />
+                <button class="btn btn-sm" onclick="app.addPrefTag()">➕ 添加标签</button>
+              </div>
+            </div>
+            <div class="form-group full-width">
+              <label>AstrBot 原生 Persona 基础设定文本 (native_persona_prompt)</label>
+              <textarea id="soul-prompt-input" rows="4" placeholder="角色底层详细人设背景描述..."></textarea>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel-card">
+          <div class="panel-header">
+            <div>
+              <div class="panel-title">🔗 群聊 / 私聊会话 (UMO) 路由绑定表</div>
+              <div class="panel-subtitle">为特定群聊或私聊显式绑定 Soul ID（留空则自动跟随该会话在 AstrBot 配置文件中选定的 Persona）</div>
+            </div>
+          </div>
+
+          <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px;">
+            <input type="text" id="bind-umo-input" placeholder="输入或选择会话 UMO (如 default_umo 或 qq:group:123456)" style="flex:2; min-width:220px;" />
+            <select id="bind-soul-select" style="flex:1; min-width:160px;"></select>
+            <button class="btn btn-primary btn-sm" onclick="app.bindUmoToSoul()">🔗 保存会话绑定</button>
+          </div>
+
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>会话标识 (UMO)</th>
+                <th>当前绑定 Soul ID</th>
+                <th>滑窗消息数</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="umo-bindings-tbody"></tbody>
+          </table>
+        </div>
+
+        <div class="panel-card">
+          <div class="panel-header">
+            <div>
+              <div class="panel-title">🔌 ModelHub 多模型网关继承状态</div>
+              <div class="panel-subtitle">插件自动继承当前会话所属 AstrBot 配置文件的模型设置</div>
+            </div>
+          </div>
+          <div class="stats-grid" id="model-status-grid"></div>
+        </div>
+      </section>
+
+      <!-- ================================================================== -->
+      <!-- MODULE 2: 🃏 Roguelite 日程实况与行动卡片编辑器                     -->
+      <!-- ================================================================== -->
+      <section id="tab-schedule" class="tab-pane">
+        <!-- Upper Half: Today's Live 6-Slot Schedule + Encounter Cards -->
+        <div class="panel-card">
+          <div class="panel-header">
+            <div>
+              <div class="panel-title">📅 今日 Roguelite 6 时段日程轴实况 (Live Schedule)</div>
+              <div class="panel-subtitle" id="schedule-subtitle">点击任意时间段卡片可直接干预并切换该时段的三态状态与定力护甲</div>
+            </div>
+            <div class="btn-group">
+              <button class="btn btn-sm" onclick="app.openForceStateModal()">⚡ 手动切换状态</button>
+              <button class="btn btn-primary btn-sm" onclick="app.rerollTodaySchedule()">🎲 重新抽取今日日程</button>
+            </div>
+          </div>
+
+          <div class="timeline-grid" id="schedule-timeline-grid"></div>
+
+          <div style="margin-top:12px;">
+            <div style="font-weight:600; font-size:13px; margin-bottom:8px; color:var(--text-secondary);">
+              🃏 今日抽出的【奇遇谈资卡】（作为当天短时记忆提供聊天话题，聊过一次即消耗为“已聊”）
+            </div>
+            <div class="encounter-list" id="today-encounters-list"></div>
+          </div>
+        </div>
+
+        <!-- Lower Half: Action Card Deck & Encounter Pool Editor -->
+        <div class="panel-card">
+          <div class="panel-header">
+            <div>
+              <div class="panel-title">🃏 三态行动卡片池与奇遇卡编辑器 (Card Deck Editor)</div>
+              <div class="panel-subtitle">管理绑定了【☕ 空闲中 / 🔥 繁忙中 / 💤 休息中】的事件状态卡与奇遇谈资卡</div>
+            </div>
+            <div class="btn-group">
+              <button class="btn btn-sm" onclick="app.openActionCardModal()">➕ 新建行动卡</button>
+              <button class="btn btn-sm" onclick="app.openEncounterCardModal()">➕ 新建奇遇卡</button>
+              <button class="btn btn-primary btn-sm" onclick="app.aiGenerateCards()">🤖 AI 根据人设生成新卡</button>
+            </div>
+          </div>
+
+          <div class="filter-bar">
+            <div class="pill-tabs" id="card-filter-tabs">
+              <button class="pill-tab active" data-filter="ALL" onclick="app.setCardFilter('ALL')">全部卡片</button>
+              <button class="pill-tab" data-filter="IDLE" onclick="app.setCardFilter('IDLE')">☕ 空闲卡 (IDLE)</button>
+              <button class="pill-tab" data-filter="BUSY" onclick="app.setCardFilter('BUSY')">🔥 繁忙卡 (BUSY)</button>
+              <button class="pill-tab" data-filter="RESTING" onclick="app.setCardFilter('RESTING')">💤 休息卡 (RESTING)</button>
+              <button class="pill-tab" data-filter="ENCOUNTER" onclick="app.setCardFilter('ENCOUNTER')">✨ 奇遇谈资卡</button>
+            </div>
+            <span class="form-hint" id="card-count-hint">共 0 张</span>
+          </div>
+
+          <div class="cards-grid" id="deck-cards-grid"></div>
+        </div>
+      </section>
+
+      <!-- ================================================================== -->
+      <!-- MODULE 3: 💖 三级用户关系与跨平台身份管理 (Relationships)           -->
+      <!-- ================================================================== -->
+      <section id="tab-users" class="tab-pane">
+        <div class="panel-card">
+          <div class="panel-header">
+            <div>
+              <div class="panel-title">💖 三级用户关系网管理 (L1普通 / ◆L2重要熟人 / ★L3核心用户)</div>
+              <div class="panel-subtitle">控制繁忙状态下的消息放行特权、L3私聊强唤醒权限、好感度与专属外号</div>
+            </div>
+            <div class="btn-group">
+              <button class="btn btn-primary btn-sm" onclick="app.openUserModal()">➕ 新增 / 指定用户关系</button>
+            </div>
+          </div>
+
+          <div class="stats-grid" id="user-stats-grid"></div>
+
+          <div class="filter-bar">
+            <div class="pill-tabs" id="user-filter-tabs">
+              <button class="pill-tab active" data-tier="" onclick="app.setUserFilter('')">全部用户</button>
+              <button class="pill-tab" data-tier="3" onclick="app.setUserFilter('3')">★ L3 核心用户 (管理员)</button>
+              <button class="pill-tab" data-tier="2" onclick="app.setUserFilter('2')">◆ L2 重要用户 (群熟人)</button>
+              <button class="pill-tab" data-tier="1" onclick="app.setUserFilter('1')">○ L1 普通用户</button>
+            </div>
+          </div>
+
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>全局 UID / 平台账号</th>
+                <th>昵称 & 专属称呼</th>
+                <th>当前关系等级</th>
+                <th>好感度 (0-100)</th>
+                <th>互动次数</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="users-tbody"></tbody>
+          </table>
+        </div>
+
+        <div class="panel-card">
+          <div class="panel-header">
+            <div>
+              <div class="panel-title">🔗 跨平台账号可视化合并 (GlobalUser Unification)</div>
+              <div class="panel-subtitle">将同一人在不同平台（如 QQ 与 Telegram）的账号合并为同一个全局身份，自动累加互动与记忆</div>
+            </div>
+          </div>
+          <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+            <div style="flex:1; min-width:200px;">
+              <label style="font-size:12px; color:var(--text-secondary);">保留的主账号 A (Primary UID):</label>
+              <select id="merge-primary-select" style="width:100%; margin-top:4px;"></select>
+            </div>
+            <div style="font-size:18px; padding-top:16px;">⬅️</div>
+            <div style="flex:1; min-width:200px;">
+              <label style="font-size:12px; color:var(--text-secondary);">待合并的副账号 B (Secondary UID):</label>
+              <select id="merge-secondary-select" style="width:100%; margin-top:4px;"></select>
+            </div>
+            <div style="padding-top:18px;">
+              <button class="btn btn-primary" onclick="app.mergeCrossPlatformUsers()">🔗 立即合并身份</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================================================================== -->
+      <!-- MODULE 4: 🧠 分级记忆库与上下文监控 (Memory Vault)                  -->
+      <!-- ================================================================== -->
+      <section id="tab-memories" class="tab-pane">
+        <div class="panel-card">
+          <div class="panel-header">
+            <div>
+              <div class="panel-title">🧠 精简版三级记忆库与定时遗忘监控 (Memory Vault & Forgetting GC)</div>
+              <div class="panel-subtitle">Tier 3 核心记忆永久保留，Tier 2 近期记忆按活力衰减与访问强化晋升，Tier 1 瞬时记忆 48h 自动清理</div>
+            </div>
+            <div class="btn-group">
+              <button class="btn btn-primary btn-sm" onclick="app.openMemoryModal()">➕ 手动新增记忆</button>
+              <button class="btn btn-sm" onclick="app.triggerMemoryExtract()">⚡ 提炼当前滑窗</button>
+              <button class="btn btn-danger btn-sm" onclick="app.triggerForgettingGC()">🗑️ 立即执行遗忘清理 GC</button>
+            </div>
+          </div>
+
+          <div class="stats-grid" id="memory-stats-grid"></div>
+
+          <div class="filter-bar">
+            <div class="pill-tabs" id="memory-filter-tabs">
+              <button class="pill-tab active" data-mtier="" onclick="app.setMemoryTierFilter('')">全部记忆</button>
+              <button class="pill-tab" data-mtier="3" onclick="app.setMemoryTierFilter('3')">💎 Tier 3 核心永久记忆</button>
+              <button class="pill-tab" data-mtier="2" onclick="app.setMemoryTierFilter('2')">📅 Tier 2 近期衰减记忆</button>
+              <button class="pill-tab" data-mtier="1" onclick="app.setMemoryTierFilter('1')">🕒 Tier 1 今日瞬时记忆</button>
+            </div>
+            <div style="display:flex; gap:6px;">
+              <input type="text" id="memory-search-input" placeholder="搜索关键词或记忆内容..." onkeydown="if(event.key==='Enter')app.loadMemories();" />
+              <button class="btn btn-sm" onclick="app.loadMemories()">🔍 筛选</button>
+            </div>
+          </div>
+
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>ID / 分级</th>
+                <th>记忆内容 (<=60字) & 关键词标签</th>
+                <th>关联用户</th>
+                <th>重要度</th>
+                <th>活力值 (Vitality) & 召回</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="memories-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ================================================================== -->
+      <!-- MODULE 5: 📱 赛博冲浪视频池与测试台 (Surfing Pool)                  -->
+      <!-- ================================================================== -->
+      <section id="tab-surfing" class="tab-pane">
+        <div class="panel-card">
+          <div class="panel-header">
+            <div>
+              <div class="panel-title">📱 赛博冲浪视频池与多模态看片测试台 (Cyber Surfing Pool)</div>
+              <div class="panel-subtitle">展示 Bot 在空闲状态下从 B站/抖音刷到的视频、热评、多模态《看片画面笔记》与第一人称吐槽</div>
+            </div>
+            <div class="btn-group">
+              <select id="surf-share-umo-select" title="选择主动分享目标会话 UMO"></select>
+              <button class="btn btn-primary btn-sm" onclick="app.triggerSurfOnce('bilibili')">🚀 立即刷一次 B站</button>
+              <button class="btn btn-primary btn-sm" onclick="app.triggerSurfOnce('douyin')">🚀 立即刷一次抖音</button>
+            </div>
+          </div>
+
+          <div class="video-wall" id="surfing-video-wall"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- ====================================================================== -->
+  <!-- MODALS                                                                 -->
+  <!-- ====================================================================== -->
+
+  <!-- 1. Import Native Persona Modal -->
+  <div class="modal-backdrop" id="modal-import-persona">
+    <div class="modal-box">
+      <div class="panel-title">📥 从 AstrBot 原生 Persona 导入人格</div>
+      <div class="form-group">
+        <label>选择 AstrBot 原生 Persona</label>
+        <select id="import-persona-select" onchange="app.onSelectNativePersona(this.value)"></select>
+      </div>
+      <div class="form-group">
+        <label>导入后的目标 Soul ID (可自定义修改)</label>
+        <input type="text" id="import-target-soul-id" placeholder="如：soul_hoshino" />
+      </div>
+      <div class="form-group">
+        <label>原生人设设定预览 (可在导入前微调)</label>
+        <textarea id="import-persona-prompt" rows="3"></textarea>
+      </div>
+      <div class="form-group">
+        <label>选择导入方式</label>
+        <label style="font-weight:400; display:flex; align-items:center; gap:6px;">
+          <input type="radio" name="import-mode" value="ai" checked />
+          ✨ <strong>方式 B（推荐）</strong>：AI 扩写角色档案并自动生成专属三态行动卡池与奇遇卡
+        </label>
+        <label style="font-weight:400; display:flex; align-items:center; gap:6px;">
+          <input type="radio" name="import-mode" value="direct" />
+          📄 <strong>方式 A</strong>：直接继承导入设定文本并挂载默认通用行动卡池
+        </label>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="app.closeModal('modal-import-persona')">取消</button>
+        <button class="btn btn-primary" onclick="app.submitImportPersona()">🚀 开始导入</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 2. Rename / Create Soul Modal -->
+  <div class="modal-backdrop" id="modal-soul-id">
+    <div class="modal-box">
+      <div class="panel-title" id="modal-soul-id-title">✏️ 修改当前 Soul ID</div>
+      <div class="form-group">
+        <label id="modal-soul-id-label">新的 Soul ID</label>
+        <input type="text" id="modal-soul-id-input" placeholder="如：soul_hoshino" />
+        <span class="form-hint" id="modal-soul-id-hint">系统将在 SQLite 事务中级联更新该角色关联的所有日程、卡片与记忆外键。</span>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="app.closeModal('modal-soul-id')">取消</button>
+        <button class="btn btn-primary" onclick="app.submitSoulIdModal()">确认</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 3. Force State Override Modal -->
+  <div class="modal-backdrop" id="modal-force-state">
+    <div class="modal-box">
+      <div class="panel-title">⚡ 手动切换时段三态状态与护甲</div>
+      <div class="form-group">
+        <label>目标时间槽 (留空默认当前活跃时段)</label>
+        <select id="force-slot-select">
+          <option value="">👉 当前活跃时段</option>
+          <option value="morning">07:00-09:00 清晨早起 (morning)</option>
+          <option value="forenoon">09:00-12:00 上午正事 (forenoon)</option>
+          <option value="noon">12:00-14:00 午休干饭 (noon)</option>
+          <option value="afternoon">14:00-18:00 下午时光 (afternoon)</option>
+          <option value="evening">18:00-23:00 晚间黄金档 (evening)</option>
+          <option value="night">23:00-07:00 深夜睡眠 (night)</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>切换目标状态</label>
+        <div style="display:flex; gap:12px; flex-wrap:wrap;">
+          <label><input type="radio" name="force-state-radio" value="IDLE" checked /> ☕ 空闲中 (IDLE)</label>
+          <label><input type="radio" name="force-state-radio" value="BUSY" /> 🔥 繁忙中 (BUSY)</label>
+          <label><input type="radio" name="force-state-radio" value="RESTING" /> 💤 休息中 (RESTING)</label>
+        </div>
+      </div>
+      <div class="form-group">
+        <label>正在做的事 (事件标题)</label>
+        <input type="text" id="force-title-input" placeholder="如：躺沙发上刷B站水群 / 苦逼赶稿中" />
+      </div>
+      <div class="form-group">
+        <label>定力护甲 (Armor: <span id="force-armor-val">40</span>)</label>
+        <input type="range" id="force-armor-input" min="0" max="100" value="40" oninput="document.getElementById('force-armor-val').textContent=this.value" />
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="app.closeModal('modal-force-state')">取消</button>
+        <button class="btn btn-primary" onclick="app.submitForceState()">⚡ 立即生效</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 4. Action Card Editor Modal -->
+  <div class="modal-backdrop" id="modal-action-card">
+    <div class="modal-box">
+      <div class="panel-title" id="modal-action-card-title">🃏 编辑三态行动卡片 (StateEventCard)</div>
+      <input type="hidden" id="card-id-input" />
+      <div class="form-group">
+        <label>卡片名称 / 正在做的事 (title)</label>
+        <input type="text" id="card-title-input" placeholder="如：窝在沙发里刷短视频 / 苦逼赶周报" />
+      </div>
+      <div class="form-group">
+        <label>绑定三态状态 (state)</label>
+        <div style="display:flex; gap:12px; flex-wrap:wrap;">
+          <label><input type="radio" name="card-state-radio" value="IDLE" checked /> ☕ 空闲中 (IDLE)</label>
+          <label><input type="radio" name="card-state-radio" value="BUSY" /> 🔥 繁忙中 (BUSY)</label>
+          <label><input type="radio" name="card-state-radio" value="RESTING" /> 💤 休息中 (RESTING)</label>
+        </div>
+      </div>
+      <div class="form-group">
+        <label>有效时间槽 (valid_slots)</label>
+        <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:6px;" id="card-slots-checkboxes">
+          <label><input type="checkbox" value="morning" /> 早间 (07-09)</label>
+          <label><input type="checkbox" value="forenoon" /> 上午 (09-12)</label>
+          <label><input type="checkbox" value="noon" checked /> 午间 (12-14)</label>
+          <label><input type="checkbox" value="afternoon" checked /> 下午 (14-18)</label>
+          <label><input type="checkbox" value="evening" checked /> 晚间 (18-23)</label>
+          <label><input type="checkbox" value="night" /> 深夜 (23-07)</label>
+        </div>
+      </div>
+      <div class="form-group">
+        <label>定力护甲 (armor: <span id="card-armor-label">45</span>) — <span id="card-armor-hint" class="form-hint">正常定力</span></label>
+        <input type="range" id="card-armor-slider" min="0" max="100" value="45" oninput="app.updateCardArmorHint(this.value)" />
+      </div>
+      <div class="form-group">
+        <label>基础抽取权重 (base_weight: <span id="card-weight-label">50</span>)</label>
+        <input type="range" id="card-weight-slider" min="1" max="100" value="50" oninput="document.getElementById('card-weight-label').textContent=this.value" />
+      </div>
+      <div class="form-group">
+        <label>卡片作用域 (scope)</label>
+        <select id="card-scope-select">
+          <option value="soul">当前 Soul 专属卡</option>
+          <option value="global">全局通用卡</option>
+        </select>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="app.closeModal('modal-action-card')">取消</button>
+        <button class="btn btn-primary" onclick="app.submitSaveActionCard()">💾 保存卡片</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 5. Encounter Talk Card Modal -->
+  <div class="modal-backdrop" id="modal-encounter-card">
+    <div class="modal-box">
+      <div class="panel-title">✨ 编辑奇遇谈资卡 (EncounterCard)</div>
+      <input type="hidden" id="encounter-old-content" />
+      <div class="form-group">
+        <label>奇遇小事描述（作为当天短时记忆提供主动聊天话题）</label>
+        <textarea id="encounter-content-input" rows="3" placeholder="如：今天中午点外卖老板居然多送了一根烤肠！"></textarea>
+      </div>
+      <div class="form-group">
+        <label>作用域</label>
+        <select id="encounter-scope-select">
+          <option value="soul">当前 Soul 专属奇遇</option>
+          <option value="global">全局通用奇遇</option>
+        </select>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="app.closeModal('modal-encounter-card')">取消</button>
+        <button class="btn btn-primary" onclick="app.submitSaveEncounterCard()">💾 保存奇遇卡</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 6. User Relationship Edit Modal -->
+  <div class="modal-backdrop" id="modal-user-edit">
+    <div class="modal-box">
+      <div class="panel-title">💖 编辑用户关系与专属称呼</div>
+      <div class="form-group">
+        <label>用户账号 ID (global_uid)</label>
+        <input type="text" id="user-uid-input" placeholder="如：12345678 或 core_tester" />
+      </div>
+      <div class="form-group">
+        <label>显示昵称 (display_name)</label>
+        <input type="text" id="user-name-input" placeholder="群名片或昵称" />
+      </div>
+      <div class="form-group">
+        <label>Bot 对 TA 的专属称呼 / 外号 (nickname)</label>
+        <input type="text" id="user-nickname-input" placeholder="如：阿泽 / 老王（选填）" />
+      </div>
+      <div class="form-group">
+        <label>三级关系等级 (tier)</label>
+        <select id="user-tier-select">
+          <option value="3">★ L3 核心用户 (管理员 / OnlyYou)</option>
+          <option value="2">◆ L2 重要用户 (群聊熟人 / 繁忙可回)</option>
+          <option value="1">○ L1 普通用户 (普通群友)</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>好感度分数 (affinity: <span id="user-affinity-label">50</span>)</label>
+        <input type="range" id="user-affinity-slider" min="0" max="100" value="50" oninput="document.getElementById('user-affinity-label').textContent=this.value" />
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="app.closeModal('modal-user-edit')">取消</button>
+        <button class="btn btn-primary" onclick="app.submitSaveUser()">💾 保存用户设置</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 7. Memory Item Add / Edit Modal -->
+  <div class="modal-backdrop" id="modal-memory-edit">
+    <div class="modal-box">
+      <div class="panel-title" id="modal-memory-title">🧠 新增 / 编辑分级记忆</div>
+      <input type="hidden" id="memory-id-input" />
+      <div class="form-group">
+        <label>记忆内容 (严格控制在 60 字以内，精炼一句话事实)</label>
+        <textarea id="memory-content-input" rows="2" maxlength="60" placeholder="如：阿泽严重海鲜过敏，平时聚餐最爱吃川渝牛油火锅"></textarea>
+      </div>
+      <div class="form-group">
+        <label>检索关键词标签 (逗号分隔)</label>
+        <input type="text" id="memory-keywords-input" placeholder="如：海鲜过敏,火锅,饮食偏好" />
+      </div>
+      <div class="form-group">
+        <label>关联用户 UID (留空则代表 Bot 自身的公共/冲浪记忆)</label>
+        <input type="text" id="memory-user-input" placeholder="如：core_tester" />
+      </div>
+      <div class="form-group">
+        <label>记忆分级 (memory_tier)</label>
+        <select id="memory-tier-select">
+          <option value="3">💎 Tier 3 核心永久记忆 (免疫日常定时遗忘)</option>
+          <option value="2">📅 Tier 2 近期情节记忆 (随时间衰减，访问强化可晋升)</option>
+          <option value="1">🕒 Tier 1 瞬时短时记忆 (48小时后自动清理)</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>重要度评分 (importance: <span id="memory-imp-label">8</span> / 10)</label>
+        <input type="range" id="memory-imp-slider" min="1" max="10" value="8" oninput="document.getElementById('memory-imp-label').textContent=this.value" />
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="app.closeModal('modal-memory-edit')">取消</button>
+        <button class="btn btn-primary" onclick="app.submitSaveMemory()">💾 保存记忆</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast-container" id="toast-container"></div>
+
+  <!-- AstrBot Plugin Page Bridge SDK (auto-rewritten by AstrBot PluginPageService) -->
+  <script src="/api/plugin/page/bridge-sdk.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

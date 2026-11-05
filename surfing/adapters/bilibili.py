@@ -1,7 +1,11 @@
 """Bilibili video adapter (popular feed + hot comments + reserved stream interface)."""
 
 from typing import Optional
-import httpx
+
+try:
+    import httpx
+except ImportError:
+    httpx = None
 
 from .base import BaseVideoAdapter, VideoItem
 

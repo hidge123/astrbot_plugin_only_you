@@ -75,6 +75,7 @@ from .core.schedule_mutator import BoundedScheduleMutator
 from .core.soul_manager import SoulManager
 from .core.state_machine import BotState, StateController, UserTier
 from .core.user_relation import UserRelationManager
+from .core.web_api import OnlyYouWebAPI
 from .prompts.templates import PROACTIVE_CHAT_PROMPT
 from .storage.db import DatabaseManager
 from .surfing.pipeline import CyberSurfingPipeline
@@ -148,6 +149,8 @@ class OnlyYouPlugin(Star):
             schedule_mutator=self.schedule_mutator,
             plugin_config=self.config,
         )
+        self.web_api = OnlyYouWebAPI(plugin=self)
+        self.web_api.register_routes()
 
         self._initialized = False
         self._init_lock = asyncio.Lock()
@@ -165,6 +168,7 @@ class OnlyYouPlugin(Star):
     async def initialize(self) -> None:
         """AstrBot Star lifecycle initialization hook."""
         await self._ensure_initialized()
+        self.web_api.register_routes()
         self._bg_tasks.append(asyncio.create_task(self._heartbeat_loop()))
         self._bg_tasks.append(asyncio.create_task(self._daily_gc_loop()))
         logger.info("[OnlyYou] Plugin initialized successfully.")

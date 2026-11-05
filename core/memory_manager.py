@@ -56,6 +56,22 @@ class MemoryItem:
             last_accessed_at=row.get("last_accessed_at"),
         )
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "soul_id": self.soul_id,
+            "user_id": self.user_id,
+            "user_tier": self.user_tier,
+            "memory_tier": self.memory_tier,
+            "content": self.content,
+            "keywords": self.keywords,
+            "importance": self.importance,
+            "vitality": round(float(self.vitality), 1),
+            "access_count": self.access_count,
+            "created_at": self.created_at,
+            "last_accessed_at": self.last_accessed_at,
+        }
+
 
 class MemoryManager:
     """
@@ -318,3 +334,89 @@ class MemoryManager:
                 f"[OnlyYou] Extracted and saved {inserted} tiered memories for soul={soul_id}"
             )
         return inserted
+
+    async def list_memories(
+        self,
+        soul_id: Optional[str] = None,
+        memory_tier: Optional[int] = None,
+        user_id: Optional[str] = None,
+        keyword: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[MemoryItem]:
+        """List memories with optional filtering by `soul_id`, `memory_tier`, `user_id`, and `keyword`."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if soul_id:
+            clauses.append("soul_id = ?")
+            params.append(soul_id)
+        if memory_tier in (1, 2, 3):
+            clauses.append("memory_tier = ?")
+            params.append(int(memory_tier))
+        if user_id:
+            clauses.append("user_id = ?")
+            params.append(str(user_id))
+        if keyword:
+            clauses.append("(content LIKE ? OR keywords LIKE ?)")
+            kw_pat = f"%{keyword.strip()}%"
+            params.extend([kw_pat, kw_pat])
+
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"""
+            SELECT * FROM memories
+            {where_sql}
+            ORDER BY memory_tier DESC, importance DESC, vitality DESC, created_at DESC
+            LIMIT ?
+        """
+        params.append(int(limit))
+        rows = await self.db.fetchall(sql, tuple(params))
+        return [MemoryItem.from_row(r) for r in rows]
+
+    async def update_memory(
+        self,
+        memory_id: int,
+        content: Optional[str] = None,
+        keywords: Optional[str] = None,
+        importance: Optional[int] = None,
+        memory_tier: Optional[int] = None,
+        vitality: Optional[float] = None,
+        user_id: Optional[str] = None,
+    ) -> Optional[MemoryItem]:
+        """Update fields of an existing memory item."""
+        row = await self.db.fetchone("SELECT * FROM memories WHERE id = ?", (int(memory_id),))
+        if not row:
+            return None
+        item = MemoryItem.from_row(row)
+        new_content = (content.strip()[:60] if content is not None else item.content) or item.content
+        new_kw = keywords.strip() if keywords is not None else item.keywords
+        new_imp = max(1, min(10, int(importance))) if importance is not None else item.importance
+        new_tier = int(memory_tier) if memory_tier in (1, 2, 3) else item.memory_tier
+        new_vit = max(0.0, min(100.0, float(vitality))) if vitality is not None else item.vitality
+        new_uid = (user_id.strip() or None) if user_id is not None else item.user_id
+
+        await self.db.execute(
+            """
+            UPDATE memories
+            SET content = ?, keywords = ?, importance = ?, memory_tier = ?, vitality = ?, user_id = ?
+            WHERE id = ?
+            """,
+            (new_content, new_kw, new_imp, new_tier, new_vit, new_uid, int(memory_id)),
+        )
+        updated_row = await self.db.fetchone("SELECT * FROM memories WHERE id = ?", (int(memory_id),))
+        return MemoryItem.from_row(updated_row) if updated_row else None
+
+    async def pin_to_core(self, memory_id: int) -> Optional[MemoryItem]:
+        """One-click pin a Tier 1/2 memory into a permanent Tier 3 (CORE) memory."""
+        row = await self.db.fetchone("SELECT * FROM memories WHERE id = ?", (int(memory_id),))
+        if not row:
+            return None
+        new_imp = max(8, int(row.get("importance", 8)))
+        await self.db.execute(
+            "UPDATE memories SET memory_tier = 3, importance = ?, vitality = 100.0 WHERE id = ?",
+            (new_imp, int(memory_id)),
+        )
+        updated = await self.db.fetchone("SELECT * FROM memories WHERE id = ?", (int(memory_id),))
+        return MemoryItem.from_row(updated) if updated else None
+
+    async def delete_memory(self, memory_id: int) -> None:
+        """Delete a single memory item by `id`."""
+        await self.db.execute("DELETE FROM memories WHERE id = ?", (int(memory_id),))

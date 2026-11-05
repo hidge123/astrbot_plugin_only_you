@@ -88,11 +88,51 @@ class DatabaseManager:
             CREATE TABLE IF NOT EXISTS users (
                 global_uid TEXT PRIMARY KEY,
                 display_name TEXT NOT NULL,
+                nickname TEXT NOT NULL DEFAULT '',
                 tier INTEGER NOT NULL DEFAULT 1,
                 interaction_count INTEGER NOT NULL DEFAULT 0,
                 affinity REAL NOT NULL DEFAULT 0.0,
                 platform_ids_json TEXT NOT NULL DEFAULT '[]',
                 updated_at INTEGER NOT NULL
+            );
+            """
+        )
+        # Safe migration for existing databases without `nickname` column
+        try:
+            await self.execute("ALTER TABLE users ADD COLUMN nickname TEXT NOT NULL DEFAULT '';")
+        except Exception:
+            pass
+
+        # 5. UMO -> Soul ID explicit routing bindings table (for WebUI Console Module 1)
+        await self.execute(
+            """
+            CREATE TABLE IF NOT EXISTS umo_soul_bindings (
+                umo TEXT PRIMARY KEY,
+                soul_id TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            """
+        )
+
+        # 6. Surfing video history pool (for WebUI Console Module 5)
+        await self.execute(
+            """
+            CREATE TABLE IF NOT EXISTS surfing_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                soul_id TEXT NOT NULL,
+                video_id TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                title TEXT NOT NULL,
+                author TEXT NOT NULL,
+                cover_url TEXT NOT NULL DEFAULT '',
+                share_url TEXT NOT NULL DEFAULT '',
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                hot_comments_json TEXT NOT NULL DEFAULT '[]',
+                visual_notes TEXT NOT NULL DEFAULT '',
+                score INTEGER NOT NULL DEFAULT 75,
+                commentary TEXT NOT NULL DEFAULT '',
+                worth_sharing INTEGER NOT NULL DEFAULT 1,
+                watched_at INTEGER NOT NULL
             );
             """
         )
