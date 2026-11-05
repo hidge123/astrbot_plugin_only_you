@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import random
 from typing import Any, Optional
 
 try:
@@ -58,6 +59,12 @@ except ImportError:
             return _dec
 
         @staticmethod
+        def on_decorating_result(*args, **kwargs):
+            def _dec(fn):
+                return fn
+            return _dec
+
+        @staticmethod
         def command(*args, **kwargs):
             def _dec(fn):
                 return fn
@@ -65,11 +72,38 @@ except ImportError:
 
     filter = _FilterStub()
 
+try:
+    from astrbot.api.message_components import Plain, Record
+except ImportError:
+    # Minimal message component stubs so the plugin stays importable offline.
+    class Plain:  # type: ignore[no-redef]
+        def __init__(self, text: str = "", **kwargs: Any):
+            self.text = text
+
+        def __repr__(self) -> str:
+            return f"Plain({self.text!r})"
+
+    class Record:  # type: ignore[no-redef]
+        def __init__(
+            self,
+            file: Optional[str] = None,
+            url: Optional[str] = None,
+            text: Optional[str] = None,
+            **kwargs: Any,
+        ):
+            self.file = file
+            self.url = url
+            self.text = text
+
+        def __repr__(self) -> str:
+            return f"Record({self.file!r})"
+
 from .core.atmosphere_reader import AtmosphereReader
 from .core.context_budget import ContextBudgetManager, SessionBuffer
 from .core.memory_manager import MemoryManager, MemoryTier
 from .core.model_hub import ModelHub
 from .core.platform_bridge import PlatformBridge
+from .core.provider_factory import ProviderFactory
 from .core.roguelite_deck import RogueliteDeckEngine
 from .core.schedule_mutator import BoundedScheduleMutator
 from .core.soul_manager import SoulManager
@@ -79,6 +113,36 @@ from .core.web_api import OnlyYouWebAPI
 from .prompts.templates import PROACTIVE_CHAT_PROMPT
 from .storage.db import DatabaseManager
 from .surfing.pipeline import CyberSurfingPipeline
+
+try:
+    from .core.character_card import render_card_summary
+except ImportError:  # pragma: no cover - character_card is created in parallel
+    def render_card_summary(card: Any, max_chars: int = 200) -> str:
+        """Fallback summary renderer (kept importable until character_card lands)."""
+        try:
+            if not isinstance(card, dict):
+                return ""
+            identity = card.get("identity") or {}
+            personality = card.get("personality") or {}
+            speech = card.get("speech") or {}
+            parts = []
+            name = str(identity.get("name") or "").strip()
+            tagline = str(identity.get("tagline") or "").strip()
+            if name:
+                parts.append(f"「{name}」")
+            if tagline:
+                parts.append(tagline)
+            tags = personality.get("personality_tags") or []
+            if isinstance(tags, list) and tags:
+                parts.append("性格：" + "、".join(str(t) for t in tags[:4]))
+            style = str(speech.get("speaking_style") or "").strip()
+            if style:
+                parts.append("说话方式：" + style)
+            text = "；".join(part for part in parts if part)
+            return text[:max_chars]
+        except Exception:
+            return ""
+
 
 
 @register(
@@ -112,7 +176,13 @@ class OnlyYouPlugin(Star):
 
         # Initialize core components
         self.db = DatabaseManager(self.db_path)
-        self.model_hub = ModelHub(context=self.context, plugin_config=self.config)
+        self.provider_factory = ProviderFactory(self.context)
+        self.model_hub = ModelHub(
+            context=self.context,
+            plugin_config=self.config,
+            db=self.db,
+            provider_factory=self.provider_factory,
+        )
         self.platform_bridge = PlatformBridge(context=self.context)
         self.soul_manager = SoulManager(
             context=self.context, db=self.db, model_hub=self.model_hub
@@ -136,6 +206,7 @@ class OnlyYouPlugin(Star):
             memory_manager=self.memory_manager,
             session_buffer=self.session_buffer,
             plugin_config=self.config,
+            soul_manager=self.soul_manager,
         )
         self.atmosphere_reader = AtmosphereReader(
             session_buffer=self.session_buffer,
@@ -156,6 +227,9 @@ class OnlyYouPlugin(Star):
         self._init_lock = asyncio.Lock()
         self._bg_tasks: list[asyncio.Task] = []
         self._known_l3_umos: dict[str, str] = {}
+        # umo -> tier of the last user message; used by the TTS scope check without
+        # touching the DB (avoids double interaction counting).
+        self._last_message_tier: dict[str, UserTier] = {}
 
     async def _ensure_initialized(self) -> None:
         if self._initialized:
@@ -163,6 +237,7 @@ class OnlyYouPlugin(Star):
         async with self._init_lock:
             if not self._initialized:
                 await self.db.initialize()
+                await self.model_hub.load()
                 self._initialized = True
 
     async def initialize(self) -> None:
@@ -179,6 +254,10 @@ class OnlyYouPlugin(Star):
             if not task.done():
                 task.cancel()
         self._bg_tasks.clear()
+        try:
+            await self.model_hub.dispose()
+        except Exception as e:
+            logger.warning(f"[OnlyYou] model_hub dispose failed: {e}")
         await self.db.close()
         logger.info("[OnlyYou] Plugin terminated cleanly.")
 
@@ -227,16 +306,19 @@ class OnlyYouPlugin(Star):
                             current_slot_title=current_slot.title,
                             encounter_text=enc_text,
                             video_text=vid_text,
+                            soul_summary=self._render_soul_summary(soul),
                         )
                         msg = await self.model_hub.call_llm_text(
-                            prompt=prompt, role="small", umo=target_umo
+                            prompt=prompt, role="decision", umo=target_umo
                         )
                         if msg:
+                            audio_path = await self._maybe_synthesize_proactive(msg)
                             sent = await self.platform_bridge.send_proactive_message(
                                 umo=target_umo,
                                 text=msg,
                                 session_buffer=self.session_buffer,
                                 soul_name=soul.name,
+                                audio_path=audio_path,
                             )
                             if sent and unused_enc:
                                 unused_enc.used = True
@@ -267,6 +349,35 @@ class OnlyYouPlugin(Star):
             transcript_text=transcript,
             umo=umo,
         )
+
+    @staticmethod
+    def _render_soul_summary(soul: Any) -> str:
+        """Build the compact `{soul_summary}` snippet for prompts (safe fallback)."""
+        try:
+            card = getattr(soul, "card", None)
+            if not card:
+                return ""
+            return render_card_summary(card)
+        except Exception as exc:
+            logger.debug(f"[OnlyYou] render_card_summary failed: {exc}")
+            return ""
+
+    async def _maybe_synthesize_proactive(self, text: str) -> Optional[str]:
+        """Synthesize a proactive message when plugin TTS is enabled (best effort)."""
+        try:
+            tts_cfg = self.model_hub.get_tts_config()
+            if (tts_cfg.get("mode") or "off") == "off" or not text:
+                return None
+            try:
+                probability = float(tts_cfg.get("probability", 1.0))
+            except (TypeError, ValueError):
+                probability = 1.0
+            if random.random() > probability:
+                return None
+            return await self.model_hub.synthesize(text)
+        except Exception as exc:
+            logger.debug(f"[OnlyYou] proactive TTS skipped: {exc}")
+            return None
 
     # ==========================================================================
     # 1. Three-State Message Gate (`priority=999`)
@@ -301,6 +412,7 @@ class OnlyYouPlugin(Star):
         umo = getattr(event, "unified_msg_origin", "") or "default_umo"
         soul = await self.soul_manager.resolve_soul(umo=umo)
         user = await self.user_relation.resolve_user(event)
+        self._last_message_tier[umo] = user.tier
 
         if user.tier == UserTier.L3_CORE and self.atmosphere_reader.is_private_event(event):
             self._known_l3_umos[user.global_uid] = umo
@@ -352,6 +464,14 @@ class OnlyYouPlugin(Star):
             current_slot=current_slot,
             is_direct_mention=is_direct_mention,
         )
+        # Let AstrBot's native pipeline (`_select_provider`) use our main model.
+        if should_reply:
+            try:
+                main_provider_id = await self.model_hub.get_main_provider_id()
+                if main_provider_id:
+                    event.set_extra("selected_provider", main_provider_id)
+            except Exception as e:
+                logger.warning(f"[OnlyYou] resolve main provider failed: {e}")
         self.platform_bridge.apply_reply_decision(event, should_reply=should_reply)
 
     # ==========================================================================
@@ -429,7 +549,101 @@ class OnlyYouPlugin(Star):
             await self.deck_engine.save_run(run)
 
     # ==========================================================================
-    # 4. Diagnostic & Management Command (`/onlyyou`)
+    # 4. Plugin-autonomous TTS (`on_decorating_result`, runs before native TTS)
+    # ==========================================================================
+    async def _tts_scope_matches(self, event: AstrMessageEvent, scope: str) -> bool:
+        """Whether the current session falls into the configured TTS scope."""
+        try:
+            if scope == "all":
+                return True
+            is_private = self.atmosphere_reader.is_private_event(event)
+            if scope == "private":
+                return is_private
+            if scope == "l3":
+                umo = getattr(event, "unified_msg_origin", "") or "default_umo"
+                tier = self._last_message_tier.get(umo)
+                if tier is not None:
+                    return tier == UserTier.L3_CORE
+                # L3 private sessions are recorded by the message gate
+                return umo in self._known_l3_umos.values()
+        except Exception as exc:
+            logger.debug(f"[OnlyYou] TTS scope check failed: {exc}")
+        return False
+
+    @filter.on_decorating_result()
+    async def on_decorating_result_hook(self, event: AstrMessageEvent):
+        """Replace LLM text replies with a synthesized voice message (best effort).
+
+        AstrBot's ``ResultDecorateStage`` runs ``on_decorating_result`` hooks *before*
+        segmented reply and native TTS, so converting the ``Plain`` segments into a
+        ``Record`` here guarantees the native TTS cannot synthesize the same text
+        again (unless ``dual_output`` is enabled by the user).
+        """
+        try:
+            tts_cfg = self.model_hub.get_tts_config()
+            if (tts_cfg.get("mode") or "off") == "off":
+                return
+            try:
+                probability = float(tts_cfg.get("probability", 1.0))
+            except (TypeError, ValueError):
+                probability = 1.0
+            if random.random() > probability:
+                return
+            scope = str(tts_cfg.get("scope") or "private")
+            if not await self._tts_scope_matches(event, scope):
+                return
+
+            result = event.get_result()
+            if result is None:
+                return
+            chain = getattr(result, "chain", None)
+            if not chain:
+                return
+            is_llm_result = getattr(result, "is_llm_result", None)
+            if callable(is_llm_result):
+                try:
+                    if not is_llm_result():
+                        return
+                except Exception:
+                    pass
+
+            plain_texts = []
+            for comp in chain:
+                if isinstance(comp, Plain):
+                    plain_texts.append(str(getattr(comp, "text", "") or ""))
+            text = "".join(plain_texts).strip()
+            if not text:
+                return
+
+            audio_path = await self.model_hub.synthesize(text)
+            if not audio_path:
+                return
+
+            dual_output = bool(tts_cfg.get("dual_output"))
+            new_chain = []
+            replaced = False
+            for comp in chain:
+                if isinstance(comp, Plain):
+                    if replaced:
+                        continue
+                    if dual_output:
+                        new_chain.append(Plain(text))
+                    try:
+                        new_chain.append(
+                            Record(file=audio_path, url=audio_path, text=text)
+                        )
+                    except TypeError:  # older AstrBot Record signature
+                        new_chain.append(Record(file=audio_path))
+                    replaced = True
+                else:
+                    new_chain.append(comp)
+            if replaced:
+                result.chain = new_chain
+        except Exception as exc:
+            logger.warning(f"[OnlyYou] TTS decorating hook failed: {exc}")
+
+    # ==========================================================================
+    # 5. Diagnostic & Management Command (`/onlyyou`)
     # ==========================================================================
     @filter.command("onlyyou", alias={"oy"})
     async def cmd_onlyyou(self, event: AstrMessageEvent):

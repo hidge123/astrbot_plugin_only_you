@@ -1,7 +1,9 @@
 """SQLite persistence layer based on aiosqlite (with stdlib sqlite3 fallback) for astrbot_plugin_only_you."""
 
+import json
 import os
 import sqlite3
+import time
 from typing import Any, Optional
 
 try:
@@ -114,7 +116,20 @@ class DatabaseManager:
             """
         )
 
-        # 6. Surfing video history pool (for WebUI Console Module 5)
+        # 6. Generic plugin settings KV store (plugin-autonomous model config,
+        #    default soul routing, migration flags...). Kept out of `AstrBotConfig`
+        #    so the platform schema integrity check never deletes undeclared keys.
+        await self.execute(
+            """
+            CREATE TABLE IF NOT EXISTS plugin_settings (
+                key TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            """
+        )
+
+        # 7. Surfing video history pool (for WebUI Console Module 5)
         await self.execute(
             """
             CREATE TABLE IF NOT EXISTS surfing_history (
@@ -135,6 +150,36 @@ class DatabaseManager:
                 watched_at INTEGER NOT NULL
             );
             """
+        )
+
+    async def get_setting(self, key: str, default: Any = None) -> Any:
+        """Read a JSON value from the generic `plugin_settings` KV table."""
+        if not key:
+            return default
+        row = await self.fetchone(
+            "SELECT value_json FROM plugin_settings WHERE key = ?", (str(key),)
+        )
+        if not row or row.get("value_json") is None:
+            return default
+        try:
+            return json.loads(row["value_json"])
+        except Exception:
+            return default
+
+    async def set_setting(self, key: str, value: Any) -> None:
+        """Upsert a JSON-serialisable value into the generic `plugin_settings` table."""
+        if not key:
+            return
+        payload = json.dumps(value, ensure_ascii=False)
+        await self.execute(
+            """
+            INSERT INTO plugin_settings (key, value_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value_json = excluded.value_json,
+                updated_at = excluded.updated_at
+            """,
+            (str(key), payload, int(time.time())),
         )
 
     async def close(self) -> None:

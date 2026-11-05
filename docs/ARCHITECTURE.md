@@ -1,6 +1,6 @@
-# OnlyYou (只有你) —— 技术架构与 AstrBot 实现方案设计 (v2.3)
+# OnlyYou (只有你) —— 技术架构与 AstrBot 实现方案设计 (v2.4)
 
-> 本文档紧密结合 [AstrBot 插件开发指南 (`Star` 规范)](https://docs.astrbot.app/dev/star/plugin-new.html)，详细定义 `astrbot_plugin_only_you` 的核心工程设计，重点包含：**三态模型（休息中 / 繁忙中 / 空闲中）× 两大原子行为（回发消息 / 刷视频）**、**Roguelite 随机日程引擎与奇遇谈资池**、**基于外部输入的受限状态微调**，以及参考并精简自 `livingmemory` 的 **分级记忆、定时自动遗忘清理 (`Forgetting GC`) 与简易上下文预算管理器 (`Context Budget Manager`)**。
+> 本文档紧密结合 [AstrBot 插件开发指南 (`Star` 规范)](https://docs.astrbot.app/dev/star/plugin-new.html)，详细定义 `astrbot_plugin_only_you` 的核心工程设计，重点包含：**三态模型（休息中 / 繁忙中 / 空闲中）× 两大原子行为（回发消息 / 刷视频）**、**Roguelite 随机日程引擎与奇遇谈资池**、**基于外部输入的受限状态微调**、参考并精简自 `livingmemory` 的 **分级记忆、定时自动遗忘清理 (`Forgetting GC`) 与简易上下文预算管理器 (`Context Budget Manager`)**，以及 v2.4 引入的 **详细角色卡（10 分区 × 39 字段）接管原生 Persona** 与 **插件自治四角色模型体系（`ProviderFactory` + `ModelHub` + `selected_provider`）**。
 
 ---
 
@@ -56,37 +56,52 @@ flowchart TB
 ```text
 astrbot_plugin_only_you/
 ├── metadata.yaml                # 插件元数据声明 (name: astrbot_plugin_only_you)
-├── _conf_schema.json            # AstrBot WebUI 可视化配置 Schema
+├── _conf_schema.json            # AstrBot WebUI 配置 Schema（仅运行参数；模型配置迁至 plugin_settings，见 §5.1）
 ├── requirements.txt             # 依赖库 (httpx, aiosqlite, pillow, imageio-ffmpeg)
-├── main.py                      # 插件入口类 OnlyYouPlugin(Star)，负责三态消息门禁与生命周期
+├── main.py                      # 插件入口类 OnlyYouPlugin(Star)：三态门禁 + selected_provider + on_decorating_result TTS + 生命周期
 ├── core/
 │   ├── state_machine.py         # 🚦 三态枚举 (RESTING/BUSY/IDLE) 与两大行为 (MESSAGE/SURF) 门禁控制器
 │   ├── roguelite_deck.py        # 🎲 Roguelite 每日日程抽卡引擎（基调卡/事件状态卡/奇遇谈资卡/连携）
 │   ├── schedule_mutator.py      # 🔄 输入驱动的受限状态微调器（基于消息/视频冲击力的状态跃迁与配额锁）
-│   ├── soul_manager.py          # 角色卡(Soul)管理：从 AstrBot 原生 Persona 继承或扩写生成专属卡池
+│   ├── character_card.py        # 🎭 详细角色卡单一数据源：CARD_SCHEMA(10 分区/39 字段)、normalize/migrate、Persona Prompt 渲染
+│   ├── soul_manager.py          # 角色卡(Soul)管理：SoulProfile.card、会话路由、AI 造卡(generate_card)、原生 Persona 导入
 │   ├── user_relation.py         # 三级用户关系管理 (L1普通 / L2重要熟人 / ★L3核心用户) 与跨平台映射
 │   ├── memory_manager.py        # 🧠 精简版分级记忆引擎 (Tier1瞬时/Tier2近期/Tier3核心 + 定时遗忘GC)
-│   ├── context_budget.py        # 🛡️ 简易上下文与Token预算管理器 (截断冗长历史 + 限制注入记忆字数)
-│   ├── model_hub.py             # 🔌 多模型统一调度网关 (Main/Small/Vision/Embedding/Rerank/TTS/T2I 继承与回退)
-│   ├── platform_bridge.py       # 🤝 AstrBot 平台配置协同桥 (复用平台白名单、原生分段回复 segmented_reply、流式与TTS)
-│   ├── web_api.py               # 🖥️ 注册 AstrBot Plugin Pages 所需的后端 Web API (context.register_web_api)
+│   ├── context_budget.py        # 🛡️ 上下文/记忆预算管理器 + _takeover_persona 三分支接管原生 Persona 段
+│   ├── provider_factory.py      # 🔧 唯一触碰 AstrBot Provider 内部结构的封装（复用/自建实例、inst_map、TTS、dispose）
+│   ├── model_hub.py             # 🔌 插件自治四角色模型网关 (main/decision/vision/tts，配置存 plugin_settings.model_config)
+│   ├── platform_bridge.py       # 🤝 AstrBot 平台配置协同桥 (原生分段回复 segmented_reply、流式、语音主动消息)
+│   ├── web_api.py               # 🖥️ 27 条 Plugin Pages Web API 路由 (17 条兼容旧版 + 10 条新增)
 │   └── atmosphere_reader.py     # 群聊主战场：防抖等待窗口、多人对话“解线团”、五维读空气器
 ├── views/                       # 🎨 AstrBot 插件自定义页面 (Plugin Pages / Views，兼容 pages/)
-│   └── console/                 # 可视化工作台（导入人格、管理 Soul ID、编辑三态行动卡池、关系与记忆管理）
-│       ├── index.html
-│       ├── app.js
-│       └── style.css
+│   └── console/                 # 灰白+青绿极简控制台（48px 顶栏 + 216px 侧栏，8 个页面）
+│       ├── index.html           # 外壳：顶栏、侧栏导航、main#view、toast/modal/drawer 容器
+│       ├── style.css            # 设计令牌 + 组件样式（浅/深色）
+│       ├── app.js               # bridge 封装、轻量状态、hash 路由、通用 UI（无构建 classic script）
+│       ├── icons.js             # ≥20 个内联 SVG 线性图标（替代 emoji）
+│       ├── charts.js            # 纯 SVG 环形表 / 24h 时间轴 / 环形图 / 条形图 / 配额圆点
+│       ├── page-overview.js     # 概览：状态环形表 + 24h 日程轴 + 基调/配额/奇遇/关系/记忆/模型小卡
+│       ├── page-schedule.js     # 日程：24h 时间轴 + 行动卡网格 + 三态筛选 + 重抽/强制切换
+│       ├── page-character.js    # 角色卡：10 分区动态表单 + AI 整卡生成/分区补全 + Prompt 预览
+│       ├── page-relations.js    # 关系：★L3 / ◆L2 / L1 三列看板 + 拖拽改级 + 合并账号
+│       ├── page-memory.js       # 记忆：Tier 分段 + 搜索 + 提炼/GC/钉选核心
+│       ├── page-surfing.js      # 冲浪：视频卡片墙 + 分享/删除 + 手动触发冲浪
+│       ├── page-models.js       # 模型：四角色卡片 + 源/模型拉取 + 继承开关 + 测试 + TTS 试听
+│       ├── page-sessions.js     # 会话：插件默认角色 + UMO 绑定表
+│       └── mock.js              # ?mock=1 / file:// 打开时的本地 Mock bridge（离线预览与截图）
 ├── surfing/
 │   ├── pipeline.py              # 📱 赛博冲浪主控流水线（仅在 IDLE 空闲状态下运行）
-│   ├── video_vision.py          # 多模态视频预处理器（短视频流直传 / FFmpeg 3x3 时间戳九宫格抽帧）
+│   ├── video_vision.py          # 多模态视频预处理器（统一 role="vision" 评分，短视频流直传 / FFmpeg 3x3 抽帧）
 │   └── adapters/
 │       ├── base.py              # 抽象平台接口 BaseVideoAdapter & VideoItem 模型
 │       ├── bilibili.py          # B站适配器（推荐流/热门/UP主动态、热评抓取、CC字幕/流解析）
 │       └── douyin.py            # 抖音适配器（热点榜/推荐流、无水印直链解析、热评抓取）
 ├── storage/
-│   └── db.py                    # 基于 aiosqlite 的持久化层
-└── prompts/
-    └── templates.py             # 集中管理角色卡扩写、日程润色、受限微调、读空气、看片吐槽等 Prompt
+│   └── db.py                    # 基于 aiosqlite 的持久化层（新增 plugin_settings KV 表 + get_setting/set_setting）
+├── prompts/
+│   └── templates.py             # 集中管理角色卡生成/分区补全、卡池、受限微调、读空气、看片、记忆提炼等 Prompt
+├── tests/                       # 离线 unittest 测试套件（provider_factory/model_hub/character_card/persona_takeover/web_api/regressions）
+└── docs/                        # 产品与架构文档 (PRD.md / ARCHITECTURE.md / PROMPTS_AND_FLOWS.md / WEBUI_DESIGN.md)
 ```
 
 ---
@@ -245,7 +260,7 @@ CREATE TABLE IF NOT EXISTS memories (
 1. **Tier 1 (`EPHEMERAL = 1`，瞬时记忆)**：
    - 每日抽出的【奇遇谈资卡】、刚看完的 B站/抖音视频、或重要度 `<= 4` 的普通群聊小事。
 2. **Tier 2 (`RECENT = 2`，近期记忆)**：
-   - 对话累计满 `N` 条（默认 15 条）后，由后台小脑异步提炼出的近期事件（重要度 `5 ~ 7`），初始 `vitality = 100.0`。
+   - 对话累计满 `N` 条（默认 15 条）后，由后台**决策模型**（`role="decision"`）异步提炼出的近期事件（重要度 `5 ~ 7`），初始 `vitality = 100.0`。
 3. **Tier 3 (`CORE = 3`，核心长效记忆)**：
    - 重要度 `>= 8`（如 ★L3核心用户 / ◆L2重要用户 的核心偏好、身份设定、重要约定），或由 Tier 2 记忆累计被召回 `access_count >= 4` 次后自动晋升而来。
 
@@ -372,63 +387,155 @@ class ContextBudgetManager:
             req.system_prompt += "\n\n[脑海中的相关记忆 (精简注入)]:\n" + "\n".join(selected_lines)
 ```
 
+> 完整的 `apply_context_and_memory_budget()` 执行顺序为：**① 角色卡接管 Persona 段（`_takeover_persona`）→ ② `req.contexts.clear()` 并注入插件滑窗 → ③ 记忆混合打分与硬预算裁剪 → ④ 追加三态指令 / 变卦独白 / 记忆块**。其中第 ① 步见 §4.5。
+
 ---
 
-## 五、 多模型统一调度接口 (`ModelHub`) 与 AstrBot 平台配置协同设计
+### 4.4 🗂️ 插件自治设置表 (`plugin_settings`) 与旧配置迁移
 
-> **核心工程原则：绝不重复造轮子，绝不与 AstrBot 平台原生配置打架。**
-> 插件只做“大脑决策层（决定什么时候说话、对谁说话、注入什么状态与记忆）”，而将模型管理、会话白名单、流式输出、分段回复（`segmented_reply`）与 TTS 转换 **100% 与 AstrBot 平台原生管线对齐协同**。
+v2.4 起，插件不再把模型选择写入 `AstrBotConfig`（`_conf_schema.json`）：AstrBot 会按 schema 做配置完整性检查，未声明的键可能被删掉，所以 **插件自治配置统一存放在 SQLite 的通用 KV 表**：
 
-### 5.1 🔌 统一多模型调度网关 (`core/model_hub.py`)
-
-随着功能演进，插件涉及 **6 大类模型能力**。插件不要求用户重复填写 API Key，而是通过 `self.context.get_provider_by_id(...)` 对接 AstrBot 的模型提供商注册表，并实现 **“插件按需覆盖 $\rightarrow$ 留空自动继承当前会话平台配置 $\rightarrow$ 缺失优雅降级”** 的三级寻址机制：
-
-```mermaid
-flowchart LR
-    Call["插件发起模型调用请求\n(指定任务角色 Role + 当前会话 UMO)"] --> Hub["🔌 ModelHub 统一网关"]
-    
-    Hub --> R1["1. 主对话模型 (Main LLM)\n默认留空 -> 自动继承当前 UMO 绑定的平台主模型"]
-    Hub --> R2["2. 小脑轻量模型 (Small Fast LLM)\n用于读空气/提炼记忆/日程微调\n若未单独指定 -> 自动回退使用主对话模型"]
-    Hub --> R3["3. 多模态视觉模型 (Vision LLM)\n用于看B站/抖音九宫格与视频\n若未单独指定 -> 自动回退使用主对话模型(若支持多模态)"]
-    Hub --> R4["4. 向量与重排模型 (Embedding & Rerank)\n用于海量记忆语义精排\n若未配置 -> 自动无感降级为 SQLite 关键词+时间新鲜度检索"]
-    Hub --> R5["5. 语音与生图模型 (TTS & Image Gen)\n预留扩展槽位：优先继承平台 TTS/T2I 配置"]
+```sql
+CREATE TABLE IF NOT EXISTS plugin_settings (
+    key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
 ```
+
+`storage/db.py` 提供 `async get_setting(key, default)`（JSON 反序列化）与 `async set_setting(key, value)`（JSON 序列化 UPSERT）。约定 key：
+
+| key | value 类型 | 说明 |
+| :--- | :--- | :--- |
+| `model_config` | dict | 四角色模型配置（结构见 §5.1），由 Pages「模型」页读写 |
+| `default_soul_id` | str | 插件默认角色（「会话」页可改；UMO 未绑定时使用） |
+| `legacy_model_migrated` | bool | 旧版模型配置（`model_hub_config`）是否已尝试迁移，只尝试一次；这是唯一保留旧字段名的迁移说明 |
+
+首次启动时 `ModelHub.load()` 会读取旧插件配置中的 `*_llm_provider_id`，经 `ProviderFactory.find_source_model_by_provider_id()` 反查出 `(source_id, model)` 迁移到 `model_config`。无论成功与否都会写入 `legacy_model_migrated = true`，之后不再重试；旧配置值从此不再生效，需在「模型」页重新确认。
+
+---
+
+### 4.5 🎭 角色卡接管原生 Persona 段 (`_takeover_persona`)
+
+`ContextBudgetManager.apply_context_and_memory_budget()` 在**最开始**调用 `_takeover_persona(req, soul)`，把 AstrBot 原生注入的 `# Persona Instructions` 段整体替换为角色卡渲染结果：
 
 ```python
-class ModelHub:
-    """插件统一模型调度网关：支持多类别模型配置与平台配置自动继承"""
-    def __init__(self, context: Context, plugin_config: dict):
-        self.context = context
-        self.cfg = plugin_config.get("model_hub_config", {})
+card_block = f"\n# Persona Instructions\n\n{render_persona_prompt(soul.card)}\n"
+sp = req.system_prompt or ""
 
-    async def get_chat_provider_id(self, role: Literal["main", "small", "vision"], umo: str = None) -> str:
-        # 1. 优先读取插件内显式指定的 Provider ID
-        explicit_id = self.cfg.get(f"{role}_llm_provider_id", "")
-        if explicit_id:
-            return explicit_id
-        
-        # 2. 若 small / vision 未单独配置，尝试回退到插件配置的 main_llm_provider_id
-        if role in ("small", "vision") and self.cfg.get("main_llm_provider_id"):
-            return self.cfg["main_llm_provider_id"]
+# ① 精确匹配：任一原生人格原文 -> 整段替换
+for p in await self.soul_manager.list_native_prompts():
+    seg = f"\n# Persona Instructions\n\n{p}\n"
+    if seg in sp:
+        req.system_prompt = sp.replace(seg, card_block, 1); return
 
-        # 3. 留空则自动继承当前会话 (umo) 在 AstrBot 平台配置文件中选定的默认主模型！
-        return await self.context.get_current_chat_provider_id(umo=umo)
+# ② 正则兜底：替换到下一个一级标题或结尾
+new_sp, n = re.subn(r"\n# Persona Instructions\n\n.*?(?=\n# |\Z)",
+                    lambda _m: card_block, sp, count=1, flags=re.S)
 
-    def get_auxiliary_provider(self, capability: Literal["embedding", "rerank", "tts", "t2i"], umo: str = None):
-        """获取 Embedding / Rerank / TTS / 生图模型实例（支持插件覆盖 -> 平台配置继承 -> None降级）"""
-        explicit_id = self.cfg.get(f"{capability}_provider_id", "")
-        if explicit_id:
-            return self.context.get_provider_by_id(explicit_id)
-        
-        # 从当前会话对应的 AstrBot 平台配置文件 (abconf) 中继承
-        ab_conf = self.context.get_config(umo=umo)
-        platform_prov_id = ab_conf.get("provider_settings", {}).get(f"{capability}_provider_id", "")
-        return self.context.get_provider_by_id(platform_prov_id) if platform_prov_id else None
+# ③ 没找到 -> 前置角色卡
+req.system_prompt = new_sp if n else card_block + sp
 ```
+
+配套设计：
+
+1. **单一数据源 `CARD_SCHEMA`**（`core/character_card.py`）：10 个分区 / 39 个字段，同时供后端渲染 Prompt 与前端 `GET card/schema` 动态生成表单。
+2. **`SoulProfile.card`**：角色卡数据唯一来源；旧的 `name / archetype / speaking_style / surfing_preferences / native_persona_prompt` 退化为读写 `card` 的兼容 `@property`，旧档案经 `migrate_legacy()` 自动迁移。
+3. **渲染预算与优先级**（`render_persona_prompt(card, max_chars=2000)`）：只渲染非空字段、按分区输出 Markdown；优先保留 `identity / speech / personality / social`，超预算时按 `examples > background > appearance > extra > rhythm > interests` 顺序丢弃低优先级分区，最后硬截断保证 `len(result) <= max_chars`；`native_persona_prompt` 只作导入来源记录，**不参与**渲染。
+4. **会话路由 `resolve_soul(umo)`**：`UMO 绑定 → plugin_settings.default_soul_id → 最近更新的角色 → 创建默认角色`；不再读取平台 `default_personality`、不做 `persona_hash` 匹配，聊天路径上也不再用 LLM 播种卡池。
+5. **AI 造卡**：`generate_card(seed_text, base_card, section)` 用**主模型**生成整卡或单个分区草稿（不落库）；`import_native_persona()` 把原生人设原文写入 `card["extra"]["native_persona_prompt"]`，可选 AI 整卡生成；行动卡 / 奇遇卡由**决策模型**生成。
 
 ---
 
-### 5.2 🤝 插件与 AstrBot 平台原生配置的五大协同法则 (`core/platform_bridge.py`)
+## 五、 插件自治四角色模型体系 (`ModelHub` × `ProviderFactory`) 与 AstrBot 平台协同设计
+
+> **核心工程原则：插件自治模型 + 100% 复用 AstrBot 原生回复管线。**
+> v2.4 起，插件不再读取 AstrBot 配置文件里的模型选择，而是通过 `ProviderFactory` 从「提供商源 + 模型名」构建或复用实例，管理 **4 个模型角色（对话 / 决策 / 视频解析 / TTS）**；主模型通过 `event.set_extra("selected_provider", ...)` 交给 AstrBot 原生管线使用，因此分段回复、流式输出、工具调用等原生能力全部保留。
+
+### 5.1 🔌 四角色模型网关 (`core/model_hub.py`) + 提供商工厂 (`core/provider_factory.py`)
+
+#### 1. 四个模型角色与继承规则
+
+| 角色 (`role`) | 用途 | 继承规则 |
+| :--- | :--- | :--- |
+| `main`（对话） | 原生管线的主对话模型；也是 AI 生成整张角色卡的创作模型 | **必填**；未配置时插件不覆盖平台默认模型 |
+| `decision`（决策） | 读空气、记忆提炼、日程微调、行动卡/奇遇卡生成（`small` 为兼容别名） | 未显式配置 → 继承 `main` |
+| `vision`（视频解析） | 赛博冲浪看片的多模态评分；始终使用 `role="vision"`，不再降级到决策模型 | 未显式配置 → 继承 `main` |
+| `tts`（语音） | 插件自建语音合成 | **不继承**；`mode="off"` 即关闭 |
+
+模型配置存放在 `plugin_settings["model_config"]`（SQLite KV，见 §4.4），结构：
+
+```json
+{
+  "main":     {"source_id": "deepseek", "model": "deepseek-flash"},
+  "decision": {"inherit": true, "source_id": "", "model": ""},
+  "vision":   {"inherit": true, "source_id": "", "model": ""},
+  "tts": {"mode": "off|source|provider", "source_id": "", "model": "", "voice": "",
+          "provider_id": "", "probability": 1.0, "scope": "private|l3|all", "dual_output": false}
+}
+```
+
+- `ModelHub.ROLES = ("main", "decision", "vision", "tts")`；`role="small" / "aux"` 统一归一为 `decision`。
+- `resolve_role(role)` 返回 `{source_id, model}`（TTS 返回 `{mode, ...}`）；`main` 未配置返回 `None`。
+- `call_llm_text()` 直接调用实例的 `inst.text_chat(prompt=..., system_prompt=..., image_urls=...)`，不再经过 `context.llm_generate`；`call_llm_json()` 复用 `extract_json()` 容错解析。
+- `save_model_config()` 归一化并写入 `plugin_settings.model_config` 后，会立即 `unregister_main()`，下一次使用按新配置热重建实例。
+- **彻底删除**旧回退链：不再读 `context.get_config()` / `get_current_chat_provider_id()` / `default_image_caption_provider_id`；Embedding / Rerank 槽位删除。
+
+#### 2. `ProviderFactory`：唯一触碰 AstrBot Provider 内部结构的模块
+
+```python
+class ProviderFactory:
+    def list_sources(self) -> list[dict]              # 提供商源（绝不含 key，仅 has_key）
+    async def list_models(self, source_id) -> list    # 已配置模型 + 远程 get_models() 拉取结果
+    def list_tts_providers(self) -> list[dict]        # AstrBot 已启用 TTS 实例 + 已配置未启用条目
+    async def find_source_model_by_provider_id(pid)   # 旧配置迁移：provider id -> (source_id, model)
+    async def get_chat_provider(source_id, model)     # 先复用 inst_map 同源同模型且启用的实例，否则自建
+    def register_main(inst) -> str                    # inst_map["onlyyou::main"] = inst；不 append 到 provider_insts
+    def unregister_main() -> None
+    async def get_tts_provider(tts_cfg)               # mode=source 自建 openai_tts_api；mode=provider 取现有实例
+    async def dispose() -> None                       # 清理 onlyyou::main 并 terminate 全部自建实例
+```
+
+自建实例的关键细节（已核对 AstrBot 4.29.3 源码）：
+
+1. **合并配置**：`{**source, **entry}`（provider 条目优先）；`entry` 形如 `{"id": "onlyyou::chat::<source>::<model>", "provider_source_id": ..., "model": ..., "enable": true, ...}`；`$ENV` / `${ENV}` 形式的 key 会从 `os.environ` 解析后写入配置。
+2. **实例化**：`provider_manager.dynamic_import_provider(type)` → `provider_cls_map[type].cls_type(cfg, provider_manager.provider_settings)` → 若实例有 `initialize` 则 `await inst.initialize()`。
+3. **实例复用与缓存**：先在 `inst_map` 中寻找 `provider_config.provider_source_id == source_id`、模型名匹配且未禁用的现有实例；找不到才自建。自建实例按 `(source_id, model)` 缓存。
+4. **不污染平台模型列表**：插件自建实例**不会**被 append 到 `provider_insts`，只按需写入 `inst_map["onlyyou::main"]`；卸载 / 换模型时由 `dispose()` 统一移除并 terminate。
+5. **防御式容错**：所有内部属性访问都是 `getattr` + `try/except`，失败只打 warning 并返回 `None` / `[]`，绝不炸掉插件生命周期。
+
+#### 3. `selected_provider`：让原生管线使用插件选出的主模型
+
+```python
+# main.py —— 三态门禁决定放行之后、apply_reply_decision 之前
+if should_reply:
+    main_provider_id = await self.model_hub.get_main_provider_id()
+    if main_provider_id:
+        event.set_extra("selected_provider", main_provider_id)
+self.platform_bridge.apply_reply_decision(event, should_reply=should_reply)
+```
+
+AstrBot 的 `astr_main_agent._select_provider()` 会先读 `event.get_extra("selected_provider")`，再通过 `context.get_provider_by_id()`（即查 `provider_manager.inst_map`）解析实例。`ModelHub.get_main_provider_id()` 的三种返回值：
+
+| 返回值 | 含义 |
+| :--- | :--- |
+| `""` | 主模型未配置 / 实例创建失败 → 回退 AstrBot 平台默认模型（「模型」页红字提示） |
+| 已有 AstrBot provider id | 复用了 AstrBot 已加载且启用的同源同模型实例 |
+| `"onlyyou::main"` | 插件自建实例已注册进 `inst_map`（不会出现在平台模型列表） |
+
+其余模型角色（decision / vision / tts）只用于插件内部 `inst.text_chat()` / `get_audio()` 调用，不进入原生回复管线；`main` 的 Persona 段则由角色卡接管（见 §4.5）。
+
+#### 4. 插件自治 TTS（`on_decorating_result` 钩子，先于原生 TTS）
+
+- **三种来源**：`mode="off"` 关闭；`mode="source"` 用提供商源（OpenAI 兼容）自建 `openai_tts_api` 实例（复用源的 `api_base` / `api_key`，音色取 `voice`，默认 `alloy`）；`mode="provider"` 直接使用 AstrBot 现有 TTS 提供商。
+- **触发条件**：TTS 开启 **且** `random() <= probability` **且** `scope` 命中（`private` 私聊 / `l3` 当前用户为 ★L3 核心用户 / `all` 任意会话）。
+- **流程**：`on_decorating_result` 钩子汇总结果链里所有 `Plain.text` → `model_hub.synthesize(text)` → 把 `Plain` 段替换为 `Record(file=..., url=..., text=...)`；`dual_output=true` 时额外保留一个 `Plain`。
+- **为何不会重复播报**：AstrBot `ResultDecorateStage` 先执行 `on_decorating_result` 钩子（约第 160 行），再分段回复（约第 209 行），最后原生 TTS（约第 270 行起）。插件已把文字转成语音后，原生 TTS 拿不到可读的 `Plain` 文本；只有开启「语音 + 文字双发」时才可能与原生 TTS 重复，页面上会提示关闭原生 TTS。
+- **主动消息**：`PlatformBridge.send_proactive_message(..., audio_path=...)` 在文字发送后追加一条 `Record` 语音；是否合成由 `ModelHub.get_tts_config()` 的开关 / 概率决定。
+
+---
+
+### 5.2 🤝 插件与 AstrBot 平台原生配置的八大协同法则 (`core/platform_bridge.py`)
 
 为了避免插件功能与 AstrBot 平台自身的配置文件（`cmd_config.json` / `abconf_*.json`）产生冲突或双重执行，制定以下协同边界：
 
@@ -438,17 +545,33 @@ class ModelHub:
 | **2. 群聊唤醒与拦截**<br/>(`WakeCheckStage`) | 原生逻辑：群里被 `@` 或命中唤醒词才设置 `should_call_llm=True` | 插件粗暴 `event.stop_event()` 后自己调 `send_message`，导致绕过平台所有后处理管线 | **通过 `event.should_call_llm(bool)` 协同管线！**<br/>• 群友没 `@` Bot，但读空气决定要接话 $\rightarrow$ 调 `event.should_call_llm(True)` 借用原生管线回复！<br/>• 群友 `@` 了 Bot，但处于 `💤休息中` 或 `🔥繁忙中(L1)` 或读空气决定不回 $\rightarrow$ 调 `event.should_call_llm(False)` 静默取消唤醒！ |
 | **3. 分段回复**<br/>(`segmented_reply`) | 平台 `RespondStage` 原生支持按标点/正则拆分为多条短气泡并带随机打字延迟发送 | 插件自己切分句子调 `send_message`，或者与平台分段叠加导致一句话被切碎两次 | **全面复用平台 `segmented_reply` 配置！**<br/>• **被动回复**：经由 `should_call_llm(True)` 走原生 `RespondStage`，直接由平台完成分段与打字延迟！<br/>• **后台主动发消息（如刷完视频主动分享）**：无前置 `event` 时，`PlatformBridge` 直接读取 `self.context.get_config(umo)` 中的 `platform_settings.segmented_reply` 正则与间隔参数执行发送，体验与平台 100% 统一！ |
 | **4. 流式输出**<br/>(`streaming_response`) | 平台支持边生成边流式推送（与分段回复/TTS 行为互斥或不同） | 插件在 Prompt 里写死要求输出 `<split>` 分段符，结果流式输出把 `<split>` 原样发给用户 | **动态感知自适应**：<br/>在 `@filter.on_llm_request` 中检查 `self.context.get_config(umo)` 的流式开关：若平台开启了流式输出或开启了原生正则分段，插件绝不在 Prompt 中注入自定义分隔符。 |
-| **5. 图像理解与文生图**<br/>(`Image Caption / Vision / T2I`) | 1. 平台 `provider_settings.default_image_caption_provider_id` 提供默认识图模型；<br/>2. 原生多模态管线自动将用户发图传给支持视觉的主模型；<br/>3. 文生图通过平台生图插件（LLM Tool）触发 | 插件对群聊图片再调一次识图导致双倍计费；或在插件内重复造文生图轮子 | **视觉继承 + 原生多模态透传**：<br/>• **群聊/私聊用户发图**：走原生多模态/识图管线，插件不二次调接口，直接复用转述结果记入群聊窗口。<br/>• **后台刷 B站/抖音看片**：若插件未单独指定 `vision_llm`，自动优先继承平台的 `default_image_caption_provider_id`（再回退至主模型）。<br/>• **文生图**：直接复用 AstrBot 生态的画图 Tool，插件零侵入。 |
-| **6. 语音输入与输出**<br/>(`STT / TTS`) | 1. `provider_stt_settings` 自动将用户语音转文字赋给 `event.message_str`；<br/>2. `provider_tts_settings` 在 `RespondStage` 自动将回复转语音 | 插件自己再配一套 STT/TTS，导致不会处理语音或发出两条重复语音 | **100% 委派给平台 `provider_stt / tts_settings`！**<br/>• **语音输入 (STT)**：平台前置管线已自动转成文字，插件直接读 `event.message_str`。<br/>• **语音输出 (TTS)**：被动回复完全走平台原生 TTS 装饰器；后台主动发消息时，读取 `ab_conf["provider_tts_settings"]` 判断是否需要调用平台 TTS Provider 转语音。 |
-| **7. 上下文消息注入与群聊感知**<br/>(`req.contexts` & `group_icl_enable`) | 平台 `ConversationManager` 按 `umo` 维护 `req.contexts`，且有 `group_icl_enable` 注入群聊记录 | 1. **致命缺陷**：插件后台调用 `context.send_message()` 主动发的视频和消息**不会进入平台 `ConversationManager`**，导致用户回复时 Bot 根本不知道自己刚主动发了啥；<br/>2. 平台群聊记录无解线团与等级标记，且与插件滑窗双重注入浪费 Token | **完全舍弃平台 `req.contexts`，由插件 100% 接管上下文管理！**<br/>• 在 `@filter.on_llm_request` 中直接执行 **`req.contexts.clear()`**，彻底丢弃平台塞入的原生历史与 `group_icl` 记录（但保留当前轮次的 `req.prompt` 与 `req.image_urls`）。<br/>• **插件统一滑窗闭环**：无论是用户消息、被动回复、还是 **Bot 后台主动发送的视频/消息**，全部统一写入插件的会话滑窗（`sliding_window_size = 15`）；当消息滑出窗口满 15 条时，触发小脑提炼为分级记忆后直接销毁原始消息！ |
+| **5. 图像理解与文生图**<br/>(`Image Caption / Vision / T2I`) | 1. 平台 `provider_settings.default_image_caption_provider_id` 提供默认识图模型；<br/>2. 原生多模态管线自动将用户发图传给支持视觉的主模型；<br/>3. 文生图通过平台生图插件（LLM Tool）触发 | 插件对群聊图片再调一次识图导致双倍计费；或在插件内重复造文生图轮子 | **用户发图走平台、后台看片走插件 `vision` 角色**：<br/>• **群聊/私聊用户发图**：走原生多模态/识图管线，插件不二次调接口，直接复用转述结果记入群聊窗口。<br/>• **后台刷 B站/抖音看片**：统一使用插件自治的 `vision` 角色（未单独配置时继承 `main`），**不再**读取平台 `default_image_caption_provider_id`。<br/>• **文生图**：直接复用 AstrBot 生态的画图 Tool，插件零侵入。 |
+| **6. 语音输入与输出**<br/>(`STT / TTS`) | 1. `provider_stt_settings` 自动将用户语音转文字赋给 `event.message_str`；<br/>2. `provider_tts_settings` 在 `ResultDecorateStage` 中把回复转语音 | 插件自己再配一套 STT/TTS，导致不会处理语音或发出两条重复语音 | **STT 委派平台、TTS 插件自治（先于原生）**：<br/>• **语音输入 (STT)**：平台前置管线已自动转成文字，插件直接读 `event.message_str`。<br/>• **语音输出 (TTS)**：插件通过 `on_decorating_result` 钩子先于平台分段回复与原生 TTS 执行，把 `Plain` 文本合成为 `Record` 语音（`ModelHub` 的 `tts` 角色，来源：关闭 / 提供商源自建 / AstrBot TTS）。插件转完后原生 TTS 拿不到可读文字，不会重复播报；仅开启「语音 + 文字双发」时需在页面提示关闭原生 TTS。 |
+| **7. 上下文消息注入与群聊感知**<br/>(`req.contexts` & `group_icl_enable`) | 平台 `ConversationManager` 按 `umo` 维护 `req.contexts`，且有 `group_icl_enable` 注入群聊记录 | 1. **致命缺陷**：插件后台调用 `context.send_message()` 主动发的视频和消息**不会进入平台 `ConversationManager`**，导致用户回复时 Bot 根本不知道自己刚主动发了啥；<br/>2. 平台群聊记录无解线团与等级标记，且与插件滑窗双重注入浪费 Token | **完全舍弃平台 `req.contexts`，由插件 100% 接管上下文管理！**<br/>• 在 `@filter.on_llm_request` 中直接执行 **`req.contexts.clear()`**，彻底丢弃平台塞入的原生历史与 `group_icl` 记录（但保留当前轮次的 `req.prompt` 与 `req.image_urls`）。<br/>• **插件统一滑窗闭环**：无论是用户消息、被动回复、还是 **Bot 后台主动发送的视频/消息**，全部统一写入插件的会话滑窗（`sliding_window_size = 15`）；当消息滑出窗口满 15 条时，触发决策模型提炼为分级记忆后直接销毁原始消息！ |
+| **8. 主模型选择与人格注入**<br/>(`selected_provider` / Persona) | 1. `astr_main_agent._select_provider()` 优先读 `event.get_extra("selected_provider")`，再经 `context.get_provider_by_id()`（即查 `provider_manager.inst_map`）解析实例；<br/>2. 人格以 `\n# Persona Instructions\n\n{prompt}\n` 形式注入 System Prompt | 插件自行调 LLM 再 `send_message`，绕过原生分段/流式/工具调用；或直接改平台配置文件导致热重载后失效 | **插件选模型 + 接管人格段**：<br/>• 门禁放行后执行 `event.set_extra("selected_provider", main_provider_id)`，回复仍由 AstrBot 原生管线生成与发送（分段/流式/工具调用全部保留）。<br/>• 角色卡通过 `_takeover_persona` 三分支替换 `# Persona Instructions` 段；AstrBot 原生 Persona 只作为一次性导入来源。 |
 
 ---
 
-## 六、 配置体系架构：极简 `_conf_schema.json` + 全功能 `Pages` 可视化控制台
+## 六、 配置体系架构：`_conf_schema.json` + `plugin_settings` + 全功能 `Pages` 可视化控制台
 
-> **设计原则**：由于导入原生人格、增删改查 `Soul ID`、可视化编辑三态行动卡片池（`StateEventCard`）、查看实时日程与管理 L1/L2/L3 关系网无法通过普通静态表单完成，本插件采用 **“双层配置架构”**：
-> 1. **`views/console/`（AstrBot Plugin Pages 可视化工作台）**：承担所有与角色卡、行动卡片池、今日三态日程、用户关系与分级记忆相关的动态交互管理（详见 **[docs/WEBUI_DESIGN.md](file:///Users/mac/Desktop/Project/OnlyYou/docs/WEBUI_DESIGN.md)**）。
-> 2. **`_conf_schema.json`（全局基础设施与默认阈值配置）**：仅保留全局模型网关绑定、算法默认阈值与冲浪 API 基础设置。
+> **设计原则**：本插件采用 **三层配置架构**，动态数据与静态阈值彻底分离：
+> 1. **`views/console/`（AstrBot Plugin Pages 可视化控制台）**：承担所有动态交互管理——角色卡、行动卡片池、今日三态日程、用户关系、分级记忆、冲浪视频池，以及 **插件自治的四角色模型配置**（详见 [`docs/WEBUI_DESIGN.md`](WEBUI_DESIGN.md)）。
+> 2. **`_conf_schema.json`（全局运行参数）**：只保留 Roguelite / 关系 / 读空气 / 冲浪 / 记忆与上下文的算法阈值和 API 基础设置；**不再包含任何模型绑定**（模型配置见 §5.1 与 §4.4）。
+> 3. **SQLite `plugin_settings` 表（插件自治设置，见 §4.4）**：存放 `model_config`、`default_soul_id`、`legacy_model_migrated` 等插件自治数据。**不放进 `AstrBotConfig`**，避免 AstrBot 的 schema 完整性检查把未声明的键删掉导致配置丢失。
+
+### 6.1 三层配置归属对照
+
+| 配置数据 | 存放位置 | 读写入口 |
+| :--- | :--- | :--- |
+| 四角色模型选择（main / decision / vision / tts） | `plugin_settings["model_config"]` | Pages「模型」页（`models/config`） |
+| 插件默认角色 | `plugin_settings["default_soul_id"]` | Pages「会话」页（`sessions/default_soul`） |
+| 角色卡 10 分区 / 行动卡 / 奇遇卡 | SQLite `souls` 表 `profile_json` | Pages「角色卡」「日程」页 |
+| 用户关系 / 分级记忆 / 冲浪历史 | SQLite `users` / `memories` / `surfing_history` | Pages「关系」「记忆」「冲浪」页 |
+| 三态门禁、读空气、冲浪、记忆与上下文阈值 | `_conf_schema.json` | AstrBot 插件配置面板 |
+
+### 6.2 最终 `_conf_schema.json`
+
+以下为 v2.4 最终 schema 全文（不含任何模型绑定，保持 JSON 合法）：
 
 ```json
 {
@@ -490,13 +613,17 @@ class ModelHub:
       "core_user_ids": {
         "description": "★ L3 核心用户 (管理员) 账号列表",
         "type": "list",
-        "items": { "type": "string" },
+        "items": {
+          "type": "string"
+        },
         "default": []
       },
       "important_user_ids": {
         "description": "◆ 初始指定的 L2 重要用户列表（繁忙状态下依然会回复的对象）",
         "type": "list",
-        "items": { "type": "string" },
+        "items": {
+          "type": "string"
+        },
         "default": []
       },
       "enable_auto_promotion_l2": {
@@ -585,40 +712,30 @@ class ModelHub:
         "default": 400
       }
     }
-  },
-  "model_hub_config": {
-    "description": "🔌 多模型统一调度网关 (留空则自动继承当前会话所属 AstrBot 配置文件的模型)",
-    "type": "object",
-    "items": {
-      "main_llm_provider_id": {
-        "description": "1. 对话主模型 (留空则自动继承平台当前会话模型)",
-        "type": "string",
-        "default": "",
-        "_special": "select_provider"
-      },
-      "small_llm_provider_id": {
-        "description": "2. 小脑轻量文本模型 (用于读空气、日程微调与记忆提炼，建议选 Flash/Mini 模型；留空回退至主模型)",
-        "type": "string",
-        "default": "",
-        "_special": "select_provider"
-      },
-      "vision_llm_provider_id": {
-        "description": "3. 多模态视觉模型 (用于后台看B站/抖音视频九宫格；留空优先继承平台默认识图模型 default_image_caption_provider_id 或主模型)",
-        "type": "string",
-        "default": "",
-        "_special": "select_provider"
-      },
-      "embedding_provider_id": {
-        "description": "4. 向量嵌入模型 Embedding (选填，用于记忆语义召回；留空自动继承平台配置或降级为关键词检索)",
-        "type": "string",
-        "default": ""
-      },
-      "rerank_provider_id": {
-        "description": "5. 重排模型 Rerank (选填，用于记忆召回精排；留空自动继承平台配置或跳过重排)",
-        "type": "string",
-        "default": ""
-      }
-    }
   }
 }
+```
+
+---
+
+## 七、 测试与验证体系
+
+v2.4 起新增离线 `tests/` 测试套件（stdlib `unittest`，零网络依赖，不要求安装 AstrBot / pytest），覆盖：
+
+| 测试文件 | 覆盖范围 |
+| :--- | :--- |
+| `tests/test_provider_factory.py` | fake `provider_manager`：复用已启用实例、自建实例、按 `(source, model)` 缓存、`register_main` / `dispose` 清理 `inst_map` |
+| `tests/test_model_hub.py` | `decision` / `vision` 继承 `main`、`tts` 未配置时关闭、`get_main_provider_id` 三分支、全程不调用 `context.get_config` / `get_current_chat_provider_id` |
+| `tests/test_character_card.py` | 旧档案迁移、扁平属性兼容、`render_persona_prompt` 跳过空字段并遵守预算 |
+| `tests/test_persona_takeover.py` | 精确替换 / 正则兜底 / 前置三分支 |
+| `tests/test_web_api.py` | 用 `set_mock_request` 调用新增路由并校验 `{status, message, data}` 信封结构 |
+| `tests/test_regressions.py` | Roguelite 6 时段抽卡、三态门禁矩阵、微调三重门禁、Forgetting GC、上下文预算 |
+| `tests/test_js_syntax.py` | `node --check views/console/*.js` 前端语法检查 + `index.html` 脚本清单检查（无 node 时自动 skip） |
+
+```bash
+# 本地离线测试（项目根目录）
+python3 -m unittest discover -s tests -v
+# Python 语法 / 前端语法检查
+python3 -m compileall -q core storage surfing prompts main.py
+node --check views/console/*.js
 ```

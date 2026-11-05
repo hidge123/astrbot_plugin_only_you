@@ -75,7 +75,7 @@ class VideoVisionProcessor:
         image_urls = [video.cover_url] if video.cover_url.startswith("http") else None
         res: Any = await self.model_hub.call_llm_json(
             prompt=prompt,
-            role="vision" if image_urls else "small",
+            role="vision",
             umo=umo,
             image_urls=image_urls,
             default=None,

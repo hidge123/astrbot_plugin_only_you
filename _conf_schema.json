@@ -37,13 +37,17 @@
       "core_user_ids": {
         "description": "★ L3 核心用户 (管理员) 账号列表",
         "type": "list",
-        "items": { "type": "string" },
+        "items": {
+          "type": "string"
+        },
         "default": []
       },
       "important_user_ids": {
         "description": "◆ 初始指定的 L2 重要用户列表（繁忙状态下依然会回复的对象）",
         "type": "list",
-        "items": { "type": "string" },
+        "items": {
+          "type": "string"
+        },
         "default": []
       },
       "enable_auto_promotion_l2": {
@@ -117,7 +121,7 @@
         "default": 15
       },
       "extract_every_n_messages": {
-        "description": "滑出窗口每累计多少条有效消息触发一次后台小脑记忆提炼",
+        "description": "滑出窗口每累计多少条有效消息触发一次后台决策模型记忆提炼",
         "type": "int",
         "default": 15
       },
@@ -130,40 +134,6 @@
         "description": "单次对话插入记忆的最大总字数预算（汉字数，防止费用过高）",
         "type": "int",
         "default": 400
-      }
-    }
-  },
-  "model_hub_config": {
-    "description": "🔌 多模型统一调度网关 (留空则自动继承当前会话所属 AstrBot 配置文件的模型)",
-    "type": "object",
-    "items": {
-      "main_llm_provider_id": {
-        "description": "1. 对话主模型 (留空则自动继承平台当前会话模型)",
-        "type": "string",
-        "default": "",
-        "_special": "select_provider"
-      },
-      "small_llm_provider_id": {
-        "description": "2. 小脑轻量文本模型 (用于读空气、日程微调与记忆提炼，建议选 Flash/Mini 模型；留空回退至主模型)",
-        "type": "string",
-        "default": "",
-        "_special": "select_provider"
-      },
-      "vision_llm_provider_id": {
-        "description": "3. 多模态视觉模型 (用于后台看B站/抖音视频九宫格；留空优先继承平台默认识图模型 default_image_caption_provider_id 或主模型)",
-        "type": "string",
-        "default": "",
-        "_special": "select_provider"
-      },
-      "embedding_provider_id": {
-        "description": "4. 向量嵌入模型 Embedding (选填，用于记忆语义召回；留空自动继承平台配置或降级为关键词检索)",
-        "type": "string",
-        "default": ""
-      },
-      "rerank_provider_id": {
-        "description": "5. 重排模型 Rerank (选填，用于记忆召回精排；留空自动继承平台配置或跳过重排)",
-        "type": "string",
-        "default": ""
       }
     }
   }

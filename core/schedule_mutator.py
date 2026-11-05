@@ -243,10 +243,10 @@ class BoundedScheduleMutator:
         )
 
         llm_res = await self.model_hub.call_llm_json(
-            prompt=prompt, role="small", umo=umo, default=None
+            prompt=prompt, role="decision", umo=umo, default=None
         )
 
-        # Deterministic fallback if small LLM fails or returns malformed JSON
+        # Deterministic fallback if decision LLM fails or returns malformed JSON
         if not isinstance(llm_res, dict):
             if current_slot.state in (BotState.BUSY, BotState.RESTING):
                 llm_res = {

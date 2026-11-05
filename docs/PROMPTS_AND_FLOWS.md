@@ -1,6 +1,6 @@
-# OnlyYou (只有你) —— 核心 Prompt 工程与交互时序设计 (v2.2)
+# OnlyYou (只有你) —— 核心 Prompt 工程与交互时序设计 (v2.4)
 
-> 本文档定义 `astrbot_plugin_only_you` v2.2 的核心提示词模板，围绕 **三种基础状态（休息中 `RESTING` / 繁忙中 `BUSY` / 空闲中 `IDLE`）**、**两大具体行为（回发消息 / 刷视频）**、**Roguelite 随机日程与奇遇谈资卡**、以及**根据消息/视频输入受限微调日程** 构建。
+> 本文档定义 `astrbot_plugin_only_you` v2.4 的核心提示词模板，围绕 **三种基础状态（休息中 `RESTING` / 繁忙中 `BUSY` / 空闲中 `IDLE`）**、**两大具体行为（回发消息 / 刷视频）**、**Roguelite 随机日程与奇遇谈资卡**、**根据消息/视频输入受限微调日程**、**详细角色卡（10 分区 × 39 字段）的 AI 生成 / 分区补全**，以及 **角色卡接管 Persona 段与插件自治 TTS 的时序** 构建。文中的“决策模型”对应 `ModelHub` 的 `decision` 角色（读空气 / 记忆提炼 / 日程微调 / 造卡）。
 
 ---
 
@@ -62,6 +62,58 @@ Persona 名称：{persona_name}
   ]
 }
 ```
+
+### 1.2 详细角色卡整卡 AI 生成 (`CHARACTER_CARD_GENERATE_PROMPT`)
+> **设计要点**：严格按 `CARD_SCHEMA`（10 分区 / 39 字段）输出**单个 JSON 对象**，顶层 key 必须是分区 id。由 **主模型**（`role="main"`）调用，返回结果只作为**草稿**给前端预览，用户「采用草稿」后才落库。
+
+```markdown
+你是资深角色设定师，请为一位「AI 数字网友」生成一张《详细角色卡》。
+
+## 角色卡结构（必须严格遵守，字段 key 与分区 id 不可改动）
+{schema_json}
+
+## 用户输入 / 灵感种子
+"""
+{seed_text}
+"""
+
+## 已有的角色卡（可能为空；请在此基础上补全，冲突时以你的补全内容为准）
+{existing_card_json}
+
+## 输出要求（务必逐条遵守）
+1. 仅输出一个合法 JSON 对象，不要输出任何解释、Markdown 代码块或多余文字。
+2. 顶层 key 必须是分区 id（identity / appearance / personality / background / interests / speech / social / rhythm / examples / extra），每个分区是 {字段 key: 值} 形式的对象。
+3. 字段 key 必须与 schema 完全一致，不要新增字段；没有内容的字段用空字符串 "" 或空数组 [] 占位。
+4. `tags` 与 `list` 类型输出字符串数组，例如 ["嘴硬心软", "慢热"]；`dialogs` 类型输出 [{"user": "用户的话", "character": "角色的回应"}]。
+5. `select` 类型只能从 schema 中该字段 options 的 value 里选择。
+6. `age` 输出字符串（如 "21"）；`extra.native_persona_prompt` 必须保持空字符串（由系统单独维护）。
+7. 角色要真实、有细节、前后一致：说话风格（口头禅、语气词、标点、回复长度）必须能直接指导聊天模型模仿；避免「温柔善良」这类空泛描述。
+```
+
+### 1.3 单分区 AI 补全 (`CHARACTER_CARD_SECTION_PROMPT`)
+> **设计要点**：只让模型补全**一个分区**，其余分区已有内容作为上下文传入以保持人设一致；只输出该分区的 JSON 对象（不含分区 id 外层）。同样由 **主模型**调用，结果为草稿不落库。
+
+```markdown
+你是资深角色设定师。下面需要补全角色卡中的【单个分区】。
+
+## 待补全的分区定义（字段 key / type / options 必须严格遵守）
+{section_json}
+
+## 角色卡其余分区的已有内容（作为上下文，保持人设一致）
+{other_sections_json}
+
+## 用户输入 / 灵感种子
+"""
+{seed_text}
+"""
+
+## 输出要求（务必逐条遵守）
+1. 只输出该分区的 JSON 对象 {字段 key: 值}，不要包含分区 id 外层、不要输出数组外层、不要任何解释或 Markdown 代码块。
+2. 只补全该分区中列出的字段 key；`tags` / `list` 用字符串数组；`dialogs` 用 [{"user": "...", "character": "..."}]；`select` 只能从 options 的 value 中选。
+3. 必须与其余分区已有内容保持一致，写出具体、可执行的细节，不要复述字段定义。
+```
+
+> 两段 Prompt 的调用方：`SoulManager.generate_card(seed_text, base_card, section)` → `ModelHub.call_llm_json(..., role="main")`；失败返回 `None`，前端提示检查主模型配置。渲染进系统提示词的规则见 §3.3。
 
 ---
 
@@ -127,6 +179,34 @@ Persona 名称：{persona_name}
    {recent_watched_video_text}
 ```
 
+
+### 3.3 角色卡接管 Persona 段（`_takeover_persona`，System Prompt 组装顺序）
+
+> **背景**：v2.4 起主对话的人设不再来自 AstrBot Persona，而是由详细角色卡渲染后**替换**平台注入的 `# Persona Instructions` 段。AstrBot 原生人格只作为一次性导入来源（Pages「角色卡」→ 从 AstrBot 导入）。
+
+`ContextBudgetManager.apply_context_and_memory_budget()` 的执行顺序：
+
+| 顺序 | 动作 | 说明 |
+| :--- | :--- | :--- |
+| 1 | `_takeover_persona(req, soul)` | 三分支替换 Persona 段（见下） |
+| 2 | `req.contexts.clear()` + 注入插件滑窗 | 完全接管上下文（剔除与当前 prompt 重复的最新一条） |
+| 3 | 记忆混合打分 + 硬预算裁剪 | `0.40*关键词 + 0.35*时间新鲜度 + 0.25*重要度` |
+| 4 | 追加三态指令 / 变卦独白 / 记忆块 | 见 §二、§三 |
+
+三个替换分支（`core/context_budget.py`）：
+
+1. **精确匹配**：遍历 `soul_manager.list_native_prompts()`，若 `\n# Persona Instructions\n\n{原生人格原文}\n` 存在于 `system_prompt`，整段替换为角色卡 block；
+2. **正则兜底**：`re.subn(r"\n# Persona Instructions\n\n.*?(?=\n# |\Z)", card_block, sp, count=1, flags=re.S)`；
+3. **前置**：没找到 Persona 段时，把角色卡 block 前置到 `system_prompt`。
+
+角色卡 block 结构：
+
+```text
+\n# Persona Instructions\n\n{render_persona_prompt(soul.card)}\n
+```
+
+> `render_persona_prompt(card, max_chars=2000)` 规则：首行固定 `你正在扮演「{name}」。`；随后按 10 个分区输出 Markdown（只渲染非空字段）；超预算时按 `examples > background > appearance > extra > rhythm > interests` 丢弃，极端超长时再按 `social > personality > speech` 丢弃（`identity` 始终保留），最后硬截断保证不超预算；`native_persona_prompt` 永不参与渲染。
+
 ---
 
 ## 四、 核心状态流转与双行为控制时序图
@@ -175,7 +255,7 @@ sequenceDiagram
 
 ## 五、 精简版分级记忆提炼 Prompt (`MEMORY_EXTRACT_AND_GRADE_PROMPT`)
 
-> **调用时机**：每当群聊或私聊累计满 `N` 条（默认 15 条）有效对话时，由后台小脑异步调用，提炼值得记住的信息并打上 **初始重要度（`importance: 1~10`）**，供后续分级存储与定时遗忘程序（`Forgetting GC`）结算。
+> **调用时机**：每当群聊或私聊累计满 `N` 条（默认 15 条）有效对话时，由后台**决策模型**（`role="decision"`）异步调用，提炼值得记住的信息并打上 **初始重要度（`importance: 1~10`）**，供后续分级存储与定时遗忘程序（`Forgetting GC`）结算。
 
 ```markdown
 请阅读以下角色【{soul_name}】与用户的近期对话片段，提炼出值得记住的记忆条目，并严格评估每条记忆的【重要度与分级】。
@@ -207,3 +287,42 @@ sequenceDiagram
   }
 ]
 ```
+
+---
+
+## 六、 插件自治 TTS 与 `on_decorating_result` 时序
+
+> **调用时机**：`ModelHub` 的 `tts` 角色开启（`mode != "off"`），且本次命中触发概率与生效范围时，在 AstrBot `ResultDecorateStage` 的 `on_decorating_result` 阶段把文字替换为语音。**该钩子先于原生分段回复与原生 TTS 执行**，因此不会重复播报。
+
+触发条件（需全部满足）：
+
+| 条件 | 取值 |
+| :--- | :--- |
+| 开关 | `tts.mode ∈ {"source", "provider"}` |
+| 概率 | `random() <= tts.probability`（0.0 ~ 1.0） |
+| 范围 | `scope = "private"`（私聊）/ `"l3"`（当前发送者为 ★L3 核心用户）/ `"all"`（任意会话） |
+| 结果链 | `event.get_result()` 存在、`is_llm_result()` 为真，且链中存在非空 `Plain` 文本 |
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant PIPE as AstrBot ResultDecorateStage
+    participant OY as OnlyYou main.py
+    participant HUB as ModelHub(tts)
+    participant PF as ProviderFactory
+    PIPE->>OY: on_decorating_result 钩子（早于分段回复 / 原生 TTS）
+    OY->>OY: 汇总 chain 中的 Plain.text
+    OY->>HUB: synthesize(text)
+    HUB->>PF: get_tts_provider(tts_cfg)
+    PF-->>HUB: 自建 openai_tts_api 实例 / 现有 AstrBot TTS 实例
+    HUB->>HUB: provider.get_audio(text) -> 音频文件路径
+    HUB-->>OY: audio_path
+    OY->>PIPE: chain 中 Plain -> Record(file=audio_path, url=audio_path, text=text)
+    Note over PIPE: dual_output=True 时额外保留一个 Plain（此时可能与原生 TTS 重复，页面会提示关闭原生 TTS）
+    PIPE->>PIPE: 继续原生分段回复 / 原生 TTS（已无可用 Plain 文本，不会重复合成）
+```
+
+- **失败降级**：合成失败或 TTS 未配置时静默保留原文字链，不阻塞回复。
+- **主动消息**：心跳/主动搭话由 `_maybe_synthesize_proactive()` 按同一 TTS 配置决定是否合成，`PlatformBridge.send_proactive_message(..., audio_path=...)` 在文字发送后追加一条 `Record` 语音。
+- **TTS 三种来源**：`off` 关闭 / `source` 提供商源 + OpenAI 兼容 TTS（自建 `openai_tts_api`，音色默认 `alloy`）/ `provider` 直接使用 AstrBot 现有 TTS 提供商。
+

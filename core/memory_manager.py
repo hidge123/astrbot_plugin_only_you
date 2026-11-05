@@ -286,7 +286,7 @@ class MemoryManager:
         umo: Optional[str] = None,
     ) -> int:
         """
-        Invoke small fast LLM with `MEMORY_EXTRACT_AND_GRADE_PROMPT` on evicted sliding-window
+        Invoke the decision model with `MEMORY_EXTRACT_AND_GRADE_PROMPT` on evicted sliding-window
         messages and store extracted memories into SQLite.
         """
         if not self.enabled or not (transcript_text or "").strip():
@@ -297,7 +297,7 @@ class MemoryManager:
             recent_chat_transcript=transcript_text,
         )
         items = await self.model_hub.call_llm_json(
-            prompt=prompt, role="small", umo=umo, default=[]
+            prompt=prompt, role="decision", umo=umo, default=[]
         )
         if not isinstance(items, list):
             return 0

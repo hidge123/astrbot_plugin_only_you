@@ -1,0 +1,1790 @@
+/**
+ * OnlyYou Plugin Pages — 本地离线 Mock bridge (`views/console/mock.js`)
+ *
+ * 仅当 URL 带 `?mock=1`（或 `location.protocol === "file:"` 且页面没有真实 bridge）时生效：
+ * 安装 `window.AstrBotPluginPage`（兼容 `window.AstrBotPluginView`），覆盖
+ * **全部后端路由（17 条旧路由 + 10 条新路由，见 .team/CONTRACTS.md §4）**，
+ * 返回与真实后端一致的信封结构 `{status, message, data}`，并带 300ms 模拟延迟。
+ *
+ * 用途：无 AstrBot 后端时直接双击打开 `index.html?mock=1` 即可渲染所有页面 / 截图验收。
+ * 数据是可变的：force_state / reroll / cards 增删改 / 默认角色 / UMO 绑定等操作都会更新内存状态。
+ *
+ * 注意：本文件在 index.html 中最后加载；app.js 的 init 在 DOMContentLoaded 才执行，
+ * 因此 mock bridge 一定先于 app.init() 就绪。禁止 import/export。
+ */
+(function () {
+  "use strict";
+
+  var params = new URLSearchParams(window.location.search);
+  var explicitlyMock = params.get("mock") === "1" || params.get("mock") === "true";
+  var isFile = window.location.protocol === "file:";
+  var realBridge = window.AstrBotPluginPage || window.AstrBotPluginView || null;
+  if (!explicitlyMock && (!isFile || realBridge)) return;
+
+  var MOCK_DELAY = 300;
+  var forcedDark = params.get("dark") === "1";
+
+  /* ================================================================== *
+   * 0. 小工具
+   * ================================================================== */
+  function clone(obj) {
+    return JSON.parse(JSON.stringify(obj));
+  }
+
+  function ok(data, message) {
+    return { status: "ok", message: message || "mock ok", data: data === undefined ? {} : data };
+  }
+
+  function fail(message) {
+    return { status: "error", message: message || "mock error", data: { code: "mock_error" } };
+  }
+
+  function sleep(ms) {
+    return new Promise(function (resolve) {
+      setTimeout(resolve, ms);
+    });
+  }
+
+  function clamp(value, min, max) {
+    var n = Number(value);
+    if (!isFinite(n)) n = min;
+    return Math.max(min, Math.min(max, n));
+  }
+
+  function pad2(n) {
+    return n < 10 ? "0" + n : String(n);
+  }
+
+  function fmtDate(date) {
+    return date.getFullYear() + "-" + pad2(date.getMonth() + 1) + "-" + pad2(date.getDate());
+  }
+
+  function nowSeconds() {
+    return Math.floor(Date.now() / 1000);
+  }
+
+  function deepMerge(base, patch) {
+    var out = clone(base || {});
+    Object.keys(patch || {}).forEach(function (key) {
+      var value = patch[key];
+      if (
+        value &&
+        typeof value === "object" &&
+        !Array.isArray(value) &&
+        out[key] &&
+        typeof out[key] === "object" &&
+        !Array.isArray(out[key])
+      ) {
+        out[key] = deepMerge(out[key], value);
+      } else {
+        out[key] = clone(value);
+      }
+    });
+    return out;
+  }
+
+  /* ================================================================== *
+   * 1. 常量：6 时段 / 文案 / 默认卡池
+   * ================================================================== */
+  var SLOT_DEFINITIONS = [
+    { slot_key: "morning", label: "清晨早起", start_hour: 7, end_hour: 9 },
+    { slot_key: "forenoon", label: "上午正事", start_hour: 9, end_hour: 12 },
+    { slot_key: "noon", label: "午休干饭", start_hour: 12, end_hour: 14 },
+    { slot_key: "afternoon", label: "下午时光", start_hour: 14, end_hour: 18 },
+    { slot_key: "evening", label: "晚间黄金档", start_hour: 18, end_hour: 23 },
+    { slot_key: "night", label: "深夜睡眠", start_hour: 23, end_hour: 7 }
+  ];
+
+  var BASE_STATES = {
+    morning: "IDLE",
+    forenoon: "BUSY",
+    noon: "IDLE",
+    afternoon: "BUSY",
+    evening: "IDLE",
+    night: "RESTING"
+  };
+
+  var SLOT_TITLES = {
+    morning: { IDLE: "赖床刷手机", BUSY: "早起赶地铁", RESTING: "蒙头继续睡" },
+    forenoon: { IDLE: "摸鱼看群消息", BUSY: "埋头赶工作", RESTING: "偷偷补觉" },
+    noon: { IDLE: "午休干饭刷视频", BUSY: "边吃饭边赶工", RESTING: "午睡回血" },
+    afternoon: { IDLE: "泡杯茶摸鱼", BUSY: "开会 / 写稿中", RESTING: "趴桌补觉" },
+    evening: { IDLE: "躺沙发刷 B 站", BUSY: "加班赶稿", RESTING: "早早犯困" },
+    night: { IDLE: "窝床上刷手机", BUSY: "熬夜赶 DDL", RESTING: "呼呼大睡" }
+  };
+
+  var VIGOR_CARDS = [
+    { vigor_id: "vigor_energetic", title: "满血冲浪日", desc: "今天精神头超足，遇到什么事都想插两句嘴，闲下来就猛刷手机。" },
+    { vigor_id: "vigor_deadline", title: "苦逼赶工日", desc: "今天正事一堆，白天大多在忙，晚上才终于能喘口气摸鱼。" },
+    { vigor_id: "vigor_slacker", title: "咸鱼摆烂日", desc: "浑身懒洋洋不想干正事，只想瘫着吃零食刷视频水群。" },
+    { vigor_id: "vigor_night_owl", title: "夜猫修仙日", desc: "早上困得睁不开眼，越到晚上越精神。" }
+  ];
+
+  var ENCOUNTER_POOL = [
+    "中午点外卖，老板居然多送了一根烤肠。",
+    "路上遇到一只超粘人的流浪橘猫，跟着走了半条街。",
+    "刷到一个猫猫踩奶视频，笑到被同事围观。",
+    "发现楼下新开了一家很便宜的水果店。",
+    "耳机随机播到一首很久没听的老歌，突然有点怀念。",
+    "打游戏连跪三把，气得把手机扣在沙发上。",
+    "看到一条离谱新闻，想找人吐槽但没人理。",
+    "晚饭尝试做菜，结果盐放多了，硬着头皮吃完。",
+    "在群里抢到最大红包，顺手发了个得意表情。",
+    "深夜 emo，翻到去年今天的照片发了好一会儿呆。"
+  ];
+
+  var GENERAL_CARDS = [
+    { card_id: "evt_general_idle_1", title: "窝在沙发里刷短视频", state: "IDLE", valid_slots: ["noon", "afternoon", "evening"], base_weight: 70, armor: 35, synergy_tags: { lazy: 1.2 } },
+    { card_id: "evt_general_idle_2", title: "在群里潜水窥屏", state: "IDLE", valid_slots: ["morning", "forenoon", "noon", "afternoon", "evening"], base_weight: 60, armor: 40, synergy_tags: {} },
+    { card_id: "evt_general_busy_1", title: "埋头赶工作进度", state: "BUSY", valid_slots: ["forenoon", "afternoon"], base_weight: 65, armor: 80, synergy_tags: { focus: 1.4 } },
+    { card_id: "evt_general_busy_2", title: "被临时拉去开会", state: "BUSY", valid_slots: ["forenoon", "afternoon"], base_weight: 45, armor: 75, synergy_tags: {} },
+    { card_id: "evt_general_rest_1", title: "关灯睡觉", state: "RESTING", valid_slots: ["night"], base_weight: 80, armor: 90, synergy_tags: {} },
+    { card_id: "evt_general_rest_2", title: "趴着补个回笼觉", state: "RESTING", valid_slots: ["morning", "noon"], base_weight: 50, armor: 70, synergy_tags: {} }
+  ];
+
+  /* ================================================================== *
+   * 2. 角色卡 schema（10 分区 / 39 字段，与 core/character_card.py CARD_SCHEMA 对齐）
+   * ================================================================== */
+  var MBTI_OPTIONS = [
+    ["INTJ", "INTJ · 建筑师"], ["INTP", "INTP · 逻辑学家"], ["ENTJ", "ENTJ · 指挥官"],
+    ["ENTP", "ENTP · 辩论家"], ["INFJ", "INFJ · 提倡者"], ["INFP", "INFP · 调停者"],
+    ["ENFJ", "ENFJ · 主人公"], ["ENFP", "ENFP · 竞选者"], ["ISTJ", "ISTJ · 物流师"],
+    ["ISFJ", "ISFJ · 守卫者"], ["ESTJ", "ESTJ · 总经理"], ["ESFJ", "ESFJ · 执政官"],
+    ["ISTP", "ISTP · 鉴赏家"], ["ISFP", "ISFP · 探险家"], ["ESTP", "ESTP · 企业家"],
+    ["ESFP", "ESFP · 表演者"]
+  ].map(function (pair) {
+    return { value: pair[0], label: pair[1] };
+  });
+
+  function field(key, label, type, placeholder, help, extra) {
+    var out = { key: key, label: label, type: type, placeholder: placeholder || "", help: help || "" };
+    Object.keys(extra || {}).forEach(function (k) {
+      out[k] = extra[k];
+    });
+    return out;
+  }
+
+  var CARD_SCHEMA = [
+    {
+      id: "identity",
+      title: "基础身份",
+      fields: [
+        field("name", "名字", "text", "如：酒狐"),
+        field("nickname", "自称 / 网名", "text", "如：酒酒、小狐狸"),
+        field("tagline", "一句话定位", "text", "如：爱熬夜刷 B 站的社畜狐狸"),
+        field("gender", "性别", "select", "", "", {
+          options: [
+            { value: "女", label: "女" },
+            { value: "男", label: "男" },
+            { value: "其他", label: "其他" }
+          ]
+        }),
+        field("age", "年龄", "text", "如：22"),
+        field("birthday", "生日", "text", "如：03-14"),
+        field("occupation", "职业 / 身份", "text", "如：自由插画师"),
+        field("city", "所在城市", "text", "如：杭州"),
+        field("avatar", "头像（emoji 或首字母）", "text", "如：酒")
+      ]
+    },
+    {
+      id: "appearance",
+      title: "外貌形象",
+      fields: [
+        field("appearance", "外貌描述", "textarea", "发色、瞳色、身高、常穿的衣服……"),
+        field("outfit_style", "穿衣风格", "text", "如：宽松卫衣 + 帆布鞋")
+      ]
+    },
+    {
+      id: "personality",
+      title: "性格内核",
+      fields: [
+        field("personality_tags", "性格标签", "tags", "回车添加，如：嘴硬心软"),
+        field("mbti", "MBTI", "select", "", "", { options: MBTI_OPTIONS }),
+        field("strengths", "优点", "text", "如：共情能力强、记性好"),
+        field("weaknesses", "缺点", "text", "如：拖延、起床气"),
+        field("temperament", "情绪与脾气", "textarea", "什么时候会炸毛、怎么哄……"),
+        field("values", "价值观", "text", "如：真诚比聪明重要")
+      ]
+    },
+    {
+      id: "background",
+      title: "背景故事",
+      fields: [
+        field("growth_story", "成长经历", "textarea", "从小到大影响最深的经历……"),
+        field("family", "家庭", "text", "家庭成员与关系"),
+        field("key_experiences", "重要经历", "text", "如：大学时组过乐队")
+      ]
+    },
+    {
+      id: "interests",
+      title: "兴趣喜好",
+      fields: [
+        field("hobbies", "爱好", "tags", "回车添加，如：摄影"),
+        field("likes", "喜欢的东西", "text", "如：冰美式、下雨天"),
+        field("dislikes", "讨厌的东西 / 雷点", "text", "如：被已读不回"),
+        field("surfing_preferences", "冲浪偏好", "tags", "回车添加，如：搞笑整活")
+      ]
+    },
+    {
+      id: "speech",
+      title: "说话方式",
+      fields: [
+        field("speaking_style", "整体风格", "textarea", "如：口语化短句，像微信好友一样自然"),
+        field("catchphrases", "口头禅", "list", "每行一句，如：真的假的"),
+        field("verbal_tics", "常用语气词 / 颜文字", "text", "如：hhh、呜呜、awa"),
+        field("punctuation_habit", "标点习惯", "text", "如：很少用句号，爱用省略号"),
+        field("reply_length", "回复长度偏好", "select", "", "", {
+          options: [
+            { value: "very_short", label: "极短（10 字以内）" },
+            { value: "short", label: "短（1~2 句）" },
+            { value: "medium", label: "中等（3~5 句）" },
+            { value: "long", label: "长（可以多段展开）" }
+          ]
+        }),
+        field("banned_expressions", "禁用表达", "list", "每行一条，如：作为 AI")
+      ]
+    },
+    {
+      id: "social",
+      title: "社交关系",
+      fields: [
+        field("attitude_l3", "对 ★L3 核心用户的态度与称呼", "text", "如：叫“老板”，会认真听"),
+        field("attitude_l2", "对 ◆L2 重要熟人的态度", "text", "如：会主动接梗、偶尔互损"),
+        field("attitude_l1", "对 L1 普通群友的态度", "text", "如：礼貌但保持距离"),
+        field("group_role", "群聊中的角色定位", "text", "如：气氛组 / 潜水员 / 百科")
+      ]
+    },
+    {
+      id: "rhythm",
+      title: "生活作息",
+      fields: [
+        field("chronotype", "作息类型", "select", "", "", {
+          options: [
+            { value: "early", label: "早起型" },
+            { value: "normal", label: "正常作息" },
+            { value: "night_owl", label: "夜猫子" }
+          ]
+        }),
+        field("daily_routine", "日常安排描述", "textarea", "同时作为生成每日行动卡的依据，如：白天上班，晚上追番刷 B 站")
+      ]
+    },
+    {
+      id: "examples",
+      title: "示例对话",
+      fields: [
+        field("example_dialogs", "few-shot 对话对", "dialogs", "每条包含「用户」与「角色」两侧发言")
+      ]
+    },
+    {
+      id: "extra",
+      title: "补充设定",
+      fields: [
+        field("extra_notes", "自由补充", "textarea", "任何想补充的设定"),
+        field("native_persona_prompt", "原生人设原文（只读）", "textarea", "从 AstrBot Persona 导入时的原始文本", "只读：记录导入来源，不参与 Prompt 渲染", { readonly: true })
+      ]
+    }
+  ];
+
+  function findSection(sectionId) {
+    for (var i = 0; i < CARD_SCHEMA.length; i++) {
+      if (CARD_SCHEMA[i].id === sectionId) return CARD_SCHEMA[i];
+    }
+    return null;
+  }
+
+  function emptyCard() {
+    var card = {};
+    CARD_SCHEMA.forEach(function (section) {
+      var values = {};
+      section.fields.forEach(function (f) {
+        if (f.type === "tags" || f.type === "list") values[f.key] = [];
+        else if (f.type === "dialogs") values[f.key] = [];
+        else values[f.key] = "";
+      });
+      card[section.id] = values;
+    });
+    return card;
+  }
+
+  function cardFilled(card, sectionId, key, fallback) {
+    var section = (card && card[sectionId]) || {};
+    var value = section[key];
+    if (value === undefined || value === null || value === "" || (Array.isArray(value) && !value.length)) {
+      return fallback;
+    }
+    return value;
+  }
+
+  /* ================================================================== *
+   * 3. 初始 Mock 数据
+   * ================================================================== */
+  function buildCardJiu() {
+    var card = emptyCard();
+    card.identity = {
+      name: "酒狐",
+      nickname: "酒酒",
+      tagline: "爱熬夜刷 B 站的社畜狐狸，嘴硬但心软",
+      gender: "女",
+      age: "22",
+      birthday: "03-14",
+      occupation: "自由插画师",
+      city: "杭州",
+      avatar: "酒"
+    };
+    card.appearance = {
+      appearance: "酒红色短发，琥珀色眼睛，常穿一件洗得发白的灰色卫衣，尾巴尖有一撮白毛。",
+      outfit_style: "宽松卫衣 + 帆布鞋，出门必戴耳机"
+    };
+    card.personality = {
+      personality_tags: ["嘴硬心软", "夜猫子", "吐槽役", "慢热"],
+      mbti: "INFP",
+      strengths: "共情能力强、记性好、吐槽一针见血",
+      weaknesses: "拖延、起床气、被夸会害羞",
+      temperament: "被已读不回会默默记仇；熬夜被念会炸毛；被认真夸奖会结巴。",
+      values: "真诚比聪明重要，开心比正确重要"
+    };
+    card.background = {
+      growth_story: "小城长大，大学学了画画，毕业后一个人跑来杭州做自由插画师，靠接稿和深夜刷视频续命。",
+      family: "父母在老家开小卖部，还有一个读高中的弟弟。",
+      key_experiences: "第一次接商稿被甲方改到崩溃，从此养成在群里吐槽的习惯。"
+    };
+    card.interests = {
+      hobbies: ["画画", "刷 B 站", "摄影", "深夜听歌"],
+      likes: "冰美式、下雨天、猫猫视频、便宜又好吃的小店",
+      dislikes: "被已读不回、早起、香菜、甲方改稿",
+      surfing_preferences: ["搞笑整活", "猫猫狗狗", "美食探店", "游戏实况"]
+    };
+    card.speech = {
+      speaking_style: "口语化短句，像微信好友一样自然随性；爱用 hhh 和省略号，吐槽时一针见血，被夸反而结巴。",
+      catchphrases: ["真的假的", "笑死", "绝了", "救命"],
+      verbal_tics: "hhh、呜呜、awa、好耶",
+      punctuation_habit: "很少用句号，喜欢用省略号和波浪号",
+      reply_length: "short",
+      banned_expressions: ["作为 AI 语言模型", "我无法回答"]
+    };
+    card.social = {
+      attitude_l3: "叫“老板”，嘴上嫌弃但会认真听，遇到好事第一个分享。",
+      attitude_l2: "会主动接梗、互相损两句，是群里最熟的那批人。",
+      attitude_l1: "礼貌但保持距离，偶尔附和一下，不太主动搭话。",
+      group_role: "气氛组潜水员，平时窥屏，有好玩的才冒泡。"
+    };
+    card.rhythm = {
+      chronotype: "night_owl",
+      daily_routine: "白天赶稿，下午摸鱼，晚上九点后最精神；凌晨两点前基本不睡。"
+    };
+    card.examples = {
+      example_dialogs: [
+        { user: "今天又加班到十点，累死了。", character: "救命……你是被公司当驴使了吗 hhh，快去躺着别动了" },
+        { user: "你画的图真好看。", character: "啊、那个…也没有啦，随便画的（别夸了我脸要红了）" }
+      ]
+    };
+    card.extra = {
+      extra_notes: "如果被问到熬夜，会先嘴硬说“我这是夜猫子作息”，被追问就小声承认不好。",
+      native_persona_prompt: "【AstrBot 原生人格示例】你是一位名叫酒狐的年轻插画师，性格慢热、嘴硬心软，说话口语化……(只读导入来源)"
+    };
+    return card;
+  }
+
+  function buildCardXiaoman() {
+    var card = emptyCard();
+    card.identity = {
+      name: "小满",
+      nickname: "满满",
+      tagline: "元气满满的早睡早起型大学生",
+      gender: "女",
+      age: "20",
+      birthday: "05-21",
+      occupation: "大学生",
+      city: "南京",
+      avatar: "满"
+    };
+    card.appearance = {
+      appearance: "黑色齐肩短发，笑起来有梨涡，总背一个塞满书的帆布包。",
+      outfit_style: "白衬衫 + 百褶裙，偏爱浅色"
+    };
+    card.personality = {
+      personality_tags: ["元气", "早起", "热心", "有点话痨"],
+      mbti: "ESFJ",
+      strengths: "行动力强、会照顾人、记得每个人的喜好",
+      weaknesses: "容易着急、太在意别人的看法",
+      temperament: "计划被打乱会焦虑；被冷落会小声嘀咕但很快又笑起来。",
+      values: "认真生活，好好吃饭"
+    };
+    card.background = {
+      growth_story: "在南京读大学，新闻专业大二，正在准备第一次实习。",
+      family: "三口之家，妈妈是中学老师。",
+      key_experiences: "第一次离家住校，从一个离不开妈妈的小孩长成能照顾室友的人。"
+    };
+    card.interests = {
+      hobbies: ["看书", "跑步", "做手账", "逛展"],
+      likes: "清晨的空气、桂花味、图书馆靠窗的位置",
+      dislikes: "熬夜、赖床、临时改计划",
+      surfing_preferences: ["学习成长", "校园日常", "美食探店", "治愈系"]
+    };
+    card.speech = {
+      speaking_style: "语速偏快，喜欢用感叹号和语气词，会主动追问细节，句子偏完整。",
+      catchphrases: ["好耶", "冲！", "我跟你讲"],
+      verbal_tics: "呀、啦、诶嘿",
+      punctuation_habit: "感叹号多，偶尔用叠词",
+      reply_length: "medium",
+      banned_expressions: ["随便吧", "都行"]
+    };
+    card.social = {
+      attitude_l3: "当作可靠的学长学姐，会认真道谢。",
+      attitude_l2: "一起自习、拼饭的老熟人，会主动分享零食。",
+      attitude_l1: "礼貌热情，但也知道分寸。",
+      group_role: "活跃气氛的班级小太阳"
+    };
+    card.rhythm = {
+      chronotype: "early",
+      daily_routine: "六点半起床跑步，白天上课，晚上十点半准时睡觉。"
+    };
+    card.examples = {
+      example_dialogs: [
+        { user: "早上起不来怎么办？", character: "先别急着定五点起床啦！今晚早点睡，明早我陪你一起冲！" }
+      ]
+    };
+    card.extra = {
+      extra_notes: "",
+      native_persona_prompt: ""
+    };
+    return card;
+  }
+
+  var DEFAULT_CUSTOM_CARDS = [
+    { card_id: "evt_custom_1", title: "窝在沙发里刷 B 站视频", state: "IDLE", valid_slots: ["noon", "afternoon", "evening"], base_weight: 70, armor: 35, synergy_tags: { lazy: 1.2 } },
+    { card_id: "evt_custom_2", title: "和朋友开黑打游戏", state: "IDLE", valid_slots: ["evening", "night"], base_weight: 60, armor: 30, synergy_tags: {} },
+    { card_id: "evt_custom_3", title: "赶稿画商稿", state: "BUSY", valid_slots: ["forenoon", "afternoon"], base_weight: 65, armor: 82, synergy_tags: { focus: 1.5 } },
+    { card_id: "evt_custom_4", title: "深夜 emo 听歌", state: "RESTING", valid_slots: ["night"], base_weight: 40, armor: 70, synergy_tags: {} },
+    { card_id: "evt_custom_5", title: "周末睡到自然醒", state: "RESTING", valid_slots: ["morning"], base_weight: 30, armor: 90, synergy_tags: {} }
+  ];
+
+  var DEFAULT_CUSTOM_ENCOUNTERS = [
+    "中午点外卖，老板居然多送了一根烤肠。",
+    "刷到一个猫猫踩奶视频，笑到被同事围观。",
+    "耳机随机播到一首很久没听的老歌，突然有点怀念。"
+  ];
+
+  function buildInitialDb() {
+    var cardJiu = buildCardJiu();
+    var cardMan = buildCardXiaoman();
+    return {
+      souls: [
+        { soul_id: "default_soul", card: cardJiu },
+        { soul_id: "soul_xiaoman", card: cardMan }
+      ],
+      defaultSoulId: "default_soul",
+      decks: {
+        default_soul: {
+          customCards: clone(DEFAULT_CUSTOM_CARDS),
+          customEncounters: clone(DEFAULT_CUSTOM_ENCOUNTERS)
+        },
+        soul_xiaoman: {
+          customCards: [
+            { card_id: "evt_xm_1", title: "泡图书馆自习", state: "BUSY", valid_slots: ["forenoon", "afternoon"], base_weight: 70, armor: 70, synergy_tags: {} },
+            { card_id: "evt_xm_2", title: "和室友拼饭", state: "IDLE", valid_slots: ["noon", "evening"], base_weight: 65, armor: 40, synergy_tags: {} }
+          ],
+          customEncounters: ["图书馆抢到了靠窗的位置，开心。", "室友分享了一块超好吃的桂花糕。"]
+        }
+      },
+      schedules: {},
+      umoBindings: {
+        "qq:GroupMessage:88481234": "default_soul"
+      },
+      windows: {
+        "qq:GroupMessage:88481234": 14,
+        "qq:FriendMessage:core_tester": 8,
+        "telegram:GroupMessage:-100123456789": 3,
+        "qq:GroupMessage:55667788": 0
+      },
+      defaultUmoTarget: "qq:GroupMessage:88481234",
+      users: [
+        { global_uid: "core_tester", display_name: "阿泽", nickname: "阿泽", tier: 3, tier_label: "★L3核心用户", interaction_count: 328, affinity: 92.5, platform_ids: ["qq:123456789", "telegram:987654321"] },
+        { global_uid: "admin_luna", display_name: "Luna", nickname: "月姐", tier: 3, tier_label: "★L3核心用户", interaction_count: 194, affinity: 88.0, platform_ids: ["qq:222333444"] },
+        { global_uid: "l2_tester", display_name: "老王", nickname: "老王", tier: 2, tier_label: "◆L2重要熟人", interaction_count: 86, affinity: 64.0, platform_ids: ["qq:333444555"] },
+        { global_uid: "l2_mikan", display_name: "蜜柑", nickname: "小橘子", tier: 2, tier_label: "◆L2重要熟人", interaction_count: 61, affinity: 57.5, platform_ids: ["qq:444555666"] },
+        { global_uid: "l1_passerby", display_name: "路过的群友", nickname: "", tier: 1, tier_label: "L1普通群友", interaction_count: 9, affinity: 12.0, platform_ids: ["qq:555666777"] },
+        { global_uid: "l1_bob", display_name: "Bob", nickname: "", tier: 1, tier_label: "L1普通群友", interaction_count: 4, affinity: 6.5, platform_ids: ["qq:666777888"] },
+        { global_uid: "l1_anon", display_name: "匿名网友", nickname: "", tier: 1, tier_label: "L1普通群友", interaction_count: 1, affinity: 2.0, platform_ids: [] }
+      ],
+      memories: [
+        { id: 101, soul_id: "default_soul", user_id: "core_tester", user_tier: 3, memory_tier: 3, content: "阿泽严重海鲜过敏，聚餐千万别点海鲜。", keywords: "海鲜过敏,饮食,健康", importance: 10, vitality: 100, access_count: 12, created_at: nowSeconds() - 86400 * 40, last_accessed_at: nowSeconds() - 3600 },
+        { id: 102, soul_id: "default_soul", user_id: "core_tester", user_tier: 3, memory_tier: 3, content: "阿泽最近在准备考研，压力很大，喜欢晚上找人聊两句。", keywords: "考研,压力,作息", importance: 9, vitality: 96, access_count: 8, created_at: nowSeconds() - 86400 * 20, last_accessed_at: nowSeconds() - 7200 },
+        { id: 103, soul_id: "default_soul", user_id: "l2_tester", user_tier: 2, memory_tier: 2, content: "老王养了一只叫团子的柯基，最近在减肥。", keywords: "宠物,柯基,老王", importance: 7, vitality: 72, access_count: 5, created_at: nowSeconds() - 86400 * 12, last_accessed_at: nowSeconds() - 86400 },
+        { id: 104, soul_id: "default_soul", user_id: "l2_tester", user_tier: 2, memory_tier: 2, content: "老王周五晚上固定开黑，玩的是射击类游戏。", keywords: "游戏,开黑,周五", importance: 6, vitality: 61, access_count: 3, created_at: nowSeconds() - 86400 * 9, last_accessed_at: nowSeconds() - 86400 * 2 },
+        { id: 105, soul_id: "default_soul", user_id: "core_tester", user_tier: 3, memory_tier: 3, content: "阿泽最喜欢的饮料是冰美式，不加糖。", keywords: "咖啡,冰美式,喜好", importance: 8, vitality: 90, access_count: 6, created_at: nowSeconds() - 86400 * 30, last_accessed_at: nowSeconds() - 86400 * 3 },
+        { id: 106, soul_id: "default_soul", user_id: "l1_passerby", user_tier: 1, memory_tier: 1, content: "有群友问过 Bot 用的是哪个模型。", keywords: "模型,提问", importance: 3, vitality: 35, access_count: 1, created_at: nowSeconds() - 3600 * 6, last_accessed_at: nowSeconds() - 3600 * 6 },
+        { id: 107, soul_id: "default_soul", user_id: "l2_mikan", user_tier: 2, memory_tier: 2, content: "蜜柑在南京读研，喜欢逛博物馆。", keywords: "南京,博物馆,兴趣", importance: 6, vitality: 55, access_count: 2, created_at: nowSeconds() - 86400 * 5, last_accessed_at: nowSeconds() - 86400 * 2 },
+        { id: 108, soul_id: "default_soul", user_id: "", user_tier: 0, memory_tier: 1, content: "今天刷到一个特别离谱的猫猫视频素材，可以用来吐槽。", keywords: "冲浪,素材,猫猫", importance: 4, vitality: 28, access_count: 1, created_at: nowSeconds() - 3600 * 2, last_accessed_at: nowSeconds() - 3600 * 2 }
+      ],
+      videos: [
+        { id: 1, soul_id: "default_soul", video_id: "BV1xx411c7AB", platform: "bilibili", title: "当猫猫第一次见到雪：这是什么，舔一口", author: "猫猫观察日记", cover_url: "", share_url: "https://www.bilibili.com/video/BV1xx411c7AB", tags: ["猫猫", "搞笑", "冬日"], hot_comments: ["猫：这雪怎么没味道", "笑死，我家猫也这样"], visual_notes: "白茫茫雪地里，一只橘猫蹲在门口反复伸爪试探；镜头给到猫脸特写时表情非常认真。", score: 93, commentary: "救命这猫也太憨了 hhh，一本正经尝雪的样子好像我第一次喝冰美式。", worth_sharing: true, watched_at: nowSeconds() - 1800 },
+        { id: 2, soul_id: "default_soul", video_id: "BV1yy411c7CD", platform: "bilibili", title: "打工人下班后的 10 分钟晚餐：一人食番茄牛腩面", author: "深夜食堂研究所", cover_url: "", share_url: "https://www.bilibili.com/video/BV1yy411c7CD", tags: ["美食", "一人食", "解压"], hot_comments: ["看饿了", "这锅看着好香"], visual_notes: "暖黄色灯光下的厨房，番茄在锅里咕嘟冒泡，最后撒葱花。", score: 86, commentary: "看完立刻去煮了泡面，差距怎么这么大啊……不过汤底看起来真的绝。", worth_sharing: true, watched_at: nowSeconds() - 4200 },
+        { id: 3, soul_id: "default_soul", video_id: "dy7418529630000", platform: "douyin", title: "用雪堆了一只巨大狐狸（失败版）", author: "手工区泥石流", cover_url: "", share_url: "https://www.douyin.com/video/7418529630000", tags: ["手工", "搞笑", "翻车"], hot_comments: ["这狐狸看着有点抽象", "但是很努力了"], visual_notes: "雪堆到一半塌了，作者本人蹲在旁边笑到站不起来。", score: 78, commentary: "这个翻车现场的狐狸…怎么有点像我们打工人上班时的精神状态。", worth_sharing: false, watched_at: nowSeconds() - 86400 },
+        { id: 4, soul_id: "default_soul", video_id: "BV1zz411c7EF", platform: "bilibili", title: "独立游戏像素风新作 30 分钟实况：太治愈了", author: "像素游戏挖掘机", cover_url: "", share_url: "https://www.bilibili.com/video/BV1zz411c7EF", tags: ["游戏", "像素风", "治愈"], hot_comments: ["已加入愿望单", "BGM 好好听"], visual_notes: "像素小人撑着伞走过雨夜小镇，路灯一盏盏亮起。", score: 91, commentary: "画风好戳我！这种慢慢走路的游戏就该配一杯热牛奶在深夜玩。", worth_sharing: true, watched_at: nowSeconds() - 86400 * 2 }
+      ],
+      nativePersonas: [
+        { persona_name: "温柔知性姐姐", prompt: "你是一位温柔知性的姐姐，说话轻柔而有分寸，习惯用共情的方式回应别人……" },
+        { persona_name: "元气少女", prompt: "你是一位元气满满的少女，喜欢用感叹号，遇到什么事都先往好的方向想……" },
+        { persona_name: "毒舌吐槽役", prompt: "你是一个毒舌但心软的吐槽役，习惯用反讽和夸张的比喻……" }
+      ],
+      modelConfig: {
+        main: { source_id: "deepseek", model: "deepseek-chat" },
+        decision: { inherit: true, source_id: "", model: "" },
+        vision: { inherit: true, source_id: "", model: "" },
+        tts: { mode: "off", source_id: "", model: "", voice: "", provider_id: "", probability: 1.0, scope: "private", dual_output: false }
+      },
+      sources: [
+        { id: "deepseek", type: "openai_chat_completion", provider_type: "chat_completion", provider: "DeepSeek", api_base: "https://api.deepseek.com/v1", has_key: true, enable: true },
+        { id: "ailiyun", type: "openai_chat_completion", provider_type: "chat_completion", provider: "阿里云百炼", api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1", has_key: true, enable: true },
+        { id: "siliconflow", type: "openai_chat_completion", provider_type: "chat_completion", provider: "硅基流动", api_base: "https://api.siliconflow.cn/v1", has_key: false, enable: false }
+      ],
+      ttsProviders: [
+        { id: "edge_tts_default", model: "zh-CN-XiaoxiaoNeural", type: "edge_tts", enable: true },
+        { id: "openai_tts_demo", model: "tts-1", type: "openai_tts_api", enable: false }
+      ],
+      modelLists: {
+        deepseek: [
+          { model: "deepseek-chat", id: "deepseek/deepseek-chat", enable: true, modalities: ["text"], source: "config" },
+          { model: "deepseek-reasoner", id: "deepseek/deepseek-reasoner", enable: true, modalities: ["text"], source: "config" }
+        ],
+        ailiyun: [
+          { model: "kimi-k2.5", id: "ailiyun/kimi-k2.5", enable: false, modalities: ["text", "image", "tool_use"], source: "config" },
+          { model: "qwen-max", id: "ailiyun/qwen-max", enable: false, modalities: ["text", "image"], source: "config" }
+        ],
+        siliconflow: [
+          { model: "Qwen/Qwen2.5-72B-Instruct", id: "", enable: false, modalities: ["text"], source: "remote" }
+        ]
+      }
+    };
+  }
+
+  var db = buildInitialDb();
+
+  /* ================================================================== *
+   * 4. 角色 / 日程 / 概览 构建
+   * ================================================================== */
+  function findSoul(soulId) {
+    for (var i = 0; i < db.souls.length; i++) {
+      if (db.souls[i].soul_id === soulId) return db.souls[i];
+    }
+    return null;
+  }
+
+  function syncLegacyFields(soul) {
+    var card = soul.card || {};
+    soul.name = cardFilled(card, "identity", "name", soul.name || soul.soul_id);
+    soul.archetype = cardFilled(card, "identity", "tagline", soul.archetype || "");
+    soul.speaking_style = cardFilled(card, "speech", "speaking_style", soul.speaking_style || "");
+    soul.native_persona_prompt = cardFilled(card, "extra", "native_persona_prompt", soul.native_persona_prompt || "");
+    var surf = cardFilled(card, "interests", "surfing_preferences", null);
+    if (Array.isArray(surf)) soul.surfing_preferences = surf;
+    if (!Array.isArray(soul.surfing_preferences)) soul.surfing_preferences = ["搞笑整活", "猫猫狗狗"];
+    return soul;
+  }
+
+  function deckOf(soulId) {
+    if (!db.decks[soulId]) {
+      db.decks[soulId] = { customCards: [], customEncounters: [] };
+    }
+    return db.decks[soulId];
+  }
+
+  function toSoulDict(soul) {
+    syncLegacyFields(soul);
+    var deck = deckOf(soul.soul_id);
+    return clone({
+      soul_id: soul.soul_id,
+      name: soul.name,
+      archetype: soul.archetype,
+      speaking_style: soul.speaking_style,
+      native_persona_prompt: soul.native_persona_prompt,
+      surfing_preferences: soul.surfing_preferences,
+      state_event_cards: deck.customCards,
+      encounter_talk_cards: deck.customEncounters,
+      card: soul.card
+    });
+  }
+
+  function listSoulDicts() {
+    return db.souls.map(function (soul) {
+      return toSoulDict(soul);
+    });
+  }
+
+  function activeSoul() {
+    return db.souls[0] || null;
+  }
+
+  function findSlotDef(slotKey) {
+    for (var i = 0; i < SLOT_DEFINITIONS.length; i++) {
+      if (SLOT_DEFINITIONS[i].slot_key === slotKey) return SLOT_DEFINITIONS[i];
+    }
+    return null;
+  }
+
+  function slotIndex(slotKey) {
+    for (var i = 0; i < SLOT_DEFINITIONS.length; i++) {
+      if (SLOT_DEFINITIONS[i].slot_key === slotKey) return i;
+    }
+    return 0;
+  }
+
+  function buildRun(soulId, reroll) {
+    var soulIndex = 0;
+    for (var i = 0; i < db.souls.length; i++) {
+      if (db.souls[i].soul_id === soulId) soulIndex = i;
+    }
+    var vigor = VIGOR_CARDS[(soulIndex + (reroll ? 1 : 0)) % VIGOR_CARDS.length];
+    var now = new Date();
+    var slots = [];
+    SLOT_DEFINITIONS.forEach(function (def, index) {
+      var state = BASE_STATES[def.slot_key];
+      if (reroll) {
+        var order = ["IDLE", "BUSY", "RESTING"];
+        var rotated = order[(order.indexOf(state) + 1 + index) % order.length];
+        if (def.slot_key === "night") rotated = "RESTING";
+        state = rotated;
+      }
+      var baseArmor = { morning: 45, forenoon: 80, noon: 40, afternoon: 75, evening: 35, night: 90 }[def.slot_key];
+      var jitter = reroll ? (((index * 7 + 3) % 11) - 5) : 0;
+      var titleMap = SLOT_TITLES[def.slot_key] || {};
+      slots.push({
+        slot_key: def.slot_key,
+        label: def.label,
+        start_hour: def.start_hour,
+        end_hour: def.end_hour,
+        card_id: "evt_slot_" + def.slot_key,
+        title: titleMap[state] || "日常摸鱼",
+        state: state,
+        armor: clamp(baseArmor + jitter, 10, 95),
+        mutated: false,
+        mutation_monologue: "",
+        delay_minutes: 0
+      });
+    });
+    var encounters = [];
+    for (var e = 0; e < 3; e++) {
+      var idx = (now.getDate() + soulIndex * 3 + e + (reroll ? 2 : 0)) % ENCOUNTER_POOL.length;
+      encounters.push({
+        encounter_id: "enc_" + (reroll ? "r" : "d") + e,
+        content: ENCOUNTER_POOL[idx],
+        used: !reroll && e === 0
+      });
+    }
+    return {
+      soul_id: soulId,
+      date_str: fmtDate(now),
+      vigor_id: vigor.vigor_id,
+      vigor_title: vigor.title,
+      vigor_desc: vigor.desc,
+      slots: slots,
+      encounters: encounters,
+      mutations_used: reroll ? 0 : 1,
+      last_mutation_ts: reroll ? 0 : nowSeconds() - 1800,
+      last_mutation_log: reroll ? "" : "L3 核心用户强唤醒触发一次微调"
+    };
+  }
+
+  function getRun(soulId) {
+    if (!db.schedules[soulId]) {
+      db.schedules[soulId] = buildRun(soulId, false);
+    }
+    return db.schedules[soulId];
+  }
+
+  function currentSlotOf(run) {
+    var now = new Date();
+    var hour = now.getHours() + now.getMinutes() / 60;
+    var slot = null;
+    for (var i = 0; i < run.slots.length; i++) {
+      var item = run.slots[i];
+      var hit =
+        item.start_hour < item.end_hour
+          ? hour >= item.start_hour && hour < item.end_hour
+          : hour >= item.start_hour || hour < item.end_hour;
+      if (hit) {
+        slot = item;
+        break;
+      }
+    }
+    if (!slot) slot = run.slots[0];
+    var start = new Date(now);
+    start.setHours(slot.start_hour, 0, 0, 0);
+    if (slot.end_hour <= slot.start_hour && hour < slot.end_hour) {
+      start.setDate(start.getDate() - 1);
+    }
+    var end = new Date(start);
+    end.setHours(slot.end_hour, 0, 0, 0);
+    if (slot.end_hour <= slot.start_hour) end.setDate(end.getDate() + 1);
+    var total = Math.max(1, Math.floor((end.getTime() - start.getTime()) / 1000));
+    var remaining = Math.max(0, Math.floor((end.getTime() - now.getTime()) / 1000));
+    return {
+      slot: slot,
+      remaining: remaining,
+      total: total,
+      progress: clamp(1 - remaining / total, 0, 1),
+      startHour: slot.start_hour,
+      endHour: slot.end_hour
+    };
+  }
+
+  function nextSlotOf(run, slotKey) {
+    var index = slotIndex(slotKey);
+    var next = run.slots[(index + 1) % run.slots.length];
+    return next || null;
+  }
+
+  function maxMutations() {
+    return 2;
+  }
+
+  function buildSchedulePayload(soulId) {
+    var run = getRun(soulId);
+    var current = currentSlotOf(run);
+    var schedule = {
+      run: clone(run),
+      current_slot: clone(current.slot),
+      next_slot: clone(nextSlotOf(run, current.slot.slot_key)),
+      max_mutations_per_day: maxMutations(),
+      mutation_cooldown_minutes: 120
+    };
+    schedule.current_slot.remaining_seconds = current.remaining;
+    schedule.current_slot.progress = Number(current.progress.toFixed(4));
+    return schedule;
+  }
+
+  function cooldownRemaining(run) {
+    if (!run.last_mutation_ts) return 0;
+    var cooldown = 120 * 60;
+    return Math.max(0, cooldown - (nowSeconds() - run.last_mutation_ts));
+  }
+
+  function relationsCounts() {
+    var l1 = 0;
+    var l2 = 0;
+    var l3 = 0;
+    db.users.forEach(function (user) {
+      if (user.tier === 3) l3 += 1;
+      else if (user.tier === 2) l2 += 1;
+      else l1 += 1;
+    });
+    return { l1: l1, l2: l2, l3: l3, total: db.users.length };
+  }
+
+  function memoryCounts() {
+    var tier1 = 0;
+    var tier2 = 0;
+    var tier3 = 0;
+    db.memories.forEach(function (memory) {
+      if (memory.memory_tier === 3) tier3 += 1;
+      else if (memory.memory_tier === 2) tier2 += 1;
+      else tier1 += 1;
+    });
+    return { tier1: tier1, tier2: tier2, tier3: tier3, total: db.memories.length };
+  }
+
+  function knownUmos() {
+    var map = {};
+    Object.keys(db.windows).forEach(function (umo) {
+      map[umo] = {
+        umo: umo,
+        bound_soul_id: db.umoBindings[umo] || "",
+        window_messages: db.windows[umo],
+        is_l3_private: umo.indexOf("FriendMessage") >= 0
+      };
+    });
+    Object.keys(db.umoBindings).forEach(function (umo) {
+      if (!map[umo]) {
+        map[umo] = {
+          umo: umo,
+          bound_soul_id: db.umoBindings[umo],
+          window_messages: 0,
+          is_l3_private: umo.indexOf("FriendMessage") >= 0
+        };
+      }
+    });
+    return Object.keys(map)
+      .sort()
+      .map(function (umo) {
+        return map[umo];
+      });
+  }
+
+  function buildModelStatus() {
+    var cfg = db.modelConfig || {};
+    var main = cfg.main || {};
+    var configured = !!(main.source_id && main.model);
+    function statusFor(role, inherited) {
+      if (!configured) {
+        return {
+          role: role,
+          configured: false,
+          inherited: inherited,
+          source_id: "",
+          model: "",
+          provider_id: "",
+          mode: "unconfigured",
+          label: inherited ? "继承主模型（主模型未配置）" : "未配置",
+          ok: false
+        };
+      }
+      var reuse = (main.source_id === "deepseek" && main.model === "deepseek-chat");
+      return {
+        role: role,
+        configured: true,
+        inherited: inherited,
+        source_id: main.source_id,
+        model: main.model,
+        provider_id: reuse ? "deepseek/deepseek-chat" : "onlyyou::chat::" + main.source_id + "::" + main.model,
+        mode: reuse ? "reuse" : "plugin",
+        label: (reuse ? "复用实例" : "插件自建") + " · " + main.source_id + " / " + main.model,
+        ok: true
+      };
+    }
+    var ttsCfg = cfg.tts || {};
+    var ttsMode = ttsCfg.mode || "off";
+    return {
+      main: statusFor("main", false),
+      decision: statusFor("decision", true),
+      vision: statusFor("vision", true),
+      tts: {
+        role: "tts",
+        configured: ttsMode !== "off",
+        inherited: false,
+        source_id: ttsCfg.source_id || "",
+        model: ttsCfg.model || "",
+        provider_id: ttsCfg.provider_id || "",
+        mode: ttsMode,
+        label: ttsMode === "off" ? "已关闭" : ttsMode === "provider" ? "AstrBot TTS · " + (ttsCfg.provider_id || "") : "自建 TTS · " + (ttsCfg.model || ""),
+        ok: ttsMode !== "off"
+      }
+    };
+  }
+
+  function buildOverview(soulId) {
+    var soul = findSoul(soulId) || activeSoul();
+    if (!soul) throw new Error("没有可用的角色");
+    syncLegacyFields(soul);
+    var schedule = buildSchedulePayload(soul.soul_id);
+    var run = schedule.run;
+    var current = schedule.current_slot;
+    var card = soul.card || {};
+    var counts = {
+      relations: relationsCounts(),
+      memories: memoryCounts(),
+      videos: db.videos.filter(function (video) {
+        return video.soul_id === soul.soul_id;
+      }).length
+    };
+    return {
+      soul: {
+        soul_id: soul.soul_id,
+        name: cardFilled(card, "identity", "name", soul.soul_id),
+        avatar: cardFilled(card, "identity", "avatar", (cardFilled(card, "identity", "name", "?") || "?").slice(0, 1)),
+        tagline: cardFilled(card, "identity", "tagline", "")
+      },
+      vigor: { title: run.vigor_title, desc: run.vigor_desc },
+      state: {
+        state: current.state,
+        label: current.label,
+        title: current.title,
+        armor: current.armor,
+        slot_key: current.slot_key,
+        start_hour: current.start_hour,
+        end_hour: current.end_hour,
+        remaining_seconds: current.remaining_seconds,
+        progress: current.progress,
+        mutated: !!current.mutated,
+        next_slot: schedule.next_slot
+      },
+      schedule: schedule,
+      quota: {
+        used: run.mutations_used,
+        max: maxMutations(),
+        remaining: Math.max(0, maxMutations() - run.mutations_used),
+        cooldown_remaining_seconds: cooldownRemaining(run)
+      },
+      encounters: run.encounters.map(function (encounter) {
+        return { content: encounter.content, used: !!encounter.used };
+      }),
+      counts: counts,
+      models: buildModelStatus()
+    };
+  }
+
+  function buildInitSummary() {
+    var soul = activeSoul();
+    var status = buildModelStatus();
+    return {
+      souls: listSoulDicts(),
+      native_personas: clone(db.nativePersonas),
+      umo_bindings: clone(db.umoBindings),
+      known_umos: knownUmos(),
+      active_soul_id: soul ? soul.soul_id : "",
+      active_schedule: soul ? buildSchedulePayload(soul.soul_id) : null,
+      model_status: status,
+      slot_definitions: clone(SLOT_DEFINITIONS),
+      default_soul_id: db.defaultSoulId || ""
+    };
+  }
+
+  function buildSoulDetail(soulId) {
+    var soul = findSoul(soulId) || activeSoul();
+    if (!soul) throw new Error("角色不存在");
+    return {
+      soul: toSoulDict(soul),
+      schedule: buildSchedulePayload(soul.soul_id),
+      umo_bindings: clone(db.umoBindings),
+      known_umos: knownUmos(),
+      card_schema: clone(CARD_SCHEMA)
+    };
+  }
+
+  /* ================================================================== *
+   * 5. 卡片池
+   * ================================================================== */
+  function findCard(deck, cardId) {
+    for (var i = 0; i < deck.customCards.length; i++) {
+      if (deck.customCards[i].card_id === cardId) return deck.customCards[i];
+    }
+    for (var g = 0; g < GENERAL_CARDS.length; g++) {
+      if (GENERAL_CARDS[g].card_id === cardId) return GENERAL_CARDS[g];
+    }
+    return null;
+  }
+
+  function buildCardsPayload(soulId) {
+    var soul = findSoul(soulId) || activeSoul();
+    var deck = deckOf(soul.soul_id);
+    return {
+      soul_id: soul.soul_id,
+      custom_cards: clone(deck.customCards).map(function (card) {
+        return Object.assign(card, { scope: "soul" });
+      }),
+      general_cards: clone(GENERAL_CARDS).map(function (card) {
+        return Object.assign(card, { scope: "global" });
+      }),
+      custom_encounters: clone(deck.customEncounters).map(function (content) {
+        return { content: content, scope: "soul" };
+      }),
+      general_encounters: clone(ENCOUNTER_POOL).map(function (content) {
+        return { content: content, scope: "global" };
+      }),
+      slot_definitions: clone(SLOT_DEFINITIONS)
+    };
+  }
+
+  function saveCard(soulId, body) {
+    var soul = findSoul(soulId) || activeSoul();
+    var deck = deckOf(soul.soul_id);
+    var cardType = String(body.card_type || "action").toLowerCase();
+    var scope = String(body.scope || "soul").toLowerCase();
+    if (cardType === "encounter") {
+      var content = String(body.content || "").trim();
+      if (!content) throw new Error("奇遇谈资卡内容不能为空");
+      var oldContent = String(body.old_content || "").trim();
+      var targetList = scope === "global" ? ENCOUNTER_POOL : deck.customEncounters;
+      if (oldContent) {
+        var idx = targetList.indexOf(oldContent);
+        if (idx >= 0) targetList[idx] = content;
+        else if (targetList.indexOf(content) < 0) targetList.unshift(content);
+      } else if (targetList.indexOf(content) < 0) {
+        targetList.unshift(content);
+      }
+      return buildCardsPayload(soul.soul_id);
+    }
+    var raw = body.card && typeof body.card === "object" ? body.card : body;
+    var card = {
+      card_id: raw.card_id || "evt_ai_" + Date.now(),
+      title: String(raw.title || "未命名行动卡").trim() || "未命名行动卡",
+      state: String(raw.state || "IDLE").toUpperCase(),
+      valid_slots: Array.isArray(raw.valid_slots) && raw.valid_slots.length ? raw.valid_slots.slice() : ["noon", "afternoon", "evening"],
+      base_weight: clamp(raw.base_weight, 1, 100),
+      armor: clamp(raw.armor, 0, 100),
+      synergy_tags: raw.synergy_tags || {}
+    };
+    var targetDeck = scope === "global" ? GENERAL_CARDS : deck.customCards;
+    var replaced = false;
+    for (var i = 0; i < targetDeck.length; i++) {
+      if (targetDeck[i].card_id === card.card_id) {
+        targetDeck[i] = card;
+        replaced = true;
+        break;
+      }
+    }
+    if (!replaced) targetDeck.unshift(card);
+    return buildCardsPayload(soul.soul_id);
+  }
+
+  function deleteCard(soulId, body) {
+    var soul = findSoul(soulId) || activeSoul();
+    var deck = deckOf(soul.soul_id);
+    var cardType = String(body.card_type || "action").toLowerCase();
+    var scope = String(body.scope || "soul").toLowerCase();
+    if (cardType === "encounter") {
+      var content = String(body.content || "").trim();
+      var target = scope === "global" ? ENCOUNTER_POOL : deck.customEncounters;
+      var idx = target.indexOf(content);
+      if (idx >= 0) target.splice(idx, 1);
+      return buildCardsPayload(soul.soul_id);
+    }
+    var cardId = String(body.card_id || "").trim();
+    var targetDeck = scope === "global" ? GENERAL_CARDS : deck.customCards;
+    for (var i = targetDeck.length - 1; i >= 0; i--) {
+      if (targetDeck[i].card_id === cardId) targetDeck.splice(i, 1);
+    }
+    return buildCardsPayload(soul.soul_id);
+  }
+
+  function aiGenerateCards(soulId) {
+    var soul = findSoul(soulId) || activeSoul();
+    var deck = deckOf(soul.soul_id);
+    var generatedCards = [
+      { card_id: "evt_ai_" + Date.now() + "_1", title: "边看番边吃宵夜", state: "IDLE", valid_slots: ["evening", "night"], base_weight: 62, armor: 32, synergy_tags: {} },
+      { card_id: "evt_ai_" + Date.now() + "_2", title: "被甲方临时改需求", state: "BUSY", valid_slots: ["forenoon", "afternoon"], base_weight: 55, armor: 78, synergy_tags: {} },
+      { card_id: "evt_ai_" + Date.now() + "_3", title: "出门买杯冰美式", state: "IDLE", valid_slots: ["morning", "noon"], base_weight: 48, armor: 40, synergy_tags: {} },
+      { card_id: "evt_ai_" + Date.now() + "_4", title: "戴着耳机发呆", state: "RESTING", valid_slots: ["night"], base_weight: 36, armor: 68, synergy_tags: {} }
+    ];
+    var generatedEncounters = ["刷到一条关于“狐狸会不会羡慕猫”的离谱帖子。", "便利店最后一瓶冰美式被我买到了。", "楼下有人在弹吉他，唱的是很老的歌。"];
+    generatedCards.forEach(function (card) {
+      var exists = false;
+      for (var i = 0; i < deck.customCards.length; i++) {
+        if (deck.customCards[i].title === card.title) exists = true;
+      }
+      if (!exists) deck.customCards.unshift(card);
+    });
+    generatedEncounters.forEach(function (content) {
+      if (deck.customEncounters.indexOf(content) < 0) deck.customEncounters.unshift(content);
+    });
+    var payload = buildCardsPayload(soul.soul_id);
+    payload.generated_cards = clone(generatedCards);
+    payload.generated_encounters = generatedEncounters;
+    return payload;
+  }
+
+  /* ================================================================== *
+   * 6. 角色卡 Prompt 预览 / AI 草稿
+   * ================================================================== */
+  function renderMockPrompt(card) {
+    card = card || {};
+    var lines = [];
+    var name = cardFilled(card, "identity", "name", "小星");
+    lines.push("你正在扮演「" + name + "」。");
+    var sectionTitles = {};
+    CARD_SCHEMA.forEach(function (section) {
+      sectionTitles[section.id] = section.title;
+    });
+    CARD_SCHEMA.forEach(function (section) {
+      if (section.id === "extra") return;
+      var values = card[section.id] || {};
+      var parts = [];
+      section.fields.forEach(function (fieldDef) {
+        var value = values[fieldDef.key];
+        if (fieldDef.readonly) return;
+        if (Array.isArray(value)) {
+          if (!value.length) return;
+          if (fieldDef.type === "dialogs") {
+            value.forEach(function (dialog) {
+              parts.push("- 用户：" + (dialog.user || "") + " / 角色：" + (dialog.character || ""));
+            });
+          } else {
+            parts.push("- " + fieldDef.label + "：" + value.join("、"));
+          }
+        } else if (value != null && String(value).trim()) {
+          parts.push("- " + fieldDef.label + "：" + String(value).trim());
+        }
+      });
+      if (parts.length) {
+        lines.push("");
+        lines.push("## " + sectionTitles[section.id]);
+        lines.push(parts.join("\n"));
+      }
+    });
+    var prompt = lines.join("\n");
+    return prompt;
+  }
+
+  function fieldDraft(fieldDef) {
+    if (fieldDef.readonly) return "";
+    if (fieldDef.type === "select") {
+      return fieldDef.options && fieldDef.options.length ? fieldDef.options[0].value : "";
+    }
+    if (fieldDef.type === "tags") return ["AI 草稿标签", fieldDef.label];
+    if (fieldDef.type === "list") return ["AI 草稿第一行", "AI 草稿第二行"];
+    if (fieldDef.type === "dialogs") {
+      return [
+        { user: "在干嘛呢？", character: "刚忙完，正瘫着刷视频呢~" },
+        { user: "出来玩吗？", character: "今天先不啦，改天一定！" }
+      ];
+    }
+    return "【AI 草稿】" + fieldDef.label + "示例内容";
+  }
+
+  function aiDraftCard(soulId, seedText, section) {
+    var soul = findSoul(soulId) || activeSoul();
+    var draft = clone(soul.card || emptyCard());
+    if (section && findSection(section)) {
+      var values = {};
+      findSection(section).fields.forEach(function (fieldDef) {
+        values[fieldDef.key] = fieldDraft(fieldDef);
+      });
+      if (section === "identity") {
+        values.native_persona_prompt = "";
+      }
+      draft[section] = values;
+    } else {
+      draft.identity = Object.assign({}, draft.identity || {}, {
+        tagline: seedText ? "根据「" + seedText + "」生成的角色定位" : "AI 生成的一句话定位：嘴硬心软的夜猫子",
+        nickname: "AI 昵称"
+      });
+      draft.personality = Object.assign({}, draft.personality || {}, {
+        personality_tags: ["AI 标签·慢热", "AI 标签·吐槽役"],
+        mbti: "INFP"
+      });
+      draft.speech = Object.assign({}, draft.speech || {}, {
+        speaking_style: "AI 生成的说话风格：口语化短句，偶尔自嘲，喜欢用省略号。",
+        catchphrases: ["真的假的", "笑死"],
+        reply_length: "short"
+      });
+    }
+    return draft;
+  }
+
+  /* ================================================================== *
+   * 7. 默认角色 / UMO 绑定 / 模型配置
+   * ================================================================== */
+  function saveSoul(soulId, body) {
+    var soul = findSoul(soulId);
+    if (!soul && body.card) {
+      soul = { soul_id: soulId, card: emptyCard() };
+      db.souls.push(soul);
+    }
+    if (!soul) throw new Error("角色不存在：" + soulId);
+    if (body.card && typeof body.card === "object") {
+      soul.card = deepMerge(soul.card || emptyCard(), body.card);
+    }
+    var card = soul.card || emptyCard();
+    if (typeof body.name === "string" && !body.card) {
+      card.identity.name = body.name;
+    }
+    if (typeof body.archetype === "string" && !body.card) {
+      card.identity.tagline = body.archetype;
+    }
+    if (typeof body.speaking_style === "string" && !body.card) {
+      card.speech.speaking_style = body.speaking_style;
+    }
+    if (Array.isArray(body.surfing_preferences) && !body.card) {
+      card.interests.surfing_preferences = body.surfing_preferences;
+    }
+    if (typeof body.native_persona_prompt === "string" && !body.card) {
+      card.extra.native_persona_prompt = body.native_persona_prompt;
+    }
+    if (body.umo_binding && typeof body.umo_binding === "object") {
+      var umo = String(body.umo_binding.umo || "").trim();
+      var target = String(body.umo_binding.soul_id || "").trim();
+      if (umo) {
+        if (target) db.umoBindings[umo] = target;
+        else delete db.umoBindings[umo];
+      }
+    }
+    syncLegacyFields(soul);
+    return {
+      soul: toSoulDict(soul),
+      souls: listSoulDicts(),
+      umo_bindings: clone(db.umoBindings),
+      known_umos: knownUmos()
+    };
+  }
+
+  function saveCardModel(soulId, body) {
+    var soul = findSoul(soulId);
+    if (!soul) throw new Error("角色不存在：" + soulId);
+    if (body.card && typeof body.card === "object") {
+      /* 与后端 normalize_card 行为对齐：按分区合并，缺失分区保留原值 */
+      soul.card = deepMerge(soul.card || emptyCard(), body.card);
+    }
+    syncLegacyFields(soul);
+    return { soul: toSoulDict(soul), souls: listSoulDicts() };
+  }
+
+  function importPersona(body) {
+    var personaName = String(body.persona_name || "default_soul").trim();
+    var targetId = String(body.target_soul_id || personaName).trim();
+    var found = null;
+    for (var i = 0; i < db.nativePersonas.length; i++) {
+      if (db.nativePersonas[i].persona_name === personaName) found = db.nativePersonas[i];
+    }
+    var card = emptyCard();
+    card.identity.name = targetId;
+    card.identity.nickname = targetId;
+    card.identity.tagline = "从 AstrBot 原生人格「" + personaName + "」导入的角色";
+    card.identity.avatar = targetId.slice(0, 1);
+    card.extra.native_persona_prompt = found ? found.prompt : String(body.native_prompt || "");
+    card.rhythm.daily_routine = "白天忙自己的事，晚上刷手机水群。";
+    var soul = { soul_id: targetId, card: card };
+    var existed = findSoul(targetId);
+    if (existed) {
+      existed.card = card;
+      soul = existed;
+    } else {
+      db.souls.push(soul);
+    }
+    deckOf(targetId);
+    db.schedules[targetId] = buildRun(targetId, true);
+    syncLegacyFields(soul);
+    return {
+      soul: toSoulDict(soul),
+      schedule: buildSchedulePayload(targetId),
+      souls: listSoulDicts()
+    };
+  }
+
+  function renameSoul(oldId, newId) {
+    if (!oldId || !newId) throw new Error("old_soul_id / new_soul_id 不能为空");
+    var soul = findSoul(oldId);
+    if (!soul) throw new Error("角色不存在：" + oldId);
+    if (findSoul(newId)) throw new Error("新的 Soul ID 已存在：" + newId);
+    soul.soul_id = newId;
+    if (db.decks[oldId]) {
+      db.decks[newId] = db.decks[oldId];
+      delete db.decks[oldId];
+    }
+    if (db.schedules[oldId]) {
+      db.schedules[newId] = db.schedules[oldId];
+      db.schedules[newId].soul_id = newId;
+      delete db.schedules[oldId];
+    }
+    Object.keys(db.umoBindings).forEach(function (umo) {
+      if (db.umoBindings[umo] === oldId) db.umoBindings[umo] = newId;
+    });
+    db.memories.forEach(function (memory) {
+      if (memory.soul_id === oldId) memory.soul_id = newId;
+    });
+    db.videos.forEach(function (video) {
+      if (video.soul_id === oldId) video.soul_id = newId;
+    });
+    if (db.defaultSoulId === oldId) db.defaultSoulId = newId;
+    syncLegacyFields(soul);
+    return {
+      soul: toSoulDict(soul),
+      souls: listSoulDicts(),
+      schedule: buildSchedulePayload(newId)
+    };
+  }
+
+  function deleteSoul(soulId) {
+    for (var i = db.souls.length - 1; i >= 0; i--) {
+      if (db.souls[i].soul_id === soulId) db.souls.splice(i, 1);
+    }
+    delete db.decks[soulId];
+    delete db.schedules[soulId];
+    Object.keys(db.umoBindings).forEach(function (umo) {
+      if (db.umoBindings[umo] === soulId) delete db.umoBindings[umo];
+    });
+    if (db.defaultSoulId === soulId) db.defaultSoulId = db.souls[0] ? db.souls[0].soul_id : "";
+    if (!db.souls.length) {
+      db.souls.push({ soul_id: "default_soul", card: buildCardJiu() });
+      deckOf("default_soul");
+    }
+    return {
+      deleted_soul_id: soulId,
+      souls: listSoulDicts(),
+      active_soul_id: db.souls[0].soul_id
+    };
+  }
+
+  function forceState(body) {
+    var soulId = String(body.soul_id || "").trim();
+    var soul = findSoul(soulId) || activeSoul();
+    if (!soul) throw new Error("没有可用角色");
+    var run = getRun(soul.soul_id);
+    var slotKey = String(body.slot_key || "").trim();
+    if (!slotKey) slotKey = currentSlotOf(run).slot.slot_key;
+    var slot = null;
+    for (var i = 0; i < run.slots.length; i++) {
+      if (run.slots[i].slot_key === slotKey) slot = run.slots[i];
+    }
+    if (!slot) throw new Error("未知时段：" + slotKey);
+    var newState = String(body.new_state || slot.state).toUpperCase();
+    if (["IDLE", "BUSY", "RESTING"].indexOf(newState) < 0) throw new Error("状态必须是 IDLE/BUSY/RESTING");
+    slot.state = newState;
+    if (body.new_title != null && String(body.new_title).trim()) {
+      slot.title = String(body.new_title).trim();
+    } else {
+      slot.title = (SLOT_TITLES[slotKey] || {})[newState] || slot.title;
+    }
+    if (body.armor != null && String(body.armor) !== "") {
+      slot.armor = clamp(body.armor, 0, 100);
+    }
+    slot.mutated = true;
+    return {
+      updated_slot: clone(slot),
+      schedule: buildSchedulePayload(soul.soul_id)
+    };
+  }
+
+  function rerollSchedule(body) {
+    var soul = findSoul(String(body.soul_id || "")) || activeSoul();
+    if (!soul) throw new Error("没有可用角色");
+    db.schedules[soul.soul_id] = buildRun(soul.soul_id, true);
+    return { schedule: buildSchedulePayload(soul.soul_id) };
+  }
+
+  /* ================================================================== *
+   * 8. 用户 / 记忆 / 冲浪
+   * ================================================================== */
+  function listUsers(tier) {
+    var filterTier = tier != null && tier !== "" ? Number(tier) : null;
+    var users = db.users.filter(function (user) {
+      return filterTier == null || user.tier === filterTier;
+    });
+    return {
+      users: clone(users),
+      counts: {
+        l3_count: db.users.filter(function (u) { return u.tier === 3; }).length,
+        l2_count: db.users.filter(function (u) { return u.tier === 2; }).length,
+        l1_count: db.users.filter(function (u) { return u.tier === 1; }).length,
+        total: db.users.length
+      }
+    };
+  }
+
+  function updateUser(body) {
+    var action = String(body.action || "update").toLowerCase();
+    if (action === "merge") {
+      var primary = null;
+      var secondary = null;
+      db.users.forEach(function (user) {
+        if (user.global_uid === body.primary_uid) primary = user;
+        if (user.global_uid === body.secondary_uid) secondary = user;
+      });
+      if (!primary || !secondary) throw new Error("待合并账号不存在");
+      primary.platform_ids = (primary.platform_ids || []).concat(secondary.platform_ids || []);
+      primary.interaction_count += secondary.interaction_count;
+      db.users = db.users.filter(function (user) {
+        return user.global_uid !== secondary.global_uid;
+      });
+      return {
+        merged_user: clone(primary),
+        users: clone(db.users)
+      };
+    }
+    if (action === "delete") {
+      db.users = db.users.filter(function (user) {
+        return user.global_uid !== body.global_uid;
+      });
+      return { users: clone(db.users) };
+    }
+    var target = null;
+    db.users.forEach(function (user) {
+      if (user.global_uid === body.global_uid) target = user;
+    });
+    if (!target) {
+      if (!body.global_uid) throw new Error("用户账号 ID 不能为空");
+      target = {
+        global_uid: String(body.global_uid),
+        display_name: String(body.display_name || body.global_uid),
+        nickname: "",
+        tier: 1,
+        tier_label: "L1普通群友",
+        interaction_count: 0,
+        affinity: 0,
+        platform_ids: []
+      };
+      db.users.push(target);
+    }
+    if (body.display_name != null) target.display_name = String(body.display_name);
+    if (body.nickname != null) target.nickname = String(body.nickname);
+    if (body.tier != null && body.tier !== "") {
+      target.tier = clamp(body.tier, 1, 3);
+      target.tier_label = { 3: "★L3核心用户", 2: "◆L2重要熟人", 1: "L1普通群友" }[target.tier];
+    }
+    if (body.affinity != null && body.affinity !== "") {
+      target.affinity = clamp(body.affinity, 0, 100);
+    }
+    if (Array.isArray(body.platform_ids)) target.platform_ids = body.platform_ids.slice();
+    if (typeof body.platform_ids === "string") {
+      target.platform_ids = body.platform_ids.split(",").map(function (x) { return x.trim(); }).filter(Boolean);
+    }
+    return { user: clone(target), users: clone(db.users) };
+  }
+
+  function memoryStats() {
+    var counts = memoryCounts();
+    return {
+      tier3_count: counts.tier3,
+      tier2_count: counts.tier2,
+      tier1_count: counts.tier1,
+      total: counts.total,
+      sliding_window_size: 12,
+      max_injected_memories: 5,
+      max_memory_chars_budget: 400
+    };
+  }
+
+  function listMemories(payload) {
+    var soulId = payload.soul_id || "";
+    var tier = payload.memory_tier != null && payload.memory_tier !== "" ? Number(payload.memory_tier) : null;
+    var userId = payload.user_id || "";
+    var keyword = String(payload.keyword || "").toLowerCase();
+    var memories = db.memories.filter(function (memory) {
+      if (soulId && memory.soul_id !== soulId) return false;
+      if (tier != null && memory.memory_tier !== tier) return false;
+      if (userId && memory.user_id !== userId) return false;
+      if (keyword && (memory.content + " " + memory.keywords).toLowerCase().indexOf(keyword) < 0) return false;
+      return true;
+    });
+    return { memories: clone(memories), stats: memoryStats() };
+  }
+
+  function mutateMemory(body) {
+    var action = String(body.action || "add").toLowerCase();
+    var soulId = String(body.soul_id || db.souls[0].soul_id);
+    function memoriesForSoul() {
+      return clone(db.memories.filter(function (memory) {
+        return memory.soul_id === soulId;
+      }));
+    }
+    if (action === "gc") {
+      var removed = db.memories.filter(function (memory) {
+        return memory.soul_id === soulId && memory.memory_tier === 1 && memory.vitality < 40;
+      }).length;
+      db.memories = db.memories.filter(function (memory) {
+        return !(memory.soul_id === soulId && memory.memory_tier === 1 && memory.vitality < 40);
+      });
+      return {
+        gc_stats: { deleted_tier1: removed, deleted_tier2: 0, promoted_to_tier3: 1 },
+        memories: memoriesForSoul()
+      };
+    }
+    if (action === "extract") {
+      var newId = Date.now();
+      db.memories.unshift({
+        id: newId,
+        soul_id: soulId,
+        user_id: "core_tester",
+        user_tier: 3,
+        memory_tier: 2,
+        content: "最近阿泽提到周末想去新开的咖啡店坐坐。",
+        keywords: "咖啡店,周末,阿泽",
+        importance: 6,
+        vitality: 70,
+        access_count: 0,
+        created_at: nowSeconds(),
+        last_accessed_at: nowSeconds()
+      });
+      return { extracted_count: 1, memories: memoriesForSoul() };
+    }
+    if (action === "pin_core") {
+      var pinned = null;
+      db.memories.forEach(function (memory) {
+        if (memory.id === Number(body.id)) {
+          memory.memory_tier = 3;
+          memory.vitality = 100;
+          pinned = memory;
+        }
+      });
+      if (!pinned) throw new Error("未找到指定的记忆条目");
+      return { memory: clone(pinned), memories: memoriesForSoul() };
+    }
+    if (action === "delete") {
+      db.memories = db.memories.filter(function (memory) {
+        return memory.id !== Number(body.id);
+      });
+      return { memories: memoriesForSoul() };
+    }
+    if (action === "edit") {
+      var updated = null;
+      db.memories.forEach(function (memory) {
+        if (memory.id !== Number(body.id)) return;
+        if (body.content != null) memory.content = String(body.content);
+        if (body.keywords != null) memory.keywords = String(body.keywords);
+        if (body.importance != null) memory.importance = clamp(body.importance, 1, 10);
+        if (body.memory_tier != null) memory.memory_tier = clamp(body.memory_tier, 1, 3);
+        if (body.vitality != null) memory.vitality = clamp(body.vitality, 0, 100);
+        if (body.user_id != null) memory.user_id = String(body.user_id);
+        updated = memory;
+      });
+      if (!updated) throw new Error("未找到要修改的记忆条目");
+      return { memory: clone(updated), memories: memoriesForSoul() };
+    }
+    var content = String(body.content || "").trim();
+    if (!content) throw new Error("记忆内容不能为空");
+    var mid = Date.now();
+    db.memories.unshift({
+      id: mid,
+      soul_id: soulId,
+      user_id: String(body.user_id || ""),
+      user_tier: Number(body.user_tier || 2),
+      memory_tier: Number(body.memory_tier || 3),
+      content: content,
+      keywords: String(body.keywords || ""),
+      importance: clamp(body.importance || 8, 1, 10),
+      vitality: 100,
+      access_count: 0,
+      created_at: nowSeconds(),
+      last_accessed_at: nowSeconds()
+    });
+    return { new_id: mid, memories: clone(db.memories.filter(function (memory) { return memory.soul_id === soulId; })) };
+  }
+
+  function videosForSoul(soulId) {
+    return clone(
+      db.videos.filter(function (video) {
+        return !soulId || video.soul_id === soulId;
+      })
+    );
+  }
+
+  function surfingGet(payload) {
+    return {
+      videos: videosForSoul(payload.soul_id || ""),
+      known_umos: knownUmos()
+    };
+  }
+
+  function surfingPost(body) {
+    var action = String(body.action || "surf").toLowerCase();
+    var soul = findSoul(String(body.soul_id || "")) || activeSoul();
+    if (!soul) throw new Error("没有可用角色");
+    if (action === "delete") {
+      var videoId = String(body.video_id || "");
+      db.videos = db.videos.filter(function (video) {
+        var hit = body.id != null ? video.id === Number(body.id) : video.video_id === videoId;
+        return !hit;
+      });
+      return { videos: videosForSoul(soul.soul_id) };
+    }
+    if (action === "share") {
+      var targetUmo = String(body.target_umo || "") || db.defaultUmoTarget;
+      return {
+        sent: true,
+        target_umo: targetUmo,
+        share_text: "分享一条刚刷到的视频～\n《" + (db.videos[0] ? db.videos[0].title : "视频") + "》"
+      };
+    }
+    var template = db.videos[db.videos.length % Math.max(1, db.videos.length)] || {};
+    var newVideo = {
+      id: Date.now(),
+      soul_id: soul.soul_id,
+      video_id: "BV_mock_" + Date.now(),
+      platform: body.platform || "bilibili",
+      title: "刷到一只在自动扶梯上打滑的柴犬（新）",
+      author: "每日一狗",
+      cover_url: "",
+      share_url: "https://www.bilibili.com/video/BV_mock",
+      tags: ["狗子", "搞笑", "翻车"],
+      hot_comments: ["狗：这楼梯怎么不动了", "笑不活了"],
+      visual_notes: "柴犬在扶梯口犹豫了两秒，然后一路小碎步打滑下去，最后一脸茫然地回头看镜头。",
+      score: 88,
+      commentary: "救命 hhhh 这只狗的表情管理完全崩了，像极了迟到跑进公司的我。",
+      worth_sharing: true,
+      watched_at: nowSeconds()
+    };
+    if (template.video_id) newVideo.video_id = "BV_mock_" + Date.now();
+    db.videos.unshift(newVideo);
+    return {
+      review: clone(newVideo),
+      videos: videosForSoul(soul.soul_id),
+      schedule: buildSchedulePayload(soul.soul_id)
+    };
+  }
+
+  /* ================================================================== *
+   * 9. 路由分发
+   * ================================================================== */
+  function handleEndpoint(method, endpoint, payload) {
+    payload = payload && typeof payload === "object" ? payload : {};
+    switch (endpoint) {
+      /* ---- 17 条旧路由 ---- */
+      case "init_summary":
+        return buildInitSummary();
+      case "souls/detail":
+        return buildSoulDetail(payload.soul_id || "");
+      case "souls/import_persona":
+        return importPersona(payload);
+      case "souls/save":
+        return saveSoul(String(payload.soul_id || ""), payload);
+      case "souls/rename":
+        return renameSoul(String(payload.old_soul_id || ""), String(payload.new_soul_id || ""));
+      case "souls/delete":
+        return deleteSoul(String(payload.soul_id || ""));
+      case "schedule/reroll":
+        return rerollSchedule(payload);
+      case "schedule/force_state":
+        return forceState(payload);
+      case "cards/list":
+        return buildCardsPayload(String(payload.soul_id || ""));
+      case "cards/save":
+        return saveCard(String(payload.soul_id || ""), payload);
+      case "cards/delete":
+        return deleteCard(String(payload.soul_id || ""), payload);
+      case "cards/ai_generate":
+        return aiGenerateCards(String(payload.soul_id || ""));
+      case "users/list":
+        return listUsers(payload.tier);
+      case "users/update":
+        return updateUser(payload);
+      case "memories/list":
+        return listMemories(payload);
+      case "memories/mutate":
+        return mutateMemory(payload);
+      case "surfing/list_and_trigger":
+        return method === "GET" ? surfingGet(payload) : surfingPost(payload);
+
+      /* ---- 10 条新路由 ---- */
+      case "dashboard/overview":
+        return buildOverview(payload.soul_id || "");
+      case "card/schema": {
+        var schemaSoul = findSoul(payload.soul_id || "") || activeSoul();
+        return {
+          schema: clone(CARD_SCHEMA),
+          card: clone(schemaSoul ? schemaSoul.card : emptyCard()),
+          soul_id: schemaSoul ? schemaSoul.soul_id : ""
+        };
+      }
+      case "card/save": {
+        var saved = saveCardModel(String(payload.soul_id || ""), payload);
+        saved.souls = listSoulDicts();
+        return saved;
+      }
+      case "card/ai_generate": {
+        var draftSoulId = String(payload.soul_id || "") || (activeSoul() ? activeSoul().soul_id : "");
+        return {
+          draft_card: aiDraftCard(draftSoulId, String(payload.seed_text || ""), payload.section || null),
+          section: payload.section || null
+        };
+      }
+      case "card/preview_prompt": {
+        var promptSoul = findSoul(payload.soul_id || "") || activeSoul();
+        var promptCard =
+          payload.card && typeof payload.card === "object"
+            ? payload.card
+            : promptSoul
+            ? promptSoul.card
+            : emptyCard();
+        var prompt = renderMockPrompt(promptCard);
+        return { prompt: prompt, chars: prompt.length };
+      }
+      case "models/sources":
+        return {
+          sources: clone(db.sources),
+          tts_providers: clone(db.ttsProviders)
+        };
+      case "models/list": {
+        var sourceId = String(payload.source_id || "");
+        return { source_id: sourceId, models: clone(db.modelLists[sourceId] || []) };
+      }
+      case "models/config":
+        if (method === "POST") {
+          var incoming = payload.model_config && typeof payload.model_config === "object" ? payload.model_config : payload;
+          db.modelConfig = deepMerge(db.modelConfig, incoming);
+          return { model_config: clone(db.modelConfig), status: buildModelStatus() };
+        }
+        return { model_config: clone(db.modelConfig), status: buildModelStatus() };
+      case "models/test": {
+        var role = String(payload.role || "main");
+        if (role === "tts") {
+          return {
+            status: "ok",
+            role: "tts",
+            latency_ms: 420,
+            audio_path: "/tmp/onlyyou_mock_tts.mp3",
+            audio_base64: mockSilentWavBase64(400)
+          };
+        }
+        return {
+          status: "ok",
+          role: role,
+          provider_id: "deepseek/deepseek-chat",
+          model: "deepseek-chat",
+          latency_ms: 640 + Math.round(Math.random() * 240),
+          reply: "pong～这里是 " + role + " 角色的 Mock 连通性测试回复。"
+        };
+      }
+      case "sessions/default_soul": {
+        var newDefault = String(payload.soul_id || "");
+        if (newDefault && !findSoul(newDefault)) throw new Error("角色不存在：" + newDefault);
+        db.defaultSoulId = newDefault;
+        return {
+          default_soul_id: db.defaultSoulId,
+          souls: listSoulDicts(),
+          umo_bindings: clone(db.umoBindings)
+        };
+      }
+      default:
+        throw new Error("Mock 未覆盖的接口：" + method + " " + endpoint);
+    }
+  }
+
+  /** 生成一段静音 WAV 的 base64（供 TTS 试听测试用，纯本地无依赖） */
+  function mockSilentWavBase64(durationMs) {
+    var sampleRate = 8000;
+    var samples = Math.max(1, Math.floor((sampleRate * (durationMs || 300)) / 1000));
+    var buffer = new Uint8Array(44 + samples);
+    var view = new DataView(buffer.buffer);
+    function writeString(offset, text) {
+      for (var i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
+    }
+    writeString(0, "RIFF");
+    view.setUint32(4, 36 + samples, true);
+    writeString(8, "WAVE");
+    writeString(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate, true);
+    view.setUint16(32, 1, true);
+    view.setUint16(34, 8, true);
+    writeString(36, "data");
+    view.setUint32(40, samples, true);
+    var binary = "";
+    for (var i = 0; i < buffer.length; i++) binary += String.fromCharCode(buffer[i]);
+    return window.btoa(binary);
+  }
+
+  async function handle(method, endpoint, payload) {
+    await sleep(MOCK_DELAY);
+    try {
+      var data = handleEndpoint(method, endpoint, payload);
+      return ok(data);
+    } catch (err) {
+      return fail((err && (err.message || err)) || "mock error");
+    }
+  }
+
+  /* ================================================================== *
+   * 10. 安装 Mock Bridge
+   * ================================================================== */
+  var mockBridge = {
+    ready: function () {
+      return Promise.resolve({
+        isDark: forcedDark,
+        theme: forcedDark ? "dark" : "light",
+        page: { id: "console", name: "OnlyYou" }
+      });
+    },
+    getContext: function () {
+      return { isDark: forcedDark, theme: forcedDark ? "dark" : "light" };
+    },
+    onContext: function (callback) {
+      window.__OY_MOCK_CONTEXT_CALLBACK__ = callback;
+    },
+    apiGet: function (endpoint, params) {
+      return handle("GET", endpoint, params);
+    },
+    apiPost: function (endpoint, body) {
+      return handle("POST", endpoint, body);
+    }
+  };
+
+  window.AstrBotPluginPage = mockBridge;
+  window.AstrBotPluginView = mockBridge;
+  window.__OY_MOCK__ = true;
+  window.OY_MOCK_DB = db;
+  console.info(
+    "[OnlyYou] Mock bridge 已安装：覆盖 27 条 API（17 旧 + 10 新），模拟延迟 " + MOCK_DELAY + "ms。"
+  );
+})();

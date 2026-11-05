@@ -18,8 +18,11 @@ ENV/
 
 # Database & local test artifacts
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
+data/
 test_data/
 .pytest_cache/
 

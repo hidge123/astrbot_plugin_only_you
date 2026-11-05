@@ -13,6 +13,21 @@ except ImportError:
     logger = logging.getLogger("onlyyou.platform_bridge")
     MessageChain = None
 
+try:
+    from astrbot.api.message_components import Record
+except ImportError:  # pragma: no cover - local offline tests
+    class Record:  # type: ignore[no-redef]
+        def __init__(
+            self,
+            file: Optional[str] = None,
+            url: Optional[str] = None,
+            text: Optional[str] = None,
+            **kwargs: Any,
+        ):
+            self.file = file
+            self.url = url
+            self.text = text
+
 
 class PlatformBridge:
     """
@@ -124,11 +139,15 @@ class PlatformBridge:
         text: str,
         session_buffer: Any = None,
         soul_name: str = "Bot",
+        audio_path: Optional[str] = None,
     ) -> bool:
         """
         Send a proactive message to `umo` reusing AstrBot's `segmented_reply` config,
         and record the proactive message into `session_buffer` so the bot never forgets
         what it proactively said!
+
+        When `audio_path` is given (plugin TTS), a `Record` voice message is sent after
+        the text segments.
         """
         if not umo or not text or self.context is None:
             return False
@@ -151,6 +170,12 @@ class PlatformBridge:
             if idx < len(segments) - 1:
                 await asyncio.sleep(random.uniform(min_d, max_d))
 
+        if audio_path:
+            sent_audio = await self.send_voice_message(
+                umo=umo, audio_path=str(audio_path), text=text
+            )
+            sent_any = sent_any or sent_audio
+
         if session_buffer is not None:
             session_buffer.record_assistant_message(
                 umo=umo,
@@ -160,3 +185,28 @@ class PlatformBridge:
             )
 
         return sent_any
+
+    async def send_voice_message(
+        self, umo: str, audio_path: str, text: str = ""
+    ) -> bool:
+        """Send a single `Record` voice message to `umo` (best effort)."""
+        if not umo or not audio_path or self.context is None:
+            return False
+        try:
+            if MessageChain is not None:
+                chain = MessageChain()
+                try:
+                    component = Record(file=audio_path, url=audio_path, text=text)
+                except TypeError:
+                    component = Record(file=audio_path)
+                chain_attr = getattr(chain, "chain", None)
+                if isinstance(chain_attr, list):
+                    chain_attr.append(component)
+                await self.context.send_message(umo, chain)
+            else:
+                await self.context.send_message(umo, audio_path)
+            return True
+        except Exception as e:
+            logger.warning(f"[OnlyYou] send_voice_message to {umo} failed: {e}")
+            return False
+

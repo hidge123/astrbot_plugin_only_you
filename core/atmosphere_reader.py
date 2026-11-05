@@ -17,6 +17,23 @@ except ImportError:
     import logging
     logger = logging.getLogger("onlyyou.atmosphere_reader")
 
+try:
+    from .character_card import render_card_summary
+except ImportError:  # pragma: no cover - character_card is created in parallel
+    def render_card_summary(card: Any, max_chars: int = 200) -> str:  # type: ignore[misc]
+        return ""
+
+
+def _soul_summary(soul: Any) -> str:
+    """Render the compact `{soul_summary}` snippet of a soul (safe fallback)."""
+    try:
+        card = getattr(soul, "card", None)
+        if not card:
+            return ""
+        return render_card_summary(card)
+    except Exception:
+        return ""
+
 
 class AtmosphereReader:
     """
@@ -174,7 +191,7 @@ class AtmosphereReader:
                 # A newer message arrived in the group during the debounce window
                 return False
 
-        # Evaluate group atmosphere via Small Fast LLM
+        # Evaluate group atmosphere via the decision model
         transcript = self.session_buffer.get_window_transcript(umo=umo, max_turns=10)
         prompt = ATMOSPHERE_EVAL_PROMPT.format(
             soul_name=soul.name,
@@ -188,10 +205,11 @@ class AtmosphereReader:
             latest_message=msg_str,
             is_direct_mention="是" if is_direct_mention else "否",
             surfing_preferences="、".join(soul.surfing_preferences[:5]),
+            soul_summary=_soul_summary(soul),
         )
 
         res = await self.model_hub.call_llm_json(
-            prompt=prompt, role="small", umo=umo, default=None
+            prompt=prompt, role="decision", umo=umo, default=None
         )
         if isinstance(res, dict):
             decision = str(res.get("decision", "IGNORE")).upper()

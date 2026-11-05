@@ -1,7 +1,10 @@
 """Backend Web API routes (`context.register_web_api`) for OnlyYou Plugin Pages (`views/console`)."""
 
+import inspect
 import random
+import re
 import time
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Optional
 
 from .memory_manager import MemoryTier
@@ -50,10 +53,88 @@ def err_response(message: str, code: str = "bad_request", data: Any = None) -> d
     }
 
 
+# ==============================================================================
+# Module-level helpers shared by the new Plugin Pages routes.
+# The parallel-implemented modules (`character_card`, rewritten `model_hub`, ...)
+# are imported lazily so that a missing/partial implementation degrades into an
+# `err_response` instead of breaking the whole plugin import chain.
+# ==============================================================================
+def _character_card_module(log_missing: bool = False) -> Any:
+    """Lazily import the contract `core.character_card` module (implemented in parallel)."""
+    try:
+        from . import character_card
+
+        return character_card
+    except Exception as exc:  # pragma: no cover - only before character_card.py lands
+        if log_missing:
+            logger.warning(f"[OnlyYou] character_card module unavailable: {exc}")
+        return None
+
+
+def _as_str_list(value: Any) -> list[str]:
+    """Normalize a legacy string (comma/、/slash separated) or array into a clean str list."""
+    if isinstance(value, str):
+        parts = re.split(r"[,，、/\n]+", value)
+        return [part.strip() for part in parts if part.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def _ensure_section(card: dict[str, Any], key: str) -> dict[str, Any]:
+    """Return `card[key]` as a dict, replacing invalid values with a fresh dict."""
+    section = card.get(key)
+    if not isinstance(section, dict):
+        section = {}
+        card[key] = section
+    return section
+
+
+def _slot_remaining_and_progress(
+    slot: Any, now_dt: Optional[datetime] = None
+) -> tuple[int, float]:
+    """
+    Compute `(remaining_seconds, progress)` for a schedule slot.
+
+    Handles the overnight `night` slot (start_hour=23, end_hour=7) via modular
+    arithmetic so 00:00-07:00 is correctly counted as the same slot.
+    """
+    now_dt = now_dt or datetime.now()
+    try:
+        start_hour = int(getattr(slot, "start_hour", 0) or 0)
+        end_hour = int(getattr(slot, "end_hour", 24) or 24)
+    except (TypeError, ValueError):
+        start_hour, end_hour = 0, 24
+
+    total_hours = (end_hour - start_hour) % 24
+    if total_hours == 0:
+        total_hours = 24
+
+    now_hour = now_dt.hour + now_dt.minute / 60.0 + now_dt.second / 3600.0
+    elapsed_hours = (now_hour - start_hour) % 24
+    elapsed_hours = min(elapsed_hours, float(total_hours))
+    remaining_hours = max(0.0, float(total_hours) - elapsed_hours)
+
+    remaining_seconds = int(round(remaining_hours * 3600))
+    progress = elapsed_hours / float(total_hours) if total_hours else 0.0
+    return remaining_seconds, round(max(0.0, min(1.0, progress)), 4)
+
+
+def _encounter_to_dict(item: Any) -> dict[str, Any]:
+    """Normalize an `EncounterCard` dataclass / dict into `{content, used}`."""
+    if isinstance(item, dict):
+        return {"content": str(item.get("content") or ""), "used": bool(item.get("used", False))}
+    return {
+        "content": str(getattr(item, "content", "") or ""),
+        "used": bool(getattr(item, "used", False)),
+    }
+
+
 class OnlyYouWebAPI:
     """
-    🖥️ Registers and handles all 17 RESTful Web API routes defined in `docs/WEBUI_DESIGN.md`
-    Section 3.3 for the `views/console` AstrBot Plugin Page.
+    🖥️ Registers and handles all 27 RESTful Web API routes for the revamped
+    `views/console` AstrBot Plugin Pages (17 legacy routes kept for compatibility
+    plus 10 new dashboard / character-card / model / session routes).
     """
 
     def __init__(self, plugin: "OnlyYouPlugin"):
@@ -104,7 +185,7 @@ class OnlyYouWebAPI:
         return dict(self._mock_body)
 
     def register_routes(self) -> None:
-        """Register all 17 WebUI Console routes with `self.plugin.context.register_web_api`."""
+        """Register all 27 WebUI Console routes with `self.plugin.context.register_web_api`."""
         ctx = getattr(self.plugin, "context", None)
         register_fn = getattr(ctx, "register_web_api", None) if ctx is not None else None
         if not callable(register_fn):
@@ -214,6 +295,70 @@ class OnlyYouWebAPI:
                 ["GET", "POST"],
                 "OnlyYou: 查看已刷视频卡片墙，或手动触发B站/抖音冲浪与分享",
             ),
+            # ------------------------------------------------------------------
+            # New Plugin Pages routes (2026 revamp): overview / character card /
+            # plugin-autonomous four-role models / default session routing.
+            # ------------------------------------------------------------------
+            (
+                f"{API_PREFIX}/dashboard/overview",
+                self.api_dashboard_overview,
+                ["GET"],
+                "OnlyYou: 概览页一次拉齐当前时段进度、日程、微调配额、奇遇卡、关系/记忆/视频统计与模型健康",
+            ),
+            (
+                f"{API_PREFIX}/card/schema",
+                self.api_card_schema,
+                ["GET"],
+                "OnlyYou: 获取角色卡 10 分区字段定义(CARD_SCHEMA)与指定角色的当前卡数据",
+            ),
+            (
+                f"{API_PREFIX}/card/save",
+                self.api_card_save,
+                ["POST"],
+                "OnlyYou: 保存完整角色卡（normalize_card 归一化后持久化）",
+            ),
+            (
+                f"{API_PREFIX}/card/ai_generate",
+                self.api_card_ai_generate,
+                ["POST"],
+                "OnlyYou: 调用主模型生成整张角色卡或单个分区的草稿（不落库）",
+            ),
+            (
+                f"{API_PREFIX}/card/preview_prompt",
+                self.api_card_preview_prompt,
+                ["POST"],
+                "OnlyYou: 预览角色卡渲染后的 Persona Prompt 与字符数",
+            ),
+            (
+                f"{API_PREFIX}/models/sources",
+                self.api_models_sources,
+                ["GET"],
+                "OnlyYou: 获取 AstrBot 提供商源列表与可用 TTS 提供商列表（不含密钥）",
+            ),
+            (
+                f"{API_PREFIX}/models/list",
+                self.api_models_list,
+                ["GET"],
+                "OnlyYou: 按提供商源 ID 拉取已配置 + 远程可用模型列表",
+            ),
+            (
+                f"{API_PREFIX}/models/config",
+                self.api_models_config,
+                ["GET", "POST"],
+                "OnlyYou: 读取或保存四角色模型配置（保存后热重建插件模型实例）",
+            ),
+            (
+                f"{API_PREFIX}/models/test",
+                self.api_models_test,
+                ["POST"],
+                "OnlyYou: 测试指定模型角色连通性（TTS 额外返回 base64 试听音频）",
+            ),
+            (
+                f"{API_PREFIX}/sessions/default_soul",
+                self.api_sessions_default_soul,
+                ["POST"],
+                "OnlyYou: 设置插件默认角色（用于未绑定 UMO 的会话路由）",
+            ),
         ]
 
         for route_path, handler, methods, desc in routes:
@@ -259,25 +404,349 @@ class OnlyYouWebAPI:
         return items
 
     # ==========================================================================
+    # Shared helpers for the new Plugin Pages routes: character cards, soul
+    # resolution, four-role model status and dashboard counters.
+    # ==========================================================================
+    @staticmethod
+    def _card_schema() -> list[dict[str, Any]]:
+        """Return `CARD_SCHEMA` of the contract `core.character_card` module (or [])."""
+        module = _character_card_module()
+        schema = getattr(module, "CARD_SCHEMA", None) if module is not None else None
+        return schema if isinstance(schema, list) else []
+
+    @staticmethod
+    def _normalize_card(raw: Any) -> dict[str, Any]:
+        """Best-effort `character_card.normalize_card` with a plain-dict fallback."""
+        if not isinstance(raw, dict):
+            return {}
+        module = _character_card_module()
+        normalize = getattr(module, "normalize_card", None) if module is not None else None
+        if callable(normalize):
+            try:
+                normalized = normalize(raw)
+                if isinstance(normalized, dict):
+                    return normalized
+            except Exception as exc:
+                logger.warning(f"[OnlyYou] normalize_card failed: {exc}")
+        return dict(raw)
+
+    @staticmethod
+    def _legacy_to_card(profile: Any) -> dict[str, Any]:
+        """Map the legacy 4-flat-field SoulProfile payload onto the 10-section card shape."""
+        data = profile if isinstance(profile, dict) else {}
+        return {
+            "identity": {
+                "name": str(data.get("name") or ""),
+                "tagline": str(data.get("archetype") or ""),
+                "avatar": "",
+            },
+            "appearance": {},
+            "personality": {},
+            "background": {},
+            "interests": {
+                "surfing_preferences": _as_str_list(data.get("surfing_preferences")),
+            },
+            "speech": {"speaking_style": str(data.get("speaking_style") or "")},
+            "social": {},
+            "rhythm": {},
+            "examples": {},
+            "extra": {"native_persona_prompt": str(data.get("native_persona_prompt") or "")},
+        }
+
+    def _soul_card(self, soul: Any) -> dict[str, Any]:
+        """Return the normalized character card of a SoulProfile (legacy migration included)."""
+        if soul is None:
+            return self._normalize_card({})
+        card = getattr(soul, "card", None)
+        if isinstance(card, dict) and card:
+            return self._normalize_card(dict(card))
+        legacy: Any = {}
+        to_dict = getattr(soul, "to_dict", None)
+        if callable(to_dict):
+            try:
+                legacy = to_dict()
+            except Exception:
+                legacy = {}
+        module = _character_card_module()
+        migrate = getattr(module, "migrate_legacy", None) if module is not None else None
+        if callable(migrate):
+            try:
+                migrated = migrate(legacy if isinstance(legacy, dict) else {})
+                if isinstance(migrated, dict):
+                    return migrated
+            except Exception as exc:
+                logger.warning(f"[OnlyYou] migrate_legacy failed: {exc}")
+        return self._normalize_card(self._legacy_to_card(legacy))
+
+    @staticmethod
+    def _apply_legacy_flat_fields(card: dict[str, Any], body: dict[str, Any]) -> None:
+        """Overlay legacy flat body fields (`name/archetype/...`) onto a card structure."""
+        identity = _ensure_section(card, "identity")
+        interests = _ensure_section(card, "interests")
+        speech = _ensure_section(card, "speech")
+        extra = _ensure_section(card, "extra")
+        if "name" in body:
+            identity["name"] = str(body.get("name") or "").strip()
+        if "archetype" in body:
+            identity["tagline"] = str(body.get("archetype") or "").strip()
+        if "speaking_style" in body:
+            speech["speaking_style"] = str(body.get("speaking_style") or "").strip()
+        if "native_persona_prompt" in body:
+            extra["native_persona_prompt"] = str(body.get("native_persona_prompt") or "").strip()
+        if "surfing_preferences" in body:
+            interests["surfing_preferences"] = _as_str_list(body.get("surfing_preferences"))
+
+    @staticmethod
+    def _fill_new_soul_defaults(card: dict[str, Any], soul_id: str) -> None:
+        """Keep the legacy `souls/save` defaults when creating a brand-new soul."""
+        identity = _ensure_section(card, "identity")
+        interests = _ensure_section(card, "interests")
+        speech = _ensure_section(card, "speech")
+        if not str(identity.get("name") or "").strip():
+            identity["name"] = soul_id
+        if not str(identity.get("tagline") or "").strip():
+            identity["tagline"] = "有自己生活节律与喜怒哀乐的数字网友"
+        if not str(speech.get("speaking_style") or "").strip():
+            speech["speaking_style"] = "口语化短句，自然随性"
+        if not _as_str_list(interests.get("surfing_preferences")):
+            interests["surfing_preferences"] = ["搞笑整活", "萌宠日常", "美食探店"]
+
+    def _card_flat_fields(
+        self, card: dict[str, Any], existing: Any = None, soul_id: str = ""
+    ) -> dict[str, Any]:
+        """Derive legacy flat SoulProfile attributes from a character card (compat shim)."""
+        identity = card.get("identity") if isinstance(card.get("identity"), dict) else {}
+        speech = card.get("speech") if isinstance(card.get("speech"), dict) else {}
+        interests = card.get("interests") if isinstance(card.get("interests"), dict) else {}
+        extra = card.get("extra") if isinstance(card.get("extra"), dict) else {}
+
+        def _pick(new_value: Any, attr: str, default: str) -> str:
+            text = str(new_value or "").strip()
+            if text:
+                return text
+            old = getattr(existing, attr, None) if existing is not None else None
+            if isinstance(old, str) and old.strip():
+                return old.strip()
+            return default
+
+        prefs = _as_str_list(interests.get("surfing_preferences"))
+        if not prefs and existing is not None:
+            old_prefs = getattr(existing, "surfing_preferences", None)
+            if isinstance(old_prefs, (list, tuple)):
+                prefs = [str(item).strip() for item in old_prefs if str(item).strip()]
+
+        return {
+            "name": _pick(identity.get("name"), "name", soul_id or "小星"),
+            "archetype": _pick(
+                identity.get("tagline"), "archetype", "有自己生活节律与喜怒哀乐的数字网友"
+            ),
+            "speaking_style": _pick(
+                speech.get("speaking_style"), "speaking_style", "口语化短句，自然随性"
+            ),
+            "native_persona_prompt": _pick(
+                extra.get("native_persona_prompt"), "native_persona_prompt", ""
+            ),
+            "surfing_preferences": prefs,
+        }
+
+    def _apply_card_to_profile(self, profile: Any, card: dict[str, Any]) -> Any:
+        """Write a normalized card onto a SoulProfile (legacy flat attrs synced when needed)."""
+        normalized = self._normalize_card(card)
+        had_card_dict = isinstance(getattr(profile, "card", None), dict)
+        try:
+            setattr(profile, "card", normalized)
+        except Exception as exc:
+            logger.warning(f"[OnlyYou] Failed to assign card to SoulProfile: {exc}")
+
+        if not had_card_dict:
+            # Pre-refactor SoulProfile (flat dataclass): keep flat attrs in sync so that
+            # the old implementation can still persist/render the profile.
+            flat = self._card_flat_fields(
+                normalized, profile, str(getattr(profile, "soul_id", "") or "")
+            )
+            for attr in ("name", "archetype", "speaking_style", "native_persona_prompt"):
+                try:
+                    setattr(profile, attr, flat[attr])
+                except Exception:
+                    pass
+            try:
+                setattr(profile, "surfing_preferences", list(flat["surfing_preferences"]))
+            except Exception:
+                pass
+        return profile
+
+    async def _resolve_soul(self, soul_id: str = "") -> Any:
+        """Resolve the requested / default / most-recent soul (never returns None)."""
+        manager = getattr(self.plugin, "soul_manager", None)
+        if manager is None:
+            raise RuntimeError("SoulManager 未初始化")
+        sid = (soul_id or "").strip()
+        soul = None
+        if sid:
+            soul = await manager.get_soul_by_id(sid)
+        if soul is None:
+            getter = getattr(manager, "get_default_soul_id", None)
+            if callable(getter):
+                try:
+                    default_id = str(await getter() or "").strip()
+                except Exception as exc:
+                    logger.warning(f"[OnlyYou] get_default_soul_id failed: {exc}")
+                    default_id = ""
+                if default_id:
+                    soul = await manager.get_soul_by_id(default_id)
+        if soul is None:
+            souls = await manager.list_souls()
+            soul = souls[0] if souls else None
+        if soul is None:
+            resolver = getattr(manager, "resolve_soul", None)
+            if callable(resolver):
+                try:
+                    soul = await resolver(allow_llm_seed=False)
+                except TypeError:
+                    soul = await resolver()
+                except Exception as exc:
+                    logger.warning(f"[OnlyYou] resolve_soul fallback failed: {exc}")
+        if soul is None:
+            raise RuntimeError("尚未创建任何角色")
+        return soul
+
+    def _provider_factory(self) -> Any:
+        """Return the contract `ProviderFactory` instance created by main.py."""
+        factory = getattr(self.plugin, "provider_factory", None)
+        if factory is None:
+            raise RuntimeError("ProviderFactory 未初始化（请检查 main.py 接线）")
+        return factory
+
+    async def _safe_model_status(self) -> dict[str, Any]:
+        """`await model_hub.get_status()` with graceful degradation to an empty dict."""
+        hub = getattr(self.plugin, "model_hub", None)
+        if hub is None:
+            return {}
+        try:
+            status = await hub.get_status()
+        except Exception as exc:
+            logger.warning(f"[OnlyYou] model_hub.get_status failed: {exc}")
+            return {}
+        return status if isinstance(status, dict) else {}
+
+    async def _safe_default_soul_id(self) -> str:
+        """Read `plugin_settings.default_soul_id` through the contract SoulManager API."""
+        manager = getattr(self.plugin, "soul_manager", None)
+        getter = getattr(manager, "get_default_soul_id", None) if manager is not None else None
+        if not callable(getter):
+            return ""
+        try:
+            return str(await getter() or "").strip()
+        except Exception as exc:
+            logger.warning(f"[OnlyYou] get_default_soul_id failed: {exc}")
+            return ""
+
+    async def _read_model_config(self, hub: Any) -> dict[str, Any]:
+        """Read the current four-role model config from ModelHub (sync/async tolerant)."""
+        for attr in ("get_model_config_async", "get_model_config"):
+            getter = getattr(hub, attr, None)
+            if not callable(getter):
+                continue
+            try:
+                value = getter()
+                if inspect.isawaitable(value):
+                    value = await value
+                if isinstance(value, dict):
+                    return value
+            except Exception as exc:
+                logger.warning(f"[OnlyYou] model_hub.{attr} failed: {exc}")
+        return {}
+
+    async def _relation_counts(self) -> dict[str, int]:
+        """Dashboard relation counters derived from `user_relation.list_users()`."""
+        counts = {"l1": 0, "l2": 0, "l3": 0, "total": 0}
+        manager = getattr(self.plugin, "user_relation", None)
+        if manager is None:
+            return counts
+        try:
+            users = list(await manager.list_users() or [])
+        except Exception as exc:
+            logger.warning(f"[OnlyYou] dashboard relation counts failed: {exc}")
+            return counts
+        counts["total"] = len(users)
+        for user in users:
+            try:
+                tier = int(getattr(user, "tier", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if tier == int(UserTier.L3_CORE):
+                counts["l3"] += 1
+            elif tier == int(UserTier.L2_IMPORTANT):
+                counts["l2"] += 1
+            elif tier == int(UserTier.L1_NORMAL):
+                counts["l1"] += 1
+        return counts
+
+    async def _memory_counts(self, soul_id: str) -> dict[str, int]:
+        """Dashboard tiered-memory counters derived from `memory_manager.list_memories()`."""
+        counts = {"tier1": 0, "tier2": 0, "tier3": 0, "total": 0}
+        manager = getattr(self.plugin, "memory_manager", None)
+        if manager is None:
+            return counts
+        try:
+            memories = list(await manager.list_memories(soul_id=soul_id, limit=1000) or [])
+        except Exception as exc:
+            logger.warning(f"[OnlyYou] dashboard memory counts failed: {exc}")
+            return counts
+        counts["total"] = len(memories)
+        for item in memories:
+            try:
+                tier = int(getattr(item, "memory_tier", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if tier == int(MemoryTier.CORE):
+                counts["tier3"] += 1
+            elif tier == int(MemoryTier.RECENT):
+                counts["tier2"] += 1
+            elif tier == int(MemoryTier.EPHEMERAL):
+                counts["tier1"] += 1
+        return counts
+
+    async def _video_count(self, soul_id: str) -> int:
+        """Dashboard surfed-video counter derived from `surfing_pipeline.list_history()`."""
+        pipeline = getattr(self.plugin, "surfing_pipeline", None)
+        if pipeline is None:
+            return 0
+        try:
+            videos = await pipeline.list_history(soul_id=soul_id, limit=1000)
+        except Exception as exc:
+            logger.warning(f"[OnlyYou] dashboard video count failed: {exc}")
+            return 0
+        return len(videos or [])
+
+    # ==========================================================================
     # 1. Init Summary & Soul Studio (`init_summary`, `souls/*`)
     # ==========================================================================
     async def api_init_summary(self) -> dict[str, Any]:
         try:
             await self.plugin._ensure_initialized()
             souls = await self.plugin.soul_manager.list_souls()
+            if not souls:
+                # Fresh install: lazily materialize the default soul so Pages never
+                # boot into an empty/500 state.
+                resolver = getattr(self.plugin.soul_manager, "resolve_soul", None)
+                if callable(resolver):
+                    try:
+                        await resolver(allow_llm_seed=False)
+                    except TypeError:
+                        await resolver()
+                    except Exception as exc:
+                        logger.warning(f"[OnlyYou] api_init_summary resolve_soul failed: {exc}")
+                    souls = await self.plugin.soul_manager.list_souls()
+            if not souls:
+                return err_response("尚未创建任何角色，请先在角色卡页新建角色")
+
             native_personas = await self.plugin.soul_manager.list_native_personas()
             bindings = await self.plugin.soul_manager.get_umo_bindings()
             active_soul = souls[0]
             sched_payload = await self._build_schedule_payload(active_soul)
-
-            m_cfg = self.plugin.config.get("model_hub_config", {}) or {}
-            model_status = {
-                "main_llm": m_cfg.get("main_llm_provider_id") or "继承平台当前会话主模型",
-                "small_llm": m_cfg.get("small_llm_provider_id") or "自动回退至主模型",
-                "vision_llm": m_cfg.get("vision_llm_provider_id") or "继承平台默认识图/主模型",
-                "embedding": m_cfg.get("embedding_provider_id") or "SQLite 关键词+时间新鲜度混合检索",
-                "rerank": m_cfg.get("rerank_provider_id") or "内置权重精排",
-            }
+            model_status = await self._safe_model_status()
+            default_soul_id = await self._safe_default_soul_id()
 
             return ok_response(
                 {
@@ -287,6 +756,7 @@ class OnlyYouWebAPI:
                     "known_umos": self._collect_known_umos(bindings),
                     "active_soul_id": active_soul.soul_id,
                     "active_schedule": sched_payload,
+                    "default_soul_id": default_soul_id,
                     "model_status": model_status,
                     "slot_definitions": SLOT_DEFINITIONS,
                 }
@@ -313,6 +783,7 @@ class OnlyYouWebAPI:
             return ok_response(
                 {
                     "soul": soul.to_dict(),
+                    "card_schema": self._card_schema(),
                     "schedule": sched_payload,
                     "umo_bindings": bindings,
                     "known_umos": self._collect_known_umos(bindings),
@@ -329,14 +800,25 @@ class OnlyYouWebAPI:
             persona_name = str(body.get("persona_name") or "default_soul").strip()
             target_soul_id = str(body.get("target_soul_id") or persona_name).strip()
             auto_gen = bool(body.get("auto_generate_cards", True))
+            ai_generate_card = bool(body.get("ai_generate_card", False))
             override_prompt = str(body.get("native_prompt") or "").strip() or None
 
-            profile = await self.plugin.soul_manager.import_native_persona(
-                persona_name=persona_name,
-                target_soul_id=target_soul_id,
-                auto_generate_cards=auto_gen,
-                override_prompt=override_prompt,
-            )
+            importer = self.plugin.soul_manager.import_native_persona
+            import_kwargs: dict[str, Any] = {
+                "persona_name": persona_name,
+                "target_soul_id": target_soul_id,
+                "auto_generate_cards": auto_gen,
+                "override_prompt": override_prompt,
+            }
+            # The rewritten SoulManager supports optional AI card elaboration; keep
+            # the legacy call signature working if the parameter is absent.
+            try:
+                supported = "ai_generate_card" in inspect.signature(importer).parameters
+            except (TypeError, ValueError):
+                supported = False
+            if supported:
+                import_kwargs["ai_generate_card"] = ai_generate_card
+            profile = await importer(**import_kwargs)
             # Build fresh schedule run with the newly imported deck
             await self.plugin.deck_engine.get_or_build_today_run(
                 soul_id=profile.soul_id,
@@ -366,54 +848,69 @@ class OnlyYouWebAPI:
             if not soul_id:
                 return err_response("Soul ID 不能为空")
 
-            existing = await self.plugin.soul_manager.get_soul_by_id(soul_id)
-            raw_prefs = body.get("surfing_preferences")
-            if isinstance(raw_prefs, str):
-                prefs = [x.strip() for x in raw_prefs.replace("，", ",").split(",") if x.strip()]
-            elif isinstance(raw_prefs, list):
-                prefs = [str(x).strip() for x in raw_prefs if str(x).strip()]
+            manager = getattr(self.plugin, "soul_manager", None)
+            if manager is None:
+                return err_response("SoulManager 未初始化")
+            existing = await manager.get_soul_by_id(soul_id)
+            body_card = body.get("card")
+            module = _character_card_module(log_missing=isinstance(body_card, dict))
+
+            if isinstance(body_card, dict):
+                # New Plugin Pages payload: the full character card takes precedence
+                # over the legacy flat fields.
+                card = self._normalize_card(body_card)
             else:
-                prefs = existing.surfing_preferences if existing else ["搞笑整活", "萌宠日常", "美食探店"]
+                # Legacy payload (flat `name/archetype/...`): keep the existing card
+                # intact and overlay only the provided legacy fields.
+                card: dict[str, Any] = {}
+                if existing is not None:
+                    card = dict(self._soul_card(existing))
+                elif module is not None:
+                    empty = getattr(module, "empty_card", None)
+                    if callable(empty):
+                        try:
+                            empty_card = empty()
+                            if isinstance(empty_card, dict):
+                                card = empty_card
+                        except Exception as exc:
+                            logger.warning(f"[OnlyYou] empty_card failed: {exc}")
+                self._apply_legacy_flat_fields(card, body)
+                card = self._normalize_card(card)
+                if existing is None:
+                    self._fill_new_soul_defaults(card, soul_id)
 
-            profile = SoulProfile(
-                soul_id=soul_id,
-                name=str(body.get("name") or (existing.name if existing else soul_id)).strip(),
-                archetype=str(
-                    body.get("archetype")
-                    or (existing.archetype if existing else "有自己生活作息的真实网友")
-                ).strip(),
-                speaking_style=str(
-                    body.get("speaking_style")
-                    or (existing.speaking_style if existing else "口语化短句，自然随性")
-                ).strip(),
-                native_persona_prompt=str(
-                    body.get("native_persona_prompt")
-                    if "native_persona_prompt" in body
-                    else (existing.native_persona_prompt if existing else "")
-                ).strip(),
-                surfing_preferences=prefs,
-                state_event_cards=existing.state_event_cards if existing else [],
-                encounter_talk_cards=existing.encounter_talk_cards if existing else [],
-            )
-            await self.plugin.soul_manager.save_soul(profile)
+            if existing is not None:
+                profile = self._apply_card_to_profile(existing, card)
+            else:
+                payload: dict[str, Any] = {"soul_id": soul_id, "card": card}
+                payload.update(self._card_flat_fields(card, existing=None, soul_id=soul_id))
+                payload["state_event_cards"] = []
+                payload["encounter_talk_cards"] = []
+                profile = SoulProfile.from_dict(payload)
+                profile = self._apply_card_to_profile(profile, card)
 
-            # Optional UMO routing binding updates
+            await manager.save_soul(profile)
+
+            # Optional UMO routing binding updates (legacy console contract)
             if isinstance(body.get("umo_binding"), dict):
                 ub = body["umo_binding"]
-                await self.plugin.soul_manager.set_umo_binding(
+                await manager.set_umo_binding(
                     str(ub.get("umo") or ""), str(ub.get("soul_id") or "")
                 )
 
-            souls = await self.plugin.soul_manager.list_souls()
-            bindings = await self.plugin.soul_manager.get_umo_bindings()
+            souls = await manager.list_souls()
+            bindings = await manager.get_umo_bindings()
+            to_dict = getattr(profile, "to_dict", None)
+            profile_dict = to_dict() if callable(to_dict) else {}
+            profile_name = str(getattr(profile, "name", "") or soul_id)
             return ok_response(
                 {
-                    "soul": profile.to_dict(),
+                    "soul": profile_dict,
                     "souls": [s.to_dict() for s in souls],
                     "umo_bindings": bindings,
                     "known_umos": self._collect_known_umos(bindings),
                 },
-                message=f"已保存角色 {profile.name} ({profile.soul_id})",
+                message=f"已保存角色 {profile_name} ({soul_id})",
             )
         except Exception as e:
             logger.warning(f"[OnlyYou] api_souls_save error: {e}")
@@ -460,7 +957,9 @@ class OnlyYouWebAPI:
                 {
                     "deleted_soul_id": soul_id,
                     "souls": [s.to_dict() for s in souls],
-                    "active_soul_id": souls[0].soul_id,
+                    # `list_souls()` recreates a default soul when the last one is
+                    # deleted; stay defensive anyway and never index an empty list.
+                    "active_soul_id": souls[0].soul_id if souls else "",
                 },
                 message=f"已删除角色 {soul_id}",
             )
@@ -675,7 +1174,7 @@ class OnlyYouWebAPI:
                 '"encounter_talk_cards": ["奇遇1", "奇遇2", "奇遇3"]}'
             )
             data = await self.plugin.model_hub.call_llm_json(
-                prompt=prompt, role="small", default=None
+                prompt=prompt, role="decision", default=None
             )
             gen_cards: list[StateEventCard] = []
             gen_encounters: list[str] = []
@@ -1105,3 +1604,360 @@ class OnlyYouWebAPI:
         except Exception as e:
             logger.warning(f"[OnlyYou] api_surfing_list_and_trigger error: {e}")
             return err_response(f"冲浪操作失败: {e}")
+
+    # ==========================================================================
+    # 6. Dashboard Overview (`dashboard/overview`)
+    # ==========================================================================
+    async def api_dashboard_overview(self) -> dict[str, Any]:
+        """One-shot payload for the new Overview page (state / schedule / quota / counters)."""
+        try:
+            await self.plugin._ensure_initialized()
+            soul = await self._resolve_soul(self._get_query_param("soul_id"))
+
+            run, cur_slot, next_slot = await self.plugin.deck_engine.get_current_and_next_slot(
+                soul_id=soul.soul_id,
+                custom_cards=soul.state_event_cards,
+                custom_encounters=soul.encounter_talk_cards,
+            )
+            max_mutations = int(self.plugin.schedule_mutator.max_mutations_per_day)
+            cooldown_seconds = int(self.plugin.schedule_mutator.mutation_cooldown_seconds)
+            schedule_payload = {
+                "run": run.to_dict(),
+                "current_slot": cur_slot.to_dict(),
+                "next_slot": next_slot.to_dict(),
+                "max_mutations_per_day": max_mutations,
+                "mutation_cooldown_minutes": int(cooldown_seconds // 60),
+            }
+
+            remaining_seconds, progress = _slot_remaining_and_progress(cur_slot, datetime.now())
+            state_value = (
+                cur_slot.state.value
+                if isinstance(cur_slot.state, BotState)
+                else str(cur_slot.state)
+            )
+            state_payload = {
+                "state": state_value,
+                "label": str(cur_slot.label),
+                "title": str(cur_slot.title),
+                "armor": int(cur_slot.armor),
+                "slot_key": str(cur_slot.slot_key),
+                "start_hour": int(cur_slot.start_hour),
+                "end_hour": int(cur_slot.end_hour),
+                "remaining_seconds": remaining_seconds,
+                "progress": progress,
+                "mutated": bool(cur_slot.mutated),
+                "next_slot": next_slot.to_dict(),
+            }
+
+            used = int(getattr(run, "mutations_used", 0) or 0)
+            last_mutation_ts = float(getattr(run, "last_mutation_ts", 0.0) or 0.0)
+            if last_mutation_ts > 0:
+                cooldown_remaining_seconds = int(
+                    max(0.0, last_mutation_ts + cooldown_seconds - time.time())
+                )
+            else:
+                cooldown_remaining_seconds = 0
+            quota_payload = {
+                "used": used,
+                "max": max_mutations,
+                "remaining": max(0, max_mutations - used),
+                "cooldown_remaining_seconds": cooldown_remaining_seconds,
+            }
+
+            card = self._soul_card(soul)
+            identity = card.get("identity") if isinstance(card.get("identity"), dict) else {}
+            soul_payload = {
+                "soul_id": soul.soul_id,
+                "name": str(identity.get("name") or getattr(soul, "name", "") or soul.soul_id),
+                "avatar": str(identity.get("avatar") or ""),
+                "tagline": str(identity.get("tagline") or getattr(soul, "archetype", "") or ""),
+            }
+
+            return ok_response(
+                {
+                    "soul": soul_payload,
+                    "vigor": {
+                        "title": str(getattr(run, "vigor_title", "") or ""),
+                        "desc": str(getattr(run, "vigor_desc", "") or ""),
+                    },
+                    "state": state_payload,
+                    "schedule": schedule_payload,
+                    "quota": quota_payload,
+                    "encounters": [
+                        _encounter_to_dict(item)
+                        for item in (getattr(run, "encounters", None) or [])
+                    ],
+                    "counts": {
+                        "relations": await self._relation_counts(),
+                        "memories": await self._memory_counts(soul.soul_id),
+                        "videos": await self._video_count(soul.soul_id),
+                    },
+                    "models": await self._safe_model_status(),
+                }
+            )
+        except Exception as e:
+            logger.warning(f"[OnlyYou] api_dashboard_overview error: {e}")
+            return err_response(f"加载概览数据失败: {e}")
+
+    # ==========================================================================
+    # 7. Character Card Studio (`card/*`)
+    # ==========================================================================
+    async def api_card_schema(self) -> dict[str, Any]:
+        """Return the character-card form schema plus the current soul card data."""
+        try:
+            await self.plugin._ensure_initialized()
+            soul = await self._resolve_soul(self._get_query_param("soul_id"))
+            module = _character_card_module(log_missing=True)
+            schema = getattr(module, "CARD_SCHEMA", None) if module is not None else None
+            if not isinstance(schema, list):
+                return err_response("角色卡 schema 不可用：core/character_card.py 尚未就绪")
+            return ok_response(
+                {
+                    "schema": schema,
+                    "card": self._soul_card(soul),
+                    "soul_id": soul.soul_id,
+                }
+            )
+        except Exception as e:
+            logger.warning(f"[OnlyYou] api_card_schema error: {e}")
+            return err_response(f"加载角色卡 schema 失败: {e}")
+
+    async def api_card_save(self) -> dict[str, Any]:
+        """Persist a complete character card (`normalize_card` applied) for one soul."""
+        try:
+            await self.plugin._ensure_initialized()
+            body = await self._get_json_body()
+            soul_id = str(body.get("soul_id") or "").strip()
+            card_raw = body.get("card")
+            if not soul_id:
+                return err_response("缺少 soul_id")
+            if not isinstance(card_raw, dict):
+                return err_response("缺少 card 对象")
+            module = _character_card_module(log_missing=True)
+            if module is None:
+                return err_response("角色卡模块不可用：core/character_card.py 尚未就绪")
+            manager = getattr(self.plugin, "soul_manager", None)
+            if manager is None:
+                return err_response("SoulManager 未初始化")
+            soul = await manager.get_soul_by_id(soul_id)
+            if soul is None:
+                return err_response(f"角色不存在: {soul_id}")
+
+            profile = self._apply_card_to_profile(soul, self._normalize_card(card_raw))
+            await manager.save_soul(profile)
+
+            souls = await manager.list_souls()
+            to_dict = getattr(profile, "to_dict", None)
+            return ok_response(
+                {
+                    "soul": to_dict() if callable(to_dict) else {},
+                    "souls": [s.to_dict() for s in souls],
+                },
+                message=f"已保存角色卡 {soul_id}",
+            )
+        except Exception as e:
+            logger.warning(f"[OnlyYou] api_card_save error: {e}")
+            return err_response(f"保存角色卡失败: {e}")
+
+    async def api_card_ai_generate(self) -> dict[str, Any]:
+        """Generate a whole-card or single-section character-card draft (not persisted)."""
+        try:
+            await self.plugin._ensure_initialized()
+            body = await self._get_json_body()
+            soul = await self._resolve_soul(str(body.get("soul_id") or "").strip())
+            seed_text = str(body.get("seed_text") or "").strip()
+            section = str(body.get("section") or "").strip() or None
+
+            module = _character_card_module()
+            if section:
+                section_ids = getattr(module, "CARD_SECTION_IDS", None) if module else None
+                if isinstance(section_ids, list) and section not in section_ids:
+                    return err_response(f"未知的角色卡分区: {section}")
+
+            manager = getattr(self.plugin, "soul_manager", None)
+            generator = getattr(manager, "generate_card", None) if manager is not None else None
+            if not callable(generator):
+                return err_response("SoulManager 未实现 generate_card")
+
+            base_card = self._soul_card(soul)
+            draft = await generator(seed_text=seed_text, base_card=base_card, section=section)
+            if not isinstance(draft, dict):
+                return err_response("AI 生成角色卡失败，请检查主模型配置与运行日志")
+            draft = self._normalize_card(draft)
+            message = f"已为 {soul.soul_id} 生成角色卡草稿"
+            if section:
+                message += f"（分区 {section}）"
+            return ok_response({"draft_card": draft, "section": section}, message=message)
+        except Exception as e:
+            logger.warning(f"[OnlyYou] api_card_ai_generate error: {e}")
+            return err_response(f"AI 生成角色卡失败: {e}")
+
+    async def api_card_preview_prompt(self) -> dict[str, Any]:
+        """Render the persona prompt of a card (either the body draft or the saved card)."""
+        try:
+            await self.plugin._ensure_initialized()
+            body = await self._get_json_body()
+            module = _character_card_module(log_missing=True)
+            render = getattr(module, "render_persona_prompt", None) if module is not None else None
+            if not callable(render):
+                return err_response("角色卡渲染不可用：core/character_card.py 尚未就绪")
+
+            body_card = body.get("card")
+            if isinstance(body_card, dict):
+                card = self._normalize_card(body_card)
+            else:
+                soul = await self._resolve_soul(str(body.get("soul_id") or "").strip())
+                card = self._soul_card(soul)
+
+            try:
+                max_chars = int(body.get("max_chars") or 2000)
+            except (TypeError, ValueError):
+                max_chars = 2000
+            max_chars = max(200, min(20000, max_chars))
+            try:
+                prompt = render(card, max_chars=max_chars)
+            except TypeError:
+                prompt = render(card)
+            prompt_text = str(prompt or "")
+            return ok_response({"prompt": prompt_text, "chars": len(prompt_text)})
+        except Exception as e:
+            logger.warning(f"[OnlyYou] api_card_preview_prompt error: {e}")
+            return err_response(f"预览角色卡 Prompt 失败: {e}")
+
+    # ==========================================================================
+    # 8. Plugin-autonomous Four-Role Models (`models/*`)
+    # ==========================================================================
+    async def api_models_sources(self) -> dict[str, Any]:
+        """List AstrBot provider sources + TTS providers (never exposes API keys)."""
+        try:
+            await self.plugin._ensure_initialized()
+            factory = self._provider_factory()
+            sources = factory.list_sources()
+            tts_providers = factory.list_tts_providers()
+            if inspect.isawaitable(sources):
+                sources = await sources
+            if inspect.isawaitable(tts_providers):
+                tts_providers = await tts_providers
+            return ok_response(
+                {
+                    "sources": list(sources or []),
+                    "tts_providers": list(tts_providers or []),
+                }
+            )
+        except Exception as e:
+            logger.warning(f"[OnlyYou] api_models_sources error: {e}")
+            return err_response(f"获取提供商源列表失败: {e}")
+
+    async def api_models_list(self) -> dict[str, Any]:
+        """List models available under one provider source (configured + remote)."""
+        try:
+            await self.plugin._ensure_initialized()
+            source_id = self._get_query_param("source_id")
+            if not source_id:
+                return err_response("缺少提供商源 ID (source_id)")
+            factory = self._provider_factory()
+            models = await factory.list_models(source_id)
+            return ok_response({"source_id": source_id, "models": list(models or [])})
+        except Exception as e:
+            logger.warning(f"[OnlyYou] api_models_list error: {e}")
+            return err_response(f"获取模型列表失败: {e}")
+
+    async def api_models_config(self) -> dict[str, Any]:
+        """GET: read the four-role model config; POST: save it and hot-rebuild instances."""
+        try:
+            await self.plugin._ensure_initialized()
+            hub = getattr(self.plugin, "model_hub", None)
+            if hub is None:
+                return err_response("ModelHub 未初始化")
+            method = self._get_method()
+            saved: dict[str, Any] = {}
+
+            if method == "POST":
+                body = await self._get_json_body()
+                raw_cfg = body.get("model_config")
+                if not isinstance(raw_cfg, dict):
+                    # Tolerate raw config bodies: {"main": {...}, "decision": {...}, ...}
+                    if any(key in body for key in ("main", "decision", "vision", "tts")):
+                        raw_cfg = body
+                if not isinstance(raw_cfg, dict):
+                    return err_response("请求体缺少 model_config 对象")
+                saver = getattr(hub, "save_model_config", None)
+                if not callable(saver):
+                    return err_response("ModelHub 未实现 save_model_config")
+                result = await saver(raw_cfg)
+                saved = result if isinstance(result, dict) else {}
+
+            model_config = saved if saved else await self._read_model_config(hub)
+            status = await self._safe_model_status()
+            message = "模型配置已保存并热重建实例" if method == "POST" else "ok"
+            return ok_response({"model_config": model_config, "status": status}, message=message)
+        except Exception as e:
+            logger.warning(f"[OnlyYou] api_models_config error: {e}")
+            return err_response(f"读取/保存模型配置失败: {e}")
+
+    async def api_models_test(self) -> dict[str, Any]:
+        """Connectivity test for one model role; TTS additionally returns base64 audio."""
+        try:
+            await self.plugin._ensure_initialized()
+            body = await self._get_json_body()
+            role = str(body.get("role") or "main").strip().lower()
+            hub = getattr(self.plugin, "model_hub", None)
+            if hub is None:
+                return err_response("ModelHub 未初始化")
+
+            roles = getattr(hub, "ROLES", ("main", "decision", "vision", "tts"))
+            allowed = {str(item).strip().lower() for item in roles}
+            allowed.add("small")  # legacy alias of `decision`
+            if role not in allowed:
+                return err_response(f"未知模型角色: {role}（可选 main/decision/vision/tts）")
+
+            tester = getattr(hub, "test_role", None)
+            if not callable(tester):
+                return err_response("ModelHub 未实现 test_role")
+            result = await tester(role)
+            if result is None:
+                return err_response("模型测试未返回结果")
+            if isinstance(result, dict):
+                return ok_response(result, message="模型测试完成")
+            return ok_response({"result": result}, message="模型测试完成")
+        except Exception as e:
+            logger.warning(f"[OnlyYou] api_models_test error: {e}")
+            return err_response(f"模型测试失败: {e}")
+
+    # ==========================================================================
+    # 9. Session Routing (`sessions/*`)
+    # ==========================================================================
+    async def api_sessions_default_soul(self) -> dict[str, Any]:
+        """Set the plugin default soul used when a session has no explicit UMO binding."""
+        try:
+            await self.plugin._ensure_initialized()
+            body = await self._get_json_body()
+            soul_id = str(body.get("soul_id") or "").strip()
+            if not soul_id:
+                return err_response("缺少 soul_id")
+            manager = getattr(self.plugin, "soul_manager", None)
+            if manager is None:
+                return err_response("SoulManager 未初始化")
+            soul = await manager.get_soul_by_id(soul_id)
+            if soul is None:
+                return err_response(f"角色不存在: {soul_id}")
+
+            setter = getattr(manager, "set_default_soul_id", None)
+            if not callable(setter):
+                return err_response("SoulManager 未实现 set_default_soul_id")
+            await setter(soul_id)
+
+            default_soul_id = await self._safe_default_soul_id() or soul_id
+            souls = await manager.list_souls()
+            bindings = await manager.get_umo_bindings()
+            return ok_response(
+                {
+                    "default_soul_id": default_soul_id,
+                    "souls": [s.to_dict() for s in souls],
+                    "umo_bindings": bindings,
+                },
+                message=f"已将默认角色设置为 {soul_id}",
+            )
+        except Exception as e:
+            logger.warning(f"[OnlyYou] api_sessions_default_soul error: {e}")
+            return err_response(f"设置默认角色失败: {e}")

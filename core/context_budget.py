@@ -2,10 +2,12 @@
 
 import asyncio
 import math
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Coroutine, Optional
 
+from .character_card import render_persona_prompt
 from .memory_manager import MemoryManager, MemoryTier
 from .roguelite_deck import DailyScheduleRun, SlotInstance
 from .soul_manager import SoulProfile
@@ -218,6 +220,7 @@ class SessionBuffer:
 class ContextBudgetManager:
     """
     简易上下文与预算管理器 (docs/ARCHITECTURE.md Section 4.3):
+    0. 用角色卡渲染出的人格 Prompt 替换 AstrBot 原生 `# Persona Instructions` 段
     1. 完全清空平台原生历史 `req.contexts.clear()`，注入插件维护的高信噪比会话滑窗
     2. 按 `[0.40 * 关键词匹配 + 0.35 * 时间新鲜度 + 0.25 * 重要度]` 对候选记忆打分排序
     3. 硬性预算裁剪 (`max_injected_memories=6`, `max_memory_chars_budget=400`)
@@ -229,10 +232,12 @@ class ContextBudgetManager:
         memory_manager: MemoryManager,
         session_buffer: SessionBuffer,
         plugin_config: dict[str, Any],
+        soul_manager: Any = None,
     ):
         self.memory_manager = memory_manager
         self.session_buffer = session_buffer
         self.plugin_config = plugin_config
+        self.soul_manager = soul_manager
 
     @property
     def cfg(self) -> dict[str, Any]:
@@ -245,6 +250,58 @@ class ContextBudgetManager:
     @property
     def max_memory_chars_budget(self) -> int:
         return max(50, int(self.cfg.get("max_memory_chars_budget", 400)))
+
+    async def _takeover_persona(self, req: Any, soul: SoulProfile) -> None:
+        """Replace AstrBot's native Persona block with the rendered character card.
+
+        Three branches (CONTRACTS.md §3.3):
+        1. Exact match: any native Persona raw prompt was injected verbatim as
+           ``\\n# Persona Instructions\\n\\n{prompt}\\n`` -> replace that whole segment.
+        2. Regex fallback: replace from the ``# Persona Instructions`` heading up to
+           the next top-level heading (or end of the system prompt).
+        3. Not found: prepend the rendered card block to the system prompt.
+        """
+        if soul is None or not isinstance(getattr(soul, "card", None), dict):
+            return
+
+        system_prompt = getattr(req, "system_prompt", None) or ""
+        card_block = (
+            "\n# Persona Instructions\n\n"
+            + render_persona_prompt(soul.card)
+            + "\n"
+        )
+
+        # ① Exact replacement of a known native Persona segment.
+        native_prompts: list[str] = []
+        if self.soul_manager is not None:
+            try:
+                native_prompts = await self.soul_manager.list_native_prompts()
+            except Exception as e:  # noqa: BLE001 - must never break the LLM hook
+                logger.warning(f"[OnlyYou] list_native_prompts failed: {e}")
+                native_prompts = []
+        for native_prompt in native_prompts or []:
+            prompt_text = str(native_prompt or "").strip()
+            if not prompt_text:
+                continue
+            segment = f"\n# Persona Instructions\n\n{prompt_text}\n"
+            if segment in system_prompt:
+                req.system_prompt = system_prompt.replace(segment, card_block, 1)
+                return
+
+        # ② Regex fallback: consume until the next top-level heading / end.
+        new_prompt, replaced_count = re.subn(
+            r"\n# Persona Instructions\n\n.*?(?=\n# |\Z)",
+            lambda _match: card_block,
+            system_prompt,
+            count=1,
+            flags=re.S,
+        )
+        if replaced_count:
+            req.system_prompt = new_prompt
+            return
+
+        # ③ No native Persona block found -> prepend the character card.
+        req.system_prompt = card_block + system_prompt
 
     async def apply_context_and_memory_budget(
         self,
@@ -261,6 +318,14 @@ class ContextBudgetManager:
         """
         umo = getattr(event, "unified_msg_origin", "") or "default_umo"
         query_text = getattr(event, "message_str", "") or getattr(req, "prompt", "") or ""
+
+        # =====================================================================
+        # 第零步：角色卡接管 AstrBot 原生 Persona 段（必须先于三态/记忆注入）
+        # =====================================================================
+        try:
+            await self._takeover_persona(req, soul)
+        except Exception as e:  # noqa: BLE001 - never break the LLM request hook
+            logger.warning(f"[OnlyYou] Persona takeover failed: {e}")
 
         # =====================================================================
         # 第一步：完全清空平台原生历史 (req.contexts.clear())，由插件全权接管上下文！
