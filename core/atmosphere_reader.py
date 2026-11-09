@@ -125,23 +125,24 @@ class AtmosphereReader:
         event: Any,
         user: UserProfile,
         on_overflow_callback: Any = None,
-    ) -> tuple[str, bool]:
+    ) -> tuple[str, bool, Any]:
         """
         Record incoming `event` into `SessionBuffer` with reply-chain topology and user tier.
-        Returns `(reply_to, is_direct_mention)`.
+        Returns `(reply_to, is_direct_mention, buffered_message)`; the buffered message
+        reference lets the three-state gate mark this exact message as unread.
         """
         umo = getattr(event, "unified_msg_origin", "") or "default_umo"
         msg_str = getattr(event, "message_str", "") or ""
         reply_to, is_direct = self.extract_reply_topology(event)
 
-        self.session_buffer.record_user_message(
+        buffered = self.session_buffer.record_user_message(
             umo=umo,
             user=user,
             content=msg_str,
             reply_to=reply_to,
             on_overflow_callback=on_overflow_callback,
         )
-        return reply_to, is_direct
+        return reply_to, is_direct, buffered
 
     async def evaluate_should_reply(
         self,

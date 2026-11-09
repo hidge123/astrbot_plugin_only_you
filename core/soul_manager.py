@@ -16,7 +16,8 @@ Key concepts after the 2026 refactor:
 - ``generate_card`` asks the **main** model for a whole-card / single-section draft
   (never persisted); ``import_native_persona`` writes the raw native prompt into
   ``card["extra"]["native_persona_prompt"]`` and optionally asks the main model for
-  a full AI card, while action/encounter cards are generated with the **decision** model.
+  a full AI card, while the four-type action card pool is generated with the
+  **decision** model (encounter cards are no longer generated).
 """
 
 import json
@@ -31,6 +32,7 @@ from .character_card import (
     normalize_card,
 )
 from .roguelite_deck import StateEventCard
+from .state_machine import ActionType
 from ..prompts.templates import (
     CARD_AND_DECK_SEED_PROMPT,
     CHARACTER_CARD_GENERATE_PROMPT,
@@ -62,6 +64,63 @@ _DEFAULT_SURFING_PREFERENCES = [
     "游戏实况",
     "美食探店",
 ]
+
+# Valid card['rhythm']['chronotype'] values; anything else normalizes to "normal".
+_VALID_CHRONOTYPES = ("early", "normal", "night_owl")
+
+# Best-effort occupation / hobby hints used to tailor the offline fallback card pool.
+_PERSONA_KEYWORD_HINTS: tuple[str, ...] = (
+    "画师",
+    "插画",
+    "原画",
+    "设计师",
+    "程序员",
+    "代码",
+    "开发",
+    "作家",
+    "写手",
+    "小说",
+    "编辑",
+    "学生",
+    "上课",
+    "考研",
+    "读研",
+    "老师",
+    "医生",
+    "护士",
+    "药师",
+    "炼丹",
+    "修士",
+    "剑客",
+    "侠客",
+    "魔法",
+    "主播",
+    "UP主",
+    "歌手",
+    "音乐",
+    "钢琴",
+    "吉他",
+    "舞者",
+    "摄影",
+    "咖啡",
+    "店主",
+    "料理",
+    "厨师",
+    "烘焙",
+    "游戏",
+    "电竞",
+    "铲屎官",
+    "旅行",
+    "健身",
+    "跑步",
+    "追星",
+    "二次元",
+    "coser",
+    "会计",
+    "律师",
+    "记者",
+    "翻译",
+)
 
 
 def _clean_text(value: Any) -> str:
@@ -99,6 +158,30 @@ def _is_empty_value(value: Any) -> bool:
     if isinstance(value, (list, tuple, dict, set)):
         return len(value) == 0
     return False
+
+
+def _compact_title(text: Any, limit: int = 18) -> str:
+    """Return a whitespace-trimmed card title capped at ``limit`` characters."""
+    clean = _clean_text(text)
+    return clean if len(clean) <= limit else clean[:limit]
+
+
+def _extract_persona_keywords(persona_prompt: Any) -> list[str]:
+    """Best-effort extraction of occupation / hobby keywords from raw Persona text."""
+    text = _clean_text(persona_prompt)
+    if not text:
+        return []
+    hits: list[tuple[int, str]] = []
+    for keyword in _PERSONA_KEYWORD_HINTS:
+        index = text.find(keyword)
+        if index >= 0:
+            hits.append((index, keyword))
+    hits.sort(key=lambda item: item[0])
+    keywords: list[str] = []
+    for _, keyword in hits:
+        if keyword not in keywords:
+            keywords.append(keyword)
+    return keywords[:3]
 
 
 class SoulProfile:
@@ -187,6 +270,16 @@ class SoulProfile:
     def surfing_preferences(self, value: Any) -> None:
         self.card["interests"]["surfing_preferences"] = value
         self.card = normalize_card(self.card)
+
+    @property
+    def chronotype(self) -> str:
+        """Rhythm chronotype: ``early`` / ``normal`` / ``night_owl`` (read-only).
+
+        Reads ``card["rhythm"]["chronotype"]``; empty or invalid values fall back
+        to ``"normal"`` so schedule generation always has a usable curve.
+        """
+        raw = _clean_text((self.card.get("rhythm") or {}).get("chronotype")).lower()
+        return raw if raw in _VALID_CHRONOTYPES else "normal"
 
     @property
     def native_persona_prompt(self) -> str:
@@ -763,67 +856,62 @@ class SoulManager:
     @staticmethod
     def build_fallback_custom_deck(
         soul_name: str, persona_prompt: str
-    ) -> "tuple[list[StateEventCard], list[str]]":
-        """Synthesize a tailored set of 6 action cards and 3 encounter cards when LLM is offline."""
-        from .state_machine import BotState
+    ) -> list[StateEventCard]:
+        """Synthesize a tailored ~10-card action pool when the LLM is offline.
 
-        short_name = (soul_name or "小星").strip()[:10]
-        cards = [
-            StateEventCard(
-                card_id=f"evt_{int(time.time())}_1",
-                title=f"{short_name}赖在被窝里补觉充能",
-                state=BotState.RESTING,
-                valid_slots=["morning", "noon"],
-                base_weight=55,
-                armor=65,
-            ),
-            StateEventCard(
-                card_id=f"evt_{int(time.time())}_2",
-                title=f"专心处理今日正事与学习计划",
-                state=BotState.BUSY,
-                valid_slots=["forenoon", "afternoon"],
-                base_weight=65,
-                armor=70,
-            ),
-            StateEventCard(
-                card_id=f"evt_{int(time.time())}_3",
-                title=f"边吃外卖边刷手机看沙雕视频",
-                state=BotState.IDLE,
-                valid_slots=["noon", "evening"],
-                base_weight=75,
-                armor=25,
-            ),
-            StateEventCard(
-                card_id=f"evt_{int(time.time())}_4",
-                title=f"瘫在沙发上摸鱼水群找人唠嗑",
-                state=BotState.IDLE,
-                valid_slots=["afternoon", "evening"],
-                base_weight=70,
-                armor=30,
-            ),
-            StateEventCard(
-                card_id=f"evt_{int(time.time())}_5",
-                title=f"戴上耳机沉浸式赶进度",
-                state=BotState.BUSY,
-                valid_slots=["afternoon", "evening"],
-                base_weight=50,
-                armor=60,
-            ),
-            StateEventCard(
-                card_id=f"evt_{int(time.time())}_6",
-                title=f"关灯缩进被窝开启免打扰睡眠",
-                state=BotState.RESTING,
-                valid_slots=["night"],
-                base_weight=80,
-                armor=75,
-            ),
+        Covers all four action types (``BUSY_TASK`` x3 / ``SURF`` x2 /
+        ``IDLE_ROAM`` x3 / ``SLEEP`` x2: one long sleep + one nap) and never
+        produces encounter cards. Every card's ``state`` is bound to its
+        ``action_type.bound_state``.
+        """
+        short_name = _clean_text(soul_name)[:6] or "小星"
+        keywords = _extract_persona_keywords(persona_prompt)
+        focus = keywords[0] if keywords else ""
+        hobby = keywords[1] if len(keywords) > 1 else ""
+
+        if focus:
+            busy_title_1 = f"{short_name}埋头忙{focus}的活"
+            busy_title_2 = f"{short_name}专心搞{focus}相关事"
+        else:
+            busy_title_1 = f"{short_name}埋头赶手头的正事"
+            busy_title_2 = f"{short_name}专心推进今日正事"
+        surf_title_2 = (
+            f"{short_name}窝着刷{hobby}短视频"
+            if hobby
+            else f"{short_name}窝在被窝刷短视频"
+        )
+
+        # (title, action_type, min_hours, max_hours, base_weight, armor)
+        specs: list[tuple[str, ActionType, float, float, int, int]] = [
+            (busy_title_1, ActionType.BUSY_TASK, 1.0, 3.0, 60, 70),
+            (busy_title_2, ActionType.BUSY_TASK, 1.5, 3.0, 55, 65),
+            (f"{short_name}关起门来专注赶进度", ActionType.BUSY_TASK, 1.0, 2.5, 50, 60),
+            (f"{short_name}瘫沙发刷B站视频", ActionType.SURF, 0.5, 2.0, 75, 30),
+            (surf_title_2, ActionType.SURF, 1.0, 2.0, 70, 35),
+            (f"{short_name}趴着发呆放空", ActionType.IDLE_ROAM, 0.5, 2.0, 70, 30),
+            (f"{short_name}翻群记录偷偷吃瓜", ActionType.IDLE_ROAM, 1.0, 2.0, 65, 25),
+            (f"{short_name}泡杯茶悠闲摸鱼", ActionType.IDLE_ROAM, 0.5, 1.5, 60, 35),
+            (f"{short_name}戴眼罩呼呼大睡", ActionType.SLEEP, 4.0, 7.5, 80, 80),
+            (f"{short_name}趴桌上小憩一会儿", ActionType.SLEEP, 1.0, 2.0, 60, 55),
         ]
-        encounters = [
-            f"今天点外卖的时候老板居然多送了一份小食，心情瞬间起飞！",
-            f"刚才出门在路边看到一只超粘人的小猫，蹲着撸了好久才走",
-            f"今天刷到一个离谱又好笑的整活神评，差点笑出鹅叫",
-        ]
-        return cards, encounters
+
+        cards: list[StateEventCard] = []
+        for index, spec in enumerate(specs, start=1):
+            title, action_type, min_hours, max_hours, base_weight, armor = spec
+            cards.append(
+                StateEventCard(
+                    card_id=f"evt_fallback_{action_type.value.lower()}_{index}",
+                    title=_compact_title(title),
+                    state=action_type.bound_state,
+                    action_type=action_type,
+                    min_hours=min_hours,
+                    max_hours=max_hours,
+                    valid_slots=[],
+                    base_weight=base_weight,
+                    armor=armor,
+                )
+            )
+        return cards
 
     # ==================================================================
     # Native Persona import
@@ -842,8 +930,11 @@ class SoulManager:
           ``card["extra"]["native_persona_prompt"]`` (never rendered).
         - ``ai_generate_card=True``: ask the **main** model for a full card; on
           failure fall back to the basic card inferred from the raw text.
-        - ``auto_generate_cards=True``: ask the **decision** model for the action /
-          encounter deck; on failure use ``build_fallback_custom_deck``.
+        - ``auto_generate_cards=True``: ask the **decision** model for the four-type
+          action card pool (8~12 cards, no encounter cards); on failure or an empty
+          result, use ``build_fallback_custom_deck``.
+        - Encounter cards are gone from the system: imported souls always store
+          ``encounter_talk_cards = []``.
         """
         pname = _clean_text(persona_name) or DEFAULT_SOUL_ID
         soul_id = _clean_text(target_soul_id or pname) or pname
@@ -873,20 +964,21 @@ class SoulManager:
                 card["extra"]["native_persona_prompt"] = native_prompt
 
         state_cards: list[StateEventCard] = []
-        encounters: list[str] = []
 
-        if auto_generate_cards and self.model_hub is not None:
-            try:
-                prompt = CARD_AND_DECK_SEED_PROMPT.format(
-                    persona_name=pname,
-                    native_persona_prompt=native_prompt[:1500],
-                )
-                data = await self.model_hub.call_llm_json(
-                    prompt=prompt, role="decision", default=None
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"[OnlyYou] Deck seeding failed: {e}")
-                data = None
+        if auto_generate_cards:
+            data: Optional[dict[str, Any]] = None
+            if self.model_hub is not None:
+                try:
+                    prompt = CARD_AND_DECK_SEED_PROMPT.format(
+                        persona_name=pname,
+                        native_persona_prompt=native_prompt[:1500],
+                    )
+                    data = await self.model_hub.call_llm_json(
+                        prompt=prompt, role="decision", default=None
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"[OnlyYou] Deck seeding failed: {e}")
+                    data = None
 
             if isinstance(data, dict):
                 for item in data.get("state_event_cards") or []:
@@ -896,27 +988,23 @@ class SoulManager:
                         state_cards.append(StateEventCard.from_dict(item))
                     except Exception as e:  # noqa: BLE001
                         logger.warning(f"[OnlyYou] Failed to parse imported card: {e}")
-                encounters = [
-                    text
-                    for text in (_clean_text(x) for x in (data.get("encounter_talk_cards") or []))
-                    if text
-                ]
                 if not ai_generate_card:
                     card = self._fill_card_from_seed_data(card, data, pname)
 
+            # LLM offline / failure / empty deck -> deterministic tailored fallback
+            # (action cards only; encounter cards are gone from the system).
             if not state_cards:
-                fallback_cards, fallback_encounters = self.build_fallback_custom_deck(
-                    pname, native_prompt
+                state_cards = self.build_fallback_custom_deck(pname, native_prompt)
+                logger.info(
+                    f"[OnlyYou] Used {len(state_cards)} fallback action cards "
+                    f"for imported persona '{pname}'."
                 )
-                state_cards = fallback_cards
-                if not encounters:
-                    encounters = fallback_encounters
 
         profile = SoulProfile(
             soul_id=soul_id,
             card=card,
             state_event_cards=state_cards,
-            encounter_talk_cards=encounters,
+            encounter_talk_cards=[],
         )
         return await self.save_soul(profile)
 

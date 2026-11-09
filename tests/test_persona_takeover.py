@@ -195,7 +195,7 @@ class TestTakeoverOrderingAndContext(PersonaTakeoverTestBase):
         assert PERSONA_START in req.system_prompt
         # 2) takeover BEFORE the BUSY state instructions
         assert req.system_prompt.index(PERSONA_START) < req.system_prompt.index(
-            "繁忙中 (BUSY)"
+            "繁忙中 (BUSY_TASK)"
         )
         # 3) contexts cleared + plugin sliding window injected, current prompt excluded
         assert "old-native-1" not in req.contexts
@@ -239,7 +239,7 @@ class TestTakeoverOrderingAndContext(PersonaTakeoverTestBase):
             run=make_run(),
             current_slot=current_slot,
         )
-        assert "空闲中 (IDLE)" in req.system_prompt
+        assert "空闲中 (" in req.system_prompt
         assert "当前三态控制器" in req.system_prompt
 
 

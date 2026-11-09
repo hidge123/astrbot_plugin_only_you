@@ -4,14 +4,9 @@
     "type": "object",
     "items": {
       "enable_roguelite_schedule": {
-        "description": "开启每日 Roguelite 随机日程构筑（自动排布 休息中/繁忙中/空闲中 三态与今日奇遇卡）",
+        "description": "开启每日 Roguelite 随机日程构筑（按角色作息曲线把四类行动卡拼成 0~24h 动态弹性时间轴）",
         "type": "bool",
         "default": true
-      },
-      "daily_encounter_count": {
-        "description": "每日随机抽取的【奇遇谈资卡】数量（作为当天短时记忆增加主动聊天话题）",
-        "type": "int",
-        "default": 2
       },
       "max_mutations_per_day": {
         "description": "每日日程最大微调次数上限（根据收到的消息或刷到的视频临时改变状态的次数上限）",
@@ -23,10 +18,45 @@
         "type": "int",
         "default": 120
       },
+      "idle_roam_cooldown_minutes": {
+        "description": "【空闲闲逛 IDLE_ROAM】翻群吃瓜 / 记忆联想主动搭话的冷却时间（分钟，避免频繁骚扰用户）",
+        "type": "int",
+        "default": 45
+      },
       "allow_l3_wake_from_resting": {
         "description": "允许 ★L3核心用户 在【休息中】状态下通过私聊唤醒 Bot",
         "type": "bool",
         "default": true
+      },
+      "unread_private_reply_enabled": {
+        "description": "【未读消息】私聊未读主动补回开关：IDLE 空闲时对休息/繁忙期间错过的私聊消息主动补发一条自然回复",
+        "type": "bool",
+        "default": true
+      },
+      "unread_group_ttl_minutes": {
+        "description": "【未读消息】群聊未读消息的有效期（分钟）：超过后不再翻群吃瓜，避免翻隔夜旧瓜",
+        "type": "int",
+        "default": 120
+      },
+      "unread_private_ttl_minutes": {
+        "description": "【未读消息】私聊未读消息的有效期（分钟）：醒来/忙完后仍会补回的时限（默认 12 小时）",
+        "type": "int",
+        "default": 720
+      },
+      "unread_max_per_chat": {
+        "description": "【未读消息】单个群/私聊会话最多保留的未读消息条数（超出丢弃最旧）",
+        "type": "int",
+        "default": 20
+      },
+      "unread_group_cooldown_minutes": {
+        "description": "【未读消息】同一个群的翻群吃瓜冷却（分钟），防止反复翻同一个群",
+        "type": "int",
+        "default": 60
+      },
+      "unread_private_cooldown_minutes": {
+        "description": "【未读消息】同一个私聊会话主动补回的冷却（分钟），防止连续补发",
+        "type": "int",
+        "default": 60
       }
     }
   },

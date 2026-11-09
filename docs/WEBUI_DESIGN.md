@@ -1,10 +1,10 @@
-# OnlyYou (只有你) —— Plugin Pages 控制台设计方案 (v2.4)
+# OnlyYou (只有你) —— Plugin Pages 控制台设计方案 (v2.5)
 
 | 文档版本 | 适用机制 | 页面入口路径 | 通信桥接对象 |
 | :--- | :--- | :--- | :--- |
-| v2.4 | AstrBot Plugin Pages (`views/`) | `views/console/index.html` | `window.AstrBotPluginPage`（兼容 `window.AstrBotPluginView`）+ `context.register_web_api` |
+| v2.5 | AstrBot Plugin Pages (`views/`) | `views/console/index.html` | `window.AstrBotPluginPage`（兼容 `window.AstrBotPluginView`）+ `context.register_web_api` |
 
-> 本文档描述 v2.4 重构后的最终控制台设计：**48px 顶栏 + 216px 侧栏 + 8 个页面**的冷静极简风格（灰白 + 青绿），以及基于 `core/web_api.py` 的 27 条 RESTful 路由契约。
+> 本文档描述 v2.5 的控制台设计：**48px 顶栏 + 216px 侧栏 + 8 个页面**的冷静极简风格（灰白 + 青绿），页面围绕 **24h 动态弹性时间轴 / 四类行动卡编辑器 / 繁忙进度条与今日繁忙成果** 组织，以及基于 `core/web_api.py` 的 27 条 RESTful 路由契约。
 
 ---
 
@@ -13,7 +13,7 @@
 AstrBot 默认的 `_conf_schema.json` 只适合静态、扁平的基础键值对配置；而 **OnlyYou (`astrbot_plugin_only_you`)** 的核心数据是动态演化的角色生命体数据，且模型选择需要「提供商源 + 模型名」两级联动，静态表单无法承载：
 
 1. **详细角色卡（10 分区 × 39 字段）**：需要按 schema 动态生成表单，支持标签输入、对话对编辑、AI 整卡生成 / 单分区补全、Prompt 预览。
-2. **Roguelite 行动卡与奇遇卡池**：每个角色拥有数十张三态行动卡，需要卡片网格编辑与 AI 生成。
+2. **角色专属四类行动卡池**：每个角色拥有 8~12 张 `SLEEP` / `SURF` / `IDLE_ROAM` / `BUSY_TASK` 行动卡（含 `min_hours ~ max_hours` 时长区间），需要卡片网格编辑与 AI 生成；不再有奇遇卡池。
 3. **今日三态日程实况**：需要 24 小时时间轴、当前时段进度、护甲环形表与手动切换状态。
 4. **四角色模型配置**：需要选择 AstrBot 提供商源、拉取模型名、测试连通性、试听 TTS——这些都需要联网交互，不能写死为配置项。
 5. **三级关系 / 分级记忆 / 冲浪视频池**：需要看板、拖拽、搜索、提炼与 GC 等交互式管理。
@@ -129,16 +129,16 @@ AstrBot 默认的 `_conf_schema.json` 只适合静态、扁平的基础键值对
 
 替代原「顶部状态条」，一屏看清当前运行态：
 
-1. **状态主卡**：左侧 SVG 环形表（`OYCharts.ringGauge`）展示护甲 `0–100`，颜色随三态变化；中间显示状态名 + 当前活动标题；下方是「本时段剩余时间」进度条；右侧预告下一时段（名称、起止时间、状态色）。
-2. **24 小时日程轴**（`OYCharts.scheduleAxis`）：6 个时段按时长画成色块，带「现在」指针；**点击任意时段**弹出状态切换弹窗（三态分段按钮 + 标题输入 + 护甲滑条），提交 `schedule/force_state`。
-3. **统计小卡**：今日基调卡（标题 / 描述）、微调配额（`OYCharts.dots` 的 ●●○ + 冷却倒计时）、奇遇谈资卡（已聊 / 未聊）、关系环形图（L1/L2/L3，`OYCharts.donut`）、记忆分级条形图（`OYCharts.bars`）、模型健康指示灯（四角色状态）。模型未配置时指示灯变红并跳转「模型」页。
+1. **状态主卡**：左侧 SVG 环形表（`OYCharts.ringGauge`）展示护甲 `0–100`，颜色随三态变化；中间显示状态名 + 行动卡类型标签（`SLEEP / SURF / IDLE_ROAM / BUSY_TASK`）+ 当前活动标题；下方是「当前时间块完成进度条 (`0% -> 100%`)」（当处于 `BUSY_TASK` 繁忙卡时直观展示当前主业推进百分比，完成后结算为一条 Tier 1 短时记忆）；右侧预告下一时间块（名称、起止时间、状态色）。
+2. **24 小时动态积木日程轴**（`OYCharts.scheduleAxis`）：按当日随机拼接生成的 7~11 个可变时长 `ScheduleBlock`（`start_hour ~ end_hour`）等比例画成弹性色块，带「现在」指针；**点击任意时间块**弹出状态切换弹窗（三态/行动类型选择 + 标题输入 + 护甲滑条），提交 `schedule/force_state`。
+3. **统计小卡**：今日基调卡（标题 / 描述 + 当前角色作息类型 `chronotype`）、微调配额（`OYCharts.dots` 的 ●●○ + 冷却倒计时）、今日繁忙完成结果（由 `BUSY_TASK` 走完 100% 或被打断时随机结算生成的 Tier 1 记忆列表）、关系环形图（L1/L2/L3，`OYCharts.donut`）、记忆分级条形图（`OYCharts.bars`）、模型健康指示灯（四角色状态）。模型未配置时指示灯变红并跳转「模型」页。
 
 ### 3.2 日程（`page-schedule.js`）
 
-1. **上方 24 小时时间轴**：同概览的 `scheduleAxis`，点击时段打开右侧抽屉编辑：三态分段按钮、事件标题、护甲滑条、生效槽位，保存走 `schedule/force_state`。
-2. **下方行动卡网格**：左侧 3px 边框颜色表示绑定状态，卡名 + 迷你护甲条 + 抽中权重；6 个时段用 6 个小圆点标记。顶部三态筛选分段控件（全部 / 空闲 / 繁忙 / 休息）。
-3. **操作**：重抽今日日程（`schedule/reroll`）、新建 / 编辑 / 删除行动卡与奇遇卡（`cards/save` / `cards/delete`）、AI 生成一批新卡（`cards/ai_generate`，调用决策模型）。
-4. 卡片编辑器字段：`title`、`state`（RESTING / BUSY / IDLE）、`valid_slots`（6 个时段多选）、`armor`（0–100）、`base_weight`（1–100）、`scope`（当前角色 / 全局）。
+1. **上方 24 小时动态时间轴**：同概览的 `scheduleAxis`，展示由角色作息类型（`early / normal / night_owl`）与角色专属四类行动卡池动态拼接而成的 24h 时间块序列；若某 `BUSY_TASK` 块已走完 `100%`，悬浮提示展示其结算生成的一句话随机完成结果记忆；点击时间块打开右侧抽屉编辑并保存走 `schedule/force_state`。
+2. **下方四类行动卡网格（已移除冗余奇遇卡面板）**：左侧 3px 边框颜色表示绑定状态（`IDLE` 青绿 / `BUSY` 琥珀 / `RESTING` 靛蓝），卡片展示行动类型徽章（`SLEEP 睡觉` / `SURF 冲浪` / `IDLE_ROAM 闲逛` / `BUSY_TASK 繁忙主业`）、卡名、时长范围胶囊（如 `1.5h ~ 3.0h`）、迷你护甲条与抽中权重。顶部筛选分段控件支持按三态或四类行动类型筛选。
+3. **操作**：重抽今日 24h 动态日程（`schedule/reroll`）、新建 / 编辑 / 删除专属行动卡（`cards/save` / `cards/delete`）、AI 生成一批贴合角色设定的四类新卡（`cards/ai_generate`，调用决策模型生成 8~12 张专属行动卡）。
+4. 卡片编辑器字段：`title`、`action_type`（`SLEEP / SURF / IDLE_ROAM / BUSY_TASK`，自动联动绑定 `state`）、`min_hours` & `max_hours`（`0.5h ~ 8.0h` 动态时长区间）、`armor`（`0–100`）、`base_weight`（`1–100`）、`scope`（当前角色 / 全局）。
 
 ### 3.3 角色卡（`page-character.js`）
 
@@ -284,22 +284,22 @@ window.OY_PAGES["overview"] = {
 
 前端 `apiGet/apiPost` 已自动解包；`status="error"` 时 `data` 通常为空、`message` 为错误原因。
 
-### 5.1 现有 17 条路由（v2.4 保留兼容）
+### 5.1 现有 17 条路由（v2.5 保留兼容）
 
 | # | 路由（前缀后） | 方法 | 入参 | `data` 返回 |
 | :--- | :--- | :--- | :--- | :--- |
-| 1 | `init_summary` | GET | - | `{ souls, native_personas, umo_bindings, known_umos, active_soul_id, active_schedule, default_soul_id, model_status, slot_definitions }`；`souls` 每项为 `SoulProfile.to_dict()`（含 `card` 与旧扁平字段），`model_status` 为四角色状态（`main/decision/vision/tts`） |
+| 1 | `init_summary` | GET | - | `{ souls, native_personas, umo_bindings, known_umos, active_soul_id, active_schedule, default_soul_id, model_status, action_types }`；`souls` 每项为 `SoulProfile.to_dict()`（含 `card` 与旧扁平字段），`model_status` 为四角色状态（`main/decision/vision/tts`），`action_types` 为四类行动定义 |
 | 2 | `souls/detail` | GET | `?soul_id=` | `{ soul, card_schema, schedule, umo_bindings, known_umos }` |
 | 3 | `souls/import_persona` | POST | `{ persona_name, target_soul_id?, auto_generate_cards?, ai_generate_card?, native_prompt? }` | `{ soul, schedule, souls }` |
 | 4 | `souls/save` | POST | `{ soul_id, card?, umo_binding? }`（也兼容旧扁平字段） | `{ soul, souls, umo_bindings, known_umos }` |
 | 5 | `souls/rename` | POST | `{ old_soul_id, new_soul_id }` | `{ soul, souls, schedule }`，级联更新关联表 |
 | 6 | `souls/delete` | POST | `{ soul_id }` | `{ deleted_soul_id, souls, active_soul_id }` |
-| 7 | `schedule/reroll` | POST | `{ soul_id? }` | `{ schedule }`（`run/current_slot/next_slot/配额与冷却`） |
-| 8 | `schedule/force_state` | POST | `{ soul_id?, slot_key?, new_state(RESTING/BUSY/IDLE), new_title?, armor? }` | `{ updated_slot, schedule }` |
-| 9 | `cards/list` | GET | `?soul_id=` | `{ soul_id, custom_cards, general_cards, custom_encounters, general_encounters, slot_definitions }` |
-| 10 | `cards/save` | POST | `{ soul_id?, card_type:"action"\|"encounter", scope:"soul"\|"global", card?, content?, old_content? }` | 同 `cards/list` 的卡片池结构 |
-| 11 | `cards/delete` | POST | `{ soul_id?, card_type, scope, card_id? \| content? }` | 同 `cards/list` 的卡片池结构 |
-| 12 | `cards/ai_generate` | POST | `{ soul_id?, auto_save? }` | 卡片池结构 + `{ generated_cards, generated_encounters }`（决策模型生成） |
+| 7 | `schedule/reroll` | POST | `{ soul_id? }` | `{ schedule }`（`run/current_slot/next_slot/chronotype/busy_results/配额与冷却`；重新随机拼接 24h 动态时间轴） |
+| 8 | `schedule/force_state` | POST | `{ soul_id?, slot_key?, action_type?(SLEEP/SURF/IDLE_ROAM/BUSY_TASK), new_state?(RESTING/BUSY/IDLE，兼容旧入参), new_title?, armor? }` | `{ updated_slot, schedule }`；`action_type` 优先并自动绑定 state |
+| 9 | `cards/list` | GET | `?soul_id=` | `{ soul_id, custom_cards, general_cards, action_types, chronotype }`；卡片含 `action_type/min_hours/max_hours/armor/base_weight` |
+| 10 | `cards/save` | POST | `{ soul_id?, card_type:"action", scope:"soul"\|"global", card }`（card 含 `action_type/min_hours/max_hours`；encounter 类型已移除并返回错误） | 同 `cards/list` 的卡片池结构 |
+| 11 | `cards/delete` | POST | `{ soul_id?, card_type:"action", scope, card_id }` | 同 `cards/list` 的卡片池结构 |
+| 12 | `cards/ai_generate` | POST | `{ soul_id?, auto_save? }` | 卡片池结构 + `{ generated_cards }`（决策模型生成 8~12 张四类专属行动卡） |
 | 13 | `users/list` | GET | `?tier=1\|2\|3` | `{ users, counts }`；`users` 每项含 `global_uid/display_name/nickname/tier/affinity/platform_ids` 等 |
 | 14 | `users/update` | POST | `{ action:"update"\|"merge"\|"delete", global_uid?, tier?, affinity?, display_name?, nickname?, platform_ids?, primary_uid?, secondary_uid? }` | update：`{ user, users }`；merge：`{ merged_user, users }`；delete：`{ users }` |
 | 15 | `memories/list` | GET | `?soul_id&memory_tier=1\|2\|3&user_id&keyword` | `{ memories, stats }`；`stats` 含 `tier3_count/tier2_count/tier1_count/total` 与上下文预算参数 |
@@ -310,7 +310,7 @@ window.OY_PAGES["overview"] = {
 
 | # | 路由（前缀后） | 方法 | 入参 | `data` 返回 |
 | :--- | :--- | :--- | :--- | :--- |
-| 18 | `dashboard/overview` | GET | `?soul_id=` | `{ soul, vigor, state, schedule, quota, encounters, counts, models }`（见下） |
+| 18 | `dashboard/overview` | GET | `?soul_id=` | `{ soul, vigor, state, schedule, quota, encounters(空数组兼容), busy_results, counts, models }`（见下；进入前会惰性结算已结束繁忙块） |
 | 19 | `card/schema` | GET | `?soul_id=` | `{ schema: CARD_SCHEMA, card, soul_id }` |
 | 20 | `card/save` | POST | `{ soul_id, card }` | `{ soul, souls }`（`normalize_card` 归一化后持久化） |
 | 21 | `card/ai_generate` | POST | `{ soul_id?, seed_text?, section? }` | `{ draft_card, section }`（**不落库**；整卡或单分区草稿） |
@@ -326,14 +326,21 @@ window.OY_PAGES["overview"] = {
 ```json
 {
   "soul": {"soul_id": "", "name": "", "avatar": "", "tagline": ""},
-  "vigor": {"title": "", "desc": ""},
+  "vigor": {"title": "", "desc": "", "chronotype": "night_owl"},
   "state": {"state": "IDLE", "label": "", "title": "", "armor": 30, "slot_key": "",
-            "start_hour": 12, "end_hour": 14, "remaining_seconds": 1234,
-            "progress": 0.42, "mutated": false, "next_slot": {}},
-  "schedule": {"run": {}, "current_slot": {}, "next_slot": {},
-               "max_mutations_per_day": 2, "mutation_cooldown_minutes": 120},
+            "action_type": "BUSY_TASK", "action_type_label": "繁忙主业",
+            "start_hour": 12.5, "end_hour": 14.0, "remaining_seconds": 1234,
+            "progress": 0.42, "progress_pct": 42, "completion_result": "",
+            "busy_settled": false, "mutated": false, "next_slot": {}},
+  "schedule": {"run": {"slots": [{"start_hour": 0.0, "end_hour": 7.5, "action_type": "SLEEP", "progress_pct": 100}]},
+               "current_slot": {}, "next_slot": {}, "chronotype": "night_owl",
+               "busy_results": [], "max_mutations_per_day": 2, "mutation_cooldown_minutes": 120},
   "quota": {"used": 1, "max": 2, "remaining": 1, "cooldown_remaining_seconds": 0},
-  "encounters": [{"content": "", "used": false}],
+  "encounters": [],
+  "busy_results": [{"slot_key": "block_2", "title": "在丹房炼制回春丹",
+                     "completion_result": "回春丹炼成了，最后一炉差点炸炉",
+                     "progress_pct": 100, "start_hour": 9.0, "end_hour": 12.0,
+                     "start_time": "09:00", "end_time": "12:00"}],
   "counts": {"relations": {"l1": 0, "l2": 0, "l3": 0, "total": 0},
              "memories": {"tier1": 0, "tier2": 0, "tier3": 0, "total": 0},
              "videos": 0},

@@ -11,7 +11,7 @@ from .character_card import render_persona_prompt
 from .memory_manager import MemoryManager, MemoryTier
 from .roguelite_deck import DailyScheduleRun, SlotInstance
 from .soul_manager import SoulProfile
-from .state_machine import BotState
+from .state_machine import ActionType, BotState
 from .user_relation import UserProfile
 from ..prompts.templates import (
     BUSY_STATE_INJECTION_PROMPT,
@@ -39,6 +39,11 @@ class BufferedMessage:
     reply_to: str = ""
     is_proactive: bool = False
     timestamp: float = 0.0
+    # Monotonic per-SessionBuffer sequence number (used by the unread backlog to
+    # avoid same-second timestamp collisions).
+    seq: int = 0
+    # Whether this message arrived in a private chat (used by the unread backlog).
+    is_private: bool = False
 
     def format_for_llm(self) -> dict[str, str]:
         """Format into an OpenAI-compatible `{role, content}` context entry."""
@@ -71,10 +76,48 @@ class SessionBuffer:
         self._windows: dict[str, list[BufferedMessage]] = {}
         self._evicted_buffers: dict[str, list[BufferedMessage]] = {}
         self._watched_videos: list[str] = []
+        # ---- unread backlog (independent of the 15-message sliding window) ----
+        # "Unread" == messages the bot could not handle because the three-state
+        # gate blocked them (RESTING: everything / BUSY: L1). Messages that passed
+        # the gate but were judged "ignore" by the atmosphere model are read.
+        self._unread: dict[str, list[BufferedMessage]] = {}
+        self._unread_kind: dict[str, bool] = {}
+        self._seq_counter: int = 0
 
     @property
     def cfg(self) -> dict[str, Any]:
         return self.plugin_config.get("memory_and_context_config", {}) or {}
+
+    @property
+    def roguelite_cfg(self) -> dict[str, Any]:
+        return self.plugin_config.get("roguelite_schedule_config", {}) or {}
+
+    @property
+    def unread_group_ttl_seconds(self) -> float:
+        """Unread group messages older than this are dropped (default 2h)."""
+        try:
+            minutes = int(self.roguelite_cfg.get("unread_group_ttl_minutes", 120))
+        except (TypeError, ValueError):
+            minutes = 120
+        return max(60, minutes) * 60.0
+
+    @property
+    def unread_private_ttl_seconds(self) -> float:
+        """Unread private messages older than this are dropped (default 12h)."""
+        try:
+            minutes = int(self.roguelite_cfg.get("unread_private_ttl_minutes", 720))
+        except (TypeError, ValueError):
+            minutes = 720
+        return max(60, minutes) * 60.0
+
+    @property
+    def unread_max_per_chat(self) -> int:
+        """Per-session unread backlog cap (oldest dropped when exceeded)."""
+        try:
+            count = int(self.roguelite_cfg.get("unread_max_per_chat", 20))
+        except (TypeError, ValueError):
+            count = 20
+        return max(1, count)
 
     @property
     def sliding_window_size(self) -> int:
@@ -93,10 +136,14 @@ class SessionBuffer:
         on_overflow_callback: Optional[
             Callable[[str, str], Coroutine[Any, Any, Any]]
         ] = None,
-    ) -> None:
-        """Record an incoming user message into the sliding window."""
+    ) -> Optional[BufferedMessage]:
+        """Record an incoming user message into the sliding window.
+
+        Returns the created :class:`BufferedMessage` so callers (e.g. the gate)
+        can mark that exact message as unread later.
+        """
         if not umo or not (content or "").strip():
-            return
+            return None
         msg = BufferedMessage(
             role="user",
             sender_id=user.global_uid,
@@ -107,8 +154,150 @@ class SessionBuffer:
             reply_to=reply_to,
             is_proactive=False,
             timestamp=time.time(),
+            seq=self._next_seq(),
         )
         self._append_and_trim(umo, msg, on_overflow_callback)
+        return msg
+
+    def _next_seq(self) -> int:
+        self._seq_counter += 1
+        return self._seq_counter
+
+    # ==================================================================
+    # Unread backlog (gate-blocked messages)
+    # ==================================================================
+    def mark_unread(
+        self, umo: str, message: Optional[BufferedMessage], is_private: bool = False
+    ) -> None:
+        """Add a gate-blocked user message to the unread backlog of ``umo``."""
+        if not umo or message is None or message.role != "user":
+            return
+        if not message.seq:
+            message.seq = self._next_seq()
+        message.is_private = bool(is_private)
+        self._unread_kind[umo] = bool(is_private)
+        bucket = self._unread.setdefault(umo, [])
+        if any(item.seq == message.seq for item in bucket):
+            return
+        bucket.append(message)
+        cap = self.unread_max_per_chat
+        if len(bucket) > cap:
+            del bucket[: len(bucket) - cap]
+
+    def _prune_unread(self, now: Optional[float] = None) -> None:
+        """Drop expired unread messages (TTL is per group / private)."""
+        now = time.time() if now is None else now
+        for umo in list(self._unread.keys()):
+            is_private = self._unread_kind.get(umo, False)
+            ttl = (
+                self.unread_private_ttl_seconds
+                if is_private
+                else self.unread_group_ttl_seconds
+            )
+            fresh = [
+                message
+                for message in self._unread.get(umo, [])
+                if (now - float(message.timestamp or 0.0)) <= ttl
+            ]
+            if fresh:
+                self._unread[umo] = fresh
+            else:
+                self._unread.pop(umo, None)
+                self._unread_kind.pop(umo, None)
+
+    def get_unread_batch(
+        self, umo: str, limit: Optional[int] = None
+    ) -> list[BufferedMessage]:
+        """Return a copy of the unread backlog for ``umo`` (oldest first)."""
+        self._prune_unread()
+        batch = list(self._unread.get(umo, []))
+        if limit is not None and limit > 0:
+            batch = batch[-limit:]
+        return batch
+
+    def get_unread_total(self) -> int:
+        self._prune_unread()
+        return sum(len(batch) for batch in self._unread.values())
+
+    def get_unread_count(self, is_private: Optional[bool] = None) -> int:
+        """Count unread messages, optionally filtered by group/private kind."""
+        self._prune_unread()
+        if is_private is None:
+            return sum(len(batch) for batch in self._unread.values())
+        return sum(
+            len(batch)
+            for umo, batch in self._unread.items()
+            if bool(self._unread_kind.get(umo, False)) == bool(is_private)
+        )
+
+    def list_unread_chats(
+        self, *, private: bool, limit: int = 20
+    ) -> list[tuple[str, list[BufferedMessage]]]:
+        """List sessions of one kind with a non-empty unread backlog.
+
+        Sorted by unread count (desc) then latest message (desc), so the busiest /
+        freshest conversations are consumed first.
+        """
+        self._prune_unread()
+        now = time.time()
+        result: list[tuple[str, list[BufferedMessage]]] = []
+        for umo, batch in self._unread.items():
+            if bool(self._unread_kind.get(umo, False)) != bool(private):
+                continue
+            if not batch:
+                continue
+            result.append((umo, list(batch)))
+        result.sort(
+            key=lambda item: (
+                -len(item[1]),
+                -max(float(m.timestamp or 0.0) for m in item[1]),
+            )
+        )
+        _ = now
+        return result[: max(1, int(limit))]
+
+    def ack_unread(self, umo: str, seqs: Optional[list[int]] = None) -> int:
+        """Mark unread messages of ``umo`` as consumed (remove them from the backlog)."""
+        bucket = self._unread.get(umo)
+        if not bucket:
+            return 0
+        if seqs is None:
+            removed = len(bucket)
+            self._unread.pop(umo, None)
+            self._unread_kind.pop(umo, None)
+            return removed
+        seq_set = {int(seq) for seq in seqs}
+        remaining = [message for message in bucket if message.seq not in seq_set]
+        removed = len(bucket) - len(remaining)
+        if remaining:
+            self._unread[umo] = remaining
+        else:
+            self._unread.pop(umo, None)
+            self._unread_kind.pop(umo, None)
+        return removed
+
+    def clear_unread(self, umo: Optional[str] = None) -> int:
+        """Clear the unread backlog for one session (or all sessions)."""
+        if umo:
+            return self.ack_unread(umo)
+        removed = sum(len(batch) for batch in self._unread.values())
+        self._unread.clear()
+        self._unread_kind.clear()
+        return removed
+
+    @staticmethod
+    def format_unread_batch(batch: list[BufferedMessage], max_chars: int = 800) -> str:
+        """Render an unread batch as a compact transcript snippet."""
+        lines: list[str] = []
+        used = 0
+        for message in batch:
+            line = message.format_for_transcript()
+            if used + len(line) > max_chars:
+                lines.append("……（更早的未读消息已省略）")
+                break
+            lines.append(line)
+            used += len(line)
+        return "\n".join(lines) if lines else "（无未读消息）"
 
     def record_assistant_message(
         self,
@@ -204,6 +393,27 @@ class SessionBuffer:
             if m.role == "user" and m.user_tier >= 2 and (now - m.timestamp) <= window_seconds
         )
 
+    def get_recent_user_message_ts(
+        self, umo: str, window_seconds: float = 7200.0
+    ) -> float:
+        """Return the timestamp of the latest user message in `umo`.
+
+        Returns ``0.0`` when the window has no user message or the latest one is
+        older than ``window_seconds`` (default 2h). Used by the IDLE_ROAM
+        ``GROUP_LURK`` branch to decide whether a known group is worth lurking.
+        """
+        if not umo:
+            return 0.0
+        now = time.time()
+        win = self._windows.get(umo, [])
+        for message in reversed(win):
+            if message.role != "user":
+                continue
+            if (now - float(message.timestamp or 0.0)) > window_seconds:
+                return 0.0
+            return float(message.timestamp or 0.0)
+        return 0.0
+
     def record_watched_video(self, summary: str) -> None:
         """Record a recently watched Bilibili/Douyin video for IDLE prompt injection."""
         if summary:
@@ -224,7 +434,7 @@ class ContextBudgetManager:
     1. 完全清空平台原生历史 `req.contexts.clear()`，注入插件维护的高信噪比会话滑窗
     2. 按 `[0.40 * 关键词匹配 + 0.35 * 时间新鲜度 + 0.25 * 重要度]` 对候选记忆打分排序
     3. 硬性预算裁剪 (`max_injected_memories=6`, `max_memory_chars_budget=400`)
-    4. 注入当前三态控制指令（BUSY 简短抽空回复 / IDLE 奇遇谈资与视频分享）与记忆块
+    4. 注入当前行动卡控制指令（BUSY_TASK 实时进度 / IDLE 今日繁忙成果与视频分享）与记忆块
     """
 
     def __init__(
@@ -302,6 +512,37 @@ class ContextBudgetManager:
 
         # ③ No native Persona block found -> prepend the character card.
         req.system_prompt = card_block + system_prompt
+
+    @staticmethod
+    def _render_short_term_talk_text(run: DailyScheduleRun) -> str:
+        """Render today's settled BUSY_TASK completion results for the IDLE prompt.
+
+        Most recent 3 results, one per line as ``- {title}：{completion_result}``;
+        falls back to ``（今天还没忙完什么事）`` when nothing has been settled yet.
+        """
+        lines: list[str] = []
+        try:
+            slots = list(getattr(run, "slots", None) or [])
+            for slot in reversed(slots):
+                action = ActionType.coerce(
+                    getattr(slot, "action_type", None), None
+                )
+                if action != ActionType.BUSY_TASK:
+                    continue
+                if not getattr(slot, "busy_settled", False):
+                    continue
+                completion = str(getattr(slot, "completion_result", "") or "").strip()
+                if not completion:
+                    continue
+                title = str(getattr(slot, "title", "") or "").strip() or "繁忙事项"
+                lines.append(f"- {title}：{completion}")
+                if len(lines) >= 3:
+                    break
+        except Exception:  # noqa: BLE001 - a malformed run must never break the LLM hook
+            return "（今天还没忙完什么事）"
+        if not lines:
+            return "（今天还没忙完什么事）"
+        return "\n   ".join(lines)
 
     async def apply_context_and_memory_budget(
         self,
@@ -404,29 +645,54 @@ class ContextBudgetManager:
             await self.memory_manager.reinforce_memories(recalled_ids)
 
         # =====================================================================
-        # 第四步：注入当前三态行为约束 + 变卦内心独白 + 精简记忆块到 System Prompt
+        # 第四步：注入当前行动卡约束（BUSY_TASK 实时进度 / IDLE 繁忙成果与视频）
+        #        + 变卦内心独白 + 精简记忆块到 System Prompt
         # =====================================================================
         additions: list[str] = []
 
-        if current_slot.state == BotState.BUSY:
+        action_type = ActionType.coerce(
+            getattr(current_slot, "action_type", None), None
+        )
+        if action_type is None:
+            # Legacy slot data (no action_type): derive from the bound state.
+            if current_slot.state == BotState.BUSY:
+                action_type = ActionType.BUSY_TASK
+            elif current_slot.state == BotState.RESTING:
+                action_type = ActionType.SLEEP
+            else:
+                action_type = ActionType.IDLE_ROAM
+        if action_type is not None:
+            action_label = action_type.label
+        else:  # pragma: no cover - defensive
+            action_label = current_slot.state.value
+
+        try:
+            progress_pct = int(current_slot.get_progress_pct())
+        except Exception:  # noqa: BLE001 - legacy slot without the helper
+            progress_pct = 0
+        try:
+            start_time, end_time = current_slot.format_time_range().split("-")
+        except Exception:  # noqa: BLE001 - legacy slot without the helper
+            start_time, end_time = "", ""
+
+        if current_slot.state == BotState.BUSY or action_type == ActionType.BUSY_TASK:
             additions.append(
                 BUSY_STATE_INJECTION_PROMPT.format(
                     current_slot_title=current_slot.title,
+                    progress_pct=progress_pct,
+                    start_time=start_time,
+                    end_time=end_time,
                     user_tier_name=user.tier.label,
                     sender_name=user.display_name,
                 )
             )
         elif current_slot.state == BotState.IDLE:
-            unused_encounters = [e for e in run.encounters if not e.used]
-            if unused_encounters:
-                enc_text = "\n   ".join(f"- {e.content}" for e in unused_encounters)
-            else:
-                enc_text = "（今日奇遇话题已聊完）"
-
             additions.append(
                 IDLE_STATE_INJECTION_PROMPT.format(
+                    action_type=action_label,
                     current_slot_title=current_slot.title,
-                    unused_encounter_cards_text=enc_text,
+                    progress_pct=progress_pct,
+                    short_term_talk_text=self._render_short_term_talk_text(run),
                     recent_watched_video_text=self.session_buffer.get_recent_watched_video_text(),
                 )
             )
@@ -451,4 +717,6 @@ class ContextBudgetManager:
             "window_count": len(session_window_msgs),
             "recalled_ids": recalled_ids,
             "injected_chars": current_chars,
+            "progress_pct": progress_pct,
+            "action_type": action_type.value if action_type is not None else "",
         }

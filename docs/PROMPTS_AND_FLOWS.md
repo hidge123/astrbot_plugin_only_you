@@ -1,29 +1,29 @@
-# OnlyYou (只有你) —— 核心 Prompt 工程与交互时序设计 (v2.4)
+# OnlyYou (只有你) —— 核心 Prompt 工程与交互时序设计 (v2.5)
 
-> 本文档定义 `astrbot_plugin_only_you` v2.4 的核心提示词模板，围绕 **三种基础状态（休息中 `RESTING` / 繁忙中 `BUSY` / 空闲中 `IDLE`）**、**两大具体行为（回发消息 / 刷视频）**、**Roguelite 随机日程与奇遇谈资卡**、**根据消息/视频输入受限微调日程**、**详细角色卡（10 分区 × 39 字段）的 AI 生成 / 分区补全**，以及 **角色卡接管 Persona 段与插件自治 TTS 的时序** 构建。文中的“决策模型”对应 `ModelHub` 的 `decision` 角色（读空气 / 记忆提炼 / 日程微调 / 造卡）。
+> 本文档定义 `astrbot_plugin_only_you` v2.5 的核心提示词模板，围绕 **三种基础状态（休息中 `RESTING` / 繁忙中 `BUSY` / 空闲中 `IDLE`）× 四类可执行行动卡（`SLEEP` / `SURF` / `IDLE_ROAM` / `BUSY_TASK`）**、**24h 动态弹性时间轴与繁忙完成结果短时记忆**、**根据消息/视频输入的时间块切分 / 延展微调**、**详细角色卡（10 分区 × 39 字段）的 AI 生成 / 分区补全**，以及 **角色卡接管 Persona 段与插件自治 TTS 的时序** 构建。文中的“决策模型”对应 `ModelHub` 的 `decision` 角色（读空气 / 记忆提炼 / 日程微调 / 造卡 / 繁忙结果与 IDLE_ROAM 搭话）。
 
 ---
 
 ## 一、 角色卡与人设专属 Roguelite 卡池生成 Prompt
 
-### 1.1 基于 AstrBot 原生 Persona 生成三态事件卡池与奇遇谈资池 (`CARD_AND_DECK_SEED_PROMPT`)
-> **设计要点**：不搞花哨冗余的分类，大模型根据原生 Persona 生成的每张事件卡都严格绑定 **`RESTING`（休息中）、`BUSY`（繁忙中）、`IDLE`（空闲中）** 三种状态之一，同时生成一组符合人设的 **【奇遇谈资卡】** 供每日随机抽取作为短时聊天谈资。
+### 1.1 基于角色卡/原生 Persona 生成角色专属四类行动卡池 (`CARD_AND_DECK_SEED_PROMPT`)
+> **设计要点**：导入或创建角色卡时，大模型一次性生成 8~12 张专属于该角色身份的《24h 四类行动卡池》（每张卡绑定 `state`、`action_type` 与 `min_hours ~ max_hours`），卡片名称固定在池中（可在控制台增删改），每天从中按作息曲线随机抽取排满 24 小时；每次 `BUSY_TASK` 走完 100% 时再动态生成当天随机不同的【完成结果短时记忆】，彻底砍掉作用重复的旧版奇遇卡！
 
 ```markdown
-你是一个角色设定师与 Roguelite 数值策划。请基于用户在 AstrBot 中配置的【原生基础人设】，生成该角色的《AI 网友角色卡》以及专属于TA身份的《三态事件卡池》与《奇遇谈资卡池》。
+你是一个角色设定师与 Roguelite 数值策划。请基于以下角色设定，生成专属于TA身份的《24h 四类行动卡池》（共 8~12 张）。
 
-## 输入：AstrBot 原生基础人设
+## 输入：角色设定
 Persona 名称：{persona_name}
-原生设定文本：
+设定文本：
 """
 {native_persona_prompt}
 """
 
-## 状态定义规范
-每张事件卡（`state_event_cards`）必须绑定以下三种状态（`state`）之一：
-- `RESTING`（休息中）：如睡觉、午休小憩（此状态下Bot完全不回消息、不刷视频）。
-- `BUSY`（繁忙中）：如上课、开会、赶稿、专注打排位（此状态下Bot只抽空简短回复重要用户L2与核心用户L3，忽略普通群友L1，且不刷视频）。
-- `IDLE`（空闲中）：如吃饭下饭、躺沙发摸鱼、睡前玩手机（此状态下Bot全量开放群聊读空气、主动找人搭话、主动去刷B站/抖音视频）。
+## 四类行动卡 (`action_type`) 与三态 (`state`) 规范
+1. `SLEEP`（绑定 `state: "RESTING"`）：睡觉/休眠/入定卡（后台完全静默，什么都不做）。时长通常为长睡眠 `4.0~8.0h` 或小憩 `1.0~2.0h`。
+2. `SURF`（绑定 `state: "IDLE"`）：冲浪刷视频卡（后台触发 B站/抖音真实看片与分享）。时长通常为 `0.5~2.0h`。
+3. `IDLE_ROAM`（绑定 `state: "IDLE"`）：贴合人设的日常消遣/发呆/闲逛卡（后台触发翻群记录吃瓜或发呆记忆联想）。时长通常为 `0.5~2.0h`。
+4. `BUSY_TASK`（绑定 `state: "BUSY"`）：100% 贴合角色职业/主业/世界观的正事卡（后台带 0%~100% 进度条，每次完成或被打断时都会随机生成当天不同的一句话结果记入短时记忆）。时长通常为 `1.0~3.5h`。
 
 ## 输出要求
 请仅输出合法的 JSON 格式：
@@ -31,34 +31,44 @@ Persona 名称：{persona_name}
   "name": "角色惯用自称或网名",
   "archetype": "一句话概括她在社交网络上的核心人设定位",
   "speaking_style": "详细的说话习惯（句式长短、常用语气词、口癖、标点习惯）",
-  "surfing_preferences": ["该角色在 IDLE 空闲状态下刷B站/抖音最爱看的 4~6 个内容标签"],
+  "surfing_preferences": ["该角色在 SURF 冲浪时最爱看的 4~6 个内容标签"],
   "state_event_cards": [
     {
-      "card_id": "evt_1",
-      "title": "贴合人设的具体事情（如：苦逼上早八高数课 / 窝在画室赶稿）",
+      "card_id": "evt_busy_1",
+      "title": "贴合人设的繁忙正事（如：在丹房炼制回春丹 / 窝在画室赶商业插画线稿）",
       "state": "BUSY",
-      "valid_slots": ["morning", "forenoon", "afternoon"],
+      "action_type": "BUSY_TASK",
+      "min_hours": 1.5,
+      "max_hours": 3.0,
       "armor": 70
     },
     {
-      "card_id": "evt_2",
-      "title": "贴合人设的空闲事项（如：边吃螺蛳粉边刷手机 / 瘫在床上摸鱼）",
+      "card_id": "evt_roam_1",
+      "title": "贴合人设的空闲消遣（如：御剑在后山吹风发呆 / 泡杯冻顶乌龙看窗外发呆）",
       "state": "IDLE",
-      "valid_slots": ["noon", "afternoon", "evening"],
+      "action_type": "IDLE_ROAM",
+      "min_hours": 0.5,
+      "max_hours": 1.5,
       "armor": 30
     },
     {
-      "card_id": "evt_3",
-      "title": "贴合人设的休息事项（如：戴眼罩呼呼大睡 / 趴桌上午睡）",
+      "card_id": "evt_surf_1",
+      "title": "贴合人设的冲浪表现（如：瘫在懒人沙发上刷B站 / 用玉简偷看凡间短视频）",
+      "state": "IDLE",
+      "action_type": "SURF",
+      "min_hours": 0.5,
+      "max_hours": 2.0,
+      "armor": 35
+    },
+    {
+      "card_id": "evt_sleep_1",
+      "title": "贴合人设的休息表现（如：闭关打坐入定 / 戴上蒸汽眼罩呼呼大睡）",
       "state": "RESTING",
-      "valid_slots": ["noon", "night"],
+      "action_type": "SLEEP",
+      "min_hours": 4.0,
+      "max_hours": 7.5,
       "armor": 65
     }
-  ],
-  "encounter_talk_cards": [
-    "贴合人设的今日奇遇小插曲1（作为当天的短时记忆增加聊天谈资，如：今天点外卖老板居然多送了一根烤肠）",
-    "贴合人设的今日奇遇小插曲2（如：早上出门差点被楼下的流浪橘猫绊倒）",
-    "贴合人设的今日奇遇小插曲3（如：刚才打游戏遇到一个开麦唱歌跑调到姥姥家的奇葩队友）"
   ]
 }
 ```
@@ -122,12 +132,12 @@ Persona 名称：{persona_name}
 > **触发条件**：仅当 `今日已微调次数 < max_mutations_per_day(2)`、`距离上次微调 > 120分钟`、且外部真实输入（**读取到的用户消息** 或 **刚刷到的高分视频**）冲击力 `Impact > 当前卡片护甲 Armor` 时调用！
 
 ```markdown
-角色【{soul_name}】正在按今日随机生成的日程行事，但刚刚收到了一个高冲击力的【外部真实输入】，打破了她当前的定力护甲！
-请根据这个输入，在受限范围内调整她【当前时间段】或【下一时间段】的状态（`RESTING` / `BUSY` / `IDLE`）与事件描述。
+角色【{soul_name}】正在按今日随机生成的 24h 动态时间轴行事，但刚刚收到了一个高冲击力的【外部真实输入】，打破了她当前的定力护甲！
+请根据这个输入，在受限范围内调整她【当前时间块】或【下一时间块】的状态（`RESTING` / `BUSY` / `IDLE`）、行动类型（`SLEEP` / `SURF` / `IDLE_ROAM` / `BUSY_TASK`）与事件描述。
 
-## 1. 当前与下一时间段原定安排
-- 当前时间段：【{current_slot_title}】 | 当前状态：`{current_state}`（定力护甲：{current_armor}）
-- 下一时间段：【{next_slot_title}】 | 原定状态：`{next_state}`
+## 1. 当前与下一时间块原定安排
+- 当前时间块：【{current_slot_title}】 | 当前状态：`{current_state}` | 当前行动类型：`{current_action_type}`（定力护甲：{current_armor}）
+- 下一时间块：【{next_slot_title}】 | 原定状态：`{next_state}` | 原定行动类型：`{next_action_type}`
 
 ## 2. 触发变卦的真实外部输入
 - 输入来源：{input_type} （`USER_MESSAGE` 读取到的用户消息 / `WATCHED_VIDEO` 刚刷到的高分视频）
@@ -136,49 +146,106 @@ Persona 名称：{persona_name}
 {input_detail}
 """
 
-## 3. 状态调整规则（三态跃迁约束）
-- 若当前为 `BUSY（繁忙中）` 且被高热度消息击穿：可将 `CURRENT_SLOT` 状态微调为 `IDLE（空闲中）`（即：放下手头正事，摸鱼陪聊/水群）。
-- 若当前为 `IDLE（空闲中）`，因刷到了极其上头的视频或正与核心用户/熟人热聊，且下一时段原定为 `BUSY` 或 `RESTING`：可将 `NEXT_SLOT` 推迟或将前半段改为 `IDLE`（即：刷视频上头/聊嗨了加钟熬夜）。
-- 若当前为 `RESTING（休息中）` 且被 ★L3核心用户 私聊强呼叫击穿：可将 `CURRENT_SLOT` 短暂改为 `IDLE`（即：被核心用户吵醒，迷迷糊糊回消息）。
+## 3. 状态调整规则（动态时间块切分 / 延展语义）
+- 当前为 `BUSY_TASK`（繁忙主业）且被高热度消息击穿：系统会把当前繁忙块在最近半点处一分为二——前半段保留 `BUSY_TASK` 并立即结算“被中途打断”的一句话完成结果，后半段从切分点起转为 `IDLE_ROAM`（即：放下手头正事，摸鱼陪聊 / 水群）。你只需给出切分后的新标题与心理独白。
+- 当前为 `SLEEP`（睡觉 / 休眠）且被 ★L3核心用户 私聊强呼叫击穿：系统会在当前睡眠块中切出一小段（约 0.5~1.0h）的 `IDLE_ROAM`（即：被核心用户吵醒，迷迷糊糊看手机回消息），其余睡眠块保持不变。你只需给出这段清醒时间的标题与心理独白。
+- 当前为 `SURF` / `IDLE_ROAM`（空闲）且刷到了极其上头的视频或正与核心用户/熟人热聊：系统会把当前时间块向后延长 0.5h，并同步压缩/后移下一时间块（即：刷视频上头 / 聊嗨了加钟熬夜）。你只需给出延长后的新标题与心理独白。
+- 三态与行动类型绑定约束：`SLEEP` 必定对应 `RESTING`、`BUSY_TASK` 必定对应 `BUSY`、`SURF` / `IDLE_ROAM` 必定对应 `IDLE`，禁止输出不匹配的组合。
 
 请仅输出合法的 JSON 格式：
 {
   "mutate_target": "CURRENT_SLOT | NEXT_SLOT",
   "new_state": "IDLE | BUSY | RESTING",
   "new_title": "微调后正在做的事（15字内，如：把作业一丢专心在群里吃瓜 / 刷视频太精神继续熬夜冲浪）",
-  "delay_next_slot_minutes": 0或30或45,
+  "delay_next_slot_minutes": 0,
   "mutation_reason_monologue": "第一人称变卦心理活动（如：'本来在忙着写东西的，看你们聊得这么起劲，不管了先摸鱼水会儿群！'）"
 }
 ```
 
 ---
 
-## 三、 不同状态下的消息回复与主动搭话 Prompt 注入
+## 三、 四类行动卡的状态注入、繁忙结果结算与空闲游荡 Prompt
 
-### 3.1 `🔥 繁忙中 (BUSY)` 状态下的抽空回复注入（仅对 L2 重要用户 / L3 核心用户触发）
-> 当处于 `BUSY` 状态时，L1 普通群友的消息已在代码层被直接拦截忽略；当 L2 熟人或 ★L3 核心用户发消息时，注入以下约束：
+### 3.1 `🔥 角色繁忙卡 (BUSY_TASK)`：当前行为记忆 + 进度条注入 + 完成结果结算
+> **极简三要素设计**：繁忙卡不做花哨的子系统，仅包含 **① 当前行为记忆**、**② 进度条 (`0% -> 100%`)**、**③ 一句话完成结果（存入 Tier 1 短时记忆）**。
 
+#### 1. 繁忙期间被动回复 ◆L2 / ★L3 时的 Prompt 注入（含实时进度条）
 ```markdown
-[当前三态控制器：🔥 繁忙中 (BUSY)]
-1. 你当前正在做的事：【{current_slot_title}】。
-2. 因为发消息的人是你的【{user_tier_name}：{sender_name}】，你决定百忙之中抽空看一眼手机回TA，但如果是普通群友你根本不会理。
-3. 回复语气要求：
-   - 表现出你手头正在忙 `{current_slot_title}`（比如偷偷摸鱼回一句、或者吐槽手头这事有多烦）。
-   - 句子必须极短（20字以内，1个气泡），不要展开长聊，除非刚才的输入已经触发了状态微调把你变成了【空闲中】。
+[当前三态控制器：🔥 繁忙中 (BUSY_TASK)]
+1. 你的【当前行为记忆】：正在专心做【{current_slot_title}】（时段：{start_time}-{end_time}）。
+2. 当前完成进度：{progress_pct}%（请据此自然表现进度感：刚开工 / 正卡在关键处 / 快搞定了）。
+3. 因为发消息的人是你的【{user_tier_name}：{sender_name}】，你决定百忙之中抽空看一眼手机回TA（普通群友 L1 已在代码层被直接忽略）。
+4. 回复语气要求：
+   - 自然带出你手头正在忙 `{current_slot_title}` 以及当前进度感，像真实网友忙里偷闲回一句。
+   - 句子必须极短（20字以内，1个气泡），不要展开长聊，除非刚才的输入已经击穿护甲、把当前时间块切成了【空闲中】。
 ```
 
-### 3.2 `☕ 空闲中 (IDLE)` 状态下的读空气与【奇遇谈资 / 视频分享】注入
-> 当处于 `IDLE` 状态时，AI 既可以在群聊对全员读空气接话，也可以利用今日抽到的**【奇遇谈资卡】**或**刚刷到的 B站/抖音视频**主动开启话题：
+#### 2. 繁忙块结束（100%）或中途打断时的一句话结果生成 (`BUSY_TASK_COMPLETION_PROMPT`)
+> 当 `BUSY_TASK` 时间块走完 `100%`（或中途被微调打断停在 `X%`）时，调用决策模型生成**一句话完成结果**，直接作为 **Tier 1 瞬时记忆 (`memory_tier=1`)** 存入 `memories` 表：
 
 ```markdown
-[当前三态控制器：☕ 空闲中 (IDLE)]
-1. 你当前正在做的事：【{current_slot_title}】，正拿着手机闲逛，精力充沛，随时可以水群或聊天。
-2. 🃏 你今天的【短时奇遇谈资】（尚未聊过的新鲜小事，可在合适时机自然当成话题聊出来）：
-   {unused_encounter_cards_text}
+角色【{soul_name}】（设定：{archetype}）刚刚结束了一段繁忙事项：
+- 繁忙事项：【{task_title}】
+- 最终进度：{progress_pct}%（{status_desc}）
+- 今天日期：{today_date}
+
+请用第一人称生成【一句话完成结果记忆】（35字以内，口语化、有生活或世界观细节，将直接存入她今日的 Tier 1 短时记忆库作为后续聊天谈资）。
+要求：必须带一个当天随机的小细节或小插曲（如工具手感、天气、小意外、小吐槽），每次生成都尽量不重样。
+
+仅输出合法的 JSON 格式（不要带多余解释，不要用 Markdown 代码块）：
+{
+  "completion_memory": "如：花了两个多小时终于把回春丹炼出来了，不过最后一炉火候大了一点差点炸炉",
+  "keywords": "炼丹,回春丹,繁忙结果"
+}
+```
+> `status_desc` 由 `main.settle_busy_block()` 预格式化：`顺利100%完成` 或 `做到{progress_pct}%被{interrupted_by}打断`（如 `做到40%被阿泽打断`）。
+
+### 3.2 `☕ 空闲卡 (SURF / IDLE_ROAM)`：冲浪分享、翻群吃瓜与发呆记忆联想注入
+> 当处于 `IDLE` 状态时，AI 既可以在群聊对全员读空气接话，也会根据当前行动卡是 `SURF`（冲浪）还是 `IDLE_ROAM`（空闲游荡）注入今日谈资与刚结算的繁忙成果：
+
+```markdown
+[当前三态控制器：☕ 空闲中 ({action_type})]
+1. 你当前正在做的事：【{current_slot_title}】（进度：{progress_pct}%），正拿着手机闲逛，精力充沛，随时可以水群或聊天。
+2. 🃏 你今天的【短时奇遇与刚忙完的事】（可在合适时机自然当成话题聊出来）：
+   {short_term_talk_text}
 3. 📱 你刚在 B站/抖音刷完的视频（可顺着话题分享或吐槽）：
    {recent_watched_video_text}
 ```
 
+#### 空闲游荡卡 (`IDLE_ROAM`) 主动行为生成 (`IDLE_ROAM_PROACTIVE_PROMPT`)
+> 当后台心跳处于 `IDLE_ROAM` 时间块且满足主动搭话冷却时，二选一执行 **【翻群记录吃瓜 (`GROUP_LURK`)】** 或 **【发呆记忆联想 (`MEMORY_MUSE`)】**：
+
+```markdown
+角色【{soul_name}】（说话风格：{speaking_style}）当前处于空闲游荡状态：【{current_slot_title}】。
+现在是 {current_time}，请根据以下输入素材，生成一句自然的第一人称主动冒泡/搭话消息（拒绝生硬的“在干嘛”，要像真人网友突然冒出来说话）。
+
+## 触发模式：{roam_mode}
+- `GROUP_LURK`（翻看群聊未读记录吃瓜）：读群友的聊天记录，自然接梗冒泡，或转头私聊 ★L3核心用户吐槽。
+- `MEMORY_MUSE`（发呆时由旧记忆或刚忙完的事产生联想）：突然想起某事，发给 ★L3核心用户开启话题。
+
+## 关联素材（未读群聊记录 或 抽出的 1~2 条记忆 / 刚忙完的事）
+"""
+{context_material}
+"""
+
+## 输出要求
+1. 仅输出合法的 JSON 格式（不要带多余解释，不要用 Markdown 代码块）。
+2. `target` 只能是 `GROUP`（在群里直接冒泡）或 `PRIVATE_L3`（私聊 ★L3核心用户）。
+3. `message` 为 30 字以内的自然口语，符合角色说话风格，不要带引号或前缀。
+{
+  "target": "GROUP | PRIVATE_L3",
+  "message": "30字以内的自然口语冒泡内容"
+}
+```
+
+> 调用方：`main.OnlyYouPlugin._run_idle_roam_action()`。`GROUP_LURK` 模式素材为近期群聊滑窗 transcript；`MEMORY_MUSE` 模式素材为 1~2 条记忆（优先今日已结算的 `BUSY_TASK` 完成结果），受 `idle_roam_cooldown_minutes`（默认 45 分钟）冷却限制。
+
+
+#### 私聊未读消息主动补回 (`UNREAD_PRIVATE_CATCHUP_PROMPT`)
+> 当 Bot 从 `RESTING` / `BUSY` 回到 `IDLE`，且存在**被三态门禁拦截**的私聊未读消息时使用：占位符为 `{soul_name}` / `{soul_archetype}` / `{speaking_style}` / `{current_slot_title}` / `{current_time}` / `{user_tier_label}` / `{user_name}` / `{unread_messages_text}` / `{recent_window_text}`。要求生成“刚睡醒/刚忙完才看到消息”的一句自然补回（≤50 字、不提“未读/补回”字眼），发送成功后清空该私聊会话的未读队列。
+
+#### 冲浪分享主动搭话 (`PROACTIVE_CHAT_PROMPT`)
+> 心跳处于 `SURF` 时间块且刷到视频时使用：占位符为 `{soul_name}` / `{soul_archetype}` / `{speaking_style}` / `{soul_summary}` / `{current_slot_title}` / `{video_text}`，生成一段第一人称分享 / 吐槽，随后经 `PlatformBridge.send_proactive_message()` 发给最近 ★L3 私聊（并同步写入会话滑窗）。
 
 ### 3.3 角色卡接管 Persona 段（`_takeover_persona`，System Prompt 组装顺序）
 
@@ -209,45 +276,53 @@ Persona 名称：{persona_name}
 
 ---
 
-## 四、 核心状态流转与双行为控制时序图
+## 四、 核心状态流转与四类行动卡执行时序图
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Deck as 🎲 Roguelite 日程引擎
+    participant Deck as 🎲 24h 动态时间轴引擎
     participant Gate as 🚦 三态门禁 (RESTING/BUSY/IDLE)
     participant Group as 群聊窗口 (含 L1/L2/L3)
     participant Private as ★L3核心用户私聊
     participant Surfer as 📱 B站/抖音冲浪管线
 
-    Note over Deck,Gate: 每日开局抽卡：生成今日时间段状态 + 抽出奇遇卡 [外卖多送了根烤肠]
-    
+    Note over Deck,Gate: 每日开局排轴：按作息曲线 (chronotype) 抽四类行动卡排满 24h（如 02:00-03:00 SURF / 03:00-11:00 SLEEP / 11:00-12:30 BUSY_TASK）
+
     rect rgb(240, 240, 245)
-    Note over Gate,Surfer: 时段一：09:30 - 11:30 【🔥 繁忙中 (BUSY)：苦逼赶早八课】
+    Note over Gate,Surfer: 时间块一：09:30 - 11:30 【🔥 繁忙主业 (BUSY_TASK)：苦逼赶稿，进度 62%】
     Group->>Gate: [L1普通群友] 路人甲: 有人打游戏吗？
     Gate-->>Group: ❌ 状态为 BUSY 且发送者为 L1 -> 直接拦截不回（0 Token消耗）
     Group->>Gate: [◆L2重要用户] 老王: @星野 周末漫展去不去？
-    Gate->>Group: ✅ 发送者为 L2 熟人 -> 放行并注入[繁忙中]Prompt：<br/>“在上早八呢别勾引我，下课再跟你说！”
+    Gate->>Group: ✅ 发送者为 L2 熟人 -> 放行并注入[繁忙中 (BUSY_TASK)]Prompt（含当前行为记忆 + 62% 进度）：<br/>“在赶稿呢别勾引我，写完再跟你说！”
     end
 
     rect rgb(235, 250, 240)
-    Note over Gate,Surfer: 时段二：12:00 - 14:00 【☕ 空闲中 (IDLE)：午休吃饭玩手机】
-    Gate->>Surfer: ✅ 状态进入 IDLE -> 自动激活行为二【刷视频】
-    Surfer-->>Gate: 刷完B站视频《猫咪假装晕倒》
-    Gate->>Private: ✅ 激活行为一【主动发消息】结合【奇遇谈资卡】+【刚刷的视频】：<br/>“哈哈哈哈今天中午点外卖老板居然多送了我一根烤肠，运气爆棚”<br/>“[发送猫咪视频] 顺便给你看我刚边啃烤肠边刷到的猫片hhh”
+    Note over Gate,Surfer: 时间块二：12:00 - 14:00 【☕ 冲浪卡 (SURF)：边吃饭边刷视频】
+    Gate->>Surfer: ✅ 行动类型为 SURF -> 自动激活真实【刷视频管线】
+    Surfer-->>Gate: 刷完B站视频《猫咪假装晕倒》（vision 评分 88）
+    Gate->>Private: ✅ 主动分享视频 + 今日【BUSY_TASK 随机完成结果】：<br/>“今天炼丹差点炸炉笑死，不过成色还不错”<br/>“[发送猫咪视频] 顺便给你看我刚刷到的猫片hhh”
+    end
+
+    rect rgb(245, 245, 255)
+    Note over Gate,Surfer: 时间块三：14:00 - 15:30 【☕ 空闲游荡卡 (IDLE_ROAM)：翻群吃瓜 / 发呆联想】
+    Gate->>Group: ✅ 翻看未读群聊滑窗，顺着话题冒泡接梗（GROUP_LURK）
+    Gate->>Private: ✅ 或抽 1~2 条旧记忆 / 今日繁忙成果，私聊 ★L3“突然想起某事”（MEMORY_MUSE）
     end
 
     rect rgb(255, 245, 235)
-    Note over Gate,Surfer: 时段三：15:00 【原定 🔥 繁忙中：写报告 (护甲 55)】 -> 触发输入微调！
+    Note over Gate,Surfer: 时间块四：15:30 - 18:00 【原定 🔥 繁忙主业：写报告 (护甲 55)】 -> 触发输入微调！
     Private->>Gate: [★L3核心用户] 连续发来消息吐槽今天遇到的奇葩事 (Impact: 85 > 护甲 55)
-    Gate->>Deck: 💥 满足微调限制 (今日微调 0/2 次) -> 将当前时段状态由 BUSY 微调为 IDLE！
+    Gate->>Deck: 💥 满足微调限制 (今日微调 0/2 次) -> 在最近半点将当前 BUSY_TASK 块一分为二：<br/>前半段立即结算“被打断”的 Tier1 完成结果，后半段切为 IDLE_ROAM！
     Gate->>Private: “本来在写报告的，看你这么气，不写了先听你骂完！！那人也太离谱了吧”
     end
 
     rect rgb(235, 235, 245)
-    Note over Gate,Surfer: 时段四：00:30 - 07:30 【💤 休息中 (RESTING)：呼呼大睡】
+    Note over Gate,Surfer: 时间块五：00:30 - 07:30 【💤 睡觉卡 (SLEEP)：呼呼大睡】
     Group->>Gate: 深夜夜猫子群友水群...
-    Gate-->>Group: ❌ 状态为 RESTING -> 全部静默拦截不回，停止刷视频
+    Gate-->>Group: ❌ 状态为 RESTING -> 全部静默拦截不回，后台零任务
+    Private->>Gate: ★L3 私聊连续强呼叫 (Impact 88 > 护甲 65)
+    Gate->>Deck: 💥 击穿护甲 -> 从当前时刻切出一小段 IDLE_ROAM 清醒窗（其余睡眠段保留）
     end
 ```
 

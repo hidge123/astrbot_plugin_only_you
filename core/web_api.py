@@ -9,13 +9,11 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from .memory_manager import MemoryTier
 from .roguelite_deck import (
-    DEFAULT_ENCOUNTER_POOL,
     DEFAULT_STATE_EVENT_CARDS,
-    SLOT_DEFINITIONS,
     StateEventCard,
 )
 from .soul_manager import SoulProfile
-from .state_machine import BotState, UserTier
+from .state_machine import ACTION_TYPE_DEFINITIONS, ActionType, BotState, UserTier
 
 try:
     from astrbot.api import logger
@@ -90,44 +88,172 @@ def _ensure_section(card: dict[str, Any], key: str) -> dict[str, Any]:
     return section
 
 
+CHRONOTYPES = ("early", "normal", "night_owl")
+
+
+def _coerce_hour(value: Any, default: float = 0.0) -> float:
+    """Best-effort float hour (dynamic timeline uses the 0.5h grid)."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _slot_attr(slot: Any, key: str, default: Any = None) -> Any:
+    """Read a slot field from either a `SlotInstance` or a plain dict payload."""
+    if isinstance(slot, dict):
+        value = slot.get(key, default)
+    else:
+        value = getattr(slot, key, default)
+    return default if value is None else value
+
+
+def _slot_action_type(slot: Any) -> Optional[ActionType]:
+    """Best-effort `ActionType` of a slot/card (legacy dict payloads tolerated)."""
+    action = getattr(slot, "action_type", None)
+    if action is None and isinstance(slot, dict):
+        action = slot.get("action_type")
+    if isinstance(action, ActionType):
+        return action
+    return ActionType.coerce(action, None)
+
+
 def _slot_remaining_and_progress(
     slot: Any, now_dt: Optional[datetime] = None
 ) -> tuple[int, float]:
     """
-    Compute `(remaining_seconds, progress)` for a schedule slot.
+    Compute `(remaining_seconds, progress)` for a dynamic timeline block.
 
-    Handles the overnight `night` slot (start_hour=23, end_hour=7) via modular
-    arithmetic so 00:00-07:00 is correctly counted as the same slot.
+    Both values derive from the block's **float** `start_hour` / `end_hour`
+    (0.5h grid, contiguous `0.0 -> 24.0`). Legacy overnight blocks
+    (`end_hour < start_hour`, e.g. `23 -> 7`) still fall back to modular
+    arithmetic so old serialized runs never break the UI.
     """
     now_dt = now_dt or datetime.now()
-    try:
-        start_hour = int(getattr(slot, "start_hour", 0) or 0)
-        end_hour = int(getattr(slot, "end_hour", 24) or 24)
-    except (TypeError, ValueError):
-        start_hour, end_hour = 0, 24
-
-    total_hours = (end_hour - start_hour) % 24
-    if total_hours == 0:
-        total_hours = 24
-
     now_hour = now_dt.hour + now_dt.minute / 60.0 + now_dt.second / 3600.0
-    elapsed_hours = (now_hour - start_hour) % 24
-    elapsed_hours = min(elapsed_hours, float(total_hours))
-    remaining_hours = max(0.0, float(total_hours) - elapsed_hours)
+    start_hour = _coerce_hour(_slot_attr(slot, "start_hour", 0.0), 0.0)
+    end_hour = _coerce_hour(_slot_attr(slot, "end_hour", 24.0), 24.0)
 
-    remaining_seconds = int(round(remaining_hours * 3600))
-    progress = elapsed_hours / float(total_hours) if total_hours else 0.0
+    if end_hour <= start_hour:
+        # Legacy `end < start` overnight slot: wrap around midnight.
+        total_hours = (end_hour - start_hour) % 24.0 or 24.0
+        elapsed_hours = (now_hour - start_hour) % 24.0
+    else:
+        total_hours = max(0.0, end_hour - start_hour)
+        elapsed_hours = now_hour - start_hour
+    elapsed_hours = max(0.0, min(total_hours, elapsed_hours))
+
+    remaining_seconds = int(round(max(0.0, total_hours - elapsed_hours) * 3600))
+    progress = elapsed_hours / total_hours if total_hours > 0 else 1.0
     return remaining_seconds, round(max(0.0, min(1.0, progress)), 4)
 
 
-def _encounter_to_dict(item: Any) -> dict[str, Any]:
-    """Normalize an `EncounterCard` dataclass / dict into `{content, used}`."""
-    if isinstance(item, dict):
-        return {"content": str(item.get("content") or ""), "used": bool(item.get("used", False))}
+def _format_slot_time_range(slot: Any) -> tuple[str, str]:
+    """Return `(start_time, end_time)` as `HH:MM` strings for a timeline block."""
+    formatter = getattr(slot, "format_time_range", None)
+    if callable(formatter):
+        try:
+            text = str(formatter() or "")
+            if "-" in text:
+                start_time, end_time = text.split("-", 1)
+                return start_time.strip(), end_time.strip()
+        except Exception:  # pragma: no cover - defensive only
+            pass
+    start_hour = _coerce_hour(_slot_attr(slot, "start_hour", 0.0), 0.0)
+    end_hour = _coerce_hour(_slot_attr(slot, "end_hour", 24.0), 24.0)
+
+    def _fmt(hour: float) -> str:
+        minutes = max(0, min(24 * 60, int(round(hour * 60))))
+        return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+    return _fmt(start_hour), _fmt(end_hour)
+
+
+def _enrich_slot(slot: Any, now_dt: Optional[datetime] = None) -> dict[str, Any]:
+    """`slot.to_dict()` plus the live `progress_pct` int (contract §6.1)."""
+    to_dict = getattr(slot, "to_dict", None)
+    if callable(to_dict):
+        data = dict(to_dict() or {})
+    elif isinstance(slot, dict):
+        data = dict(slot)
+    else:
+        data = {}
+    progress_pct: Optional[int] = None
+    getter = getattr(slot, "get_progress_pct", None)
+    if callable(getter):
+        try:
+            progress_pct = int(getter(now_dt))
+        except Exception:  # pragma: no cover - defensive only
+            progress_pct = None
+    if progress_pct is None:
+        _, progress = _slot_remaining_and_progress(slot, now_dt)
+        progress_pct = int(round(progress * 100))
+    data["progress_pct"] = max(0, min(100, int(progress_pct)))
+    return data
+
+
+_CARD_PAYLOAD_FIELDS = (
+    "card_id",
+    "title",
+    "state",
+    "action_type",
+    "min_hours",
+    "max_hours",
+    "valid_slots",
+    "base_weight",
+    "armor",
+    "synergy_tags",
+)
+
+
+def _card_payload_from_body(body: dict[str, Any]) -> dict[str, Any]:
+    """Merge the nested `card` object with flat top-level card fields.
+
+    The WebUI sends `{"card": {...}, "scope": ..., "soul_id": ...}`, while legacy
+    callers send the card fields flat in the body and may put `action_type` /
+    `min_hours` / `max_hours` next to (instead of inside) the `card` object.
+    """
+    body = body if isinstance(body, dict) else {}
+    nested = body.get("card")
+    if isinstance(nested, dict):
+        card_data = dict(nested)
+        for key in _CARD_PAYLOAD_FIELDS:
+            if key not in card_data and body.get(key) is not None:
+                card_data[key] = body[key]
+        return card_data
     return {
-        "content": str(getattr(item, "content", "") or ""),
-        "used": bool(getattr(item, "used", False)),
+        key: value
+        for key, value in body.items()
+        if key not in ("card_type", "scope", "soul_id")
     }
+
+
+def _busy_results_payload(run: Any, now_dt: Optional[datetime] = None) -> list[dict[str, Any]]:
+    """Settled (or already finished) `BUSY_TASK` blocks -> today's Tier-1 results."""
+    now_dt = now_dt or datetime.now()
+    now_hour = now_dt.hour + now_dt.minute / 60.0 + now_dt.second / 3600.0
+    results: list[dict[str, Any]] = []
+    for slot in _slot_attr(run, "slots", None) or []:
+        if _slot_action_type(slot) != ActionType.BUSY_TASK:
+            continue
+        end_hour = _coerce_hour(_slot_attr(slot, "end_hour", 24.0), 24.0)
+        settled = bool(_slot_attr(slot, "busy_settled", False))
+        if not settled and end_hour > now_hour:
+            continue
+        start_time, end_time = _format_slot_time_range(slot)
+        results.append(
+            {
+                "slot_key": str(_slot_attr(slot, "slot_key", "") or ""),
+                "title": str(_slot_attr(slot, "title", "") or ""),
+                "completion_result": str(_slot_attr(slot, "completion_result", "") or ""),
+                "progress_pct": int(_enrich_slot(slot, now_dt).get("progress_pct", 100)),
+                "start_hour": _coerce_hour(_slot_attr(slot, "start_hour", 0.0), 0.0),
+                "end_hour": end_hour,
+                "start_time": start_time,
+                "end_time": end_time,
+            }
+        )
+    return results
 
 
 class OnlyYouWebAPI:
@@ -233,7 +359,7 @@ class OnlyYouWebAPI:
                 f"{API_PREFIX}/schedule/reroll",
                 self.api_schedule_reroll,
                 ["POST"],
-                "OnlyYou: 重新抽取今日 Roguelite 三态日程与奇遇谈资卡",
+                "OnlyYou: 重新抽取今日 24h 动态日程（四类行动卡）",
             ),
             (
                 f"{API_PREFIX}/schedule/force_state",
@@ -245,25 +371,25 @@ class OnlyYouWebAPI:
                 f"{API_PREFIX}/cards/list",
                 self.api_cards_list,
                 ["GET"],
-                "OnlyYou: 获取指定 Soul 可用的三态行动卡片池与奇遇谈资卡池",
+                "OnlyYou: 获取指定 Soul 的专属行动卡池、全局默认卡池与四类行动定义",
             ),
             (
                 f"{API_PREFIX}/cards/save",
                 self.api_cards_save,
                 ["POST"],
-                "OnlyYou: 新增或保存单张三态行动卡片或奇遇谈资卡",
+                "OnlyYou: 新增或保存单张四类行动卡片（SLEEP/SURF/IDLE_ROAM/BUSY_TASK）",
             ),
             (
                 f"{API_PREFIX}/cards/delete",
                 self.api_cards_delete,
                 ["POST"],
-                "OnlyYou: 删除指定三态行动卡片或奇遇谈资卡",
+                "OnlyYou: 删除指定行动卡片",
             ),
             (
                 f"{API_PREFIX}/cards/ai_generate",
                 self.api_cards_ai_generate,
                 ["POST"],
-                "OnlyYou: 调用小脑模型根据角色设定生成新的三态行动卡与奇遇卡",
+                "OnlyYou: 调用小脑模型根据角色设定生成 8~12 张专属四类行动卡",
             ),
             (
                 f"{API_PREFIX}/users/list",
@@ -303,7 +429,7 @@ class OnlyYouWebAPI:
                 f"{API_PREFIX}/dashboard/overview",
                 self.api_dashboard_overview,
                 ["GET"],
-                "OnlyYou: 概览页一次拉齐当前时段进度、日程、微调配额、奇遇卡、关系/记忆/视频统计与模型健康",
+                "OnlyYou: 概览页一次拉齐当前时间块进度、24h 日程、繁忙成果、微调配额、关系/记忆/视频统计与模型健康",
             ),
             (
                 f"{API_PREFIX}/card/schema",
@@ -365,21 +491,92 @@ class OnlyYouWebAPI:
             register_fn(route_path, handler, methods, desc)
         logger.info(f"[OnlyYou] Registered {len(routes)} Web API routes for Plugin Pages.")
 
-    async def _build_schedule_payload(self, soul: SoulProfile) -> dict[str, Any]:
-        run, cur_slot, next_slot = await self.plugin.deck_engine.get_current_and_next_slot(
-            soul_id=soul.soul_id,
-            custom_cards=soul.state_event_cards,
-            custom_encounters=soul.encounter_talk_cards,
-        )
-        return {
-            "run": run.to_dict(),
-            "current_slot": cur_slot.to_dict(),
-            "next_slot": next_slot.to_dict(),
-            "max_mutations_per_day": self.plugin.schedule_mutator.max_mutations_per_day,
-            "mutation_cooldown_minutes": int(
-                self.plugin.schedule_mutator.mutation_cooldown_seconds // 60
-            ),
+    # ==========================================================================
+    # 24h dynamic timeline payload helpers (contract §6.1 / §6.2)
+    # ==========================================================================
+    @staticmethod
+    def _soul_chronotype(soul: Any) -> str:
+        """Best-effort normalized chronotype of a SoulProfile (``normal`` fallback)."""
+        raw = str(getattr(soul, "chronotype", "") or "").strip().lower()
+        return raw if raw in CHRONOTYPES else "normal"
+
+    async def _settle_finished_busy_blocks_safe(
+        self, soul: Any, run: Any, now_dt: Optional[datetime] = None
+    ) -> list[str]:
+        """Lazily settle finished `BUSY_TASK` blocks through `main.py` (never raises).
+
+        `main.py::_settle_finished_busy_blocks` is owned by the runtime teammate;
+        when it is absent / still being written the page must keep working, so a
+        missing method simply means "nothing to settle".
+        """
+        settler = getattr(self.plugin, "_settle_finished_busy_blocks", None)
+        if not callable(settler):
+            return []
+        try:
+            try:
+                value = settler(soul, run, now_dt)
+            except TypeError:
+                # Older/partial implementation without the optional `now_dt` arg.
+                value = settler(soul, run)
+            if inspect.isawaitable(value):
+                value = await value
+        except Exception as exc:
+            logger.warning(f"[OnlyYou] lazy busy-task settlement failed: {exc}")
+            return []
+        if not isinstance(value, (list, tuple, set)):
+            return []
+        return [str(item) for item in value if str(item).strip()]
+
+    async def _load_current_schedule(self, soul: Any) -> tuple[Any, Any, Any, datetime, str]:
+        """Load the current timeline, lazily settle finished busy blocks, reload it."""
+        now_dt = datetime.now()
+        chronotype = self._soul_chronotype(soul)
+        fetch_kwargs: dict[str, Any] = {
+            "soul_id": soul.soul_id,
+            "custom_cards": getattr(soul, "state_event_cards", None),
+            "now_dt": now_dt,
+            "chronotype": chronotype,
         }
+        run, cur_slot, next_slot = await self.plugin.deck_engine.get_current_and_next_slot(
+            **fetch_kwargs
+        )
+        # Lazy completion settlement can rewrite `completion_result` / `busy_settled`,
+        # so always re-read the latest run afterwards (contract §6.2).
+        await self._settle_finished_busy_blocks_safe(soul, run, now_dt)
+        run, cur_slot, next_slot = await self.plugin.deck_engine.get_current_and_next_slot(
+            **fetch_kwargs
+        )
+        return run, cur_slot, next_slot, now_dt, chronotype
+
+    def _schedule_payload_from(
+        self,
+        run: Any,
+        cur_slot: Any,
+        next_slot: Any,
+        now_dt: datetime,
+        chronotype: str,
+    ) -> dict[str, Any]:
+        """Assemble the frozen `_build_schedule_payload` shape (contract §6.2)."""
+        run_data = dict(run.to_dict() or {}) if callable(getattr(run, "to_dict", None)) else {}
+        run_data["slots"] = [
+            _enrich_slot(slot, now_dt) for slot in (_slot_attr(run, "slots", None) or [])
+        ]
+        mutator = getattr(self.plugin, "schedule_mutator", None)
+        return {
+            "run": run_data,
+            "current_slot": _enrich_slot(cur_slot, now_dt),
+            "next_slot": _enrich_slot(next_slot, now_dt),
+            "max_mutations_per_day": int(getattr(mutator, "max_mutations_per_day", 2) or 2),
+            "mutation_cooldown_minutes": int(
+                (getattr(mutator, "mutation_cooldown_seconds", 0) or 0) // 60
+            ),
+            "chronotype": chronotype,
+            "busy_results": _busy_results_payload(run, now_dt),
+        }
+
+    async def _build_schedule_payload(self, soul: SoulProfile) -> dict[str, Any]:
+        run, cur_slot, next_slot, now_dt, chronotype = await self._load_current_schedule(soul)
+        return self._schedule_payload_from(run, cur_slot, next_slot, now_dt, chronotype)
 
     def _collect_known_umos(self, bindings: dict[str, str]) -> list[dict[str, Any]]:
         seen: set[str] = set()
@@ -758,7 +955,7 @@ class OnlyYouWebAPI:
                     "active_schedule": sched_payload,
                     "default_soul_id": default_soul_id,
                     "model_status": model_status,
-                    "slot_definitions": SLOT_DEFINITIONS,
+                    "action_types": ACTION_TYPE_DEFINITIONS,
                 }
             )
         except Exception as e:
@@ -823,8 +1020,8 @@ class OnlyYouWebAPI:
             await self.plugin.deck_engine.get_or_build_today_run(
                 soul_id=profile.soul_id,
                 custom_cards=profile.state_event_cards,
-                custom_encounters=profile.encounter_talk_cards,
                 force_reroll=True,
+                chronotype=self._soul_chronotype(profile),
             )
             sched_payload = await self._build_schedule_payload(profile)
             souls = await self.plugin.soul_manager.list_souls()
@@ -885,7 +1082,6 @@ class OnlyYouWebAPI:
                 payload: dict[str, Any] = {"soul_id": soul_id, "card": card}
                 payload.update(self._card_flat_fields(card, existing=None, soul_id=soul_id))
                 payload["state_event_cards"] = []
-                payload["encounter_talk_cards"] = []
                 profile = SoulProfile.from_dict(payload)
                 profile = self._apply_card_to_profile(profile, card)
 
@@ -981,13 +1177,13 @@ class OnlyYouWebAPI:
             await self.plugin.deck_engine.get_or_build_today_run(
                 soul_id=soul.soul_id,
                 custom_cards=soul.state_event_cards,
-                custom_encounters=soul.encounter_talk_cards,
                 force_reroll=True,
+                chronotype=self._soul_chronotype(soul),
             )
             sched_payload = await self._build_schedule_payload(soul)
             return ok_response(
                 {"schedule": sched_payload},
-                message="已重新抽取今日 Roguelite 日程与奇遇谈资卡",
+                message="已重新抽取今日 24h 动态日程",
             )
         except Exception as e:
             return err_response(f"重抽日程失败: {e}")
@@ -1001,11 +1197,24 @@ class OnlyYouWebAPI:
             if soul is None:
                 soul = (await self.plugin.soul_manager.list_souls())[0]
 
-            raw_state = str(body.get("new_state") or "IDLE").strip().upper()
-            if raw_state not in BotState.__members__:
-                return err_response("状态必须是 RESTING、BUSY 或 IDLE 之一")
+            # Optional four-action override (contract §6.4): when present it wins
+            # over the legacy `new_state` payload and the bound state is derived.
+            raw_action = str(body.get("action_type") or "").strip().upper()
+            action_type: Optional[ActionType] = None
+            if raw_action:
+                action_type = ActionType.coerce(raw_action, None)
+                if action_type is None:
+                    return err_response(
+                        "行动类型必须是 SLEEP、SURF、IDLE_ROAM 或 BUSY_TASK 之一"
+                    )
 
-            new_state = BotState(raw_state)
+            new_state: Optional[BotState] = None
+            if action_type is None:
+                raw_state = str(body.get("new_state") or "IDLE").strip().upper()
+                if raw_state not in BotState.__members__:
+                    return err_response("状态必须是 RESTING、BUSY 或 IDLE 之一")
+                new_state = BotState(raw_state)
+
             new_title = str(body.get("new_title") or "").strip() or None
             armor_raw = body.get("armor")
             new_armor = int(armor_raw) if armor_raw is not None and str(armor_raw) != "" else None
@@ -1017,14 +1226,25 @@ class OnlyYouWebAPI:
                 new_title=new_title,
                 armor=new_armor,
                 slot_key=slot_key,
+                action_type=action_type,
             )
             sched_payload = await self._build_schedule_payload(soul)
+            updated_action = _slot_action_type(updated_slot) or ActionType.IDLE_ROAM
+            updated_state = getattr(updated_slot, "state", None)
+            state_value = (
+                updated_state.value
+                if isinstance(updated_state, BotState)
+                else str(updated_state or updated_action.bound_state.value)
+            )
             return ok_response(
                 {
-                    "updated_slot": updated_slot.to_dict(),
+                    "updated_slot": _enrich_slot(updated_slot),
                     "schedule": sched_payload,
                 },
-                message=f"已将时段【{updated_slot.label}】切换为 {updated_slot.state.value} ({updated_slot.title})",
+                message=(
+                    f"已将时段【{getattr(updated_slot, 'label', '')}】切换为 "
+                    f"{updated_action.label} {state_value} ({getattr(updated_slot, 'title', '')})"
+                ),
             )
         except Exception as e:
             return err_response(f"切换状态失败: {e}")
@@ -1040,27 +1260,7 @@ class OnlyYouWebAPI:
             )
             if soul is None:
                 soul = (await self.plugin.soul_manager.list_souls())[0]
-
-            custom_cards = [{**c.to_dict(), "scope": "soul"} for c in soul.state_event_cards]
-            general_cards = [
-                {**c.to_dict(), "scope": "global"} for c in DEFAULT_STATE_EVENT_CARDS
-            ]
-            custom_encounters = [
-                {"content": txt, "scope": "soul"} for txt in soul.encounter_talk_cards
-            ]
-            general_encounters = [
-                {"content": txt, "scope": "global"} for txt in DEFAULT_ENCOUNTER_POOL
-            ]
-            return ok_response(
-                {
-                    "soul_id": soul.soul_id,
-                    "custom_cards": custom_cards,
-                    "general_cards": general_cards,
-                    "custom_encounters": custom_encounters,
-                    "general_encounters": general_encounters,
-                    "slot_definitions": SLOT_DEFINITIONS,
-                }
-            )
+            return await self.api_cards_list_for_soul(soul)
         except Exception as e:
             return err_response(f"获取卡片池失败: {e}")
 
@@ -1077,43 +1277,33 @@ class OnlyYouWebAPI:
             scope = str(body.get("scope") or "soul").strip().lower()
 
             if card_type == "encounter":
-                content = str(body.get("content") or "").strip()
-                old_content = str(body.get("old_content") or "").strip()
-                if not content:
-                    return err_response("奇遇谈资卡内容不能为空")
-                target_list = (
-                    DEFAULT_ENCOUNTER_POOL
-                    if scope == "global"
-                    else soul.encounter_talk_cards
-                )
-                if old_content and old_content in target_list:
-                    idx = target_list.index(old_content)
-                    target_list[idx] = content
-                elif content not in target_list:
-                    target_list.insert(0, content)
-                await self.plugin.soul_manager.save_soul(soul)
-            else:
-                card_data = body.get("card") if isinstance(body.get("card"), dict) else body
-                card = StateEventCard.from_dict(card_data)
-                if not card.card_id:
-                    card.card_id = f"evt_{int(time.time())}_{random.randint(100, 999)}"
-                card.armor = max(0, min(100, int(card.armor)))
-                card.base_weight = max(1, min(100, int(card.base_weight)))
+                # Encounter-talk cards were removed from the product (contract §6.4).
+                return err_response("奇遇谈资卡已从系统中移除")
 
-                target_deck = (
-                    DEFAULT_STATE_EVENT_CARDS
-                    if scope == "global"
-                    else soul.state_event_cards
-                )
-                replaced = False
-                for i, existing in enumerate(target_deck):
-                    if existing.card_id == card.card_id:
-                        target_deck[i] = card
-                        replaced = True
-                        break
-                if not replaced:
-                    target_deck.insert(0, card)
-                await self.plugin.soul_manager.save_soul(soul)
+            card_data = _card_payload_from_body(body)
+            card = StateEventCard.from_dict(card_data)
+            if not card.card_id:
+                card.card_id = f"evt_{int(time.time())}_{random.randint(100, 999)}"
+            card.armor = max(0, min(100, int(card.armor)))
+            card.base_weight = max(1, min(100, int(card.base_weight)))
+            # `from_dict` already derives the bound `BotState`; keep it explicit so a
+            # legacy `state` field can never desync from the four action types.
+            card.state = card.action.bound_state
+
+            target_deck = (
+                DEFAULT_STATE_EVENT_CARDS
+                if scope == "global"
+                else soul.state_event_cards
+            )
+            replaced = False
+            for i, existing in enumerate(target_deck):
+                if existing.card_id == card.card_id:
+                    target_deck[i] = card
+                    replaced = True
+                    break
+            if not replaced:
+                target_deck.insert(0, card)
+            await self.plugin.soul_manager.save_soul(soul)
 
             return await self.api_cards_list_for_soul(soul)
         except Exception as e:
@@ -1132,24 +1322,18 @@ class OnlyYouWebAPI:
             scope = str(body.get("scope") or "soul").strip().lower()
 
             if card_type == "encounter":
-                content = str(body.get("content") or "").strip()
-                target_list = (
-                    DEFAULT_ENCOUNTER_POOL
-                    if scope == "global"
-                    else soul.encounter_talk_cards
-                )
-                if content in target_list:
-                    target_list.remove(content)
-                await self.plugin.soul_manager.save_soul(soul)
-            else:
-                card_id = str(body.get("card_id") or "").strip()
-                target_deck = (
-                    DEFAULT_STATE_EVENT_CARDS
-                    if scope == "global"
-                    else soul.state_event_cards
-                )
-                target_deck[:] = [c for c in target_deck if c.card_id != card_id]
-                await self.plugin.soul_manager.save_soul(soul)
+                return err_response("奇遇谈资卡已从系统中移除")
+
+            card_id = str(body.get("card_id") or "").strip()
+            if not card_id:
+                return err_response("缺少 card_id")
+            target_deck = (
+                DEFAULT_STATE_EVENT_CARDS
+                if scope == "global"
+                else soul.state_event_cards
+            )
+            target_deck[:] = [c for c in target_deck if c.card_id != card_id]
+            await self.plugin.soul_manager.save_soul(soul)
 
             return await self.api_cards_list_for_soul(soul)
         except Exception as e:
@@ -1166,52 +1350,60 @@ class OnlyYouWebAPI:
                 soul = (await self.plugin.soul_manager.list_souls())[0]
 
             prompt = (
-                f"请为角色【{soul.name}】（人设定位：{soul.archetype}，口癖：{soul.speaking_style}，"
-                f"冲浪喜好：{', '.join(soul.surfing_preferences)}）生成 5 张全新的三态行动卡片（覆盖 RESTING/BUSY/IDLE）"
-                f"和 3 张今日奇遇谈资卡。\n"
-                '仅输出合法 JSON：{"state_event_cards": [{"card_id": "evt_ai_1", "title": "...", "state": "IDLE|BUSY|RESTING", '
-                '"valid_slots": ["morning","forenoon","noon","afternoon","evening","night"], "armor": 45, "base_weight": 60}], '
-                '"encounter_talk_cards": ["奇遇1", "奇遇2", "奇遇3"]}'
+                f"请为角色【{soul.name}】（人设定位：{soul.archetype}；口癖：{soul.speaking_style}；"
+                f"冲浪喜好：{', '.join(soul.surfing_preferences) or '无特别偏好'}）"
+                f"生成 8~12 张贴合该角色身份与爱好的专属行动卡，必须覆盖四类行动：\n"
+                f"- SLEEP（睡觉 / 休眠，绑定 RESTING）：长睡 4.0~7.5 小时，或小憩 1.0~2.0 小时\n"
+                f"- SURF（冲浪刷片，绑定 IDLE）：0.5~2.0 小时\n"
+                f"- IDLE_ROAM（空闲闲逛，绑定 IDLE）：0.5~2.0 小时\n"
+                f"- BUSY_TASK（繁忙主业，绑定 BUSY）：1.0~3.0 小时\n"
+                f"每张卡需要：title（贴合角色的活动标题）、action_type、min_hours、max_hours"
+                f"（0.5 步长，min_hours <= max_hours）、armor（0~100）、base_weight（1~100）。\n"
+                '仅输出合法 JSON：{"state_event_cards": [{"card_id": "evt_ai_1", "title": "...", '
+                '"action_type": "BUSY_TASK", "min_hours": 1.5, "max_hours": 3.0, "armor": 60, '
+                '"base_weight": 55}]}'
             )
             data = await self.plugin.model_hub.call_llm_json(
                 prompt=prompt, role="decision", default=None
             )
             gen_cards: list[StateEventCard] = []
-            gen_encounters: list[str] = []
-
             if isinstance(data, dict) and data.get("state_event_cards"):
-                for idx, raw_c in enumerate(data.get("state_event_cards") or []):
-                    if isinstance(raw_c, dict):
-                        c = StateEventCard.from_dict(raw_c)
-                        c.card_id = f"evt_ai_{int(time.time())}_{idx + 1}"
-                        gen_cards.append(c)
-                gen_encounters = [
-                    str(x).strip()
-                    for x in (data.get("encounter_talk_cards") or [])
-                    if str(x).strip()
-                ]
+                for raw_c in data.get("state_event_cards") or []:
+                    if not isinstance(raw_c, dict):
+                        continue
+                    try:
+                        gen_cards.append(StateEventCard.from_dict(raw_c))
+                    except Exception as exc:  # never let one bad card break the batch
+                        logger.warning(f"[OnlyYou] AI card parse skipped: {exc}")
 
+            persona_prompt = str(getattr(soul, "native_persona_prompt", "") or "")
+            if not persona_prompt:
+                persona_prompt = f"{soul.name} {soul.archetype} {soul.speaking_style}".strip()
             if not gen_cards:
-                fallback_cards, fallback_enc = self.plugin.soul_manager.build_fallback_custom_deck(
-                    soul.name, soul.native_persona_prompt
+                fallback = self.plugin.soul_manager.build_fallback_custom_deck(
+                    soul.name, persona_prompt
                 )
-                gen_cards = fallback_cards[:5]
-                gen_encounters = fallback_enc[:3]
+                # New signature returns `list[StateEventCard]`; tolerate a legacy tuple.
+                if isinstance(fallback, tuple):
+                    fallback = fallback[0] if fallback else []
+                gen_cards = [c for c in (fallback or []) if isinstance(c, StateEventCard)]
+            gen_cards = gen_cards[:12]
+            # Rewrite card ids so every generated card is unique per batch.
+            stamp = int(time.time())
+            for idx, card in enumerate(gen_cards):
+                card.card_id = f"evt_ai_{stamp}_{idx + 1}"
 
             if auto_save:
                 existing_titles = {c.title for c in soul.state_event_cards}
-                for c in gen_cards:
-                    if c.title not in existing_titles:
-                        soul.state_event_cards.insert(0, c)
-                for e in gen_encounters:
-                    if e not in soul.encounter_talk_cards:
-                        soul.encounter_talk_cards.insert(0, e)
+                for card in gen_cards:
+                    if card.title not in existing_titles:
+                        soul.state_event_cards.insert(0, card)
+                        existing_titles.add(card.title)
                 await self.plugin.soul_manager.save_soul(soul)
 
             payload = await self.api_cards_list_for_soul(soul)
             payload["data"]["generated_cards"] = [c.to_dict() for c in gen_cards]
-            payload["data"]["generated_encounters"] = gen_encounters
-            payload["message"] = f"已为 {soul.name} 生成 {len(gen_cards)} 张行动卡与 {len(gen_encounters)} 张奇遇卡"
+            payload["message"] = f"已为 {soul.name} 生成 {len(gen_cards)} 张专属行动卡"
             return payload
         except Exception as e:
             return err_response(f"AI 生成卡片失败: {e}")
@@ -1220,17 +1412,14 @@ class OnlyYouWebAPI:
         return ok_response(
             {
                 "soul_id": soul.soul_id,
-                "custom_cards": [{**c.to_dict(), "scope": "soul"} for c in soul.state_event_cards],
+                "custom_cards": [
+                    {**c.to_dict(), "scope": "soul"} for c in soul.state_event_cards
+                ],
                 "general_cards": [
                     {**c.to_dict(), "scope": "global"} for c in DEFAULT_STATE_EVENT_CARDS
                 ],
-                "custom_encounters": [
-                    {"content": txt, "scope": "soul"} for txt in soul.encounter_talk_cards
-                ],
-                "general_encounters": [
-                    {"content": txt, "scope": "global"} for txt in DEFAULT_ENCOUNTER_POOL
-                ],
-                "slot_definitions": SLOT_DEFINITIONS,
+                "action_types": ACTION_TYPE_DEFINITIONS,
+                "chronotype": self._soul_chronotype(soul),
             }
         )
 
@@ -1581,7 +1770,7 @@ class OnlyYouWebAPI:
             cur_slot = await self.plugin.deck_engine.get_current_slot(
                 soul_id=soul.soul_id,
                 custom_cards=soul.state_event_cards,
-                custom_encounters=soul.encounter_talk_cards,
+                chronotype=self._soul_chronotype(soul),
             )
             review = await self.plugin.surfing_pipeline.surf_once(
                 soul=soul,
@@ -1614,39 +1803,41 @@ class OnlyYouWebAPI:
             await self.plugin._ensure_initialized()
             soul = await self._resolve_soul(self._get_query_param("soul_id"))
 
-            run, cur_slot, next_slot = await self.plugin.deck_engine.get_current_and_next_slot(
-                soul_id=soul.soul_id,
-                custom_cards=soul.state_event_cards,
-                custom_encounters=soul.encounter_talk_cards,
+            run, cur_slot, next_slot, now_dt, chronotype = await self._load_current_schedule(soul)
+            schedule_payload = self._schedule_payload_from(
+                run, cur_slot, next_slot, now_dt, chronotype
             )
-            max_mutations = int(self.plugin.schedule_mutator.max_mutations_per_day)
-            cooldown_seconds = int(self.plugin.schedule_mutator.mutation_cooldown_seconds)
-            schedule_payload = {
-                "run": run.to_dict(),
-                "current_slot": cur_slot.to_dict(),
-                "next_slot": next_slot.to_dict(),
-                "max_mutations_per_day": max_mutations,
-                "mutation_cooldown_minutes": int(cooldown_seconds // 60),
-            }
+            mutator = getattr(self.plugin, "schedule_mutator", None)
+            max_mutations = int(getattr(mutator, "max_mutations_per_day", 2) or 2)
+            cooldown_seconds = int(getattr(mutator, "mutation_cooldown_seconds", 0) or 0)
 
-            remaining_seconds, progress = _slot_remaining_and_progress(cur_slot, datetime.now())
+            remaining_seconds, progress = _slot_remaining_and_progress(cur_slot, now_dt)
+            current_action = _slot_action_type(cur_slot) or ActionType.IDLE_ROAM
+            raw_state = getattr(cur_slot, "state", None)
             state_value = (
-                cur_slot.state.value
-                if isinstance(cur_slot.state, BotState)
-                else str(cur_slot.state)
+                raw_state.value
+                if isinstance(raw_state, BotState)
+                else str(raw_state or current_action.bound_state.value)
             )
+            enriched_current = schedule_payload["current_slot"]
+            progress_pct = int(enriched_current.get("progress_pct", round(progress * 100)))
             state_payload = {
                 "state": state_value,
-                "label": str(cur_slot.label),
-                "title": str(cur_slot.title),
-                "armor": int(cur_slot.armor),
-                "slot_key": str(cur_slot.slot_key),
-                "start_hour": int(cur_slot.start_hour),
-                "end_hour": int(cur_slot.end_hour),
+                "action_type": current_action.value,
+                "action_type_label": current_action.label,
+                "label": str(getattr(cur_slot, "label", "") or current_action.label),
+                "title": str(getattr(cur_slot, "title", "") or ""),
+                "armor": int(getattr(cur_slot, "armor", 50) or 0),
+                "slot_key": str(getattr(cur_slot, "slot_key", "") or ""),
+                "start_hour": _coerce_hour(getattr(cur_slot, "start_hour", 0.0), 0.0),
+                "end_hour": _coerce_hour(getattr(cur_slot, "end_hour", 24.0), 24.0),
                 "remaining_seconds": remaining_seconds,
                 "progress": progress,
-                "mutated": bool(cur_slot.mutated),
-                "next_slot": next_slot.to_dict(),
+                "progress_pct": max(0, min(100, progress_pct)),
+                "completion_result": str(getattr(cur_slot, "completion_result", "") or ""),
+                "busy_settled": bool(getattr(cur_slot, "busy_settled", False)),
+                "mutated": bool(getattr(cur_slot, "mutated", False)),
+                "next_slot": schedule_payload["next_slot"],
             }
 
             used = int(getattr(run, "mutations_used", 0) or 0)
@@ -1679,14 +1870,15 @@ class OnlyYouWebAPI:
                     "vigor": {
                         "title": str(getattr(run, "vigor_title", "") or ""),
                         "desc": str(getattr(run, "vigor_desc", "") or ""),
+                        "chronotype": chronotype,
                     },
                     "state": state_payload,
                     "schedule": schedule_payload,
                     "quota": quota_payload,
-                    "encounters": [
-                        _encounter_to_dict(item)
-                        for item in (getattr(run, "encounters", None) or [])
-                    ],
+                    # Encounter-talk cards were removed from the product; the empty
+                    # list is kept so old frontend bundles can still deserialize.
+                    "encounters": [],
+                    "busy_results": schedule_payload["busy_results"],
                     "counts": {
                         "relations": await self._relation_counts(),
                         "memories": await self._memory_counts(soul.soul_id),

@@ -3378,3 +3378,248 @@ html.dark .tier-pill.tier-2 { color: #a5b4fc; }
     transition-duration: 0.01ms !important;
   }
 }
+
+/* --------------------------------------------------------------------------
+ * 16. 24h 动态时间轴 × 四类行动卡（SLEEP / SURF / IDLE_ROAM / BUSY_TASK）
+ *     新增：行动徽章色 / 繁忙进度条 / 时长胶囊 / 今日繁忙成果小卡 /
+ *           时间轴块与筛选按钮的 action 配色增强。沿用灰白+青绿设计令牌。
+ * -------------------------------------------------------------------------- */
+:root {
+  --action-sleep: #6366f1;
+  --action-sleep-soft: rgba(99, 102, 241, 0.12);
+  --action-sleep-text: #4338ca;
+  --action-surf: #0891b2;
+  --action-surf-soft: rgba(8, 145, 178, 0.12);
+  --action-surf-text: #0e7490;
+  --action-idle-roam: #10b981;
+  --action-idle-roam-soft: rgba(16, 185, 129, 0.12);
+  --action-idle-roam-text: #047857;
+  --action-busy-task: #f59e0b;
+  --action-busy-task-soft: rgba(245, 158, 11, 0.14);
+  --action-busy-task-text: #b45309;
+}
+
+html.dark,
+html[data-theme="dark"] {
+  --action-sleep: #a5b4fc;
+  --action-sleep-soft: rgba(165, 180, 252, 0.16);
+  --action-sleep-text: #c7d2fe;
+  --action-surf: #22d3ee;
+  --action-surf-soft: rgba(34, 211, 238, 0.16);
+  --action-surf-text: #67e8f9;
+  --action-idle-roam: #34d399;
+  --action-idle-roam-soft: rgba(52, 211, 153, 0.16);
+  --action-idle-roam-text: #6ee7b7;
+  --action-busy-task: #fbbf24;
+  --action-busy-task-soft: rgba(251, 191, 36, 0.16);
+  --action-busy-task-text: #fcd34d;
+}
+
+/* 四类行动徽章 */
+.action-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.action-badge::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.85;
+  flex: 0 0 auto;
+}
+
+.action-badge.action-sleep {
+  background: var(--action-sleep-soft);
+  color: var(--action-sleep-text);
+}
+
+.action-badge.action-surf {
+  background: var(--action-surf-soft);
+  color: var(--action-surf-text);
+}
+
+.action-badge.action-idle-roam {
+  background: var(--action-idle-roam-soft);
+  color: var(--action-idle-roam-text);
+}
+
+.action-badge.action-busy-task {
+  background: var(--action-busy-task-soft);
+  color: var(--action-busy-task-text);
+}
+
+/* BUSY_TASK 实时进度条（概览主卡） */
+.busy-progress {
+  height: 8px;
+  border-radius: 99px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.busy-progress-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--action-busy-task), var(--state-busy));
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.14);
+  transition: width 0.4s ease;
+}
+
+.busy-result-inline {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 7px 9px;
+  border-radius: var(--radius-sm);
+  background: var(--action-busy-task-soft);
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.busy-result-inline .oy-icon {
+  flex: 0 0 auto;
+  margin-top: 1px;
+  color: var(--action-busy-task-text);
+}
+
+/* 时长胶囊（行动卡 min_hours ~ max_hours） */
+.duration-pill {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.action-duration {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 今日繁忙成果（Tier 1 短时记忆）小卡 */
+.busy-result-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 196px;
+  overflow-y: auto;
+  min-width: 0;
+}
+
+.busy-result-item {
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--action-busy-task);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  min-width: 0;
+}
+
+.busy-result-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.busy-result-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.busy-result-title .oy-icon {
+  flex: 0 0 auto;
+  color: var(--action-busy-task-text);
+}
+
+.busy-result-meta {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.busy-result-text {
+  margin-top: 3px;
+  font-size: 11.5px;
+  color: var(--text-2);
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* 时间轴色块按四类行动增强配色（SURF 与 IDLE_ROAM 同属 IDLE，靠色相区分） */
+.sched-seg[data-action-type="SLEEP"] {
+  --st: var(--action-sleep);
+  --st-block: var(--action-sleep-soft);
+  --st-text: var(--action-sleep-text);
+}
+
+.sched-seg[data-action-type="SURF"] {
+  --st: var(--action-surf);
+  --st-block: var(--action-surf-soft);
+  --st-text: var(--action-surf-text);
+}
+
+.sched-seg[data-action-type="IDLE_ROAM"] {
+  --st: var(--action-idle-roam);
+  --st-block: var(--action-idle-roam-soft);
+  --st-text: var(--action-idle-roam-text);
+}
+
+.sched-seg[data-action-type="BUSY_TASK"] {
+  --st: var(--action-busy-task);
+  --st-block: var(--action-busy-task-soft);
+  --st-text: var(--action-busy-task-text);
+}
+
+/* 筛选分段控件的行动配色 */
+.seg-btn.active[data-action-type="SLEEP"] {
+  color: var(--action-sleep-text);
+}
+
+.seg-btn.active[data-action-type="SURF"] {
+  color: var(--action-surf-text);
+}
+
+.seg-btn.active[data-action-type="IDLE_ROAM"] {
+  color: var(--action-idle-roam-text);
+}
+
+.seg-btn.active[data-action-type="BUSY_TASK"] {
+  color: var(--action-busy-task-text);
+}

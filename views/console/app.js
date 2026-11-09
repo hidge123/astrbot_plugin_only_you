@@ -5,7 +5,7 @@
  *  1. AstrBot Dashboard bridge 封装：apiGet / apiPost / ready / getContext / onContext，
  *     无 bridge 时自动 fetch `/api/plug/astrbot_plugin_only_you/{endpoint}` 兜底。
  *  2. 轻量状态管理：state = { souls, currentSoulId, currentSoul, overview, modelStatus,
- *     slotDefinitions, defaultSoulId, nativePersonas, umoBindings, knownUmos, activeSchedule }。
+ *     actionTypes, defaultSoulId, nativePersonas, umoBindings, knownUmos, activeSchedule }。
  *  3. hash 路由（#/overview / #/schedule / ...），从 window.OY_PAGES 自动生成 216px 侧栏。
  *  4. 通用 UI：toast / modal / drawer / confirm；主题初始化与 AstrBot Dashboard 明暗同步。
  *  5. 页面生命周期：render(container, ctx) / destroy()；ctx 就是 app 本身。
@@ -105,7 +105,7 @@
       currentSoul: null,
       overview: null,
       modelStatus: {},
-      slotDefinitions: [],
+      actionTypes: [],
       defaultSoulId: "",
       nativePersonas: [],
       umoBindings: {},
@@ -404,7 +404,7 @@
     state.umoBindings = init.umo_bindings || {};
     state.knownUmos = Array.isArray(init.known_umos) ? init.known_umos : [];
     state.modelStatus = init.model_status || {};
-    state.slotDefinitions = Array.isArray(init.slot_definitions) ? init.slot_definitions : [];
+    state.actionTypes = Array.isArray(init.action_types) ? init.action_types : [];
     state.defaultSoulId = init.default_soul_id || "";
     state.activeSchedule = init.active_schedule || null;
 

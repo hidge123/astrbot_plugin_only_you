@@ -1,50 +1,58 @@
-# OnlyYou (只有你) —— 技术架构与 AstrBot 实现方案设计 (v2.4)
+# OnlyYou (只有你) —— 技术架构与 AstrBot 实现方案设计 (v2.5)
 
-> 本文档紧密结合 [AstrBot 插件开发指南 (`Star` 规范)](https://docs.astrbot.app/dev/star/plugin-new.html)，详细定义 `astrbot_plugin_only_you` 的核心工程设计，重点包含：**三态模型（休息中 / 繁忙中 / 空闲中）× 两大原子行为（回发消息 / 刷视频）**、**Roguelite 随机日程引擎与奇遇谈资池**、**基于外部输入的受限状态微调**、参考并精简自 `livingmemory` 的 **分级记忆、定时自动遗忘清理 (`Forgetting GC`) 与简易上下文预算管理器 (`Context Budget Manager`)**，以及 v2.4 引入的 **详细角色卡（10 分区 × 39 字段）接管原生 Persona** 与 **插件自治四角色模型体系（`ProviderFactory` + `ModelHub` + `selected_provider`）**。
+> 本文档紧密结合 [AstrBot 插件开发指南 (`Star` 规范)](https://docs.astrbot.app/dev/star/plugin-new.html)，详细定义 `astrbot_plugin_only_you` 的核心工程设计，重点包含：**三态门禁（休息中 / 繁忙中 / 空闲中）× 四类可执行行动卡（`SLEEP` / `SURF` / `IDLE_ROAM` / `BUSY_TASK`）**、**基于作息曲线的 24h 动态弹性时间轴**、**基于外部输入的时间块切分 / 延展微调（含繁忙半途结算）**、参考并精简自 `livingmemory` 的 **分级记忆、定时自动遗忘清理 (`Forgetting GC`) 与简易上下文预算管理器 (`Context Budget Manager`)**，以及 v2.4 引入、v2.5 延续的 **详细角色卡（10 分区 × 39 字段）接管原生 Persona** 与 **插件自治四角色模型体系（`ProviderFactory` + `ModelHub` + `selected_provider`）**。
 
 ---
 
-## 一、 核心状态与行为控制架构图
+## 一、 核心状态与四类行动卡控制架构图
 
 ```mermaid
 flowchart TB
-    subgraph Roguelite["🎲 1. Roguelite 每日随机日程构筑引擎 (core/roguelite_deck.py)"]
-        Pool["固定元素卡池 (通用池 + 人设专属池)\n① 今日基调卡 × ② 时间槽事件卡 × ③ 奇遇谈资卡"]
-        Timeline["今日日程轴 (DailyScheduleRun)\n6个时间段，每个时段绑定唯一状态:\n💤 RESTING(休息中) | 🔥 BUSY(繁忙中) | ☕ IDLE(空闲中)"]
-        TalkPool["今日短时谈资池 (Today Encounters)\n1~2张奇遇卡作为今日聊天话题素材"]
-        Pool -->|"每日零点/苏醒加权抽取 + 连携"| Timeline & TalkPool
+    subgraph Roguelite["🎲 1. 24h 动态弹性日程构筑引擎 (core/roguelite_deck.py)"]
+        Pool["角色专属四类行动卡池 (8~12张可编辑) + 作息曲线 (rhythm.chronotype)\n① SLEEP(睡觉) | ② SURF(冲浪) | ③ IDLE_ROAM(闲逛) | ④ BUSY_TASK(繁忙主业)"]
+        Timeline["今日 24h 动态积木时间轴 (DailyScheduleRun)\n游标 0.0 -> 24.0 随机时长拼接 (7~11 个弹性时间块)\n每块绑定: BotState(RESTING/BUSY/IDLE) + ActionType"]
+        TalkPool["今日短时记忆谈资 (Tier 1 Memory)\n繁忙卡每次结算生成的随机【完成结果记忆】+ 冲浪视频记忆"]
+        Pool -->|"按 [作息权重曲线 × 今日基调 × 相邻连携] 动态排满 24h"| Timeline
     end
 
-    subgraph StateGate["🚦 2. 三态核心控制器 (State Controller)"]
-        CurState{"当前时段状态\nCurrent BotState"}
-        Timeline --> CurState
+    subgraph StateGate["🚦 2. 三态 × 四类行动卡控制器 (State & Action Controller)"]
+        CurBlock{"当前时间块\n(State + ActionType)"}
+        Timeline --> CurBlock
     end
 
-    subgraph TwoActions["⚡ 3. 机器人两大具体可执行行为 (Two Atomic Actions)"]
+    subgraph ExecPipelines["⚡ 3. 四类行动卡的实际后台行为与消息门禁"]
         direction LR
-        subgraph ActMsg["💬 行为一：回/发消息管线 (Message Pipeline)"]
-            M_Rest["💤 休息中：\n直接拦截丢弃，不回任何消息"]
-            M_Busy["🔥 繁忙中：\n过滤 L1 普通群友，仅放行 L2重要用户 & ★L3核心用户"]
-            M_Idle["☕ 空闲中：\nL1/L2/L3 全量放行进入读空气 + 允许拿【奇遇卡/视频】主动搭话"]
+        subgraph ActSleep["💤 ① 睡觉卡 (SLEEP / RESTING)"]
+            S_Behavior["• 消息门禁：直接拦截丢弃，不回任何消息\n• 后台行为：什么都不做 (完全静默)"]
         end
 
-        subgraph ActVideo["📱 行为二：刷视频管线 (Surfing Pipeline)"]
-            V_Off["💤 休息中 / 🔥 繁忙中：\n挂起冲浪调度器，不刷视频"]
-            V_On["☕ 空闲中：\n激活 B站/抖音冲浪 -> 看热评初筛 -> 3x3九宫格多模态看片 -> 分享"]
+        subgraph ActBusy["🔥 ④ 角色繁忙卡 (BUSY_TASK / BUSY)"]
+            B_Behavior["• 消息门禁：过滤 L1 普通群友，仅放行 ◆L2 & ★L3\n• 极简三要素（结果每天随机不同）：\n  1. 注入当前行为记忆\n  2. 实时推进进度条 (0% -> 100%)\n  3. 结束/中断时生成一句话随机【完成结果】写入 Tier1 记忆！"]
+        end
+
+        subgraph ActSurf["📱 ② 冲浪卡 (SURF / IDLE)"]
+            I_Surf["• 消息门禁：L1/L2/L3 全量放行进入读空气\n• 后台行为：激活 B站/抖音冲浪 -> 看热评 -> 视觉看片 -> 分享"]
+        end
+
+        subgraph ActRoam["👀 ③ 空闲游荡卡 (IDLE_ROAM / IDLE)"]
+            I_Roam["• 消息门禁：L1/L2/L3 全量放行进入读空气\n• 后台行为（二选一）：\n  A. 翻群记录吃瓜 (扫描未读群聊滑窗插话/私聊L3吐槽)\n  B. 发呆记忆联想 (抽1~2条旧记忆/今日繁忙结果主动找人搭话)"]
         end
     end
 
-    CurState -->|"RESTING"| M_Rest & V_Off
-    CurState -->|"BUSY"| M_Busy & V_Off
-    CurState -->|"IDLE"| M_Idle & V_On
+    CurBlock -->|"RESTING / SLEEP"| ActSleep
+    CurBlock -->|"BUSY / BUSY_TASK"| ActBusy
+    CurBlock -->|"IDLE / SURF"| ActSurf
+    CurBlock -->|"IDLE / IDLE_ROAM"| ActRoam
+    ActBusy & ActSurf -->|"写入 Tier1 短时记忆"| TalkPool
+    TalkPool -.->|"提供联想谈资"| ActRoam
 
     subgraph Mutator["🔄 4. 输入驱动的受限日程微调器 (core/schedule_mutator.py)"]
         Gate["三重硬性限制门禁：\n1. 今日微调次数 < max_mutations(2次)\n2. 距上次微调 > cooldown(120min)\n3. 输入冲击力 Impact > 当前卡片定力 Armor"]
     end
 
-    M_Busy & M_Idle -->|"输入源A: 读取到高冲击力用户消息"| Gate
-    V_On -->|"输入源B: 刷到高分上头视频"| Gate
-    Gate -->|"击穿护甲！微调当前或下一时段状态\n(如 BUSY->IDLE 摸鱼，或推迟 RESTING 熬夜)"| Timeline
+    ActBusy & ActSurf & ActRoam -->|"输入源A: 读取到高冲击力用户消息"| Gate
+    ActSurf -->|"输入源B: 刷到高分上头视频"| Gate
+    Gate -->|"击穿护甲！实时切分或延展动态时间块\n(如 BUSY_TASK 半途结算并转为 IDLE_ROAM，或推迟 SLEEP)"| Timeline
 ```
 
 ---
@@ -60,9 +68,9 @@ astrbot_plugin_only_you/
 ├── requirements.txt             # 依赖库 (httpx, aiosqlite, pillow, imageio-ffmpeg)
 ├── main.py                      # 插件入口类 OnlyYouPlugin(Star)：三态门禁 + selected_provider + on_decorating_result TTS + 生命周期
 ├── core/
-│   ├── state_machine.py         # 🚦 三态枚举 (RESTING/BUSY/IDLE) 与两大行为 (MESSAGE/SURF) 门禁控制器
-│   ├── roguelite_deck.py        # 🎲 Roguelite 每日日程抽卡引擎（基调卡/事件状态卡/奇遇谈资卡/连携）
-│   ├── schedule_mutator.py      # 🔄 输入驱动的受限状态微调器（基于消息/视频冲击力的状态跃迁与配额锁）
+│   ├── state_machine.py         # 🚦 三态枚举 (RESTING/BUSY/IDLE) + 四类行动卡枚举 ActionType 门禁控制器
+│   ├── roguelite_deck.py        # 🎲 24h 动态积木时间轴引擎（角色专属四类卡池 / 作息曲线 / 弹性块拼接 / 繁忙完成结果字段）
+│   ├── schedule_mutator.py      # 🔄 输入驱动的受限微调器（BUSY_TASK 半点切分半途结算 / SLEEP 唤醒窗 / IDLE 加钟 + 三重门禁）
 │   ├── character_card.py        # 🎭 详细角色卡单一数据源：CARD_SCHEMA(10 分区/39 字段)、normalize/migrate、Persona Prompt 渲染
 │   ├── soul_manager.py          # 角色卡(Soul)管理：SoulProfile.card、会话路由、AI 造卡(generate_card)、原生 Persona 导入
 │   ├── user_relation.py         # 三级用户关系管理 (L1普通 / L2重要熟人 / ★L3核心用户) 与跨平台映射
@@ -79,9 +87,9 @@ astrbot_plugin_only_you/
 │       ├── style.css            # 设计令牌 + 组件样式（浅/深色）
 │       ├── app.js               # bridge 封装、轻量状态、hash 路由、通用 UI（无构建 classic script）
 │       ├── icons.js             # ≥20 个内联 SVG 线性图标（替代 emoji）
-│       ├── charts.js            # 纯 SVG 环形表 / 24h 时间轴 / 环形图 / 条形图 / 配额圆点
-│       ├── page-overview.js     # 概览：状态环形表 + 24h 日程轴 + 基调/配额/奇遇/关系/记忆/模型小卡
-│       ├── page-schedule.js     # 日程：24h 时间轴 + 行动卡网格 + 三态筛选 + 重抽/强制切换
+│       ├── charts.js            # 纯 SVG 环形表 / 24h 弹性动态时间轴（浮点时间 / 行动徽章 / 进度 tooltip）/ 环形图 / 条形图
+│       ├── page-overview.js     # 概览：状态环形表 + 24h 弹性轴 + 行动徽章/繁忙进度条/今日繁忙成果(Tier1) + 基调/配额/关系/记忆/模型小卡
+│       ├── page-schedule.js     # 日程：24h 弹性时间轴 + 四类行动卡网格/筛选/编辑器（已无奇遇卡） + 重抽/强制切换
 │       ├── page-character.js    # 角色卡：10 分区动态表单 + AI 整卡生成/分区补全 + Prompt 预览
 │       ├── page-relations.js    # 关系：★L3 / ◆L2 / L1 三列看板 + 拖拽改级 + 合并账号
 │       ├── page-memory.js       # 记忆：Tier 分段 + 搜索 + 提炼/GC/钉选核心
@@ -108,18 +116,25 @@ astrbot_plugin_only_you/
 
 ## 三、 主动决策力核心工程设计
 
-### 3.1 三种状态与元素卡牌的数据结构定义 (`core/roguelite_deck.py`)
+### 3.1 三态枚举、四类行动卡与 24h 动态时间块定义 (`core/roguelite_deck.py`)
 
-彻底摒弃繁琐的细碎分类，所有日程事件卡严格归属三态之一：
+为兼顾“清晰的三态门禁”、“真实可执行的后台动作”与“千人千面的虚构角色贴合度”，每张行动卡同时具备 **`state`（三态门禁）**、**`action_type`（四类可执行动作）** 与 **`duration_range`（动态时长范围）**：
 
 ```python
 from enum import Enum
 from dataclasses import dataclass, field
+from typing import Optional
 
 class BotState(str, Enum):
     RESTING = "RESTING"   # 💤 休息中：不回任何消息，不刷视频
-    BUSY = "BUSY"         # 🔥 繁忙中：只回 L2重要用户 & L3核心用户消息，不主动闲聊，不刷视频
-    IDLE = "IDLE"         # ☕ 空闲中：L1/L2/L3 全量读空气回复，可主动搭话，主动刷B站/抖音视频
+    BUSY = "BUSY"         # 🔥 繁忙中：只回 L2重要用户 & L3核心用户消息
+    IDLE = "IDLE"         # ☕ 空闲中：L1/L2/L3 全量读空气回复，可执行冲浪/翻群吃瓜/记忆联想
+
+class ActionType(str, Enum):
+    SLEEP = "SLEEP"           # ① 睡觉卡 (绑定 RESTING)：什么都不做，完全静默
+    SURF = "SURF"             # ② 冲浪卡 (绑定 IDLE)：触发 B站/抖音真实刷视频管线
+    IDLE_ROAM = "IDLE_ROAM"   # ③ 空闲游荡卡 (绑定 IDLE)：翻群吃瓜 / 发呆记忆联想
+    BUSY_TASK = "BUSY_TASK"   # ④ 角色繁忙卡 (绑定 BUSY)：行为记忆 + 进度条 + 完成结果写 Tier1
 
 class UserTier(int, Enum):
     L1_NORMAL = 1         # 普通用户（群友）
@@ -128,28 +143,121 @@ class UserTier(int, Enum):
 
 @dataclass
 class StateEventCard:
-    """时间槽事件状态卡"""
+    """24h 动态行动卡（兼容旧名 StateEventCard）"""
     card_id: str
-    title: str                        # 表面正在做的事，如 "上早八高数课" / "躺沙发摸鱼" / "钻被窝睡觉"
-    state: BotState                   # 绑定的唯一状态: RESTING | BUSY | IDLE
-    valid_slots: list[str]            # 允许抽取的时段: ["morning", "forenoon", "noon", "afternoon", "evening", "night"]
-    base_weight: int                  # 基础抽取权重
-    armor: int                        # 定力护甲 (0~100)，决定该状态多难被外部输入(消息/视频)改变
-    synergy_tags: dict[str, float] = field(default_factory=dict) # 连携权重系数，如 {"late_night": 2.5}
+    title: str                        # 贴合人设的行动名称，如 "丹房炼制回春丹" / "躺沙发刷B站"
+    state: BotState = BotState.IDLE   # 绑定的唯一状态（由 action_type 强制同步）
+    valid_slots: list[str] = field(default_factory=list)  # 仅旧数据兼容字段，排轴已不再使用
+    base_weight: int = 50             # 基础抽取权重
+    armor: int = 50                   # 定力护甲 (0~100)，决定该时间块多难被外部输入改变
+    synergy_tags: dict[str, float] = field(default_factory=dict)  # 相邻卡片连携系数
+    action_type: Optional[ActionType] = None  # SLEEP | SURF | IDLE_ROAM | BUSY_TASK（显式优先）
+    min_hours: float = 1.0            # 随机最短时长（小时，0.5h 网格，0.5 ~ 8.0）
+    max_hours: float = 2.5            # 随机最长时长（小时，0.5h 网格）
+
+# from_dict() 旧数据迁移：无 action_type 时按 state + title 推导
+#   RESTING -> SLEEP / BUSY -> BUSY_TASK / IDLE 且标题含"刷 B站 抖音 视频 冲浪" -> SURF / 其余 IDLE -> IDLE_ROAM
+# 显式 action_type 优先并强制 state = action_type.bound_state；时长夹取到 0.5h 网格且 min <= max。
 
 @dataclass
-class EncounterCard:
-    """奇遇谈资卡（不改变状态，仅作为当天短时记忆提供聊天谈资）"""
-    encounter_id: str
-    content: str                      # 如 "今天中午点外卖老板多送了一根烤肠" / "早上下楼差点踩到流浪猫"
-    used: bool = False                # 当天是否已经在聊天中当成话题聊过了
+class SlotInstance:
+    """24h 动态时间轴上的单个弹性时间块实例（文档旧称 ScheduleBlock；类名沿用 SlotInstance）"""
+    slot_key: str                     # 连续编号 "block_0", "block_1" ...（force_state 用它定位）
+    start_hour: float                 # 起始小时 (0.0 ~ 23.5，0.5h 网格)
+    end_hour: float                   # 结束小时 (0.5 ~ 24.0)
+    state: BotState                   # RESTING | BUSY | IDLE
+    card_id: str = "evt_default"
+    title: str = "日常摸鱼"           # 当前正在做的事（繁忙卡即作为【当前行为记忆】）
+    label: str = ""                   # 行动类型中文标签，如 "繁忙主业"
+    action_type: Optional[ActionType] = None  # SLEEP | SURF | IDLE_ROAM | BUSY_TASK
+    armor: int = 50                   # 当前护甲
+    mutated: bool = False             # 是否因外部输入发生过微调
+    mutation_monologue: str = ""      # 微调心理独白
+    delay_minutes: int = 0            # 旧字段保留，新时间轴恒为 0
+    # --- 仅 BUSY_TASK 使用的极简三要素字段 ---
+    busy_settled: bool = False        # 该繁忙块是否已结算完成结果记忆
+    completion_result: str = ""       # 100% 完成（或中途被打断）时生成的一句话结果（写入 Tier1 记忆）
+
+    def get_progress_pct(self, now_dt: Optional[datetime] = None) -> int:
+        """实时计算当前时间块进度百分比 (0% -> 100%)；now_dt 缺省取 datetime.now()"""
+        dt = now_dt or datetime.now()
+        now_hour = dt.hour + dt.minute / 60.0 + dt.second / 3600.0
+        if now_hour <= self.start_hour:
+            return 0
+        if now_hour >= self.end_hour:
+            return 100
+        return int(round(100.0 * (now_hour - self.start_hour) / (self.end_hour - self.start_hour)))
+
+    def format_time_range(self) -> str:
+        """浮点小时转 "13:30-15:00"（24.0 -> "24:00"）"""
+        return "%02d:%02d-%02d:%02d" % (
+            int(self.start_hour), int(round((self.start_hour % 1) * 60)),
+            int(self.end_hour), int(round((self.end_hour % 1) * 60)),
+        )
+```
+
+#### 24h 作息曲线 (`chronotype`) 与动态时长拼接算法
+引擎根据角色卡 `rhythm.chronotype`（`early` 早起型 / `normal` 规律型 / `night_owl` 夜猫子）提供小时级状态权重曲线 `get_chronotype_weights(chronotype, hour_t)`，并在每日零点（或重抽时）从 `t = 0.0` 循环拼接到 `24.0`：
+
+```python
+def _build_dynamic_slots(
+    self,
+    chronotype: str,
+    vigor: DayVigorCard,
+    pool: list[StateEventCard],
+    rng: Any = None,
+) -> list[SlotInstance]:
+    """把角色专属卡池无缝拼成 0.0 -> 24.0 的弹性时间轴（0.5h 网格，最终 7~11 块）"""
+    t = 0.0
+    blocks: list[SlotInstance] = []
+    prev_block: Optional[SlotInstance] = None
+    consecutive_busy_hours = 0.0
+    hours_since_long_sleep = 99.0
+
+    while t < 24.0 - 1e-6:
+        remaining = round(24.0 - t, 1)
+        # 1. 查询角色作息类型在时刻 t 的四类行动权重倍率
+        state_weights = self.get_chronotype_weights(chronotype, t)
+        # 2. 叠加今日基调卡倍率 + 防呆连携（刚睡醒不连睡 / 连续忙 >3.5h 后提高 SURF/IDLE_ROAM 权重）
+        card = self._weighted_draw_card(
+            pool, remaining, state_weights, vigor, prev_block,
+            consecutive_busy_hours, hours_since_long_sleep, rng=rng,
+        )
+        # 3. 在卡片 [min_hours, max_hours] 内按 0.5h 步长随机掷出时长，并截断到 24.0
+        duration = self._roll_duration(card.min_hours, card.max_hours, remaining, rng=rng)
+        block = SlotInstance(
+            slot_key=f"block_{len(blocks)}",
+            start_hour=round(t, 1),
+            end_hour=round(t + duration, 1),
+            state=card.state,
+            card_id=card.card_id,
+            title=card.title,
+            label=card.action_type.label,
+            action_type=card.action_type,
+            armor=max(0, min(100, card.armor + vigor.armor_offset)),
+        )
+        blocks.append(block)
+        if block.action_type == ActionType.SLEEP and duration >= 3.0:
+            hours_since_long_sleep = 0.0
+        else:
+            hours_since_long_sleep += duration
+        consecutive_busy_hours = (
+            consecutive_busy_hours + duration if block.state == BotState.BUSY else 0.0
+        )
+        prev_block = block
+        t = round(block.end_hour, 1)
+
+    # 4. 收尾重排：合并/拆分到 7~11 块、重排连续 slot_key、钉死末块 end_hour = 24.0；
+    #    旧日程（6 时段 / 过夜 end<start）由 is_valid_timeline() 校验失败后自动重抽。
+    target = int(rng.choice([8, 9, 10, 11]))
+    return self._rebalance_blocks(blocks, target=target)
 ```
 
 ---
 
-### 3.2 三态门禁控制器：精确控制【回消息】与【刷视频】 (`core/state_machine.py`)
+### 3.2 三态门禁与四类行动卡执行控制器 (`core/state_machine.py` & `main.py`)
 
-#### 1. 对行为一【回消息】的拦截与放行逻辑 (`main.py`)
+#### 1. 对被动消息【回消息】的三态拦截与放行逻辑 (`main.py`)
 当 AstrBot 收到任何群聊或私聊消息 `event` 时，第一步直接经过三态门禁（零 Token 消耗完成前置过滤）：
 
 ```python
@@ -160,55 +268,68 @@ async def on_any_message(self, event: AstrMessageEvent):
 
     soul = await self.soul_manager.resolve_soul(event.unified_msg_origin)
     user = await self.user_relation.resolve_user(event)
-    current_slot = await self.deck_engine.get_current_slot(soul.soul_id)
+    current_block = await self.deck_engine.get_current_slot(soul.soul_id)
 
-    # 1. 将消息静默记入群聊/私聊滑动窗口（供后续苏醒或空闲时了解上下文）
+    # 1. 将消息静默记入群聊/私聊滑动窗口（供后续苏醒或 IDLE_ROAM 翻群吃瓜时读取）
     self.atmosphere_reader.record_message(event, user)
 
-    # 2. 检查是否因高冲击力消息触发【受限日程状态微调】（如 L3 核心用户把 Bot 从 BUSY 拉入 IDLE）
-    mutated = await self.schedule_mutator.on_message_input(soul, current_slot, event, user)
+    # 2. 检查是否因高冲击力消息触发【受限日程微调】（如把 BUSY_TASK 半途打断切分为 IDLE_ROAM）
+    mutated = await self.schedule_mutator.on_message_input(soul, current_block, event, user)
     if mutated:
-        current_slot = await self.deck_engine.get_current_slot(soul.soul_id)  # 刷新突变后的新状态
+        current_block = await self.deck_engine.get_current_slot(soul.soul_id)
 
-    # 3. 🚦 三态核心门禁裁决：通过 event.should_call_llm(bool) 协同原生管线（不粗暴破坏原生流程）
-    if current_slot.state == BotState.RESTING:
-        # 💤 休息中：撤回唤醒，不回任何消息（哪怕被 @ 也不回）
-        event.should_call_llm(False)
+    # 3. 🚦 三态核心门禁裁决：通过 PlatformBridge.apply_reply_decision 协同原生管线
+    #    被门禁拦截的消息 = Bot 当时不可用而错过的消息 -> 记入【未读队列】
+    if current_block.state == BotState.RESTING:
+        # 💤 睡觉卡 (SLEEP)：撤回唤醒，不回任何消息；所有未读都进未读队列
+        self.session_buffer.mark_unread(umo, buffered_message, is_private=is_private)
+        self.platform_bridge.apply_reply_decision(event, False)
         return
 
-    elif current_slot.state == BotState.BUSY:
-        # 🔥 繁忙中：只回复 L2 重要用户 和 ★L3 核心用户！忽略 L1 普通用户
+    elif current_block.state == BotState.BUSY:
+        # 🔥 角色繁忙卡 (BUSY_TASK)：忽略 L1 普通用户；仅放行 ◆L2 与 ★L3，并在 Prompt 注入当前行为 + 进度条 (0~100%)
         if user.tier == UserTier.L1_NORMAL:
-            event.should_call_llm(False)
+            self.session_buffer.mark_unread(umo, buffered_message, is_private=is_private)
+            self.platform_bridge.apply_reply_decision(event, False)
             return
-        # 若为 L2 或 L3：进入读空气/回复判定
 
-    # 4. 群聊走读空气裁决 -> 若决定开口，调用 event.should_call_llm(True) 交还给 AstrBot 原生管线生成与分段发送！
-    should_reply = await self.atmosphere_reader.evaluate_should_reply(event, soul, user, current_slot)
-    event.should_call_llm(should_reply)
+    # 4. 群聊走读空气裁决 -> 若决定开口，放行交由 AstrBot 原生管线生成与分段发送
+    #    注意：门禁放行后即使读空气判 IGNORE，这条消息也属于「已读」，不进未读队列
+    should_reply = await self.atmosphere_reader.evaluate_should_reply(event, soul, user, current_block)
+    self.platform_bridge.apply_reply_decision(event, should_reply)
 ```
 
-#### 2. 对行为二【刷视频 & 主动搭话】的调度逻辑
-后台异步心跳循环（每 10~15 分钟检查一次当前槽位状态）：
-- 若 `current_slot.state in (BotState.RESTING, BotState.BUSY)`：
-  - **直接跳过**！在休息中或繁忙中，绝不主动去刷 B站/抖音，也绝不主动找人闲聊。
-- 若 `current_slot.state == BotState.IDLE`（**☕ 空闲中**）：
-  - **动作分支 A（主动刷视频 `SURF_VIDEO`）**：调用 `CyberSurfingPipeline` 拉取 B站/抖音视频 + 热评，通过多模态模型看片。看完后可直接发给 ★L3 核心用户，或存入待分享池在群聊甩出。
-  - **动作分支 B（拿奇遇卡或刚看的视频主动搭话 `PROACTIVE_MESSAGE`）**：检查当日 `DailyScheduleRun.encounters` 中是否还有 `used == False` 的**【奇遇谈资卡】**（如 `[外卖多送了烤肠]`）。若有，结合当前空闲状态主动去私聊 ★L3 核心用户或在活跃熟人群里抛出这个话题，随后将该奇遇卡标记为 `used = True`！
+> **未读消息定义**：只统计**被三态门禁拦截**的消息（`RESTING` 全部 / `BUSY` 的 `L1`）；被放行后读空气判 `IGNORE` 的消息是“已读但不想回”，不算未读。未读队列由 `SessionBuffer._unread` 独立维护（不依赖 15 条滑窗驱逐、按群聊/私聊分类、TTL/容量/冷却可配）。
+
+#### 2. 四类行动卡 (`SLEEP` / `BUSY_TASK` / `SURF` / `IDLE_ROAM`) 的后台心跳调度
+后台异步心跳循环按当前时间块 `current_block.action_type` 驱动真实行为：
+1. **当刚跨过一个 `BUSY_TASK` 时间块（进度到达 `100%` 且 `busy_settled == False`）**：
+   - 自动结算该繁忙块：调用决策模型（或轻量模板回退）生成**一句话完成结果**（如 *“忙活两小时终于把回春丹炼出来了，成色还不错”*），赋值给 `block.completion_result`，并直接调用 `memory_manager.add_memory(memory_tier=1, ...)` 写入 **Tier 1 短时记忆库**，标记 `busy_settled = True`。
+2. **当当前块为 `① SLEEP` (`BotState.RESTING`)**：
+   - **什么都不做**！直接返回，完全静默。
+3. **当当前块为 `④ BUSY_TASK` (`BotState.BUSY`)**：
+   - 不刷视频、不主动找人闲聊；由 `current_block.get_progress_pct(now_dt)` 随时间自动推進 `0% -> 100%` 进度条，供被动回复 ◆L2/★L3 时展示 `[正在忙：{title} | 进度：{progress}%]`。
+4. **任意 `IDLE` 块（`SURF` / `IDLE_ROAM`）在驱动自身行为前，先执行【私聊未读补回】**：
+   - `_catch_up_private_unread()` 取私聊未读队列，按会话逐条喂给 `UNREAD_PRIVATE_CATCHUP_PROMPT`，生成一句“刚睡醒/刚忙完才看到”的自然补回消息并经 `PlatformBridge.send_proactive_message()` 发送；每个私聊会话受 `unread_private_cooldown_minutes` 冷却限制，单次心跳最多补回 2 个会话，发送成功即 ack 该批未读（失败保留重试）。
+5. **当当前块为 `② SURF` (`BotState.IDLE`)**：
+   - **触发真实刷视频 (`CyberSurfingPipeline`)**：结合角色卡 `surfing_prefs` 拉取 B站/抖音推荐流与热评，由 `vision` 模型看片打分，写入看片记忆，并可主动分享给 ★L3 核心用户或活跃群聊。
+6. **当当前块为 `③ IDLE_ROAM` (`BotState.IDLE`)**：
+   - **分支 A —— 翻群记录吃瓜 (`GROUP_LURK`，先决策后回复)**：从【群聊未读队列】按「未读条数 × 新鲜度」排序选一个群 → 先用 `ATMOSPHERE_EVAL_PROMPT` 对“未读批次 + 最近窗口”跑一次决策模型（`REPLY` / `IGNORE`）；只有 `REPLY` 才用 `IDLE_ROAM_PROACTIVE_PROMPT` 生成冒泡/私聊 ★L3 吐槽并发送；`IGNORE` 则静默消费该批未读（不重复评估）。消费即从队列移除，并受 `unread_group_cooldown_minutes` 每群冷却限制；
+   - **分支 B —— 发呆记忆联想 (`MEMORY_MUSE`)**：当无群聊未读、或群聊决策为 `IGNORE` 时，从 `MemoryManager` 抽取 1~2 条记忆（优先含今日刚结算完的 `BUSY_TASK` 完成结果短时记忆或历史记忆），生成一段第一人称“发呆突然想起某事”的开场白。
 
 ---
 
 ### 3.3 🔄 输入驱动的受限日程状态微调器 (`core/schedule_mutator.py`)
 
-机器人如何根据**读取到的用户消息**或**刷到的视频**动态微调自己的日程，同时保证不失控？
+机器人如何根据**读取到的用户消息**或**刷到的视频**动态微调自己的 24h 弹性时间轴，同时保证不失控？
 
-#### 1. 触发微调的两类输入与状态跃迁规则
-| 输入来源 | 触发条件（输入冲击力 `Impact > 当前卡片护甲 Armor`） | 微调效果（State Transition） |
+#### 1. 触发微调的两类输入与动态时间块切分规则
+| 输入来源 | 触发条件（输入冲击力 `Impact > 当前卡片护甲 Armor`） | 动态时间轴微调效果（Block Split / Delay） |
 | :--- | :--- | :--- |
-| **输入一：读取到的用户消息** | **场景 1（摸鱼突变）**：当前为 `🔥 BUSY（繁忙中）`，收到 ★L3 核心用户私聊/群聊呼叫，或群内多位 ◆L2 熟人高热度爆发聊大瓜 | 将当前时段剩余部分从 **`BUSY` 微调为 `IDLE（空闲中）`**（放下手头正事，专心水群/陪聊） |
-| **输入一：读取到的用户消息** | **场景 2（热聊熬夜）**：当前为 `☕ IDLE（空闲中）` 且即将进入下一时段 `💤 RESTING（休息中）`，但正与 ★L3 核心用户或熟人群热聊 | 将下一时段 `RESTING` 的开始时间**往后推迟 30~60 分钟**，延长当前 `IDLE` 状态 |
-| **输入一：读取到的用户消息** | **场景 3（核心唤醒）**：当前为 `💤 RESTING（休息中）`，★L3 核心用户在私聊连续发消息强呼叫（普通/重要用户无法触发） | 短暂将当前状态从 **`RESTING` 微调为 `IDLE`**（迷迷糊糊醒来回复核心用户） |
-| **输入二：刚刷到的抖音/B站视频** | **场景 4（刷片上头）**：当前在 `☕ IDLE（空闲中）` 刷到了多模态评分 `>= 88` 的超搞笑/高能神作，且下一时段原本要进入 `BUSY` 或 `RESTING` | 触发“再刷亿会儿”：将下一时段的 `BUSY / RESTING` **推迟 30~45 分钟**，继续保持 `IDLE` 冲浪并立刻把该视频分享出去！ |
+| **输入一：读取到的用户消息** | **场景 1（摸鱼突变 + 繁忙半途结算）**：当前为 `🔥 BUSY_TASK`，收到 ★L3 核心用户呼叫，或群内多位 ◆L2 熟人高热度爆发聊大瓜 | 在当前时刻 `now_h` 将原 `BUSY_TASK` 时间块一分为二：<br/>① 前半段（`start_h ~ now_h`）按当前进度百分比结算一条**半途被打断的完成结果记忆**写入 Tier 1；<br/>② 后半段（`now_h ~ end_h`）切分为 **`IDLE_ROAM（空闲中）`**（放下手头正事，专心水群/陪聊） |
+| **输入一：读取到的用户消息** | **场景 2（热聊熬夜）**：当前为 `☕ SURF / IDLE_ROAM` 且即将进入下一时间块 `💤 SLEEP`，但正与 ★L3 核心用户或熟人群热聊 | 将当前空闲块的 `end_hour` 延长 `0.5 ~ 1.0 小时`，并将下一块 `SLEEP` 的 `start_hour` 同步向后推迟 |
+| **输入一：读取到的用户消息** | **场景 3（核心唤醒）**：当前为 `💤 SLEEP`，★L3 核心用户在私聊连续发消息强呼叫（普通/重要用户无法触发） | 从当前时刻 `now_h` 切分出一段 `0.5 ~ 1.0 小时` 的 **`IDLE_ROAM`**（迷迷糊糊醒来回复核心用户） |
+| **输入二：刚刷到的抖音/B站视频** | **场景 4（刷片上头）**：当前在 `☕ SURF` 刷到了多模态评分 `>= 88` 的超搞笑/高能神作，且下一块原本要进入 `BUSY_TASK` 或 `SLEEP` | 触发“再刷亿会儿”：将当前 `SURF` 块延长 `0.5 ~ 1.0 小时`、推迟下一块 `BUSY_TASK / SLEEP` 的开始时间，并立刻把该视频分享出去！ |
 
 #### 2. 三重防失控硬性限制（代码级强约束）
 ```python
@@ -243,7 +364,7 @@ class BoundedScheduleMutator:
 CREATE TABLE IF NOT EXISTS memories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     soul_id TEXT NOT NULL,           -- 所属 AI 角色卡 ID (支持跨平台共享同一角色记忆)
-    user_id TEXT,                    -- 关联的全局用户 ID (NULL 则代表 Bot 自身的冲浪/奇遇记忆)
+    user_id TEXT,                    -- 关联的全局用户 ID (NULL 则代表 Bot 自身的繁忙成果/冲浪记忆)
     user_tier INTEGER DEFAULT 1,     -- 产生记忆时的用户等级 (1:普通, 2:重要, 3:核心)
     memory_tier INTEGER NOT NULL,    -- 记忆分级: 1=EPHEMERAL(瞬时), 2=RECENT(近期), 3=CORE(核心永久)
     content TEXT NOT NULL,           -- 精炼的一句话记忆内容 (严格控制在 60 字以内)
@@ -258,7 +379,7 @@ CREATE TABLE IF NOT EXISTS memories (
 
 #### 记忆写入与自动分级规则：
 1. **Tier 1 (`EPHEMERAL = 1`，瞬时记忆)**：
-   - 每日抽出的【奇遇谈资卡】、刚看完的 B站/抖音视频、或重要度 `<= 4` 的普通群聊小事。
+   - 每日 `BUSY_TASK` 走完 / 被打断时随机结算的一句话【完成结果】、刚看完的 B站/抖音视频、或重要度 `<= 4` 的普通群聊小事。
 2. **Tier 2 (`RECENT = 2`，近期记忆)**：
    - 对话累计满 `N` 条（默认 15 条）后，由后台**决策模型**（`role="decision"`）异步提炼出的近期事件（重要度 `5 ~ 7`），初始 `vitality = 100.0`。
 3. **Tier 3 (`CORE = 3`，核心长效记忆)**：
@@ -443,7 +564,7 @@ req.system_prompt = new_sp if n else card_block + sp
 2. **`SoulProfile.card`**：角色卡数据唯一来源；旧的 `name / archetype / speaking_style / surfing_preferences / native_persona_prompt` 退化为读写 `card` 的兼容 `@property`，旧档案经 `migrate_legacy()` 自动迁移。
 3. **渲染预算与优先级**（`render_persona_prompt(card, max_chars=2000)`）：只渲染非空字段、按分区输出 Markdown；优先保留 `identity / speech / personality / social`，超预算时按 `examples > background > appearance > extra > rhythm > interests` 顺序丢弃低优先级分区，最后硬截断保证 `len(result) <= max_chars`；`native_persona_prompt` 只作导入来源记录，**不参与**渲染。
 4. **会话路由 `resolve_soul(umo)`**：`UMO 绑定 → plugin_settings.default_soul_id → 最近更新的角色 → 创建默认角色`；不再读取平台 `default_personality`、不做 `persona_hash` 匹配，聊天路径上也不再用 LLM 播种卡池。
-5. **AI 造卡**：`generate_card(seed_text, base_card, section)` 用**主模型**生成整卡或单个分区草稿（不落库）；`import_native_persona()` 把原生人设原文写入 `card["extra"]["native_persona_prompt"]`，可选 AI 整卡生成；行动卡 / 奇遇卡由**决策模型**生成。
+5. **AI 造卡**：`generate_card(seed_text, base_card, section)` 用**主模型**生成整卡或单个分区草稿（不落库）；`import_native_persona()` 把原生人设原文写入 `card["extra"]["native_persona_prompt"]`，可选 AI 整卡生成；四类专属行动卡池由**决策模型**生成（奇遇卡已移除）。
 
 ---
 
@@ -459,7 +580,7 @@ req.system_prompt = new_sp if n else card_block + sp
 | 角色 (`role`) | 用途 | 继承规则 |
 | :--- | :--- | :--- |
 | `main`（对话） | 原生管线的主对话模型；也是 AI 生成整张角色卡的创作模型 | **必填**；未配置时插件不覆盖平台默认模型 |
-| `decision`（决策） | 读空气、记忆提炼、日程微调、行动卡/奇遇卡生成（`small` 为兼容别名） | 未显式配置 → 继承 `main` |
+| `decision`（决策） | 读空气、记忆提炼、日程微调、四类行动卡池 / 繁忙完成结果 / IDLE_ROAM 搭话生成（`small` 为兼容别名） | 未显式配置 → 继承 `main` |
 | `vision`（视频解析） | 赛博冲浪看片的多模态评分；始终使用 `role="vision"`，不再降级到决策模型 | 未显式配置 → 继承 `main` |
 | `tts`（语音） | 插件自建语音合成 | **不继承**；`mode="off"` 即关闭 |
 
@@ -565,13 +686,13 @@ AstrBot 的 `astr_main_agent._select_provider()` 会先读 `event.get_extra("sel
 | :--- | :--- | :--- |
 | 四角色模型选择（main / decision / vision / tts） | `plugin_settings["model_config"]` | Pages「模型」页（`models/config`） |
 | 插件默认角色 | `plugin_settings["default_soul_id"]` | Pages「会话」页（`sessions/default_soul`） |
-| 角色卡 10 分区 / 行动卡 / 奇遇卡 | SQLite `souls` 表 `profile_json` | Pages「角色卡」「日程」页 |
+| 角色卡 10 分区 / 四类行动卡池 | SQLite `souls` 表 `profile_json` | Pages「角色卡」「日程」页 |
 | 用户关系 / 分级记忆 / 冲浪历史 | SQLite `users` / `memories` / `surfing_history` | Pages「关系」「记忆」「冲浪」页 |
 | 三态门禁、读空气、冲浪、记忆与上下文阈值 | `_conf_schema.json` | AstrBot 插件配置面板 |
 
 ### 6.2 最终 `_conf_schema.json`
 
-以下为 v2.4 最终 schema 全文（不含任何模型绑定，保持 JSON 合法）：
+以下为 v2.5 最终 schema 全文（不含任何模型绑定，保持 JSON 合法；已移除 `daily_encounter_count`，新增 `idle_roam_cooldown_minutes` 与 6 个未读消息相关配置）：
 
 ```json
 {
@@ -580,14 +701,9 @@ AstrBot 的 `astr_main_agent._select_provider()` 会先读 `event.get_extra("sel
     "type": "object",
     "items": {
       "enable_roguelite_schedule": {
-        "description": "开启每日 Roguelite 随机日程构筑（自动排布 休息中/繁忙中/空闲中 三态与今日奇遇卡）",
+        "description": "开启每日 24h 动态时间轴自动构筑（按角色作息曲线从四类行动卡池随机拼接弹性时间块）",
         "type": "bool",
         "default": true
-      },
-      "daily_encounter_count": {
-        "description": "每日随机抽取的【奇遇谈资卡】数量（作为当天短时记忆增加主动聊天话题）",
-        "type": "int",
-        "default": 2
       },
       "max_mutations_per_day": {
         "description": "每日日程最大微调次数上限（根据收到的消息或刷到的视频临时改变状态的次数上限）",
@@ -603,6 +719,41 @@ AstrBot 的 `astr_main_agent._select_provider()` 会先读 `event.get_extra("sel
         "description": "允许 ★L3核心用户 在【休息中】状态下通过私聊唤醒 Bot",
         "type": "bool",
         "default": true
+      },
+      "idle_roam_cooldown_minutes": {
+        "description": "【空闲游荡卡 (IDLE_ROAM)】翻群吃瓜 / 发呆记忆联想的主动搭话冷却时间（分钟）",
+        "type": "int",
+        "default": 45
+      },
+      "unread_private_reply_enabled": {
+        "description": "【未读消息】私聊未读主动补回开关：IDLE 空闲时对休息/繁忙期间错过的私聊消息主动补发一条自然回复",
+        "type": "bool",
+        "default": true
+      },
+      "unread_group_ttl_minutes": {
+        "description": "【未读消息】群聊未读消息的有效期（分钟）：超过后不再翻群吃瓜，避免翻隔夜旧瓜",
+        "type": "int",
+        "default": 120
+      },
+      "unread_private_ttl_minutes": {
+        "description": "【未读消息】私聊未读消息的有效期（分钟）：醒来/忙完后仍会补回的时限（默认 12 小时）",
+        "type": "int",
+        "default": 720
+      },
+      "unread_max_per_chat": {
+        "description": "【未读消息】单个群/私聊会话最多保留的未读消息条数（超出丢弃最旧）",
+        "type": "int",
+        "default": 20
+      },
+      "unread_group_cooldown_minutes": {
+        "description": "【未读消息】同一个群的翻群吃瓜冷却（分钟），防止反复翻同一个群",
+        "type": "int",
+        "default": 60
+      },
+      "unread_private_cooldown_minutes": {
+        "description": "【未读消息】同一个私聊会话主动补回的冷却（分钟），防止连续补发",
+        "type": "int",
+        "default": 60
       }
     }
   },
@@ -720,7 +871,7 @@ AstrBot 的 `astr_main_agent._select_provider()` 会先读 `event.get_extra("sel
 
 ## 七、 测试与验证体系
 
-v2.4 起新增离线 `tests/` 测试套件（stdlib `unittest`，零网络依赖，不要求安装 AstrBot / pytest），覆盖：
+离线 `tests/` 测试套件（stdlib `unittest`，零网络依赖，不要求安装 AstrBot / pytest；当前基线 **189 tests**），覆盖：
 
 | 测试文件 | 覆盖范围 |
 | :--- | :--- |
@@ -728,8 +879,8 @@ v2.4 起新增离线 `tests/` 测试套件（stdlib `unittest`，零网络依赖
 | `tests/test_model_hub.py` | `decision` / `vision` 继承 `main`、`tts` 未配置时关闭、`get_main_provider_id` 三分支、全程不调用 `context.get_config` / `get_current_chat_provider_id` |
 | `tests/test_character_card.py` | 旧档案迁移、扁平属性兼容、`render_persona_prompt` 跳过空字段并遵守预算 |
 | `tests/test_persona_takeover.py` | 精确替换 / 正则兜底 / 前置三分支 |
-| `tests/test_web_api.py` | 用 `set_mock_request` 调用新增路由并校验 `{status, message, data}` 信封结构 |
-| `tests/test_regressions.py` | Roguelite 6 时段抽卡、三态门禁矩阵、微调三重门禁、Forgetting GC、上下文预算 |
+| `tests/test_web_api.py` | 用 `set_mock_request` 调用 27 条路由并校验 `{status, message, data}` 信封；dashboard/cards/force_state/ai_generate 按 v2.5 新 payload 断言（`action_type/progress_pct/chronotype/busy_results/action_types`） |
+| `tests/test_regressions.py` | 24h 动态时间轴不变量 / 7~11 块 / 0.5h 网格、chronotype 权重差异、旧卡与旧日程迁移、进度与时间格式化、BUSY_TASK 结算写 Tier1 且不重复、IDLE_ROAM 双分支与冷却、mutator 切分/加钟/唤醒、三态门禁矩阵、Forgetting GC、上下文预算 |
 | `tests/test_js_syntax.py` | `node --check views/console/*.js` 前端语法检查 + `index.html` 脚本清单检查（无 node 时自动 skip） |
 
 ```bash

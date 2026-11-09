@@ -154,12 +154,18 @@ class TestInitSummary(WebApiTestBase):
             "active_schedule",
             "default_soul_id",
             "model_status",
-            "slot_definitions",
+            "action_types",
         }
         assert data["souls"] and isinstance(data["souls"][0]["card"], dict)
         assert data["active_soul_id"] == data["souls"][0]["soul_id"]
         assert data["default_soul_id"] == data["active_soul_id"]
-        assert len(data["slot_definitions"]) == 6
+        assert len(data["action_types"]) == 4
+        assert {item["value"] for item in data["action_types"]} == {
+            "SLEEP",
+            "SURF",
+            "IDLE_ROAM",
+            "BUSY_TASK",
+        }
         assert set(data["model_status"]) == {"main", "decision", "vision", "tts"}
         assert data["model_status"]["main"]["mode"] == "unconfigured"
         assert data["model_status"]["tts"]["mode"] == "off"
@@ -168,7 +174,7 @@ class TestInitSummary(WebApiTestBase):
         schedule = data["active_schedule"]
         assert schedule["max_mutations_per_day"] == 2
         assert schedule["mutation_cooldown_minutes"] == 120
-        assert len(schedule["run"]["slots"]) == 6
+        assert 7 <= len(schedule["run"]["slots"]) <= 11
 
 
 class TestDashboardOverview(WebApiTestBase):
@@ -181,6 +187,7 @@ class TestDashboardOverview(WebApiTestBase):
             "schedule",
             "quota",
             "encounters",
+            "busy_results",
             "counts",
             "models",
         }
@@ -198,21 +205,43 @@ class TestDashboardOverview(WebApiTestBase):
             "end_hour",
             "remaining_seconds",
             "progress",
+            "progress_pct",
+            "action_type",
+            "action_type_label",
+            "completion_result",
+            "busy_settled",
             "mutated",
             "next_slot",
         }
         assert state["state"] in ("RESTING", "BUSY", "IDLE")
+        assert state["action_type"] in ("SLEEP", "SURF", "IDLE_ROAM", "BUSY_TASK")
+        assert isinstance(state["action_type_label"], str) and state["action_type_label"]
+        assert 0 <= state["progress_pct"] <= 100
         assert 0.0 <= state["progress"] <= 1.0
         assert state["remaining_seconds"] >= 0
+        assert data["vigor"]["chronotype"] in ("early", "normal", "night_owl")
         assert data["schedule"]["max_mutations_per_day"] == 2
         quota = data["quota"]
         assert quota["max"] == 2
         assert quota["used"] == 0
         assert quota["remaining"] == 2
         assert quota["cooldown_remaining_seconds"] == 0
-        assert isinstance(data["encounters"], list)
-        for encounter in data["encounters"]:
-            assert set(encounter) == {"content", "used"}
+        assert data["encounters"] == []
+        assert isinstance(data["busy_results"], list)
+        for result in data["busy_results"]:
+            assert set(result) >= {
+                "slot_key",
+                "title",
+                "completion_result",
+                "progress_pct",
+                "start_hour",
+                "end_hour",
+            }
+        slots = data["schedule"]["run"]["slots"]
+        assert 7 <= len(slots) <= 11
+        assert slots[0]["start_hour"] == 0.0 and slots[-1]["end_hour"] == 24.0
+        for slot in slots:
+            assert "progress_pct" in slot
         counts = data["counts"]
         assert set(counts) == {"relations", "memories", "videos"}
         assert set(counts["relations"]) == {"l1", "l2", "l3", "total"}
@@ -286,9 +315,9 @@ class TestDashboardOverview(WebApiTestBase):
 
 class TestNightSlotProgress(WebApiTestBase):
     def test_overnight_night_slot_progress(self):
-        slot = make_slot(
-            "night", "深夜睡眠", start_hour=23, end_hour=7, state=None, armor=70
-        )
+        # Legacy serialized run payloads may still carry an overnight `end < start`
+        # block; the helper keeps its modular fallback for those dict payloads.
+        slot = {"start_hour": 23, "end_hour": 7}
         remaining, progress = mods.web_api._slot_remaining_and_progress(
             slot, datetime(2024, 1, 2, 23, 30)
         )
@@ -609,7 +638,13 @@ class TestLegacyRoutes(WebApiTestBase):
         assert data["soul_id"]
         assert data["general_cards"] and data["general_cards"][0]["scope"] == "global"
         assert data["custom_cards"] == []
-        assert len(data["slot_definitions"]) == 6
+        assert len(data["action_types"]) == 4
+        assert {item["value"] for item in data["action_types"]} == {
+            "SLEEP",
+            "SURF",
+            "IDLE_ROAM",
+            "BUSY_TASK",
+        }
 
     async def test_users_list_and_update(self):
         await self.plugin.user_relation.get_or_create_user("u-1", "阿一")

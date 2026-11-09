@@ -147,9 +147,9 @@ def make_plugin_config(**overrides):
         },
         "roguelite_schedule_config": {
             "enable_roguelite_schedule": True,
-            "daily_encounter_count": 2,
             "max_mutations_per_day": 2,
             "mutation_cooldown_minutes": 120,
+            "idle_roam_cooldown_minutes": 45,
             "allow_l3_wake_from_resting": True,
         },
         "relationship_config": {
@@ -462,16 +462,39 @@ DEFAULT_FAKE_PROVIDERS = [
 # Fake plugin (real components + temporary SQLite database; never OnlyYouPlugin)
 # ---------------------------------------------------------------------------
 class FakePlugin:
-    """Assembled stand-in exposing exactly the attributes ``core/web_api.py`` reads."""
+    """Assembled stand-in exposing exactly the attributes ``core/web_api.py`` reads.
+
+    It also mirrors the new ``main.py`` runtime attributes/methods that ``web_api``
+    lazily calls (``_settle_finished_busy_blocks``) or inspects (``_known_group_umos``,
+    ``_last_idle_roam_ts``) so the Web API route tests never hit ``AttributeError``.
+    """
 
     def __init__(self, **components):
         self.__dict__.update(components)
         self._initialized = True
         self._known_l3_umos = {}
         self._last_message_tier = {}
+        # 24h dynamic timeline runtime state (same shape as ``OnlyYouPlugin``).
+        self._known_group_umos = set()
+        self._last_idle_roam_ts = {}
+        self._busy_settling = set()
 
     async def _ensure_initialized(self):
         return None
+
+    async def settle_busy_block(
+        self, soul, run, block, progress_pct=100, interrupted_by=""
+    ):
+        """Stub runtime settler: returns the block's already-known completion result."""
+        return str(getattr(block, "completion_result", "") or "")
+
+    async def _settle_finished_busy_blocks(self, soul, run, now_dt=None):
+        """Stub lazy settlement (the real ``main.py`` implementation is covered by
+        ``test_regressions.TestBusyTaskSettlement``)."""
+        return []
+
+    async def _run_idle_roam_action(self, soul, run, current_slot):
+        return False
 
 
 async def build_fake_plugin(
@@ -556,8 +579,13 @@ def card_with(**sections):
     return mods.character_card.normalize_card(card)
 
 
-def make_soul(soul_id="soul_a", card=None, **legacy):
-    """Build a SoulProfile (defaults to the built-in demo card)."""
+def make_soul(soul_id="soul_a", card=None, chronotype=None, **legacy):
+    """Build a SoulProfile (defaults to the built-in demo card).
+
+    ``chronotype`` (``early`` / ``normal`` / ``night_owl``) is written into the
+    character card's ``rhythm.chronotype`` section so ``SoulProfile.chronotype``
+    reports it.
+    """
     mods = load_plugin_modules()
     if card is None:
         card = card_with(
@@ -575,6 +603,12 @@ def make_soul(soul_id="soul_a", card=None, **legacy):
             },
             interests={"surfing_preferences": ["搞笑整活", "萌宠日常"]},
         )
+    card = dict(card or {})
+    if chronotype:
+        rhythm = dict(card.get("rhythm") or {})
+        rhythm["chronotype"] = mods.roguelite_deck.normalize_chronotype(chronotype)
+        card["rhythm"] = rhythm
+        card = mods.character_card.normalize_card(card)
     return mods.soul_manager.SoulProfile(soul_id=soul_id, card=card, **legacy)
 
 
@@ -587,61 +621,132 @@ def make_user(uid="user-1", name="阿一", tier=None):
 
 
 def make_slot(
-    slot_key="evening",
-    label="晚间黄金档",
-    start_hour=18,
-    end_hour=23,
+    slot_key="block_0",
+    label=None,
+    start_hour=9.0,
+    end_hour=12.0,
     state=None,
+    action_type=None,
     armor=50,
-    card_id="gen_evening_surf",
-    title="躺沙发上快乐刷视频",
+    card_id="evt_test",
+    title="专心处理手头正事",
     mutated=False,
     mutation_monologue="",
     delay_minutes=0,
+    busy_settled=False,
+    completion_result="",
 ):
+    """Build a 24h dynamic timeline block (``SlotInstance``).
+
+    ``action_type`` (str/``ActionType``/``None``) wins over ``state``; when both are
+    omitted the action type is derived from the default title (``IDLE_ROAM``).
+    ``label=None`` lets ``SlotInstance`` fill the four-action Chinese label itself.
+    ``start_hour`` / ``end_hour`` are floats on the 0.5h grid.
+    """
     mods = load_plugin_modules()
     bot_state = mods.state_machine.BotState.IDLE if state is None else state
+    parsed_action = None
+    if action_type is not None:
+        parsed_action = mods.roguelite_deck.ActionType.coerce(action_type, None)
     return mods.roguelite_deck.SlotInstance(
         slot_key=slot_key,
         label=label,
-        start_hour=start_hour,
-        end_hour=end_hour,
+        start_hour=float(start_hour),
+        end_hour=float(end_hour),
         card_id=card_id,
         title=title,
         state=bot_state,
+        action_type=parsed_action,
         armor=armor,
         mutated=mutated,
         mutation_monologue=mutation_monologue,
         delay_minutes=delay_minutes,
+        busy_settled=busy_settled,
+        completion_result=completion_result,
     )
 
 
-def make_run(soul_id="soul_a", slots=None, encounters=None, mutations_used=0, last_mutation_ts=0.0):
+def make_default_slots():
+    """The canonical 8-block 0.0 -> 24.0 default timeline used by ``make_run``.
+
+    Contains all four action types, floats on the 0.5h grid and seamless joints:
+    SLEEP 0-7 / IDLE_ROAM 7-9 / BUSY_TASK 9-12 / IDLE_ROAM 12-13 / SURF 13-15 /
+    BUSY_TASK 15-18 / IDLE_ROAM 18-23 / SLEEP 23-24.
+    """
+    mods = load_plugin_modules()
+    action = mods.roguelite_deck.ActionType
+    bot = mods.state_machine.BotState
+    return [
+        make_slot(
+            slot_key="block_0", start_hour=0.0, end_hour=7.0, state=bot.RESTING,
+            action_type=action.SLEEP, card_id="gen_sleep_night", armor=70,
+            title="关灯钻进被窝呼呼大睡",
+        ),
+        make_slot(
+            slot_key="block_1", start_hour=7.0, end_hour=9.0, state=bot.IDLE,
+            action_type=action.IDLE_ROAM, card_id="gen_roam_commute", armor=35,
+            title="叼着面包赶早八通勤",
+        ),
+        make_slot(
+            slot_key="block_2", start_hour=9.0, end_hour=12.0, state=bot.BUSY,
+            action_type=action.BUSY_TASK, card_id="gen_busy_focus", armor=60,
+            title="沉浸式处理手头正事与学习",
+        ),
+        make_slot(
+            slot_key="block_3", start_hour=12.0, end_hour=13.0, state=bot.IDLE,
+            action_type=action.IDLE_ROAM, card_id="gen_roam_slack", armor=30,
+            title="午休摸鱼刷手机",
+        ),
+        make_slot(
+            slot_key="block_4", start_hour=13.0, end_hour=15.0, state=bot.IDLE,
+            action_type=action.SURF, card_id="gen_surf_evening", armor=25,
+            title="躺沙发上快乐刷视频吹水",
+        ),
+        make_slot(
+            slot_key="block_5", start_hour=15.0, end_hour=18.0, state=bot.BUSY,
+            action_type=action.BUSY_TASK, card_id="gen_busy_afternoon", armor=55,
+            title="跟烦人的任务死磕赶进度",
+        ),
+        make_slot(
+            slot_key="block_6", start_hour=18.0, end_hour=23.0, state=bot.IDLE,
+            action_type=action.IDLE_ROAM, card_id="gen_roam_tea", armor=30,
+            title="喝下午茶瘫在椅子上逛B站水群",
+        ),
+        make_slot(
+            slot_key="block_7", start_hour=23.0, end_hour=24.0, state=bot.RESTING,
+            action_type=action.SLEEP, card_id="gen_sleep_night", armor=65,
+            title="关灯准备睡觉",
+        ),
+    ]
+
+
+def make_run(
+    soul_id="soul_a",
+    slots=None,
+    encounters=None,
+    mutations_used=0,
+    last_mutation_ts=0.0,
+    chronotype="normal",
+    last_mutation_log="",
+):
+    """Build a ``DailyScheduleRun`` covering the full 0.0 -> 24.0 dynamic timeline."""
     mods = load_plugin_modules()
     if slots is None:
-        slots = [
-            make_slot("morning", "清晨早起", 7, 9),
-            make_slot("forenoon", "上午正事", 9, 12),
-            make_slot("noon", "午休干饭", 12, 14),
-            make_slot("afternoon", "下午时光", 14, 18),
-            make_slot("evening", "晚间黄金档", 18, 23),
-            make_slot("night", "深夜睡眠", 23, 7),
-        ]
+        slots = make_default_slots()
     if encounters is None:
-        encounters = [
-            mods.roguelite_deck.EncounterCard(encounter_id="enc_1", content="老板多送了一根烤肠"),
-            mods.roguelite_deck.EncounterCard(encounter_id="enc_2", content="路边撸到一只橘猫"),
-        ]
+        encounters = []
     return mods.roguelite_deck.DailyScheduleRun(
         soul_id=soul_id,
         date_str=mods.roguelite_deck.RogueliteDeckEngine.today_str(),
         vigor_id="vigor_energetic",
         vigor_title="满血冲浪日",
         vigor_desc="今天精神头超足",
-        slots=slots,
-        encounters=encounters,
+        slots=list(slots),
+        encounters=list(encounters),
         mutations_used=mutations_used,
         last_mutation_ts=last_mutation_ts,
+        last_mutation_log=last_mutation_log,
+        chronotype=mods.roguelite_deck.normalize_chronotype(chronotype),
     )
 
 

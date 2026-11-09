@@ -9,12 +9,69 @@
  *   OYCharts.donut({ items:[{label,value,color}], size, centerValue, centerLabel })
  *   OYCharts.bars({ items:[{label,value,max,color}] })
  *   OYCharts.dots({ used, max })
+ *
+ * 时间轴为「24h 动态积木」：每个块带 start_hour / end_hour 浮点小时
+ * （0.5h 网格，连续覆盖 0~24），宽度按 (end-start)/24 弹性渲染；
+ * 块可带 action_type（SLEEP/SURF/IDLE_ROAM/BUSY_TASK）、progress_pct、
+ * busy_settled、completion_result 等新字段（旧 6 时段过夜数据自动兜底拆段）。
  */
 (function () {
   "use strict";
 
   var STATE_LABEL = { IDLE: "空闲", BUSY: "繁忙", RESTING: "休息" };
   var STATE_CLASS = { IDLE: "st-idle", BUSY: "st-busy", RESTING: "st-resting" };
+
+  /* 四类行动原型（与 core/state_machine.py ACTION_TYPE_DEFINITIONS 对齐；
+   * label 为完整中文名（后端 action_types 同形），short 为徽章 / 筛选用的中文简称） */
+  var ACTION_TYPES = [
+    { value: "SLEEP", label: "睡觉 / 休眠", short: "睡觉", state: "RESTING", min_hours: 1.0, max_hours: 7.5 },
+    { value: "SURF", label: "冲浪刷片", short: "冲浪", state: "IDLE", min_hours: 0.5, max_hours: 2.0 },
+    { value: "IDLE_ROAM", label: "空闲闲逛", short: "闲逛", state: "IDLE", min_hours: 0.5, max_hours: 2.0 },
+    { value: "BUSY_TASK", label: "繁忙主业", short: "繁忙主业", state: "BUSY", min_hours: 1.0, max_hours: 3.0 }
+  ];
+  var ACTION_MAP = {};
+  ACTION_TYPES.forEach(function (item) {
+    ACTION_MAP[item.value] = item;
+  });
+
+  /** 任意值 → 四类 action_type 之一（大小写宽容）；非法返回 "" */
+  function normActionType(value) {
+    var key = String(value == null ? "" : value).toUpperCase();
+    return ACTION_MAP[key] ? key : "";
+  }
+
+  /** 旧数据兜底：无 action_type 时按 state / title 推导（与后端 from_dict 迁移规则一致） */
+  function actionTypeOf(slot) {
+    if (!slot) return "";
+    var explicit = normActionType(slot.action_type);
+    if (explicit) return explicit;
+    var state = String(slot.state || "").toUpperCase();
+    var title = String(slot.title || "");
+    if (state === "RESTING") return "SLEEP";
+    if (state === "BUSY") return "BUSY_TASK";
+    if (/刷|B站|b站|抖音|视频|冲浪/.test(title)) return "SURF";
+    if (state === "IDLE") return "IDLE_ROAM";
+    return "";
+  }
+
+  /** 行动类型 → 中文名（short=true 返回简称，如「睡觉」「繁忙主业」） */
+  function actionLabel(actionType, short) {
+    var def = ACTION_MAP[normActionType(actionType)];
+    if (!def) return "";
+    return short ? def.short : def.label;
+  }
+
+  /** 行动类型 → 绑定的三态（用于旧数据/缺 state 时补全） */
+  function actionState(actionType) {
+    var def = ACTION_MAP[normActionType(actionType)];
+    return def ? def.state : "";
+  }
+
+  /** 行动类型 → CSS 徽章类名：action-sleep / action-surf / action-idle-roam / action-busy-task */
+  function actionClass(actionType) {
+    var t = normActionType(actionType);
+    return t ? "action-" + t.toLowerCase().replace(/_/g, "-") : "";
+  }
 
   function num(v, dflt) {
     var n = Number(v);
@@ -41,8 +98,18 @@
     return String(n).length < 2 ? "0" + n : String(n);
   }
   function fmtHour(h) {
-    var hour = Math.floor(num(h, 0)) % 24;
-    return pad2(hour) + ":00";
+    var n = num(h, 0);
+    n = Math.max(0, Math.min(24, n));
+    var totalMinutes = Math.round(n * 60);
+    var hour = Math.floor(totalMinutes / 60);
+    var minute = totalMinutes % 60;
+    return pad2(hour) + ":" + pad2(minute);
+  }
+
+  /** 时长（小时浮点）→ "1.5h" / "3.0h"（时长胶囊用） */
+  function fmtHours(h) {
+    var n = num(h, 0);
+    return n.toFixed(1) + "h";
   }
 
   /* ------------------------------------------------------------------ *
@@ -116,12 +183,13 @@
   }
 
   /* ------------------------------------------------------------------ *
-   * 2) 24 小时日程轴：彩色时段块 + 现在指针
+   * 2) 24h 动态日程轴：弹性宽度块 + 行动/状态色 + 现在指针
    * ------------------------------------------------------------------ */
   function slotRanges(slot) {
     var start = num(slot.start_hour, 0);
     var end = num(slot.end_hour, 24);
     if (end === 0) end = 24;
+    /* 新时间轴恒为 end > start（0~24 连续无缝）；旧 6 时段过夜块拆成两段兜底 */
     if (end > start) return [[start, end]];
     return [
       [start, 24],
@@ -158,22 +226,32 @@
 
     html += '<div class="sched-axis-track">';
     segs.forEach(function (seg) {
+      var slot = seg.slot;
+      /* 弹性宽度：每块占 (end-start)/24 的百分比（0.5h 网格 → 最小 ~2.08%） */
       var left = (seg.start / 24) * 100;
       var width = ((seg.end - seg.start) / 24) * 100;
-      var state = String(seg.slot.state || "").toUpperCase();
-      var isCurrent = !!currentKey && seg.slot.slot_key === currentKey;
-      var tip =
-        (seg.slot.label || seg.slot.slot_key || "") +
-        " · " +
-        stateLabel(state) +
-        " · " +
-        (seg.slot.title || "") +
-        " · 护甲 " +
-        num(seg.slot.armor, 0) +
-        " · " +
-        fmtHour(seg.slot.start_hour) +
-        "–" +
-        fmtHour(seg.slot.end_hour);
+      var spanHours = seg.end - seg.start;
+      var actionType = actionTypeOf(slot);
+      var state = String(slot.state || actionState(actionType) || "").toUpperCase();
+      var isCurrent = !!currentKey && slot.slot_key === currentKey;
+      var progressPct = null;
+      if (actionType === "BUSY_TASK" && slot.progress_pct != null && slot.progress_pct !== "") {
+        progressPct = Math.max(0, Math.min(100, Math.round(num(slot.progress_pct, 0))));
+      }
+
+      var tipParts = [
+        slot.label || actionLabel(actionType, false) || slot.slot_key || "",
+        stateLabel(state),
+        slot.title || "",
+        fmtHour(seg.start) + "-" + fmtHour(seg.end),
+        "护甲 " + Math.round(num(slot.armor, 0))
+      ];
+      if (progressPct != null) tipParts.push("进度 " + progressPct + "%");
+      if (slot.busy_settled && slot.completion_result) {
+        tipParts.push("完成：" + slot.completion_result);
+      }
+      var tip = tipParts.join(" · ");
+
       var cls =
         "sched-seg " +
         stateClass(state) +
@@ -190,13 +268,19 @@
         '" data-tip="' +
         esc(tip) +
         '" data-slot-key="' +
-        esc(seg.slot.slot_key || "") +
+        esc(slot.slot_key || "") +
         '" data-state="' +
         esc(state) +
+        '" data-action-type="' +
+        esc(actionType) +
         '">';
-      if (width >= 8 && seg.end - seg.start >= 2) {
-        html += '<span class="sched-seg-name">' + esc(seg.slot.label || seg.slot.slot_key) + "</span>";
-        html += '<span class="sched-seg-meta">' + stateLabel(state) + (seg.slot.mutated ? " · 已微调" : "") + "</span>";
+      /* 宽度足够时显示标题 + 行动 label；过窄只留小色块（避免文字溢出） */
+      if (width >= 8 && spanHours >= 1) {
+        var metaText = actionLabel(actionType, true) || stateLabel(state);
+        if (progressPct != null) metaText += " · " + progressPct + "%";
+        if (slot.mutated) metaText += " · 已微调";
+        html += '<span class="sched-seg-name">' + esc(slot.title || slot.label || slot.slot_key) + "</span>";
+        html += '<span class="sched-seg-meta">' + esc(metaText) + "</span>";
       } else if (width >= 4) {
         html += '<span class="sched-seg-mini"></span>';
       }
@@ -313,6 +397,14 @@
     stateClass: stateClass,
     stateLabel: stateLabel,
     fmtHour: fmtHour,
+    fmtHours: fmtHours,
+    /* 四类行动工具的共享出口（page-overview / page-schedule 共用） */
+    ACTION_TYPES: ACTION_TYPES,
+    actionLabel: actionLabel,
+    actionClass: actionClass,
+    actionState: actionState,
+    actionTypeOf: actionTypeOf,
+    normActionType: normActionType,
     esc: esc
   };
 })();

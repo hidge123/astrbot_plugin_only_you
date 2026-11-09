@@ -3,8 +3,14 @@
  *
  * 仅当 URL 带 `?mock=1`（或 `location.protocol === "file:"` 且页面没有真实 bridge）时生效：
  * 安装 `window.AstrBotPluginPage`（兼容 `window.AstrBotPluginView`），覆盖
- * **全部后端路由（17 条旧路由 + 10 条新路由，见 .team/CONTRACTS.md §4）**，
+ * **全部后端路由（17 条旧路由 + 10 条新路由，见 .team/NEW_TIMELINE_CONTRACT.md §6）**，
  * 返回与真实后端一致的信封结构 `{status, message, data}`，并带 300ms 模拟延迟。
+ *
+ * 数据形状为「24h 动态积木时间轴 × 四类行动卡」新契约：
+ *  - 今日日程 7~11 个浮点时间块（0.5h 网格，连续 0~24），每块带 action_type / progress_pct，
+ *    BUSY_TASK 块带 busy_settled / completion_result（按当前时间惰性结算）；
+ *  - 卡池返回 custom_cards / general_cards / action_types / chronotype，无奇遇卡字段；
+ *  - dashboard/overview 的 state 带 action_type / action_type_label / progress_pct / busy_results。
  *
  * 用途：无 AstrBot 后端时直接双击打开 `index.html?mock=1` 即可渲染所有页面 / 截图验收。
  * 数据是可变的：force_state / reroll / cards 增删改 / 默认角色 / UMO 绑定等操作都会更新内存状态。
@@ -51,8 +57,34 @@
     return Math.max(min, Math.min(max, n));
   }
 
+  /** clamp 到 0..1（进度比例用） */
+  function clamp01(value) {
+    var n = Number(value);
+    if (!isFinite(n)) n = 0;
+    return Math.max(0, Math.min(1, n));
+  }
+
+  /** 夹到 0.5h 网格并限制在 [0.5, 8.0]（与后端 SlotInstance 不变量一致） */
+  function roundHalf(value) {
+    return Math.round(clamp(value, 0.5, 8) * 2) / 2;
+  }
+
+  function nowHourFloat() {
+    var d = new Date();
+    return d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600;
+  }
+
   function pad2(n) {
     return n < 10 ? "0" + n : String(n);
+  }
+
+  /** 浮点小时 → "HH:MM"（0 → "00:00"、13.5 → "13:30"、24 → "24:00"） */
+  function fmtHour(value) {
+    var n = clamp(value, 0, 24);
+    var totalMinutes = Math.round(n * 60);
+    var hour = Math.floor(totalMinutes / 60);
+    var minute = totalMinutes % 60;
+    return pad2(hour) + ":" + pad2(minute);
   }
 
   function fmtDate(date) {
@@ -84,34 +116,71 @@
   }
 
   /* ================================================================== *
-   * 1. 常量：6 时段 / 文案 / 默认卡池
+   * 1. 常量：四类行动 / 今日基调 / 默认行动卡池
    * ================================================================== */
-  var SLOT_DEFINITIONS = [
-    { slot_key: "morning", label: "清晨早起", start_hour: 7, end_hour: 9 },
-    { slot_key: "forenoon", label: "上午正事", start_hour: 9, end_hour: 12 },
-    { slot_key: "noon", label: "午休干饭", start_hour: 12, end_hour: 14 },
-    { slot_key: "afternoon", label: "下午时光", start_hour: 14, end_hour: 18 },
-    { slot_key: "evening", label: "晚间黄金档", start_hour: 18, end_hour: 23 },
-    { slot_key: "night", label: "深夜睡眠", start_hour: 23, end_hour: 7 }
+  var ACTION_TYPE_DEFINITIONS = [
+    { value: "SLEEP", label: "睡觉 / 休眠", state: "RESTING", min_hours: 1.0, max_hours: 7.5 },
+    { value: "SURF", label: "冲浪刷片", state: "IDLE", min_hours: 0.5, max_hours: 2.0 },
+    { value: "IDLE_ROAM", label: "空闲闲逛", state: "IDLE", min_hours: 0.5, max_hours: 2.0 },
+    { value: "BUSY_TASK", label: "繁忙主业", state: "BUSY", min_hours: 1.0, max_hours: 3.0 }
   ];
+  var ACTION_TYPE_MAP = {};
+  ACTION_TYPE_DEFINITIONS.forEach(function (def) {
+    ACTION_TYPE_MAP[def.value] = def;
+  });
 
-  var BASE_STATES = {
-    morning: "IDLE",
-    forenoon: "BUSY",
-    noon: "IDLE",
-    afternoon: "BUSY",
-    evening: "IDLE",
-    night: "RESTING"
-  };
+  /** 任意值 → 合法 action_type；非法返回 "" */
+  function coerceActionType(value) {
+    var key = String(value == null ? "" : value).toUpperCase();
+    return ACTION_TYPE_MAP[key] ? key : "";
+  }
 
-  var SLOT_TITLES = {
-    morning: { IDLE: "赖床刷手机", BUSY: "早起赶地铁", RESTING: "蒙头继续睡" },
-    forenoon: { IDLE: "摸鱼看群消息", BUSY: "埋头赶工作", RESTING: "偷偷补觉" },
-    noon: { IDLE: "午休干饭刷视频", BUSY: "边吃饭边赶工", RESTING: "午睡回血" },
-    afternoon: { IDLE: "泡杯茶摸鱼", BUSY: "开会 / 写稿中", RESTING: "趴桌补觉" },
-    evening: { IDLE: "躺沙发刷 B 站", BUSY: "加班赶稿", RESTING: "早早犯困" },
-    night: { IDLE: "窝床上刷手机", BUSY: "熬夜赶 DDL", RESTING: "呼呼大睡" }
-  };
+  /** 旧数据兜底：无 action_type 时按 state / title 推导（与后端 from_dict 迁移规则一致） */
+  function actionTypeFromLegacy(state, title) {
+    var id = String(state || "").toUpperCase();
+    var text = String(title || "");
+    if (id === "RESTING") return "SLEEP";
+    if (id === "BUSY") return "BUSY_TASK";
+    if (/刷|B站|b站|抖音|视频|冲浪/.test(text)) return "SURF";
+    return "IDLE_ROAM";
+  }
+
+  function actionLabelOf(actionType) {
+    var def = ACTION_TYPE_MAP[coerceActionType(actionType)];
+    return def ? def.label : "";
+  }
+
+  function boundStateOf(actionType) {
+    var def = ACTION_TYPE_MAP[coerceActionType(actionType)];
+    return def ? def.state : "IDLE";
+  }
+
+  /** 行动卡归一化：补齐 action_type / min_hours / max_hours；state 与 action_type 强制同步 */
+  function normalizeCard(raw) {
+    raw = raw || {};
+    var legacyState = String(raw.state || "IDLE").toUpperCase();
+    var actionType = coerceActionType(raw.action_type) || actionTypeFromLegacy(legacyState, raw.title);
+    var minHours = roundHalf(raw.min_hours != null ? raw.min_hours : 1.0);
+    var maxHours = roundHalf(raw.max_hours != null ? raw.max_hours : 2.5);
+    if (minHours > maxHours) {
+      var swap = minHours;
+      minHours = maxHours;
+      maxHours = swap;
+    }
+    return {
+      card_id: raw.card_id || "evt_ai_" + Date.now(),
+      title: String(raw.title || "未命名行动卡").trim() || "未命名行动卡",
+      state: boundStateOf(actionType),
+      action_type: actionType,
+      min_hours: minHours,
+      max_hours: maxHours,
+      /* 保留旧字段仅为兼容旧 UI / 旧数据，排轴不再使用 */
+      valid_slots: [],
+      base_weight: clamp(raw.base_weight, 1, 100),
+      armor: clamp(raw.armor, 0, 100),
+      synergy_tags: raw.synergy_tags || {}
+    };
+  }
 
   var VIGOR_CARDS = [
     { vigor_id: "vigor_energetic", title: "满血冲浪日", desc: "今天精神头超足，遇到什么事都想插两句嘴，闲下来就猛刷手机。" },
@@ -120,27 +189,40 @@
     { vigor_id: "vigor_night_owl", title: "夜猫修仙日", desc: "早上困得睁不开眼，越到晚上越精神。" }
   ];
 
-  var ENCOUNTER_POOL = [
-    "中午点外卖，老板居然多送了一根烤肠。",
-    "路上遇到一只超粘人的流浪橘猫，跟着走了半条街。",
-    "刷到一个猫猫踩奶视频，笑到被同事围观。",
-    "发现楼下新开了一家很便宜的水果店。",
-    "耳机随机播到一首很久没听的老歌，突然有点怀念。",
-    "打游戏连跪三把，气得把手机扣在沙发上。",
-    "看到一条离谱新闻，想找人吐槽但没人理。",
-    "晚饭尝试做菜，结果盐放多了，硬着头皮吃完。",
-    "在群里抢到最大红包，顺手发了个得意表情。",
-    "深夜 emo，翻到去年今天的照片发了好一会儿呆。"
-  ];
-
+  /* 默认内置卡池：每个 action_type 至少 2 张（顺序即展示顺序） */
   var GENERAL_CARDS = [
-    { card_id: "evt_general_idle_1", title: "窝在沙发里刷短视频", state: "IDLE", valid_slots: ["noon", "afternoon", "evening"], base_weight: 70, armor: 35, synergy_tags: { lazy: 1.2 } },
-    { card_id: "evt_general_idle_2", title: "在群里潜水窥屏", state: "IDLE", valid_slots: ["morning", "forenoon", "noon", "afternoon", "evening"], base_weight: 60, armor: 40, synergy_tags: {} },
-    { card_id: "evt_general_busy_1", title: "埋头赶工作进度", state: "BUSY", valid_slots: ["forenoon", "afternoon"], base_weight: 65, armor: 80, synergy_tags: { focus: 1.4 } },
-    { card_id: "evt_general_busy_2", title: "被临时拉去开会", state: "BUSY", valid_slots: ["forenoon", "afternoon"], base_weight: 45, armor: 75, synergy_tags: {} },
-    { card_id: "evt_general_rest_1", title: "关灯睡觉", state: "RESTING", valid_slots: ["night"], base_weight: 80, armor: 90, synergy_tags: {} },
-    { card_id: "evt_general_rest_2", title: "趴着补个回笼觉", state: "RESTING", valid_slots: ["morning", "noon"], base_weight: 50, armor: 70, synergy_tags: {} }
-  ];
+    { card_id: "evt_general_sleep_1", title: "关灯睡觉", action_type: "SLEEP", min_hours: 4.0, max_hours: 7.5, base_weight: 80, armor: 90, synergy_tags: {} },
+    { card_id: "evt_general_sleep_2", title: "趴着补个回笼觉", action_type: "SLEEP", min_hours: 1.0, max_hours: 2.0, base_weight: 50, armor: 70, synergy_tags: {} },
+    { card_id: "evt_general_surf_1", title: "窝在沙发里刷短视频", action_type: "SURF", min_hours: 0.5, max_hours: 2.0, base_weight: 70, armor: 35, synergy_tags: { lazy: 1.2 } },
+    { card_id: "evt_general_surf_2", title: "深夜刷 B 站鬼畜区", action_type: "SURF", min_hours: 0.5, max_hours: 2.0, base_weight: 60, armor: 28, synergy_tags: {} },
+    { card_id: "evt_general_roam_1", title: "在群里潜水窥屏", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 2.0, base_weight: 60, armor: 40, synergy_tags: {} },
+    { card_id: "evt_general_roam_2", title: "泡杯茶发呆", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.5, base_weight: 45, armor: 45, synergy_tags: {} },
+    { card_id: "evt_general_busy_1", title: "埋头赶工作进度", action_type: "BUSY_TASK", min_hours: 1.0, max_hours: 3.0, base_weight: 65, armor: 80, synergy_tags: { focus: 1.4 } },
+    { card_id: "evt_general_busy_2", title: "被临时拉去开会", action_type: "BUSY_TASK", min_hours: 1.0, max_hours: 2.5, base_weight: 45, armor: 75, synergy_tags: {} }
+  ].map(normalizeCard);
+
+  /* 角色专属行动卡（酒狐：夜猫子插画师） */
+  var DEFAULT_CUSTOM_CARDS = [
+    { card_id: "evt_custom_sleep_1", title: "裹着被子呼呼大睡", action_type: "SLEEP", min_hours: 4.0, max_hours: 7.5, base_weight: 85, armor: 88, synergy_tags: {} },
+    { card_id: "evt_custom_sleep_2", title: "午睡回血", action_type: "SLEEP", min_hours: 1.0, max_hours: 2.0, base_weight: 45, armor: 65, synergy_tags: {} },
+    { card_id: "evt_custom_surf_1", title: "窝在沙发里刷 B 站视频", action_type: "SURF", min_hours: 0.5, max_hours: 2.0, base_weight: 72, armor: 35, synergy_tags: { lazy: 1.2 } },
+    { card_id: "evt_custom_surf_2", title: "深夜刷鬼畜区停不下来", action_type: "SURF", min_hours: 0.5, max_hours: 2.0, base_weight: 58, armor: 26, synergy_tags: {} },
+    { card_id: "evt_custom_roam_1", title: "在群里潜水窥屏", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.5, base_weight: 58, armor: 42, synergy_tags: {} },
+    { card_id: "evt_custom_roam_2", title: "下楼买杯冰美式", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.0, base_weight: 48, armor: 45, synergy_tags: {} },
+    { card_id: "evt_custom_busy_1", title: "赶稿画商稿", action_type: "BUSY_TASK", min_hours: 1.5, max_hours: 3.0, base_weight: 70, armor: 82, synergy_tags: { focus: 1.5 } },
+    { card_id: "evt_custom_busy_2", title: "被甲方拉着改需求", action_type: "BUSY_TASK", min_hours: 1.0, max_hours: 2.5, base_weight: 55, armor: 74, synergy_tags: {} }
+  ].map(normalizeCard);
+
+  /* 角色专属行动卡（小满：早起型大学生） */
+  var DEFAULT_XIAOMAN_CARDS = [
+    { card_id: "evt_xm_sleep_1", title: "早早睡觉养精神", action_type: "SLEEP", min_hours: 4.0, max_hours: 7.5, base_weight: 85, armor: 90, synergy_tags: {} },
+    { card_id: "evt_xm_sleep_2", title: "午睡一小时", action_type: "SLEEP", min_hours: 0.5, max_hours: 2.0, base_weight: 50, armor: 62, synergy_tags: {} },
+    { card_id: "evt_xm_surf_1", title: "刷会儿短视频放松", action_type: "SURF", min_hours: 0.5, max_hours: 1.5, base_weight: 55, armor: 30, synergy_tags: {} },
+    { card_id: "evt_xm_roam_1", title: "和室友拼饭", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.5, base_weight: 65, armor: 40, synergy_tags: {} },
+    { card_id: "evt_xm_roam_2", title: "食堂干饭 + 操场散步", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.5, base_weight: 50, armor: 42, synergy_tags: {} },
+    { card_id: "evt_xm_busy_1", title: "泡图书馆自习", action_type: "BUSY_TASK", min_hours: 1.0, max_hours: 3.0, base_weight: 70, armor: 70, synergy_tags: {} },
+    { card_id: "evt_xm_busy_2", title: "写课程作业", action_type: "BUSY_TASK", min_hours: 1.0, max_hours: 2.5, base_weight: 60, armor: 68, synergy_tags: {} }
+  ].map(normalizeCard);
 
   /* ================================================================== *
    * 2. 角色卡 schema（10 分区 / 39 字段，与 core/character_card.py CARD_SCHEMA 对齐）
@@ -451,20 +533,6 @@
     return card;
   }
 
-  var DEFAULT_CUSTOM_CARDS = [
-    { card_id: "evt_custom_1", title: "窝在沙发里刷 B 站视频", state: "IDLE", valid_slots: ["noon", "afternoon", "evening"], base_weight: 70, armor: 35, synergy_tags: { lazy: 1.2 } },
-    { card_id: "evt_custom_2", title: "和朋友开黑打游戏", state: "IDLE", valid_slots: ["evening", "night"], base_weight: 60, armor: 30, synergy_tags: {} },
-    { card_id: "evt_custom_3", title: "赶稿画商稿", state: "BUSY", valid_slots: ["forenoon", "afternoon"], base_weight: 65, armor: 82, synergy_tags: { focus: 1.5 } },
-    { card_id: "evt_custom_4", title: "深夜 emo 听歌", state: "RESTING", valid_slots: ["night"], base_weight: 40, armor: 70, synergy_tags: {} },
-    { card_id: "evt_custom_5", title: "周末睡到自然醒", state: "RESTING", valid_slots: ["morning"], base_weight: 30, armor: 90, synergy_tags: {} }
-  ];
-
-  var DEFAULT_CUSTOM_ENCOUNTERS = [
-    "中午点外卖，老板居然多送了一根烤肠。",
-    "刷到一个猫猫踩奶视频，笑到被同事围观。",
-    "耳机随机播到一首很久没听的老歌，突然有点怀念。"
-  ];
-
   function buildInitialDb() {
     var cardJiu = buildCardJiu();
     var cardMan = buildCardXiaoman();
@@ -476,15 +544,10 @@
       defaultSoulId: "default_soul",
       decks: {
         default_soul: {
-          customCards: clone(DEFAULT_CUSTOM_CARDS),
-          customEncounters: clone(DEFAULT_CUSTOM_ENCOUNTERS)
+          customCards: clone(DEFAULT_CUSTOM_CARDS)
         },
         soul_xiaoman: {
-          customCards: [
-            { card_id: "evt_xm_1", title: "泡图书馆自习", state: "BUSY", valid_slots: ["forenoon", "afternoon"], base_weight: 70, armor: 70, synergy_tags: {} },
-            { card_id: "evt_xm_2", title: "和室友拼饭", state: "IDLE", valid_slots: ["noon", "evening"], base_weight: 65, armor: 40, synergy_tags: {} }
-          ],
-          customEncounters: ["图书馆抢到了靠窗的位置，开心。", "室友分享了一块超好吃的桂花糕。"]
+          customCards: clone(DEFAULT_XIAOMAN_CARDS)
         }
       },
       schedules: {},
@@ -583,10 +646,16 @@
     return soul;
   }
 
+  function soulChronotype(soul) {
+    var card = soul && soul.card;
+    var value = card && card.rhythm && card.rhythm.chronotype;
+    value = String(value || "normal").toLowerCase();
+    return value === "early" || value === "night_owl" ? value : "normal";
+  }
+
   function deckOf(soulId) {
-    if (!db.decks[soulId]) {
-      db.decks[soulId] = { customCards: [], customEncounters: [] };
-    }
+    if (!db.decks[soulId]) db.decks[soulId] = { customCards: [] };
+    if (!Array.isArray(db.decks[soulId].customCards)) db.decks[soulId].customCards = [];
     return db.decks[soulId];
   }
 
@@ -600,8 +669,10 @@
       speaking_style: soul.speaking_style,
       native_persona_prompt: soul.native_persona_prompt,
       surfing_preferences: soul.surfing_preferences,
+      chronotype: soulChronotype(soul),
       state_event_cards: deck.customCards,
-      encounter_talk_cards: deck.customEncounters,
+      /* 奇遇卡已从系统移除：仅保留空数组兼容旧字段 */
+      encounter_talk_cards: [],
       card: soul.card
     });
   }
@@ -616,18 +687,117 @@
     return db.souls[0] || null;
   }
 
-  function findSlotDef(slotKey) {
-    for (var i = 0; i < SLOT_DEFINITIONS.length; i++) {
-      if (SLOT_DEFINITIONS[i].slot_key === slotKey) return SLOT_DEFINITIONS[i];
-    }
-    return null;
+  /* 24h 动态积木时间轴模板：[时长(h), action_type, 标题, 护甲]
+   * 每个模板都从 0.0 连续拼到 24.0（0.5h 网格），块数 10~11，覆盖四类行动。 */
+  var RUN_PATTERNS = {
+    night_owl: [
+      [7.5, "SLEEP", "裹着被子呼呼大睡", 88],
+      [1.0, "IDLE_ROAM", "赖床刷手机", 40],
+      [2.5, "BUSY_TASK", "赶稿画商稿", 82],
+      [1.5, "IDLE_ROAM", "下楼买杯冰美式", 38],
+      [2.5, "BUSY_TASK", "被甲方拉着改需求", 76],
+      [2.0, "SURF", "躺沙发刷 B 站", 30],
+      [1.5, "IDLE_ROAM", "在群里潜水窥屏", 42],
+      [2.5, "BUSY_TASK", "埋头赶工作进度", 78],
+      [2.0, "SURF", "深夜刷 B 站鬼畜区", 26],
+      [1.0, "IDLE_ROAM", "窝床上刷手机", 35]
+    ],
+    night_owl_reroll: [
+      [6.5, "SLEEP", "熬夜后补个长觉", 85],
+      [1.5, "IDLE_ROAM", "迷迷糊糊摸手机", 32],
+      [2.0, "SURF", "早餐配短视频", 34],
+      [3.0, "BUSY_TASK", "集中赶稿冲刺", 80],
+      [1.0, "IDLE_ROAM", "泡杯咖啡发呆", 44],
+      [2.0, "BUSY_TASK", "和甲方对需求", 72],
+      [2.0, "SURF", "午后刷 B 站摸鱼", 33],
+      [2.5, "BUSY_TASK", "继续埋头赶工", 74],
+      [2.0, "IDLE_ROAM", "下楼散步买宵夜", 40],
+      [1.5, "SURF", "深夜短视频上瘾", 28]
+    ],
+    early: [
+      [6.0, "SLEEP", "早早睡觉养精神", 90],
+      [1.0, "IDLE_ROAM", "起床洗漱收拾书包", 45],
+      [2.5, "BUSY_TASK", "泡图书馆自习", 70],
+      [1.0, "IDLE_ROAM", "和室友拼饭", 40],
+      [2.0, "BUSY_TASK", "上午专业课程", 72],
+      [1.0, "SLEEP", "午睡回血", 60],
+      [3.0, "BUSY_TASK", "写课程作业", 68],
+      [1.5, "SURF", "刷会儿短视频放松", 32],
+      [2.0, "IDLE_ROAM", "食堂干饭 + 操场散步", 42],
+      [2.0, "BUSY_TASK", "复习英语", 66],
+      [2.0, "SLEEP", "准时上床睡觉", 88]
+    ],
+    early_reroll: [
+      [6.5, "SLEEP", "一觉睡到自然醒", 88],
+      [1.5, "SURF", "早起刷校园视频", 33],
+      [2.5, "BUSY_TASK", "去教室抢前排", 68],
+      [1.5, "IDLE_ROAM", "课间和同学聊天", 40],
+      [2.0, "BUSY_TASK", "小组作业讨论", 70],
+      [1.5, "SLEEP", "午睡回血", 58],
+      [2.5, "BUSY_TASK", "图书馆自习", 66],
+      [2.0, "SURF", "刷 B 站学习区", 30],
+      [2.0, "IDLE_ROAM", "操场散步", 44],
+      [1.0, "IDLE_ROAM", "回宿舍洗漱", 46],
+      [2.0, "SLEEP", "准时睡觉", 90]
+    ],
+    normal: [
+      [7.0, "SLEEP", "按时睡觉", 88],
+      [1.0, "IDLE_ROAM", "起床刷牙吃早饭", 45],
+      [2.5, "BUSY_TASK", "上午处理正事", 78],
+      [1.0, "IDLE_ROAM", "午休前刷会儿手机", 38],
+      [1.5, "SLEEP", "午睡一会儿", 62],
+      [2.0, "BUSY_TASK", "下午继续干活", 75],
+      [1.5, "SURF", "摸鱼刷短视频", 32],
+      [2.0, "BUSY_TASK", "收尾今天的工作", 72],
+      [2.0, "IDLE_ROAM", "晚饭后散步", 42],
+      [1.5, "SURF", "睡前刷 B 站", 30],
+      [2.0, "IDLE_ROAM", "窝着发呆", 36]
+    ],
+    normal_reroll: [
+      [6.5, "SLEEP", "踏实睡一觉", 86],
+      [1.5, "IDLE_ROAM", "慢慢悠悠起床", 46],
+      [2.0, "SURF", "晨间刷手机", 34],
+      [3.0, "BUSY_TASK", "上午攻坚", 76],
+      [1.5, "IDLE_ROAM", "午休散步", 42],
+      [1.0, "SLEEP", "午睡 1 小时", 60],
+      [2.5, "BUSY_TASK", "下午推进项目", 74],
+      [2.0, "IDLE_ROAM", "处理杂事", 44],
+      [2.0, "BUSY_TASK", "下班前收尾", 70],
+      [1.5, "SURF", "晚饭后刷视频", 32],
+      [1.5, "IDLE_ROAM", "洗漱发呆", 38]
+    ]
+  };
+
+  function patternFor(soulId, reroll) {
+    var soul = findSoul(soulId) || activeSoul();
+    var key = soulChronotype(soul) + (reroll ? "_reroll" : "");
+    return RUN_PATTERNS[key] || RUN_PATTERNS.normal;
   }
 
-  function slotIndex(slotKey) {
-    for (var i = 0; i < SLOT_DEFINITIONS.length; i++) {
-      if (SLOT_DEFINITIONS[i].slot_key === slotKey) return i;
+  /* BUSY_TASK 每日随机完成结果池（mock 用：已结束的繁忙块惰性结算时取一条） */
+  var COMPLETION_RESULTS = [
+    "总算把这张商稿的线稿拖完了，甲方一句「再改改」又给怼回来。",
+    "赶在截稿前把稿子交上去了，手都是抖的。",
+    "把拖了三天的需求文档写完，感觉灵魂被抽走一半。",
+    "开会开到走神，最后靠一杯冰美式撑住了。",
+    "工作推进到一大半被叫去吃饭，进度卡在关键节点上。",
+    "硬着头皮把方案改到第五版，甲方终于说了句「可以」。"
+  ];
+
+  function hashString(text) {
+    var value = 0;
+    text = String(text || "");
+    for (var i = 0; i < text.length; i++) {
+      value = (value * 31 + text.charCodeAt(i)) % 100000;
     }
-    return 0;
+    return value;
+  }
+
+  function completionFor(index, seed) {
+    var length = COMPLETION_RESULTS.length;
+    var idx = (Number(seed || 0) + index * 7) % length;
+    if (idx < 0) idx += length;
+    return COMPLETION_RESULTS[idx];
   }
 
   function buildRun(soulId, reroll) {
@@ -636,42 +806,35 @@
       if (db.souls[i].soul_id === soulId) soulIndex = i;
     }
     var vigor = VIGOR_CARDS[(soulIndex + (reroll ? 1 : 0)) % VIGOR_CARDS.length];
+    var pattern = patternFor(soulId, reroll);
     var now = new Date();
     var slots = [];
-    SLOT_DEFINITIONS.forEach(function (def, index) {
-      var state = BASE_STATES[def.slot_key];
-      if (reroll) {
-        var order = ["IDLE", "BUSY", "RESTING"];
-        var rotated = order[(order.indexOf(state) + 1 + index) % order.length];
-        if (def.slot_key === "night") rotated = "RESTING";
-        state = rotated;
-      }
-      var baseArmor = { morning: 45, forenoon: 80, noon: 40, afternoon: 75, evening: 35, night: 90 }[def.slot_key];
-      var jitter = reroll ? (((index * 7 + 3) % 11) - 5) : 0;
-      var titleMap = SLOT_TITLES[def.slot_key] || {};
+    var cursor = 0;
+    pattern.forEach(function (item, index) {
+      var duration = roundHalf(item[0]);
+      var start = cursor;
+      var end = Math.round((cursor + duration) * 2) / 2;
+      if (index === pattern.length - 1) end = 24;
+      cursor = end;
+      var actionType = coerceActionType(item[1]) || "IDLE_ROAM";
       slots.push({
-        slot_key: def.slot_key,
-        label: def.label,
-        start_hour: def.start_hour,
-        end_hour: def.end_hour,
-        card_id: "evt_slot_" + def.slot_key,
-        title: titleMap[state] || "日常摸鱼",
-        state: state,
-        armor: clamp(baseArmor + jitter, 10, 95),
+        slot_key: "block_" + index,
+        label: actionLabelOf(actionType),
+        start_hour: start,
+        end_hour: end,
+        card_id: "evt_slot_" + actionType.toLowerCase() + "_" + index,
+        title: item[2],
+        state: boundStateOf(actionType),
+        action_type: actionType,
+        armor: clamp(item[3], 0, 100),
         mutated: false,
         mutation_monologue: "",
-        delay_minutes: 0
+        /* 旧字段保留（新时间轴不再使用） */
+        delay_minutes: 0,
+        busy_settled: false,
+        completion_result: ""
       });
     });
-    var encounters = [];
-    for (var e = 0; e < 3; e++) {
-      var idx = (now.getDate() + soulIndex * 3 + e + (reroll ? 2 : 0)) % ENCOUNTER_POOL.length;
-      encounters.push({
-        encounter_id: "enc_" + (reroll ? "r" : "d") + e,
-        content: ENCOUNTER_POOL[idx],
-        used: !reroll && e === 0
-      });
-    }
     return {
       soul_id: soulId,
       date_str: fmtDate(now),
@@ -679,7 +842,8 @@
       vigor_title: vigor.title,
       vigor_desc: vigor.desc,
       slots: slots,
-      encounters: encounters,
+      /* 奇遇卡已移除：恒为空数组 */
+      encounters: [],
       mutations_used: reroll ? 0 : 1,
       last_mutation_ts: reroll ? 0 : nowSeconds() - 1800,
       last_mutation_log: reroll ? "" : "L3 核心用户强唤醒触发一次微调"
@@ -693,61 +857,119 @@
     return db.schedules[soulId];
   }
 
+  /** 惰性结算：已结束但未结算的 BUSY_TASK 块补上当天随机完成结果
+   *  （对齐后端 web_api 惰性调用 `_settle_finished_busy_blocks` 的语义） */
+  function settleFinishedBusyBlocks(run) {
+    var hour = nowHourFloat();
+    var seed = hashString(String(run.date_str || "") + "|" + String(run.soul_id || ""));
+    run.slots.forEach(function (slot, index) {
+      if (slot.action_type !== "BUSY_TASK") return;
+      if (slot.end_hour > hour + 1e-6) return;
+      if (slot.busy_settled) return;
+      slot.busy_settled = true;
+      slot.completion_result = completionFor(index, seed);
+    });
+    return run;
+  }
+
+  function progressPctOf(slot, nowHour) {
+    var start = Number(slot.start_hour) || 0;
+    var end = Number(slot.end_hour) || 0;
+    if (end <= start) return 0;
+    return Math.round(clamp01((nowHour - start) / (end - start)) * 100);
+  }
+
   function currentSlotOf(run) {
-    var now = new Date();
-    var hour = now.getHours() + now.getMinutes() / 60;
-    var slot = null;
+    var hour = nowHourFloat();
+    var slot = run.slots[0] || null;
     for (var i = 0; i < run.slots.length; i++) {
       var item = run.slots[i];
-      var hit =
-        item.start_hour < item.end_hour
-          ? hour >= item.start_hour && hour < item.end_hour
-          : hour >= item.start_hour || hour < item.end_hour;
-      if (hit) {
+      if (hour >= item.start_hour && hour < item.end_hour) {
         slot = item;
         break;
       }
+      if (i === run.slots.length - 1 && hour >= item.end_hour) slot = item;
     }
-    if (!slot) slot = run.slots[0];
-    var start = new Date(now);
-    start.setHours(slot.start_hour, 0, 0, 0);
-    if (slot.end_hour <= slot.start_hour && hour < slot.end_hour) {
-      start.setDate(start.getDate() - 1);
-    }
-    var end = new Date(start);
-    end.setHours(slot.end_hour, 0, 0, 0);
-    if (slot.end_hour <= slot.start_hour) end.setDate(end.getDate() + 1);
-    var total = Math.max(1, Math.floor((end.getTime() - start.getTime()) / 1000));
-    var remaining = Math.max(0, Math.floor((end.getTime() - now.getTime()) / 1000));
+    if (!slot) return null;
+    var total = Math.max(1, Math.round((slot.end_hour - slot.start_hour) * 3600));
+    var remaining = Math.max(0, Math.min(total, Math.round((slot.end_hour - hour) * 3600)));
+    var progress = clamp01((hour - slot.start_hour) / Math.max(0.001, slot.end_hour - slot.start_hour));
     return {
       slot: slot,
       remaining: remaining,
       total: total,
-      progress: clamp(1 - remaining / total, 0, 1),
+      progress: progress,
+      progressPct: Math.round(progress * 100),
       startHour: slot.start_hour,
       endHour: slot.end_hour
     };
   }
 
   function nextSlotOf(run, slotKey) {
-    var index = slotIndex(slotKey);
-    var next = run.slots[(index + 1) % run.slots.length];
-    return next || null;
+    for (var i = 0; i < run.slots.length; i++) {
+      if (run.slots[i].slot_key === slotKey) {
+        return run.slots[(i + 1) % run.slots.length] || null;
+      }
+    }
+    return run.slots[0] || null;
+  }
+
+  /** slot dict + progress_pct（对齐后端 _build_schedule_payload 的每块字段） */
+  function slotWithProgress(slot) {
+    var copy = clone(slot);
+    copy.progress_pct = progressPctOf(slot, nowHourFloat());
+    return copy;
   }
 
   function maxMutations() {
     return 2;
   }
 
+  /** 今日繁忙成果：已结算或已结束的 BUSY_TASK 块 */
+  function buildBusyResults(run, nowHour) {
+    var results = [];
+    run.slots.forEach(function (slot) {
+      if (slot.action_type !== "BUSY_TASK") return;
+      var ended = slot.end_hour <= nowHour + 1e-6;
+      if (!slot.busy_settled && !ended) return;
+      results.push({
+        slot_key: slot.slot_key,
+        title: slot.title,
+        completion_result: slot.completion_result || "",
+        progress_pct: ended ? 100 : progressPctOf(slot, nowHour),
+        start_hour: slot.start_hour,
+        end_hour: slot.end_hour,
+        start_time: fmtHour(slot.start_hour),
+        end_time: fmtHour(slot.end_hour)
+      });
+    });
+    return results;
+  }
+
   function buildSchedulePayload(soulId) {
-    var run = getRun(soulId);
+    var soul = findSoul(soulId) || activeSoul();
+    if (!soul) throw new Error("没有可用角色");
+    var run = getRun(soul.soul_id);
+    settleFinishedBusyBlocks(run);
+    var nowHour = nowHourFloat();
     var current = currentSlotOf(run);
+    if (!current) throw new Error("今日日程没有可用时间块");
+    var nextSlot = nextSlotOf(run, current.slot.slot_key);
+    var runPayload = clone(run);
+    /* 每块附带 progress_pct（契约 §6.2） */
+    runPayload.slots = runPayload.slots.map(function (slot) {
+      var copy = clone(slot);
+      copy.progress_pct = progressPctOf(slot, nowHour);
+      return copy;
+    });
     var schedule = {
-      run: clone(run),
-      current_slot: clone(current.slot),
-      next_slot: clone(nextSlotOf(run, current.slot.slot_key)),
+      run: runPayload,
+      current_slot: slotWithProgress(current.slot),
+      next_slot: nextSlot ? slotWithProgress(nextSlot) : null,
       max_mutations_per_day: maxMutations(),
-      mutation_cooldown_minutes: 120
+      mutation_cooldown_minutes: 120,
+      chronotype: soulChronotype(soul),
+      busy_results: buildBusyResults(run, nowHour)
     };
     schedule.current_slot.remaining_seconds = current.remaining;
     schedule.current_slot.progress = Number(current.progress.toFixed(4));
@@ -877,6 +1099,8 @@
         return video.soul_id === soul.soul_id;
       }).length
     };
+    var actionType = coerceActionType(current.action_type) || actionTypeFromLegacy(current.state, current.title);
+    var actionTypeLabel = actionLabelOf(actionType) || current.label;
     return {
       soul: {
         soul_id: soul.soul_id,
@@ -884,10 +1108,12 @@
         avatar: cardFilled(card, "identity", "avatar", (cardFilled(card, "identity", "name", "?") || "?").slice(0, 1)),
         tagline: cardFilled(card, "identity", "tagline", "")
       },
-      vigor: { title: run.vigor_title, desc: run.vigor_desc },
+      vigor: { title: run.vigor_title, desc: run.vigor_desc, chronotype: schedule.chronotype },
       state: {
         state: current.state,
-        label: current.label,
+        action_type: actionType,
+        action_type_label: actionTypeLabel,
+        label: actionTypeLabel,
         title: current.title,
         armor: current.armor,
         slot_key: current.slot_key,
@@ -895,6 +1121,9 @@
         end_hour: current.end_hour,
         remaining_seconds: current.remaining_seconds,
         progress: current.progress,
+        progress_pct: current.progress_pct,
+        completion_result: current.completion_result || "",
+        busy_settled: !!current.busy_settled,
         mutated: !!current.mutated,
         next_slot: schedule.next_slot
       },
@@ -905,9 +1134,9 @@
         remaining: Math.max(0, maxMutations() - run.mutations_used),
         cooldown_remaining_seconds: cooldownRemaining(run)
       },
-      encounters: run.encounters.map(function (encounter) {
-        return { content: encounter.content, used: !!encounter.used };
-      }),
+      /* 今日繁忙成果（Tier 1 短时记忆）+ 奇遇卡空数组兼容旧前端 */
+      busy_results: schedule.busy_results,
+      encounters: [],
       counts: counts,
       models: buildModelStatus()
     };
@@ -924,7 +1153,7 @@
       active_soul_id: soul ? soul.soul_id : "",
       active_schedule: soul ? buildSchedulePayload(soul.soul_id) : null,
       model_status: status,
-      slot_definitions: clone(SLOT_DEFINITIONS),
+      action_types: clone(ACTION_TYPE_DEFINITIONS),
       default_soul_id: db.defaultSoulId || ""
     };
   }
@@ -965,45 +1194,18 @@
       general_cards: clone(GENERAL_CARDS).map(function (card) {
         return Object.assign(card, { scope: "global" });
       }),
-      custom_encounters: clone(deck.customEncounters).map(function (content) {
-        return { content: content, scope: "soul" };
-      }),
-      general_encounters: clone(ENCOUNTER_POOL).map(function (content) {
-        return { content: content, scope: "global" };
-      }),
-      slot_definitions: clone(SLOT_DEFINITIONS)
+      /* 编辑器 / 筛选用的四类行动定义（契约 §6.4） */
+      action_types: clone(ACTION_TYPE_DEFINITIONS),
+      chronotype: soulChronotype(soul)
     };
   }
 
   function saveCard(soulId, body) {
     var soul = findSoul(soulId) || activeSoul();
     var deck = deckOf(soul.soul_id);
-    var cardType = String(body.card_type || "action").toLowerCase();
     var scope = String(body.scope || "soul").toLowerCase();
-    if (cardType === "encounter") {
-      var content = String(body.content || "").trim();
-      if (!content) throw new Error("奇遇谈资卡内容不能为空");
-      var oldContent = String(body.old_content || "").trim();
-      var targetList = scope === "global" ? ENCOUNTER_POOL : deck.customEncounters;
-      if (oldContent) {
-        var idx = targetList.indexOf(oldContent);
-        if (idx >= 0) targetList[idx] = content;
-        else if (targetList.indexOf(content) < 0) targetList.unshift(content);
-      } else if (targetList.indexOf(content) < 0) {
-        targetList.unshift(content);
-      }
-      return buildCardsPayload(soul.soul_id);
-    }
     var raw = body.card && typeof body.card === "object" ? body.card : body;
-    var card = {
-      card_id: raw.card_id || "evt_ai_" + Date.now(),
-      title: String(raw.title || "未命名行动卡").trim() || "未命名行动卡",
-      state: String(raw.state || "IDLE").toUpperCase(),
-      valid_slots: Array.isArray(raw.valid_slots) && raw.valid_slots.length ? raw.valid_slots.slice() : ["noon", "afternoon", "evening"],
-      base_weight: clamp(raw.base_weight, 1, 100),
-      armor: clamp(raw.armor, 0, 100),
-      synergy_tags: raw.synergy_tags || {}
-    };
+    var card = normalizeCard(raw);
     var targetDeck = scope === "global" ? GENERAL_CARDS : deck.customCards;
     var replaced = false;
     for (var i = 0; i < targetDeck.length; i++) {
@@ -1020,15 +1222,7 @@
   function deleteCard(soulId, body) {
     var soul = findSoul(soulId) || activeSoul();
     var deck = deckOf(soul.soul_id);
-    var cardType = String(body.card_type || "action").toLowerCase();
     var scope = String(body.scope || "soul").toLowerCase();
-    if (cardType === "encounter") {
-      var content = String(body.content || "").trim();
-      var target = scope === "global" ? ENCOUNTER_POOL : deck.customEncounters;
-      var idx = target.indexOf(content);
-      if (idx >= 0) target.splice(idx, 1);
-      return buildCardsPayload(soul.soul_id);
-    }
     var cardId = String(body.card_id || "").trim();
     var targetDeck = scope === "global" ? GENERAL_CARDS : deck.customCards;
     for (var i = targetDeck.length - 1; i >= 0; i--) {
@@ -1037,16 +1231,18 @@
     return buildCardsPayload(soul.soul_id);
   }
 
+  /** AI 生成一批四类专属行动卡（mock：固定一批模拟卡，返回 generated_cards） */
   function aiGenerateCards(soulId) {
     var soul = findSoul(soulId) || activeSoul();
     var deck = deckOf(soul.soul_id);
+    var stamp = Date.now();
     var generatedCards = [
-      { card_id: "evt_ai_" + Date.now() + "_1", title: "边看番边吃宵夜", state: "IDLE", valid_slots: ["evening", "night"], base_weight: 62, armor: 32, synergy_tags: {} },
-      { card_id: "evt_ai_" + Date.now() + "_2", title: "被甲方临时改需求", state: "BUSY", valid_slots: ["forenoon", "afternoon"], base_weight: 55, armor: 78, synergy_tags: {} },
-      { card_id: "evt_ai_" + Date.now() + "_3", title: "出门买杯冰美式", state: "IDLE", valid_slots: ["morning", "noon"], base_weight: 48, armor: 40, synergy_tags: {} },
-      { card_id: "evt_ai_" + Date.now() + "_4", title: "戴着耳机发呆", state: "RESTING", valid_slots: ["night"], base_weight: 36, armor: 68, synergy_tags: {} }
-    ];
-    var generatedEncounters = ["刷到一条关于“狐狸会不会羡慕猫”的离谱帖子。", "便利店最后一瓶冰美式被我买到了。", "楼下有人在弹吉他，唱的是很老的歌。"];
+      { card_id: "evt_ai_" + stamp + "_1", title: "边看番边吃宵夜", action_type: "SURF", min_hours: 0.5, max_hours: 2.0, base_weight: 62, armor: 32, synergy_tags: {} },
+      { card_id: "evt_ai_" + stamp + "_2", title: "被甲方临时改需求", action_type: "BUSY_TASK", min_hours: 1.0, max_hours: 2.5, base_weight: 55, armor: 78, synergy_tags: {} },
+      { card_id: "evt_ai_" + stamp + "_3", title: "出门买杯冰美式", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.0, base_weight: 48, armor: 40, synergy_tags: {} },
+      { card_id: "evt_ai_" + stamp + "_4", title: "戴着耳机发呆", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.5, base_weight: 36, armor: 68, synergy_tags: {} },
+      { card_id: "evt_ai_" + stamp + "_5", title: "补个长长的回笼觉", action_type: "SLEEP", min_hours: 1.0, max_hours: 3.0, base_weight: 42, armor: 75, synergy_tags: {} }
+    ].map(normalizeCard);
     generatedCards.forEach(function (card) {
       var exists = false;
       for (var i = 0; i < deck.customCards.length; i++) {
@@ -1054,12 +1250,8 @@
       }
       if (!exists) deck.customCards.unshift(card);
     });
-    generatedEncounters.forEach(function (content) {
-      if (deck.customEncounters.indexOf(content) < 0) deck.customEncounters.unshift(content);
-    });
     var payload = buildCardsPayload(soul.soul_id);
     payload.generated_cards = clone(generatedCards);
-    payload.generated_encounters = generatedEncounters;
     return payload;
   }
 
@@ -1294,32 +1486,53 @@
     };
   }
 
+  function defaultTitleFor(actionType) {
+    var fallback = {
+      SLEEP: "关灯睡觉",
+      SURF: "窝在沙发里刷短视频",
+      IDLE_ROAM: "在群里潜水窥屏",
+      BUSY_TASK: "埋头赶工作进度"
+    };
+    return fallback[coerceActionType(actionType)] || "";
+  }
+
   function forceState(body) {
     var soulId = String(body.soul_id || "").trim();
     var soul = findSoul(soulId) || activeSoul();
     if (!soul) throw new Error("没有可用角色");
     var run = getRun(soul.soul_id);
+    var current = currentSlotOf(run);
     var slotKey = String(body.slot_key || "").trim();
-    if (!slotKey) slotKey = currentSlotOf(run).slot.slot_key;
+    if (!slotKey && current) slotKey = current.slot.slot_key;
     var slot = null;
     for (var i = 0; i < run.slots.length; i++) {
       if (run.slots[i].slot_key === slotKey) slot = run.slots[i];
     }
-    if (!slot) throw new Error("未知时段：" + slotKey);
-    var newState = String(body.new_state || slot.state).toUpperCase();
-    if (["IDLE", "BUSY", "RESTING"].indexOf(newState) < 0) throw new Error("状态必须是 IDLE/BUSY/RESTING");
-    slot.state = newState;
-    if (body.new_title != null && String(body.new_title).trim()) {
-      slot.title = String(body.new_title).trim();
+    if (!slot) throw new Error("未知时间块：" + slotKey);
+    /* action_type 优先；否则由 new_state 派生（RESTING→SLEEP / BUSY→BUSY_TASK / IDLE→IDLE_ROAM） */
+    var actionType = coerceActionType(body.action_type);
+    var newState = "";
+    if (actionType) {
+      newState = boundStateOf(actionType);
     } else {
-      slot.title = (SLOT_TITLES[slotKey] || {})[newState] || slot.title;
+      newState = String(body.new_state || "").toUpperCase();
+      if (newState !== "IDLE" && newState !== "BUSY" && newState !== "RESTING") newState = slot.state;
+      actionType = newState === "RESTING" ? "SLEEP" : newState === "BUSY" ? "BUSY_TASK" : "IDLE_ROAM";
     }
+    slot.action_type = actionType;
+    slot.state = newState;
+    slot.label = actionLabelOf(actionType);
+    var newTitle = body.new_title != null ? String(body.new_title).trim() : "";
+    slot.title = newTitle || defaultTitleFor(actionType) || slot.title;
+    slot.busy_settled = false;
+    slot.completion_result = "";
+    slot.mutated = false;
+    slot.mutation_monologue = "";
     if (body.armor != null && String(body.armor) !== "") {
       slot.armor = clamp(body.armor, 0, 100);
     }
-    slot.mutated = true;
     return {
-      updated_slot: clone(slot),
+      updated_slot: slotWithProgress(slot),
       schedule: buildSchedulePayload(soul.soul_id)
     };
   }

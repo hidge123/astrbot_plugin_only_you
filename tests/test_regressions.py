@@ -18,12 +18,15 @@ Also runs ``compileall`` (to ``/tmp`` pycache) and imports ``OnlyYou.main`` offl
 import inspect
 import json
 import os
+import random
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime
+from types import MethodType, SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -34,6 +37,7 @@ from _helpers import (  # noqa: E402
     StubModelHub,
     card_with,
     load_plugin_modules,
+    make_default_slots,
     make_plugin_config,
     make_run,
     make_slot,
@@ -54,10 +58,135 @@ MemoryManager = mods.memory_manager.MemoryManager
 MemoryTier = mods.memory_manager.MemoryTier
 ContextBudgetManager = mods.context_budget.ContextBudgetManager
 SessionBuffer = mods.context_budget.SessionBuffer
+ActionType = mods.state_machine.ActionType
+SlotInstance = mods.roguelite_deck.SlotInstance
+StateEventCard = mods.roguelite_deck.StateEventCard
+DailyScheduleRun = mods.roguelite_deck.DailyScheduleRun
+normalize_chronotype = mods.roguelite_deck.normalize_chronotype
+
+_PLUGIN_METHOD_NAMES = (
+    "settle_busy_block",
+    "_settle_finished_busy_blocks",
+    "_run_idle_roam_action",
+    "_idle_roam_cooldown_seconds",
+    "_roguelite_setting",
+    "_group_lurk_cooldown_seconds",
+    "_private_catchup_cooldown_seconds",
+    "_unread_private_reply_enabled",
+    "_pick_group_unread_candidate",
+    "_decide_group_unread_reply",
+    "_catch_up_private_unread",
+    "_pick_memory_muse_material",
+    "_resolve_idle_roam_target",
+    "_extract_idle_roam_message",
+    "_latest_l3_umo",
+    "_fallback_busy_completion",
+    "_fallback_private_catchup",
+    "_maybe_synthesize_proactive",
+    "_render_soul_summary",
+    "on_any_message",
+)
+
+
+def bind_plugin_methods(fake):
+    """Bind the *real* ``OnlyYouPlugin`` methods onto a lightweight fake ``self``.
+
+    ``OnlyYouPlugin`` itself is never instantiated by the test suite (its StarTools
+    stub would create an SQLite database inside the repository), so unit tests call
+    the unbound methods against a ``SimpleNamespace`` carrying the real components.
+    """
+    from OnlyYou.main import OnlyYouPlugin
+
+    for name in _PLUGIN_METHOD_NAMES:
+        raw = inspect.getattr_static(OnlyYouPlugin, name)
+        if isinstance(raw, staticmethod):
+            setattr(fake, name, raw.__func__)
+        else:
+            setattr(fake, name, MethodType(raw, fake))
+    return fake
+
+
+class RecordingProactiveBridge:
+    """Minimal ``PlatformBridge`` stand-in recording proactive sends."""
+
+    def __init__(self):
+        self.sent = []
+        self.ok = True
+        self.decisions = []
+
+    def apply_reply_decision(self, event, should_reply=False):
+        self.decisions.append(bool(should_reply))
+
+    async def send_proactive_message(
+        self, umo, text, session_buffer=None, soul_name="Bot", audio_path=None
+    ):
+        self.sent.append((umo, text, audio_path))
+        return self.ok
+
+
+class SequencedStubModelHub(StubModelHub):
+    """StubModelHub returning queued JSON/text results (decision then generation)."""
+
+    def __init__(self, json_results=None, text_results=None):
+        super().__init__()
+        self.json_results = list(json_results or [])
+        self.text_results = list(text_results or [])
+
+    async def call_llm_json(
+        self,
+        prompt="",
+        role="decision",
+        umo=None,
+        system_prompt="",
+        image_urls=None,
+        default=None,
+    ):
+        self.calls.append(
+            {"prompt": prompt, "role": role, "umo": umo, "default": default}
+        )
+        if self.json_results:
+            return self.json_results.pop(0)
+        return default
+
+    async def call_llm_text(
+        self,
+        prompt="",
+        role="decision",
+        umo=None,
+        system_prompt="",
+        image_urls=None,
+    ):
+        self.calls.append({"prompt": prompt, "role": role, "umo": umo})
+        if self.text_results:
+            return self.text_results.pop(0)
+        return self.text_result
+
+
+class _StubAtmosphereForGate:
+    """AtmosphereReader stand-in for the three-state gate unit test."""
+
+    def __init__(self, session_buffer):
+        self.session_buffer = session_buffer
+
+    def record_message(self, event, user, on_overflow_callback=None):
+        message = self.session_buffer.record_user_message(
+            event.unified_msg_origin,
+            user,
+            event.message_str,
+            on_overflow_callback=on_overflow_callback,
+        )
+        return "", False, message
+
+    @staticmethod
+    def is_private_event(event):
+        return True
+
+    async def evaluate_should_reply(self, **kwargs):
+        return False
 
 
 # ===========================================================================
-# 1. Roguelite 6-slot schedule
+# 1. Roguelite 24h dynamic action-card timeline
 # ===========================================================================
 class TestRogueliteDeck(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -72,109 +201,317 @@ class TestRogueliteDeck(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self._temp_db.close()
 
-    async def test_draws_all_six_slots(self):
-        run = await self.engine.get_or_build_today_run("soul-a")
-        assert len(run.slots) == 6
-        assert [slot.slot_key for slot in run.slots] == [
-            item["slot_key"] for item in SLOT_DEFINITIONS
-        ]
-        for slot, definition in zip(run.slots, SLOT_DEFINITIONS):
-            assert slot.label == definition["label"]
-            assert slot.start_hour == definition["start_hour"]
-            assert slot.end_hour == definition["end_hour"]
+    # -- helpers ---------------------------------------------------------
+    @staticmethod
+    def assert_timeline(run, engine, chronotype=None):
+        slots = run.slots
+        assert engine.is_valid_timeline(run)
+        assert 7 <= len(slots) <= 11, len(slots)
+        assert slots[0].start_hour == 0.0
+        assert slots[-1].end_hour == 24.0
+        prev = 0.0
+        for slot in slots:
+            assert abs(slot.start_hour - prev) < 1e-9, (
+                slot.slot_key,
+                slot.start_hour,
+                prev,
+            )
+            duration = slot.end_hour - slot.start_hour
+            assert duration >= 0.5, duration
+            assert abs(duration * 2 - round(duration * 2)) < 1e-9, duration
             assert isinstance(slot.state, BotState)
+            assert isinstance(slot.action_type, ActionType)
+            assert slot.action_type.bound_state == slot.state
+            assert slot.title and slot.label
             assert 0 <= slot.armor <= 100
-            assert slot.title
-        assert len(run.encounters) == 2
-        assert all(encounter.content for encounter in run.encounters)
-        assert run.date_str
+            prev = slot.end_hour
+        assert run.encounters == []
+        if chronotype is not None:
+            assert run.chronotype == chronotype
+
+    async def _build(self, soul_id, chronotype="normal", seed=0):
+        random.seed(seed)
+        return await self.engine.get_or_build_today_run(
+            soul_id, chronotype=chronotype, force_reroll=True
+        )
+
+    # -- timeline invariants --------------------------------------------
+    async def test_dynamic_timeline_covers_full_day_for_all_chronotypes(self):
+        for chronotype in ("early", "normal", "night_owl"):
+            for seed in range(5):
+                run = await self._build(
+                    f"{chronotype}-{seed}", chronotype=chronotype, seed=seed
+                )
+                self.assert_timeline(run, self.engine, chronotype=chronotype)
 
     async def test_same_day_run_is_stable_and_persisted(self):
-        first = await self.engine.get_or_build_today_run("soul-a")
-        second = await self.engine.get_or_build_today_run("soul-a")
+        first = await self._build("soul-stable", seed=3)
+        second = await self.engine.get_or_build_today_run("soul-stable")
         assert second is first  # in-memory cache
 
         # a brand-new engine (empty cache) must load the persisted run from SQLite
         other_engine = RogueliteDeckEngine(self.db, self.config)
-        reloaded = await other_engine.get_or_build_today_run("soul-a")
+        reloaded = await other_engine.get_or_build_today_run("soul-stable")
         assert reloaded.to_dict() == first.to_dict()
+        self.assert_timeline(reloaded, other_engine)
 
         # a different soul gets an independent run
-        other_soul_run = await other_engine.get_or_build_today_run("soul-b")
+        other_soul_run = await other_engine.get_or_build_today_run(
+            "soul-b", chronotype="early"
+        )
         assert other_soul_run.soul_id == "soul-b"
+        self.assert_timeline(other_soul_run, other_engine)
 
-    async def test_reroll_changes_schedule_and_keeps_six_slots(self):
-        original = await self.engine.get_or_build_today_run("soul-a")
-        rerolled = None
+    async def test_reroll_regenerates_a_valid_timeline(self):
+        original = await self._build("soul-reroll", seed=11)
+        rerolled = original
         changed = False
-        for _ in range(3):
+        for _ in range(4):
             rerolled = await self.engine.get_or_build_today_run(
-                "soul-a", force_reroll=True
+                "soul-reroll", force_reroll=True
             )
-            assert len(rerolled.slots) == 6
+            self.assert_timeline(rerolled, self.engine)
             if rerolled.to_dict() != original.to_dict():
                 changed = True
                 break
         assert changed, "reroll should (almost surely) produce a different schedule"
-        # reroll result replaces the persisted row
         fresh_engine = RogueliteDeckEngine(self.db, self.config)
-        persisted = await fresh_engine.get_or_build_today_run("soul-a")
+        persisted = await fresh_engine.get_or_build_today_run("soul-reroll")
         assert persisted.to_dict() == rerolled.to_dict()
 
-    async def test_custom_cards_and_encounters_enter_the_pool(self):
-        soul = make_soul("soul-c")
-        assert soul.state_event_cards == []
-        # Ask for the whole encounter pool so the custom entry is guaranteed to be drawn.
-        config = make_plugin_config(
-            roguelite_schedule_config={
-                "enable_roguelite_schedule": True,
-                "daily_encounter_count": 100,
-                "max_mutations_per_day": 2,
-                "mutation_cooldown_minutes": 120,
+    async def test_custom_card_pool_is_used_and_completed_to_four_actions(self):
+        custom = [
+            StateEventCard(
+                card_id="custom_busy",
+                title="在丹房炼制回春丹",
+                state=BotState.BUSY,
+                action_type=ActionType.BUSY_TASK,
+                min_hours=1.0,
+                max_hours=2.0,
+                armor=60,
+            ),
+            StateEventCard(
+                card_id="custom_surf",
+                title="瘫在懒人沙发上刷B站",
+                state=BotState.IDLE,
+                action_type=ActionType.SURF,
+                min_hours=0.5,
+                max_hours=1.5,
+                armor=30,
+            ),
+        ]
+        pool = self.engine._normalize_pool(custom)
+        assert {card.action for card in pool} == set(ActionType)
+        assert any(card.card_id == "custom_busy" for card in pool)
+        # The Soul's own cards must be drawable while all four types stay covered.
+        drawn_custom = False
+        for seed in range(10):
+            random.seed(seed)
+            run = await self.engine.get_or_build_today_run(
+                f"soul-custom-{seed}",
+                custom_cards=custom,
+                chronotype="night_owl",
+                force_reroll=True,
+            )
+            self.assert_timeline(run, self.engine)
+            if any(slot.card_id.startswith("custom_") for slot in run.slots):
+                drawn_custom = True
+        assert drawn_custom
+
+    async def test_chronotype_weight_curves_differ(self):
+        early_1am = self.engine.get_chronotype_weights("early", 1.0)
+        owl_1am = self.engine.get_chronotype_weights("night_owl", 1.0)
+        early_9am = self.engine.get_chronotype_weights("early", 9.0)
+        owl_9am = self.engine.get_chronotype_weights("night_owl", 9.0)
+        # 01:00 — early bird is fast asleep, night owl is wide awake.
+        assert early_1am[ActionType.SLEEP] > 3.0
+        assert owl_1am[ActionType.SLEEP] < 1.0
+        assert owl_1am[ActionType.SURF] > 1.0
+        assert early_1am[ActionType.BUSY_TASK] < 1.0
+        # 09:00 — reversed: night owl is still asleep, early bird already busy.
+        assert owl_9am[ActionType.SLEEP] > 3.0
+        assert early_9am[ActionType.SLEEP] < 1.0
+        assert early_9am[ActionType.BUSY_TASK] > 1.0
+        for action in ActionType:
+            for weights in (early_1am, owl_1am, early_9am, owl_9am):
+                assert weights[action] > 0
+
+    def test_legacy_card_dict_migrates_action_type_and_hours(self):
+        surf = StateEventCard.from_dict(
+            {"card_id": "a", "title": "躺沙发上刷B站", "state": "IDLE", "armor": 20}
+        )
+        assert surf.action_type == ActionType.SURF
+        assert surf.state == BotState.IDLE
+        assert (surf.min_hours, surf.max_hours) == (0.5, 2.0)
+
+        sleep = StateEventCard.from_dict(
+            {"card_id": "b", "title": "关灯钻进被窝呼呼大睡", "state": "RESTING"}
+        )
+        assert sleep.action_type == ActionType.SLEEP
+        assert (sleep.min_hours, sleep.max_hours) == (4.0, 7.5)
+
+        nap = StateEventCard.from_dict(
+            {"card_id": "c", "title": "戴眼罩午休眯一会儿", "state": "RESTING"}
+        )
+        assert nap.action_type == ActionType.SLEEP
+        assert (nap.min_hours, nap.max_hours) == (1.0, 2.0)
+
+        busy = StateEventCard.from_dict(
+            {"card_id": "d", "title": "沉浸式处理手头正事", "state": "BUSY"}
+        )
+        assert busy.action_type == ActionType.BUSY_TASK
+        assert (busy.min_hours, busy.max_hours) == (1.0, 3.0)
+
+        roam = StateEventCard.from_dict(
+            {"card_id": "e", "title": "趴在窗边发呆", "state": "IDLE"}
+        )
+        assert roam.action_type == ActionType.IDLE_ROAM
+        assert (roam.min_hours, roam.max_hours) == (0.5, 2.0)
+
+        # explicit action_type wins over the (legacy) state field
+        explicit = StateEventCard.from_dict(
+            {
+                "card_id": "f",
+                "title": "冲浪刷片",
+                "state": "BUSY",
+                "action_type": "SURF",
+                "min_hours": 0.2,
+                "max_hours": 12.0,
             }
         )
-        engine = RogueliteDeckEngine(self.db, config)
-        run = await engine.get_or_build_today_run(
-            "soul-c",
-            custom_encounters=["独家奇遇：今天捡到一只猫"],
-            force_reroll=True,
+        assert explicit.action_type == ActionType.SURF
+        assert explicit.state == BotState.IDLE
+        assert explicit.min_hours == 0.5
+        assert explicit.max_hours == 8.0
+
+    async def test_legacy_six_slot_run_is_redrawn(self):
+        date_str = self.engine.today_str()
+        legacy = {
+            "soul_id": "soul-legacy",
+            "date_str": date_str,
+            "vigor_id": "vigor_normal",
+            "vigor_title": "普通一天",
+            "vigor_desc": "普通一天",
+            "slots": [
+                {
+                    "slot_key": "morning",
+                    "label": "清晨早起",
+                    "start_hour": 7,
+                    "end_hour": 9,
+                    "title": "早起",
+                    "state": "IDLE",
+                    "armor": 50,
+                },
+                {
+                    "slot_key": "night",
+                    "label": "深夜睡眠",
+                    "start_hour": 23,
+                    "end_hour": 7,
+                    "title": "睡觉",
+                    "state": "RESTING",
+                    "armor": 60,
+                },
+            ],
+        }
+        await self.db.execute(
+            "INSERT INTO daily_schedules (soul_id, date_str, run_json, updated_at)"
+            " VALUES (?, ?, ?, ?)",
+            ("soul-legacy", date_str, json.dumps(legacy), 0),
         )
-        assert len(run.slots) == 6
-        assert any("独家奇遇" in encounter.content for encounter in run.encounters)
+        run = await self.engine.get_or_build_today_run("soul-legacy")
+        self.assert_timeline(run, self.engine)
 
     async def test_resolve_slot_index_for_time(self):
-        run = await self.engine.get_or_build_today_run("soul-a")
-        from datetime import datetime
-
-        cases = [
-            (datetime(2024, 1, 2, 8, 0), "morning"),
-            (datetime(2024, 1, 2, 10, 0), "forenoon"),
-            (datetime(2024, 1, 2, 13, 0), "noon"),
-            (datetime(2024, 1, 2, 15, 0), "afternoon"),
-            (datetime(2024, 1, 2, 20, 0), "evening"),
-            (datetime(2024, 1, 2, 2, 0), "night"),
-        ]
-        for now_dt, expected_key in cases:
-            index = self.engine.resolve_slot_index_for_time(run, now_dt)
-            assert run.slots[index].slot_key == expected_key, (now_dt, expected_key)
+        run = await self._build("soul-resolve", seed=5)
+        for index, slot in enumerate(run.slots):
+            midpoint = slot.start_hour + (slot.end_hour - slot.start_hour) / 2.0
+            hour = int(midpoint)
+            minute = int(round((midpoint - hour) * 60))
+            now_dt = datetime(2024, 1, 2, hour, minute)
+            assert self.engine.resolve_slot_index_for_time(run, now_dt) == index, (
+                now_dt,
+                slot,
+            )
+        first = self.engine.resolve_slot_index_for_time(
+            run, datetime(2024, 1, 2, 0, 0)
+        )
+        assert run.slots[first].start_hour == 0.0
+        last = self.engine.resolve_slot_index_for_time(
+            run, datetime(2024, 1, 2, 23, 59)
+        )
+        assert run.slots[last].end_hour == 24.0
 
     async def test_force_set_current_state(self):
-        from datetime import datetime
-
         now_dt = datetime(2024, 1, 2, 10, 0)
         slot = await self.engine.force_set_current_state(
-            "soul-a",
+            "soul-force",
             BotState.BUSY,
             new_title="苦逼赶稿",
             armor=80,
             now_dt=now_dt,
         )
         assert slot.state == BotState.BUSY
+        assert slot.action_type == ActionType.BUSY_TASK
         assert slot.title == "苦逼赶稿"
         assert slot.armor == 80
         assert slot.mutated is False
-        current = await self.engine.get_current_slot("soul-a", now_dt=now_dt)
+        current = await self.engine.get_current_slot("soul-force", now_dt=now_dt)
         assert current.state == BotState.BUSY
+
+        surf = await self.engine.force_set_current_state(
+            "soul-force", None, action_type=ActionType.SURF, now_dt=now_dt
+        )
+        assert surf.action_type == ActionType.SURF
+        assert surf.state == BotState.IDLE
+        assert surf.busy_settled is False
+        assert surf.completion_result == ""
+
+        # bare ``state IDLE`` keeps the current SURF action ...
+        bare_idle = await self.engine.force_set_current_state(
+            "soul-force", BotState.IDLE, now_dt=now_dt
+        )
+        assert bare_idle.action_type == ActionType.SURF
+        # ... while an explicit non-surf title derives IDLE_ROAM again.
+        roam = await self.engine.force_set_current_state(
+            "soul-force",
+            BotState.IDLE,
+            new_title="趴在窗边发呆看云",
+            now_dt=now_dt,
+        )
+        assert roam.action_type == ActionType.IDLE_ROAM
+        assert roam.state == BotState.IDLE
+        assert roam.label == ActionType.IDLE_ROAM.label
+
+    def test_progress_and_time_range_formatting(self):
+        block = SlotInstance(
+            slot_key="block_x",
+            start_hour=8.0,
+            end_hour=10.0,
+            state=BotState.BUSY,
+            action_type=ActionType.BUSY_TASK,
+            title="炼制回春丹",
+        )
+        assert block.get_progress_pct(datetime(2024, 1, 1, 8, 0)) == 0
+        assert block.get_progress_pct(datetime(2024, 1, 1, 9, 0)) == 50
+        assert block.get_progress_pct(datetime(2024, 1, 1, 10, 0)) == 100
+        assert block.format_time_range() == "08:00-10:00"
+
+        half = SlotInstance(
+            slot_key="block_y",
+            start_hour=13.5,
+            end_hour=15.0,
+            state=BotState.IDLE,
+            action_type=ActionType.SURF,
+        )
+        assert half.format_time_range() == "13:30-15:00"
+        late = SlotInstance(
+            slot_key="block_z",
+            start_hour=23.5,
+            end_hour=24.0,
+            state=BotState.RESTING,
+            action_type=ActionType.SLEEP,
+        )
+        assert late.format_time_range() == "23:30-24:00"
 
 
 # ===========================================================================
@@ -735,10 +1072,30 @@ class TestContextBudget(ContextBudgetTestBase):
         budget, _manager, _buffer = self.build_budget(config)
         req = FakeRequest(prompt="在吗", system_prompt="BASE", contexts=["old"])
         await self.apply(
-            req, FakeEvent(message_str="在吗", umo="umo-1"), make_slot(state=BotState.BUSY)
+            req,
+            FakeEvent(message_str="在吗", umo="umo-1"),
+            make_slot(state=BotState.BUSY, action_type=ActionType.BUSY_TASK),
         )
-        assert "繁忙中 (BUSY)" in req.system_prompt
+        assert "BUSY_TASK" in req.system_prompt
+        assert "当前完成进度" in req.system_prompt
         assert "当前三态控制器" in req.system_prompt
+
+    async def test_idle_instructions_include_settled_busy_results(self):
+        config = make_plugin_config()
+        budget, _manager, _buffer = self.build_budget(config)
+        slots = make_default_slots()
+        busy = [s for s in slots if s.action_type == ActionType.BUSY_TASK][0]
+        busy.busy_settled = True
+        busy.completion_result = "终于把回春丹炼出来了，差点炸炉"
+        req = FakeRequest(prompt="在吗", system_prompt="BASE")
+        await self.apply(
+            req,
+            FakeEvent(message_str="在吗", umo="umo-1"),
+            make_slot(state=BotState.IDLE, action_type=ActionType.IDLE_ROAM),
+            run=make_run(slots=slots),
+        )
+        assert "空闲中 (" in req.system_prompt
+        assert "终于把回春丹炼出来了" in req.system_prompt
 
     async def test_mutated_slot_injects_monologue(self):
         config = make_plugin_config()
@@ -755,7 +1112,665 @@ class TestContextBudget(ContextBudgetTestBase):
 
 
 # ===========================================================================
-# 6. Project-level sanity: offline import + compileall
+# 6. BUSY_TASK daily completion settlement + IDLE_ROAM proactive action
+# ===========================================================================
+class DynamicTimelineTestBase(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="onlyyou-tests-")
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self._temp_db = mods.db.DatabaseManager(os.path.join(self.tmpdir, "only.you.db"))
+        self.db = self._temp_db
+        await self.db.initialize()
+        self.config = make_plugin_config()
+
+    async def asyncTearDown(self):
+        await self._temp_db.close()
+
+
+class TestBusyTaskSettlement(DynamicTimelineTestBase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.engine = RogueliteDeckEngine(self.db, self.config)
+        self.memory_manager = MemoryManager(self.db, StubModelHub(), self.config)
+        self.soul = make_soul("soul-busy")
+
+    def fake_plugin(self, json_result=None):
+        fake = SimpleNamespace(
+            model_hub=StubModelHub(json_result=json_result),
+            deck_engine=self.engine,
+            memory_manager=self.memory_manager,
+            _busy_settling=set(),
+        )
+        return bind_plugin_methods(fake)
+
+    async def _tier1_rows(self):
+        return await self.db.fetchall(
+            "SELECT content, importance FROM memories"
+            " WHERE soul_id = ? AND memory_tier = 1",
+            (self.soul.soul_id,),
+        )
+
+    async def test_settle_busy_block_writes_tier1_once(self):
+        run = make_run(self.soul.soul_id)
+        block = next(s for s in run.slots if s.action_type == ActionType.BUSY_TASK)
+        fake = self.fake_plugin(
+            {
+                "completion_memory": "花了两个多小时终于把回春丹炼出来了，最后一炉差点炸炉",
+                "keywords": "炼丹,回春丹",
+            }
+        )
+        text = await fake.settle_busy_block(self.soul, run, block, progress_pct=100)
+        assert text == "花了两个多小时终于把回春丹炼出来了，最后一炉差点炸炉"
+        assert block.busy_settled is True
+        assert block.completion_result == text
+        rows = await self._tier1_rows()
+        assert len(rows) == 1
+        assert rows[0]["content"] == text
+        assert rows[0]["importance"] == 4
+
+        # second settlement attempt must not duplicate the Tier 1 memory
+        again = await fake.settle_busy_block(self.soul, run, block, progress_pct=100)
+        assert again == text
+        assert len(await self._tier1_rows()) == 1
+
+    async def test_settle_busy_block_falls_back_when_llm_missing(self):
+        run = make_run(self.soul.soul_id)
+        block = next(s for s in run.slots if s.action_type == ActionType.BUSY_TASK)
+        fake = self.fake_plugin(None)
+        text = await fake.settle_busy_block(
+            self.soul, run, block, progress_pct=40, interrupted_by="阿泽"
+        )
+        assert text
+        assert block.busy_settled is True
+        assert block.completion_result == text
+        assert len(await self._tier1_rows()) == 1
+
+    async def test_settle_finished_busy_blocks_only_finished_ones(self):
+        run = make_run(self.soul.soul_id)
+        busies = [s for s in run.slots if s.action_type == ActionType.BUSY_TASK]
+        assert len(busies) >= 2
+        fake = self.fake_plugin(
+            {"completion_memory": "上午的正事顺利收尾，顺手把桌面也收拾了"}
+        )
+        texts = await fake._settle_finished_busy_blocks(
+            self.soul, run, now_dt=datetime(2024, 1, 2, 13, 0)
+        )
+        assert len(texts) == 1
+        assert busies[0].busy_settled is True
+        assert busies[1].busy_settled is False
+        assert len(await self._tier1_rows()) == 1
+
+
+class TestUnreadBacklog(unittest.TestCase):
+    """The unread backlog is independent of the 15-message sliding window."""
+
+    def _buffer(self, **roguelite_overrides):
+        config = make_plugin_config(
+            roguelite_schedule_config={
+                "enable_roguelite_schedule": True,
+                "max_mutations_per_day": 2,
+                "mutation_cooldown_minutes": 120,
+                "allow_l3_wake_from_resting": True,
+                **roguelite_overrides,
+            }
+        )
+        return SessionBuffer(config)
+
+    def test_record_returns_sequential_messages(self):
+        buffer = self._buffer()
+        user = make_user("u-1", "阿一")
+        first = buffer.record_user_message("umo-1", user, "第一句")
+        second = buffer.record_user_message("umo-1", user, "第二句")
+        assert first is not None and second is not None
+        assert second.seq > first.seq
+        assert first.role == "user" and first.sender_name == "阿一"
+
+    def test_mark_unread_partitions_group_and_private(self):
+        buffer = self._buffer()
+        user = make_user("u-1", "阿一")
+        group_msg = buffer.record_user_message("aiocqhttp:GroupMessage:g1", user, "群消息")
+        private_msg = buffer.record_user_message(
+            "aiocqhttp:FriendMessage:f1", user, "私聊消息"
+        )
+        buffer.mark_unread("aiocqhttp:GroupMessage:g1", group_msg, is_private=False)
+        buffer.mark_unread("aiocqhttp:FriendMessage:f1", private_msg, is_private=True)
+        assert buffer.get_unread_count(is_private=False) == 1
+        assert buffer.get_unread_count(is_private=True) == 1
+        assert buffer.get_unread_total() == 2
+        group_chats = buffer.list_unread_chats(private=False)
+        private_chats = buffer.list_unread_chats(private=True)
+        assert [umo for umo, _ in group_chats] == ["aiocqhttp:GroupMessage:g1"]
+        assert [umo for umo, _ in private_chats] == ["aiocqhttp:FriendMessage:f1"]
+
+    def test_ack_unread_removes_only_consumed_messages(self):
+        buffer = self._buffer()
+        user = make_user("u-1", "阿一")
+        first = buffer.record_user_message("umo-1", user, "第一条")
+        second = buffer.record_user_message("umo-1", user, "第二条")
+        buffer.mark_unread("umo-1", first, is_private=True)
+        buffer.mark_unread("umo-1", second, is_private=True)
+        removed = buffer.ack_unread("umo-1", [first.seq])
+        assert removed == 1
+        remaining = buffer.get_unread_batch("umo-1")
+        assert [m.seq for m in remaining] == [second.seq]
+        assert buffer.ack_unread("umo-1") == 1
+        assert buffer.get_unread_total() == 0
+
+    def test_unread_survives_sliding_window_eviction(self):
+        buffer = self._buffer()
+        user = make_user("u-1", "阿一")
+        first = buffer.record_user_message("umo-1", user, "最早的消息")
+        buffer.mark_unread("umo-1", first, is_private=True)
+        for index in range(buffer.sliding_window_size + 5):
+            buffer.record_user_message("umo-1", user, f"后续消息{index}")
+        # the message was pushed out of the 15-message window but stays unread
+        assert first not in buffer._windows.get("umo-1", [])
+        assert [m.seq for m in buffer.get_unread_batch("umo-1")] == [first.seq]
+
+    def test_unread_cap_keeps_newest_messages(self):
+        buffer = self._buffer(unread_max_per_chat=2)
+        user = make_user("u-1", "阿一")
+        messages = [
+            buffer.record_user_message("umo-1", user, f"消息{index}")
+            for index in range(3)
+        ]
+        for message in messages:
+            buffer.mark_unread("umo-1", message, is_private=True)
+        batch = buffer.get_unread_batch("umo-1")
+        assert [m.content for m in batch] == ["消息1", "消息2"]
+
+    def test_expired_group_unread_is_pruned(self):
+        buffer = self._buffer()
+        user = make_user("u-1", "阿一")
+        message = buffer.record_user_message("umo-1", user, "很久以前的群消息")
+        buffer.mark_unread("umo-1", message, is_private=False)
+        message.timestamp = time.time() - 10000  # group TTL default 2h
+        assert buffer.get_unread_batch("umo-1") == []
+        assert buffer.get_unread_total() == 0
+
+    def test_format_unread_batch_renders_transcript(self):
+        buffer = self._buffer()
+        user = make_user("u-1", "阿一", tier=UserTier.L2_IMPORTANT)
+        message = buffer.record_user_message("umo-1", user, "周末去漫展吗")
+        text = buffer.format_unread_batch([message])
+        assert "阿一" in text and "漫展" in text
+
+
+class TestGateUnreadMarking(unittest.IsolatedAsyncioTestCase):
+    """Only gate-blocked messages become unread; IGNORE after the gate stays read."""
+
+    async def _run_gate(self, slot_state, tier, action_type):
+        config = make_plugin_config()
+        buffer = SessionBuffer(config)
+        bridge = RecordingProactiveBridge()
+        soul = make_soul("gate-soul")
+        slot = make_slot(state=slot_state, action_type=action_type, armor=50)
+        user = make_user("u-1", "阿一", tier=tier)
+
+        async def resolve_soul(umo=None, allow_llm_seed=True):
+            return soul
+
+        async def resolve_user(event):
+            return user
+
+        async def noop_mutator(**kwargs):
+            return False
+
+        async def get_current_slot(**kwargs):
+            return slot
+
+        async def noop_init():
+            return None
+
+        fake = SimpleNamespace(
+            config=config,
+            session_buffer=buffer,
+            platform_bridge=bridge,
+            soul_manager=SimpleNamespace(resolve_soul=resolve_soul),
+            user_relation=SimpleNamespace(resolve_user=resolve_user),
+            atmosphere_reader=_StubAtmosphereForGate(buffer),
+            schedule_mutator=SimpleNamespace(on_message_input=noop_mutator),
+            deck_engine=SimpleNamespace(get_current_slot=get_current_slot),
+            _last_message_tier={},
+            _known_l3_umos={},
+            _known_group_umos=set(),
+            _ensure_initialized=noop_init,
+            _on_window_overflow=None,
+        )
+        fake = bind_plugin_methods(fake)
+        await fake.on_any_message(FakeEvent(message_str="在吗", umo="umo-1"))
+        return buffer, bridge
+
+    async def test_resting_blocked_message_is_unread(self):
+        buffer, bridge = await self._run_gate(
+            BotState.RESTING, UserTier.L1_NORMAL, ActionType.SLEEP
+        )
+        assert buffer.get_unread_total() == 1
+        assert buffer.get_unread_count(is_private=True) == 1
+        assert bridge.sent == []
+
+    async def test_busy_l1_blocked_message_is_unread(self):
+        buffer, _bridge = await self._run_gate(
+            BotState.BUSY, UserTier.L1_NORMAL, ActionType.BUSY_TASK
+        )
+        assert buffer.get_unread_total() == 1
+
+    async def test_busy_l2_allowed_but_ignored_is_read(self):
+        buffer, _bridge = await self._run_gate(
+            BotState.BUSY, UserTier.L2_IMPORTANT, ActionType.BUSY_TASK
+        )
+        # gate allowed it; the atmosphere stub then says IGNORE -> read, not unread
+        assert buffer.get_unread_total() == 0
+
+    async def test_idle_ignored_message_is_read(self):
+        buffer, _bridge = await self._run_gate(
+            BotState.IDLE, UserTier.L1_NORMAL, ActionType.IDLE_ROAM
+        )
+        assert buffer.get_unread_total() == 0
+
+
+class TestIdleRoamAction(DynamicTimelineTestBase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.engine = RogueliteDeckEngine(self.db, self.config)
+        self.memory_manager = MemoryManager(self.db, StubModelHub(), self.config)
+        self.session_buffer = SessionBuffer(self.config)
+        self.soul = make_soul("soul-roam")
+        self.current_slot = make_slot(
+            state=BotState.IDLE,
+            action_type=ActionType.IDLE_ROAM,
+            title="趴在窗边发呆",
+        )
+        self.run = make_run(self.soul.soul_id)
+
+    def _make_fake(self, json_results, groups=None, cooldown=0):
+        config = make_plugin_config(
+            roguelite_schedule_config={
+                "enable_roguelite_schedule": True,
+                "max_mutations_per_day": 2,
+                "mutation_cooldown_minutes": 120,
+                "idle_roam_cooldown_minutes": cooldown,
+                "allow_l3_wake_from_resting": True,
+                "unread_group_cooldown_minutes": 60,
+                "unread_private_cooldown_minutes": 60,
+            }
+        )
+        self.config = config
+        bridge = RecordingProactiveBridge()
+        fake = SimpleNamespace(
+            config=config,
+            model_hub=SequencedStubModelHub(json_results=json_results),
+            memory_manager=self.memory_manager,
+            session_buffer=self.session_buffer,
+            platform_bridge=bridge,
+            _known_group_umos=set(groups or []),
+            _known_l3_umos={"core-uid": "aiocqhttp:FriendMessage:l3"},
+            _last_idle_roam_ts={},
+            _last_group_lurk_ts={},
+            _last_private_catchup_ts={},
+        )
+        return bind_plugin_methods(fake), bridge
+
+    def _mark_group_unread(self, umo="aiocqhttp:GroupMessage:g1", content="群里刚聊到一个超大的瓜"):
+        user = make_user("u-1", "群友")
+        message = self.session_buffer.record_user_message(umo, user, content)
+        assert message is not None
+        self.session_buffer.mark_unread(umo, message, is_private=False)
+        return message
+
+    async def test_group_lurk_decides_reply_then_bubbles_up(self):
+        umo = "aiocqhttp:GroupMessage:g1"
+        self._mark_group_unread(umo)
+        fake, bridge = self._make_fake(
+            [
+                {"decision": "REPLY", "confidence": 0.9, "reason": "大瓜可接"},
+                {"target": "GROUP", "message": "哈哈哈这个瓜我也刚看到，太离谱了"},
+            ]
+        )
+        sent = await fake._run_idle_roam_action(
+            self.soul, self.run, self.current_slot
+        )
+        assert sent is True
+        assert bridge.sent and bridge.sent[0][0] == umo
+        # decision prompt first, generation prompt second
+        assert "未读消息" in fake.model_hub.calls[0]["prompt"]
+        assert "GROUP_LURK" in fake.model_hub.calls[1]["prompt"]
+        # consumed once, never replayed
+        assert self.session_buffer.get_unread_total() == 0
+
+    async def test_group_lurk_ignore_consumes_without_sending(self):
+        umo = "aiocqhttp:GroupMessage:g1"
+        self._mark_group_unread(umo)
+        fake, bridge = self._make_fake([{"decision": "IGNORE", "confidence": 0.8}])
+        sent = await fake._run_idle_roam_action(
+            self.soul, self.run, self.current_slot
+        )
+        # no memories -> MEMORY_MUSE also sends nothing
+        assert sent is False
+        assert bridge.sent == []
+        assert self.session_buffer.get_unread_total() == 0
+
+    async def test_group_lurk_respects_per_group_cooldown(self):
+        umo = "aiocqhttp:GroupMessage:g1"
+        self._mark_group_unread(umo)
+        fake, bridge = self._make_fake(
+            [
+                {"decision": "REPLY", "confidence": 0.9},
+                {"target": "GROUP", "message": "这瓜保熟吗"},
+            ]
+        )
+        assert (
+            await fake._run_idle_roam_action(self.soul, self.run, self.current_slot)
+            is True
+        )
+        # a new unread message arrives, but the group is cooling down
+        self._mark_group_unread(umo, "群里又聊起来了")
+        assert (
+            await fake._run_idle_roam_action(self.soul, self.run, self.current_slot)
+            is False
+        )
+        assert len(bridge.sent) == 1
+        assert self.session_buffer.get_unread_total() == 1
+
+    async def test_memory_muse_dms_l3_with_busy_result(self):
+        await self.memory_manager.add_memory(
+            soul_id=self.soul.soul_id,
+            content="今天把回春丹炼成了，差点炸炉",
+            keywords="炼丹,繁忙结果",
+            importance=4,
+            memory_tier=1,
+        )
+        fake, bridge = self._make_fake(
+            [{"target": "PRIVATE_L3", "message": "突然想起今天炼丹差点炸炉，笑死"}]
+        )
+        sent = await fake._run_idle_roam_action(
+            self.soul, self.run, self.current_slot
+        )
+        assert sent is True
+        assert bridge.sent[0][0] == "aiocqhttp:FriendMessage:l3"
+        assert "MEMORY_MUSE" in fake.model_hub.calls[0]["prompt"]
+        assert "回春丹" in fake.model_hub.calls[0]["prompt"]
+
+    async def test_idle_roam_cooldown_blocks_second_call(self):
+        self._mark_group_unread("aiocqhttp:GroupMessage:g1")
+        fake, _bridge = self._make_fake(
+            [
+                {"decision": "REPLY", "confidence": 0.9},
+                {"target": "GROUP", "message": "这瓜保熟吗"},
+            ],
+            cooldown=45,
+        )
+        assert (
+            await fake._run_idle_roam_action(self.soul, self.run, self.current_slot)
+            is True
+        )
+        calls_before = len(fake.model_hub.calls)
+        assert (
+            await fake._run_idle_roam_action(self.soul, self.run, self.current_slot)
+            is False
+        )
+        assert len(fake.model_hub.calls) == calls_before
+
+
+class TestPrivateUnreadCatchUp(DynamicTimelineTestBase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.session_buffer = SessionBuffer(self.config)
+        self.soul = make_soul("soul-private")
+        self.current_slot = make_slot(
+            state=BotState.IDLE,
+            action_type=ActionType.IDLE_ROAM,
+            title="趴在窗边发呆",
+        )
+        self.run = make_run(self.soul.soul_id)
+
+    def _make_fake(self, text_result="", ok=True, enabled=True, cooldown=60):
+        config = make_plugin_config(
+            roguelite_schedule_config={
+                "enable_roguelite_schedule": True,
+                "max_mutations_per_day": 2,
+                "mutation_cooldown_minutes": 120,
+                "idle_roam_cooldown_minutes": 45,
+                "allow_l3_wake_from_resting": True,
+                "unread_private_reply_enabled": enabled,
+                "unread_private_cooldown_minutes": cooldown,
+                "unread_private_ttl_minutes": 720,
+            }
+        )
+        self.config = config
+        self.session_buffer.plugin_config = config
+        bridge = RecordingProactiveBridge()
+        bridge.ok = ok
+        hub = SequencedStubModelHub(text_results=[text_result])
+        fake = SimpleNamespace(
+            config=config,
+            model_hub=hub,
+            memory_manager=MemoryManager(self.db, StubModelHub(), config),
+            session_buffer=self.session_buffer,
+            platform_bridge=bridge,
+            _last_idle_roam_ts={},
+            _last_group_lurk_ts={},
+            _last_private_catchup_ts={},
+            _known_group_umos=set(),
+            _known_l3_umos={},
+        )
+        return bind_plugin_methods(fake), bridge, hub
+
+    def _mark_private_unread(self, umo="aiocqhttp:FriendMessage:f1", content="睡了吗？"):
+        user = make_user("u-l3", "阿泽", tier=UserTier.L3_CORE)
+        message = self.session_buffer.record_user_message(umo, user, content)
+        assert message is not None
+        self.session_buffer.mark_unread(umo, message, is_private=True)
+        return message
+
+    async def test_catches_up_private_unread_and_acks(self):
+        umo = "aiocqhttp:FriendMessage:f1"
+        self._mark_private_unread(umo)
+        fake, bridge, hub = self._make_fake(text_result="刚看到你消息，之前睡着了，现在才回你～")
+        processed = await fake._catch_up_private_unread(
+            self.soul, self.run, self.current_slot
+        )
+        assert processed == 1
+        assert bridge.sent and bridge.sent[0][0] == umo
+        assert "刚看到你消息" in bridge.sent[0][1]
+        assert "睡了吗" in hub.calls[0]["prompt"]
+        assert self.session_buffer.get_unread_total() == 0
+
+    async def test_second_call_is_gated_by_cooldown(self):
+        umo = "aiocqhttp:FriendMessage:f1"
+        self._mark_private_unread(umo)
+        fake, bridge, _hub = self._make_fake(text_result="好")
+        assert (
+            await fake._catch_up_private_unread(self.soul, self.run, self.current_slot)
+            == 1
+        )
+        self._mark_private_unread(umo, "又发了一条")
+        assert (
+            await fake._catch_up_private_unread(self.soul, self.run, self.current_slot)
+            == 0
+        )
+        assert len(bridge.sent) == 1
+        assert self.session_buffer.get_unread_total() == 1
+
+    async def test_disabled_switch_does_nothing(self):
+        self._mark_private_unread()
+        fake, bridge, hub = self._make_fake(enabled=False)
+        assert (
+            await fake._catch_up_private_unread(self.soul, self.run, self.current_slot)
+            == 0
+        )
+        assert bridge.sent == [] and hub.calls == []
+        assert self.session_buffer.get_unread_total() == 1
+
+    async def test_send_failure_keeps_backlog(self):
+        self._mark_private_unread()
+        fake, bridge, _hub = self._make_fake(text_result="好", ok=False)
+        assert (
+            await fake._catch_up_private_unread(self.soul, self.run, self.current_slot)
+            == 0
+        )
+        assert bridge.sent  # attempted
+        assert self.session_buffer.get_unread_total() == 1
+
+    async def test_empty_llm_reply_uses_fallback(self):
+        self._mark_private_unread()
+        fake, bridge, _hub = self._make_fake(text_result="")
+        assert (
+            await fake._catch_up_private_unread(self.soul, self.run, self.current_slot)
+            == 1
+        )
+        assert bridge.sent and bridge.sent[0][1].strip()
+        assert self.session_buffer.get_unread_total() == 0
+
+
+class TestBoundedScheduleMutatorDynamicBlocks(DynamicTimelineTestBase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.engine = RogueliteDeckEngine(self.db, self.config)
+        self.soul = make_soul("soul-mutate")
+        self.settled = []
+
+    def _build_mutator(self):
+        async def busy_settler(soul, run, block, progress_pct, interrupted_by):
+            self.settled.append((block, int(progress_pct), interrupted_by))
+            block.completion_result = "本来在忙这件事，刚做到一半就被拉去聊天了"
+            block.busy_settled = True
+            await self.engine.save_run(run)
+
+        return BoundedScheduleMutator(
+            self.engine,
+            StubModelHub(json_result=None),
+            self.config,
+            busy_settler=busy_settler,
+        )
+
+    # Fixed calendar date used both to build the run and to resolve "now" inside
+    # the mutator (``get_or_build_today_run`` keys its cache by ``today_str(now_dt)``,
+    # so the build and the mutation must share the same date).
+    BASE_DT = datetime(2024, 1, 2, 12, 0)
+
+    async def _find_run_with(self, predicate):
+        for seed in range(30):
+            random.seed(seed)
+            run = await self.engine.get_or_build_today_run(
+                self.soul.soul_id,
+                chronotype="night_owl",
+                force_reroll=True,
+                now_dt=self.BASE_DT,
+            )
+            for index, slot in enumerate(run.slots):
+                if predicate(run, index, slot):
+                    return run, index, slot
+        return None, None, None
+
+    @staticmethod
+    def _dt_for_hour(hour):
+        hour_int = int(hour)
+        minute = int(round((hour - hour_int) * 60))
+        return datetime(2024, 1, 2, hour_int, minute)
+
+    def _event(self):
+        return FakeEvent(
+            message_str="醒醒！！快看，出大事了救命！！", umo="umo-1"
+        )
+
+    def _core_user(self):
+        return make_user("u-core", "核心用户", tier=UserTier.L3_CORE)
+
+    async def test_busy_task_interruption_splits_and_settles(self):
+        run, index, busy = await self._find_run_with(
+            lambda run, index, slot: slot.action_type == ActionType.BUSY_TASK
+            and (slot.end_hour - slot.start_hour) >= 1.5
+        )
+        assert run is not None, "no suitable BUSY_TASK block found"
+        busy.armor = 40
+        now_hour = busy.start_hour + 0.5
+        mutator = self._build_mutator()
+        mutated = await mutator.on_message_input(
+            soul=self.soul,
+            event=self._event(),
+            user=self._core_user(),
+            is_private_chat=True,
+            now_dt=self._dt_for_hour(now_hour),
+        )
+        assert mutated is True
+        assert run.mutations_used == 1
+        assert self.settled
+        settled_block, progress_pct, interrupted_by = self.settled[0]
+        assert 0 < progress_pct < 100
+        assert interrupted_by == "核心用户"
+        assert settled_block.completion_result
+        assert settled_block.busy_settled is True
+        assert self.engine.is_valid_timeline(run)
+        assert any(
+            slot.action_type == ActionType.IDLE_ROAM and slot.mutated
+            for slot in run.slots
+        )
+        assert any(
+            slot.action_type == ActionType.BUSY_TASK and slot.busy_settled
+            for slot in run.slots
+        )
+
+    async def test_idle_block_extension_pushes_next_block(self):
+        def predicate(run, index, slot):
+            if index + 1 >= len(run.slots):
+                return False
+            nxt = run.slots[index + 1]
+            return (
+                slot.action_type in (ActionType.SURF, ActionType.IDLE_ROAM)
+                and (slot.end_hour - slot.start_hour) >= 1.0
+                and nxt.action_type in (ActionType.SLEEP, ActionType.BUSY_TASK)
+                and (nxt.end_hour - nxt.start_hour) >= 1.0
+            )
+
+        run, index, block = await self._find_run_with(predicate)
+        assert run is not None, "no suitable IDLE block found"
+        block.armor = 20
+        next_block = run.slots[index + 1]
+        old_end = block.end_hour
+        old_next_start = next_block.start_hour
+        mutator = self._build_mutator()
+        mutated = await mutator.on_message_input(
+            soul=self.soul,
+            event=self._event(),
+            user=self._core_user(),
+            is_private_chat=False,
+            is_direct_mention=True,
+            now_dt=self._dt_for_hour(block.start_hour + 0.5),
+        )
+        assert mutated is True
+        assert block.end_hour >= old_end + 0.5 - 1e-9
+        assert next_block.start_hour >= old_next_start + 0.5 - 1e-9
+        assert self.engine.is_valid_timeline(run)
+
+    async def test_sleep_wake_carves_idle_roam_window(self):
+        def predicate(run, index, slot):
+            return (
+                slot.action_type == ActionType.SLEEP
+                and (slot.end_hour - slot.start_hour) >= 1.5
+            )
+
+        run, index, sleep_block = await self._find_run_with(predicate)
+        assert run is not None, "no suitable SLEEP block found"
+        sleep_block.armor = 50
+        mutator = self._build_mutator()
+        mutated = await mutator.on_message_input(
+            soul=self.soul,
+            event=self._event(),
+            user=self._core_user(),
+            is_private_chat=True,
+            now_dt=self._dt_for_hour(sleep_block.start_hour + 0.5),
+        )
+        assert mutated is True
+        assert self.engine.is_valid_timeline(run)
+        assert any(
+            slot.action_type == ActionType.IDLE_ROAM and slot.mutated
+            for slot in run.slots
+        )
+
+
+# ===========================================================================
+# 7. Project-level sanity: offline import + compileall
 # ===========================================================================
 class TestProjectSanity(unittest.TestCase):
     def test_main_module_imports_offline_without_instantiation(self):
@@ -769,6 +1784,9 @@ class TestProjectSanity(unittest.TestCase):
             "on_decorating_result_hook",
             "terminate",
             "initialize",
+            "settle_busy_block",
+            "_settle_finished_busy_blocks",
+            "_run_idle_roam_action",
         ):
             assert hasattr(main_module.OnlyYouPlugin, method), method
         source = inspect.getsource(main_module.OnlyYouPlugin.on_any_message)
@@ -787,6 +1805,11 @@ class TestProjectSanity(unittest.TestCase):
             "rerank_provider_id",
         ):
             assert removed not in json.dumps(schema)
+        # 24h dynamic timeline config: encounter count removed, roam cooldown added.
+        roguelite = schema.get("roguelite_schedule_config", {}).get("items", {})
+        assert "daily_encounter_count" not in roguelite
+        assert "idle_roam_cooldown_minutes" in roguelite
+        assert roguelite["idle_roam_cooldown_minutes"]["default"] == 45
 
     def test_compileall_passes_without_repo_artifacts(self):
         pycache_prefix = tempfile.mkdtemp(prefix="onlyyou-pyc-")
