@@ -9,7 +9,7 @@ from typing import Any, Optional
 
 try:
     from astrbot.api import AstrBotConfig, logger
-    from astrbot.api.event import AstrMessageEvent, filter
+    from astrbot.api.event import AstrMessageEvent, MessageChain, filter
     from astrbot.api.provider import LLMResponse, ProviderRequest
     from astrbot.api.star import Context, Star, StarTools, register
 except ImportError:
@@ -38,6 +38,21 @@ except ImportError:
             return cls
         return _decorator
 
+    class _CommandGroupStub:
+        """Minimal stand-in for AstrBot's ``RegisteringCommandable``.
+
+        Only used when AstrBot is not importable (offline unit tests); real
+        sub-command handlers are still plain functions so tests can call them.
+        """
+
+        def __init__(self, fn):
+            self._fn = fn
+
+        def command(self, *args, **kwargs):
+            def _dec(fn):
+                return fn
+            return _dec
+
     class _FilterStub:
         class EventMessageType:
             ALL = "ALL"
@@ -46,6 +61,12 @@ except ImportError:
         def event_message_type(*args, **kwargs):
             def _dec(fn):
                 return fn
+            return _dec
+
+        @staticmethod
+        def command_group(*args, **kwargs):
+            def _dec(fn):
+                return _CommandGroupStub(fn)
             return _dec
 
         @staticmethod
@@ -99,6 +120,17 @@ except ImportError:
 
         def __repr__(self) -> str:
             return f"Record({self.file!r})"
+
+    class MessageChain:  # type: ignore[no-redef]
+        """Minimal MessageChain stub used by off-line unit tests."""
+
+        def __init__(self, chain: Optional[list] = None, **kwargs: Any):
+            self.chain = list(chain or [])
+            self.type = kwargs.get("type")
+
+        def message(self, text: str):
+            self.chain.append(Plain(text))
+            return self
 
 from .core.atmosphere_reader import AtmosphereReader
 from .core.context_budget import ContextBudgetManager, SessionBuffer
@@ -169,6 +201,14 @@ class OnlyYouPlugin(Star):
     - 三级用户关系体系 (L1普通 / ◆L2重要熟人 / ★L3核心用户)
     - 精简版三级记忆 + 定时自动遗忘清理 (Forgetting GC) + 上下文预算管理器
     """
+
+    #: All valid `/onlyyou` (`/oy`) sub-commands. Must stay in sync with the
+    #: ``@onlyyou.command(...)`` registrations below: AstrBot's dashboard
+    #: command list is rendered from those CommandFilters, and the listener
+    #: below uses this set to catch typos before they fall through to the LLM.
+    ONLYYOU_SUBCOMMANDS = frozenset(
+        {"status", "state", "reroll", "tier", "memory", "surf", "unread", "help"}
+    )
 
     def __init__(self, context: Context, config: Optional[AstrBotConfig] = None):
         super().__init__(context)
@@ -1056,6 +1096,18 @@ class OnlyYouPlugin(Star):
             or lower_msg == "oy"
             or lower_msg.startswith("oy ")
         ):
+            # AstrBot's command-group matcher only *wakes* the event for
+            # ``/onlyyou <unknown>`` (no CommandFilter matches), so the typo
+            # would otherwise fall through to the main LLM. Answer with the
+            # help list instead; known sub-commands stay untouched for the
+            # registered command handlers.
+            cmd_tokens = msg_str.split()
+            cmd_name = cmd_tokens[0].lstrip("/").lower() if cmd_tokens else ""
+            if cmd_name in ("onlyyou", "oy"):
+                sub = cmd_tokens[1].lower() if len(cmd_tokens) > 1 else ""
+                if sub and sub not in self.ONLYYOU_SUBCOMMANDS:
+                    event.stop_event()
+                    await event.send(MessageChain().message(self._onlyyou_help_text()))
             return
 
         umo = getattr(event, "unified_msg_origin", "") or "default_umo"
@@ -1293,19 +1345,86 @@ class OnlyYouPlugin(Star):
             logger.warning(f"[OnlyYou] TTS decorating hook failed: {exc}")
 
     # ==========================================================================
-    # 5. Diagnostic & Management Command (`/onlyyou`)
+    # 5. Diagnostic & Management Command (`/onlyyou`, alias `/oy`)
     # ==========================================================================
-    @filter.command("onlyyou", alias={"oy"})
-    async def cmd_onlyyou(self, event: AstrMessageEvent):
-        """
-        Unified `/onlyyou` (`/oy`) command for inspecting and controlling OnlyYou systems:
-        - `/onlyyou status`
-        - `/onlyyou state <RESTING|BUSY|IDLE> [title] [armor]`
-        - `/onlyyou reroll`
-        - `/onlyyou memory [list|gc|add|extract]`
-        - `/onlyyou tier [user_id] [1|2|3]`
-        - `/onlyyou surf`
-        """
+    # Registered as an AstrBot **command group** so that the AstrBot dashboard
+    # plugin panel renders the complete sub-command list (status / state /
+    # reroll / tier / memory / surf / unread / help) instead of a single
+    # opaque `/onlyyou` entry. Each sub-command handler below is a thin
+    # delegate; all real logic lives in `_dispatch_onlyyou`.
+    #
+    # NOTE: the group function itself is never executed by AstrBot (the wake
+    # stage only uses its CommandGroupFilter for matching and for the
+    # "参数不足" command tree); keep it as a no-op.
+    @filter.command_group("onlyyou", alias={"oy"})
+    def onlyyou(self):
+        """OnlyYou 调试与管理指令组（状态 / 日程 / 关系 / 记忆 / 冲浪 / 未读）"""
+        pass
+
+    @onlyyou.command("status")
+    async def onlyyou_status(self, event: AstrMessageEvent):
+        """查看角色卡、24h 动态时间轴、护甲与进度、微调配额、今日繁忙成果"""
+        async for result in self._dispatch_onlyyou(event, "status"):
+            yield result
+
+    @onlyyou.command("state")
+    async def onlyyou_state(self, event: AstrMessageEvent):
+        """强制切换当前时间块状态（RESTING|BUSY|IDLE [标题] [护甲]）"""
+        async for result in self._dispatch_onlyyou(event, "state"):
+            yield result
+
+    @onlyyou.command("reroll")
+    async def onlyyou_reroll(self, event: AstrMessageEvent):
+        """按专属行动卡池与作息曲线重新抽取今日 24h 动态时间轴"""
+        async for result in self._dispatch_onlyyou(event, "reroll"):
+            yield result
+
+    @onlyyou.command("tier")
+    async def onlyyou_tier(self, event: AstrMessageEvent):
+        """查看或修改用户的三级关系等级（1=L1普通 / 2=L2重要 / 3=L3核心）"""
+        async for result in self._dispatch_onlyyou(event, "tier"):
+            yield result
+
+    @onlyyou.command("memory")
+    async def onlyyou_memory(self, event: AstrMessageEvent):
+        """管理分级记忆与遗忘 GC（list / add / extract / gc）"""
+        async for result in self._dispatch_onlyyou(event, "memory"):
+            yield result
+
+    @onlyyou.command("surf")
+    async def onlyyou_surf(self, event: AstrMessageEvent):
+        """在 IDLE 状态下立即触发一次赛博冲浪看片与吐槽分享"""
+        async for result in self._dispatch_onlyyou(event, "surf"):
+            yield result
+
+    @onlyyou.command("unread")
+    async def onlyyou_unread(self, event: AstrMessageEvent):
+        """查看未读消息队列 / 立即补回 / 清空（list / flush / clear）"""
+        async for result in self._dispatch_onlyyou(event, "unread"):
+            yield result
+
+    @onlyyou.command("help")
+    async def onlyyou_help(self, event: AstrMessageEvent):
+        """显示 OnlyYou 完整指令列表"""
+        async for result in self._dispatch_onlyyou(event, "help"):
+            yield result
+
+    def _onlyyou_help_text(self) -> str:
+        """Complete `/onlyyou` command list (shared by `help` and typo fallback)."""
+        return (
+            "OnlyYou 指令列表（别名 /oy，直接发送 /onlyyou 可查看指令树）：\n"
+            "• /onlyyou status - 查看 24h 动态时间轴、繁忙进度与今日繁忙成果\n"
+            "• /onlyyou state <RESTING|BUSY|IDLE> [标题] [护甲] - 切换当前时间块状态\n"
+            "• /onlyyou reroll - 重新抽取今日动态时间轴与专属行动卡\n"
+            "• /onlyyou tier [user_id] [1|2|3] - 查看或修改用户关系等级\n"
+            "• /onlyyou memory [list|gc|extract|add] - 管理三级记忆与遗忘GC\n"
+            "• /onlyyou surf - 在 IDLE 状态下触发一次刷视频\n"
+            "• /onlyyou unread [list|flush|clear] - 查看/立即补回/清空因休息或繁忙错过的未读消息\n"
+            "• /onlyyou help - 显示本指令列表"
+        )
+
+    async def _dispatch_onlyyou(self, event: AstrMessageEvent, default_sub: str = "status"):
+        """Shared implementation for every `/onlyyou` sub-command."""
         await self._ensure_initialized()
         umo = getattr(event, "unified_msg_origin", "") or "default_umo"
         raw_msg = (getattr(event, "message_str", "") or "").strip()
@@ -1314,7 +1433,7 @@ class OnlyYouPlugin(Star):
         if tokens and tokens[0].lstrip("/").lower() in ("onlyyou", "oy"):
             tokens = tokens[1:]
 
-        sub = tokens[0].lower() if tokens else "status"
+        sub = tokens[0].lower() if tokens else default_sub
         soul = await self.soul_manager.resolve_soul(umo=umo)
         user = await self.user_relation.resolve_user(event)
 
@@ -1580,13 +1699,4 @@ class OnlyYouPlugin(Star):
             )
             return
 
-        yield event.plain_result(
-            "OnlyYou 指令列表：\n"
-            "• /onlyyou status - 查看 24h 动态时间轴、繁忙进度与今日繁忙成果\n"
-            "• /onlyyou state <RESTING|BUSY|IDLE> [标题] [护甲] - 切换当前时间块状态\n"
-            "• /onlyyou reroll - 重新抽取今日动态时间轴与专属行动卡\n"
-            "• /onlyyou tier [user_id] [1|2|3] - 查看或修改用户关系等级\n"
-            "• /onlyyou memory [list|gc|extract|add] - 管理三级记忆与遗忘GC\n"
-            "• /onlyyou surf - 在 IDLE 状态下触发一次刷视频\n"
-            "• /onlyyou unread [list|flush|clear] - 查看/立即补回/清空因休息或繁忙错过的未读消息"
-        )
+        yield event.plain_result(self._onlyyou_help_text())

@@ -1793,6 +1793,70 @@ class TestProjectSanity(unittest.TestCase):
         assert "selected_provider" in source
         assert "get_main_provider_id" in source
 
+    def test_onlyyou_command_group_exposes_all_subcommands(self):
+        """The dashboard plugin panel lists commands from AstrBot's
+        CommandFilter/CommandGroupFilter registry, so `/onlyyou` must be a
+        command group with one real handler per sub-command."""
+        import OnlyYou.main as main_module
+
+        plugin_cls = main_module.OnlyYouPlugin
+        for handler in (
+            "onlyyou_status",
+            "onlyyou_state",
+            "onlyyou_reroll",
+            "onlyyou_tier",
+            "onlyyou_memory",
+            "onlyyou_surf",
+            "onlyyou_unread",
+            "onlyyou_help",
+        ):
+            assert hasattr(plugin_cls, handler), handler
+            assert inspect.getdoc(getattr(plugin_cls, handler)), handler
+        assert hasattr(plugin_cls, "_dispatch_onlyyou")
+        dispatch_src = inspect.getsource(plugin_cls._dispatch_onlyyou)
+        assert "default_sub" in dispatch_src
+        # Every sub-command handler must delegate to the shared dispatcher
+        # (guards against a stale standalone `cmd_onlyyou` implementation).
+        for handler in (
+            "onlyyou_status",
+            "onlyyou_state",
+            "onlyyou_reroll",
+            "onlyyou_tier",
+            "onlyyou_memory",
+            "onlyyou_surf",
+            "onlyyou_unread",
+            "onlyyou_help",
+        ):
+            src = inspect.getsource(getattr(plugin_cls, handler))
+            assert "_dispatch_onlyyou" in src, handler
+        assert not hasattr(plugin_cls, "cmd_onlyyou")
+
+    def test_onlyyou_help_text_covers_every_subcommand(self):
+        import OnlyYou.main as main_module
+
+        plugin_cls = main_module.OnlyYouPlugin
+        text = plugin_cls._onlyyou_help_text(object())
+        for sub in plugin_cls.ONLYYOU_SUBCOMMANDS:
+            assert f"/onlyyou {sub}" in text, sub
+        registered = {
+            name[len("onlyyou_"):]
+            for name in dir(plugin_cls)
+            if name.startswith("onlyyou_")
+        }
+        assert registered == set(plugin_cls.ONLYYOU_SUBCOMMANDS)
+        # Unknown sub-commands must be intercepted before falling through to
+        # the native LLM pipeline.
+        listener_src = inspect.getsource(plugin_cls.on_any_message)
+        assert "ONLYYOU_SUBCOMMANDS" in listener_src
+        assert "_onlyyou_help_text" in listener_src
+
+    def test_metadata_help_lists_unread_and_has_no_encounters(self):
+        with open(os.path.join(PROJECT_ROOT, "metadata.yaml"), "r", encoding="utf-8") as handle:
+            metadata = handle.read()
+        assert "/onlyyou unread" in metadata
+        assert "/onlyyou help" in metadata
+        assert "奇遇" not in metadata
+
     def test_conf_schema_is_valid_and_has_no_model_config(self):
         path = os.path.join(PROJECT_ROOT, "_conf_schema.json")
         with open(path, "r", encoding="utf-8") as handle:

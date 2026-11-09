@@ -1,13 +1,15 @@
 name: astrbot_plugin_only_you
 desc: OnlyYou (只有你) —— 具备生命节律、三级记忆与赛博冲浪能力的高自治 AI 伴侣与数字网友插件
 help: |
-  OnlyYou (只有你) 插件核心指令：
-  /onlyyou status - 查看当前角色卡、今日 Roguelite 日程、当前三态与微调配额
-  /onlyyou state <RESTING|BUSY|IDLE> [标题] - 手动强制切换当前时段状态（调试/控制）
-  /onlyyou reroll - 重新抽取今日 Roguelite 日程与奇遇谈资卡
-  /onlyyou memory [list|gc|add] - 查看记忆列表、手动触发定时遗忘清理(GC)或添加测试记忆
+  OnlyYou (只有你) 插件核心指令（指令组，别名 /oy，直接发送 /onlyyou 可查看完整指令树）：
+  /onlyyou status - 查看当前角色卡、24h 动态时间轴、繁忙进度、微调配额与今日繁忙成果
+  /onlyyou state <RESTING|BUSY|IDLE> [标题] [护甲] - 手动强制切换当前时间块状态（调试/控制）
+  /onlyyou reroll - 按角色专属卡池与作息曲线重新抽取今日 24h 动态时间轴
+  /onlyyou memory [list|add|extract|gc] - 查看记忆列表、添加测试记忆、立即提炼或触发遗忘清理(GC)
   /onlyyou tier <user_id> <1|2|3> - 查看或设置用户的三级关系等级 (L1/L2/L3)
   /onlyyou surf - 手动触发一次 B站/抖音赛博冲浪看片与分享测试
+  /onlyyou unread [list|flush|clear] - 查看/立即补回/清空因休息或繁忙错过的未读消息
+  /onlyyou help - 显示完整指令列表
 version: 0.1.0
 author: hidge123
 repo: https://github.com/hidge123/astrbot_plugin_only_you
