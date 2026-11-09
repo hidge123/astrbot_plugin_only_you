@@ -805,9 +805,13 @@ class FakeRequest:
 class FakeEvent:
     """Minimal AstrBot ``AstrMessageEvent`` stand-in."""
 
-    def __init__(self, message_str="", umo="default:FriendMessage:test"):
+    def __init__(self, message_str="", umo="default:FriendMessage:test", role="member"):
         self.message_str = message_str
         self.unified_msg_origin = umo
+        self.role = role
+
+    def is_admin(self):
+        return self.role == "admin"
 
 
 def make_memory(

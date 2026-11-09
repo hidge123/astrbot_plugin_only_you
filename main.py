@@ -63,6 +63,18 @@ except ImportError:
                 return fn
             return _dec
 
+        class PermissionType:
+            ADMIN = "admin"
+            MEMBER = "member"
+            GROUP_ADMIN = "group_admin"
+            SHARED_GROUP_ADMIN = "shared_group_admin"
+
+        @staticmethod
+        def permission_type(*args, **kwargs):
+            def _dec(fn):
+                return fn
+            return _dec
+
         @staticmethod
         def command_group(*args, **kwargs):
             def _dec(fn):
@@ -209,6 +221,10 @@ class OnlyYouPlugin(Star):
     ONLYYOU_SUBCOMMANDS = frozenset(
         {"status", "state", "reroll", "tier", "memory", "surf", "unread", "help"}
     )
+
+    #: Reply sent when a non-admin tries the bare group name or an unknown
+    #: sub-command (both bypass AstrBot's PermissionTypeFilter).
+    _ADMIN_ONLY_HINT = "⛔ /onlyyou（/oy）指令仅管理员可用。"
 
     def __init__(self, context: Context, config: Optional[AstrBotConfig] = None):
         super().__init__(context)
@@ -1096,16 +1112,26 @@ class OnlyYouPlugin(Star):
             or lower_msg == "oy"
             or lower_msg.startswith("oy ")
         ):
-            # AstrBot's command-group matcher only *wakes* the event for
-            # ``/onlyyou <unknown>`` (no CommandFilter matches), so the typo
-            # would otherwise fall through to the main LLM. Answer with the
-            # help list instead; known sub-commands stay untouched for the
-            # registered command handlers.
+            # ``/onlyyou`` is admin-only by default: every sub-command handler
+            # carries AstrBot's PermissionTypeFilter(ADMIN), which the dashboard
+            # "指令管理" panel can override per command. Two cases bypass that
+            # filter and are handled here instead:
+            #   1. AstrBot's command-group matcher only *wakes* the event for an
+            #      unknown sub-command (no CommandFilter matches), so the typo
+            #      would fall through to the main LLM;
+            #   2. the bare group name (`/onlyyou`) makes AstrBot raise the
+            #      "参数不足" command tree before permission filters run.
             cmd_tokens = msg_str.split()
             cmd_name = cmd_tokens[0].lstrip("/").lower() if cmd_tokens else ""
             if cmd_name in ("onlyyou", "oy"):
                 sub = cmd_tokens[1].lower() if len(cmd_tokens) > 1 else ""
-                if sub and sub not in self.ONLYYOU_SUBCOMMANDS:
+                is_admin = bool(getattr(event, "is_admin", None) and event.is_admin())
+                if not is_admin:
+                    event.stop_event()
+                    await event.send(
+                        MessageChain().message(self._ADMIN_ONLY_HINT)
+                    )
+                elif sub and sub not in self.ONLYYOU_SUBCOMMANDS:
                     event.stop_event()
                     await event.send(MessageChain().message(self._onlyyou_help_text()))
             return
@@ -1362,48 +1388,56 @@ class OnlyYouPlugin(Star):
         pass
 
     @onlyyou.command("status")
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def onlyyou_status(self, event: AstrMessageEvent):
         """查看角色卡、24h 动态时间轴、护甲与进度、微调配额、今日繁忙成果"""
         async for result in self._dispatch_onlyyou(event, "status"):
             yield result
 
     @onlyyou.command("state")
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def onlyyou_state(self, event: AstrMessageEvent):
         """强制切换当前时间块状态（RESTING|BUSY|IDLE [标题] [护甲]）"""
         async for result in self._dispatch_onlyyou(event, "state"):
             yield result
 
     @onlyyou.command("reroll")
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def onlyyou_reroll(self, event: AstrMessageEvent):
         """按专属行动卡池与作息曲线重新抽取今日 24h 动态时间轴"""
         async for result in self._dispatch_onlyyou(event, "reroll"):
             yield result
 
     @onlyyou.command("tier")
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def onlyyou_tier(self, event: AstrMessageEvent):
         """查看或修改用户的三级关系等级（1=L1普通 / 2=L2重要 / 3=L3核心）"""
         async for result in self._dispatch_onlyyou(event, "tier"):
             yield result
 
     @onlyyou.command("memory")
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def onlyyou_memory(self, event: AstrMessageEvent):
         """管理分级记忆与遗忘 GC（list / add / extract / gc）"""
         async for result in self._dispatch_onlyyou(event, "memory"):
             yield result
 
     @onlyyou.command("surf")
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def onlyyou_surf(self, event: AstrMessageEvent):
         """在 IDLE 状态下立即触发一次赛博冲浪看片与吐槽分享"""
         async for result in self._dispatch_onlyyou(event, "surf"):
             yield result
 
     @onlyyou.command("unread")
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def onlyyou_unread(self, event: AstrMessageEvent):
         """查看未读消息队列 / 立即补回 / 清空（list / flush / clear）"""
         async for result in self._dispatch_onlyyou(event, "unread"):
             yield result
 
     @onlyyou.command("help")
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def onlyyou_help(self, event: AstrMessageEvent):
         """显示 OnlyYou 完整指令列表"""
         async for result in self._dispatch_onlyyou(event, "help"):
@@ -1412,7 +1446,7 @@ class OnlyYouPlugin(Star):
     def _onlyyou_help_text(self) -> str:
         """Complete `/onlyyou` command list (shared by `help` and typo fallback)."""
         return (
-            "OnlyYou 指令列表（别名 /oy，直接发送 /onlyyou 可查看指令树）：\n"
+            "OnlyYou 指令列表（别名 /oy，仅管理员可用；直接发送 /onlyyou 可查看指令树）：\n"
             "• /onlyyou status - 查看 24h 动态时间轴、繁忙进度与今日繁忙成果\n"
             "• /onlyyou state <RESTING|BUSY|IDLE> [标题] [护甲] - 切换当前时间块状态\n"
             "• /onlyyou reroll - 重新抽取今日动态时间轴与专属行动卡\n"

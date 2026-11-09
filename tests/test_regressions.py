@@ -1850,11 +1850,33 @@ class TestProjectSanity(unittest.TestCase):
         assert "ONLYYOU_SUBCOMMANDS" in listener_src
         assert "_onlyyou_help_text" in listener_src
 
+    def test_onlyyou_commands_are_admin_only_by_default(self):
+        """Every sub-command must carry AstrBot's PermissionTypeFilter(ADMIN) so
+        the dashboard command panel lists them as admin-only; the dashboard
+        "指令管理" page can still override this per command."""
+        import OnlyYou.main as main_module
+
+        plugin_cls = main_module.OnlyYouPlugin
+        assert plugin_cls._ADMIN_ONLY_HINT
+        for sub in sorted(plugin_cls.ONLYYOU_SUBCOMMANDS):
+            source = inspect.getsource(getattr(plugin_cls, f"onlyyou_{sub}"))
+            assert "permission_type" in source, sub
+            assert "PermissionType.ADMIN" in source, sub
+        listener_src = inspect.getsource(plugin_cls.on_any_message)
+        assert "_ADMIN_ONLY_HINT" in listener_src
+        assert "is_admin" in listener_src
+        # Default (non-admin) event must be reported as non-admin.
+        from tests._helpers import FakeEvent  # type: ignore
+
+        assert FakeEvent().is_admin() is False
+        assert FakeEvent(role="admin").is_admin() is True
+
     def test_metadata_help_lists_unread_and_has_no_encounters(self):
         with open(os.path.join(PROJECT_ROOT, "metadata.yaml"), "r", encoding="utf-8") as handle:
             metadata = handle.read()
         assert "/onlyyou unread" in metadata
         assert "/onlyyou help" in metadata
+        assert "仅管理员" in metadata
         assert "奇遇" not in metadata
 
     def test_conf_schema_is_valid_and_has_no_model_config(self):

@@ -1,7 +1,7 @@
 name: astrbot_plugin_only_you
 desc: OnlyYou (只有你) —— 具备生命节律、三级记忆与赛博冲浪能力的高自治 AI 伴侣与数字网友插件
 help: |
-  OnlyYou (只有你) 插件核心指令（指令组，别名 /oy，直接发送 /onlyyou 可查看完整指令树）：
+  OnlyYou (只有你) 插件核心指令（指令组，别名 /oy，**仅管理员可用**；直接发送 /onlyyou 可查看完整指令树）：
   /onlyyou status - 查看当前角色卡、24h 动态时间轴、繁忙进度、微调配额与今日繁忙成果
   /onlyyou state <RESTING|BUSY|IDLE> [标题] [护甲] - 手动强制切换当前时间块状态（调试/控制）
   /onlyyou reroll - 按角色专属卡池与作息曲线重新抽取今日 24h 动态时间轴
