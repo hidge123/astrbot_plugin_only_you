@@ -453,7 +453,9 @@ class TestRogueliteDeck(unittest.IsolatedAsyncioTestCase):
         assert slot.state == BotState.BUSY
         assert slot.action_type == ActionType.BUSY_TASK
         assert slot.title == "苦逼赶稿"
-        assert slot.armor == 80
+        # v2.6: the ``armor=`` argument is deprecated/ignored — every block is
+        # pinned to the fixed tier bound to its action type (BUSY_TASK=65).
+        assert slot.armor == ActionType.BUSY_TASK.fixed_armor == 65
         assert slot.mutated is False
         current = await self.engine.get_current_slot("soul-force", now_dt=now_dt)
         assert current.state == BotState.BUSY
@@ -463,6 +465,7 @@ class TestRogueliteDeck(unittest.IsolatedAsyncioTestCase):
         )
         assert surf.action_type == ActionType.SURF
         assert surf.state == BotState.IDLE
+        assert surf.armor == ActionType.SURF.fixed_armor == 40
         assert surf.busy_settled is False
         assert surf.completion_result == ""
 
@@ -471,6 +474,7 @@ class TestRogueliteDeck(unittest.IsolatedAsyncioTestCase):
             "soul-force", BotState.IDLE, now_dt=now_dt
         )
         assert bare_idle.action_type == ActionType.SURF
+        assert bare_idle.armor == ActionType.SURF.fixed_armor == 40
         # ... while an explicit non-surf title derives IDLE_ROAM again.
         roam = await self.engine.force_set_current_state(
             "soul-force",
@@ -480,6 +484,7 @@ class TestRogueliteDeck(unittest.IsolatedAsyncioTestCase):
         )
         assert roam.action_type == ActionType.IDLE_ROAM
         assert roam.state == BotState.IDLE
+        assert roam.armor == ActionType.IDLE_ROAM.fixed_armor == 25
         assert roam.label == ActionType.IDLE_ROAM.label
 
     def test_progress_and_time_range_formatting(self):

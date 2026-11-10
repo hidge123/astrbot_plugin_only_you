@@ -1,6 +1,6 @@
-# OnlyYou (只有你) —— 核心 Prompt 工程与交互时序设计 (v2.5)
+# OnlyYou (只有你) —— 核心 Prompt 工程与交互时序设计 (v2.6)
 
-> 本文档定义 `astrbot_plugin_only_you` v2.5 的核心提示词模板，围绕 **三种基础状态（休息中 `RESTING` / 繁忙中 `BUSY` / 空闲中 `IDLE`）× 四类可执行行动卡（`SLEEP` / `SURF` / `IDLE_ROAM` / `BUSY_TASK`）**、**24h 动态弹性时间轴与繁忙完成结果短时记忆**、**根据消息/视频输入的时间块切分 / 延展微调**、**详细角色卡（10 分区 × 39 字段）的 AI 生成 / 分区补全**，以及 **角色卡接管 Persona 段与插件自治 TTS 的时序** 构建。文中的“决策模型”对应 `ModelHub` 的 `decision` 角色（读空气 / 记忆提炼 / 日程微调 / 造卡 / 繁忙结果与 IDLE_ROAM 搭话）。
+> 本文档定义 `astrbot_plugin_only_you` v2.6 的核心提示词模板，围绕 **三种基础状态（休息中 `RESTING` / 繁忙中 `BUSY` / 空闲中 `IDLE`）× 四类可执行行动卡（`SLEEP` / `SURF` / `IDLE_ROAM` / `BUSY_TASK`）**、**24h 动态弹性时间轴与繁忙完成结果短时记忆**、**根据消息/视频输入的时间块切分 / 延展微调**、**详细角色卡（10 分区 × 36 字段）的 AI 生成 / 分区补全**、**角色卡接管 Persona 段与插件自治 TTS 的时序**，以及 v2.6 新增的 **用户关系等级重要度与专属态度注入（`USER_RELATION_CONTEXT_PROMPT`）** 构建。文中的“决策模型”对应 `ModelHub` 的 `decision` 角色（读空气 / 记忆提炼 / 日程微调 / 造卡 / 繁忙结果与 IDLE_ROAM 搭话）。
 
 ---
 
@@ -39,8 +39,7 @@ Persona 名称：{persona_name}
       "state": "BUSY",
       "action_type": "BUSY_TASK",
       "min_hours": 1.5,
-      "max_hours": 3.0,
-      "armor": 70
+      "max_hours": 3.0
     },
     {
       "card_id": "evt_roam_1",
@@ -48,8 +47,7 @@ Persona 名称：{persona_name}
       "state": "IDLE",
       "action_type": "IDLE_ROAM",
       "min_hours": 0.5,
-      "max_hours": 1.5,
-      "armor": 30
+      "max_hours": 1.5
     },
     {
       "card_id": "evt_surf_1",
@@ -57,8 +55,7 @@ Persona 名称：{persona_name}
       "state": "IDLE",
       "action_type": "SURF",
       "min_hours": 0.5,
-      "max_hours": 2.0,
-      "armor": 35
+      "max_hours": 2.0
     },
     {
       "card_id": "evt_sleep_1",
@@ -66,15 +63,16 @@ Persona 名称：{persona_name}
       "state": "RESTING",
       "action_type": "SLEEP",
       "min_hours": 4.0,
-      "max_hours": 7.5,
-      "armor": 65
+      "max_hours": 7.5
     }
   ]
 }
 ```
 
+> **v2.6**：卡池生成 Prompt 不再要求模型输出 `armor`（示例 JSON 已删除该字段），落库时由 `action_type.fixed_armor` 自动写入固定档位（`SLEEP=80 / BUSY_TASK=65 / SURF=40 / IDLE_ROAM=25`），用户也无法在控制台手调护甲。
+
 ### 1.2 详细角色卡整卡 AI 生成 (`CHARACTER_CARD_GENERATE_PROMPT`)
-> **设计要点**：严格按 `CARD_SCHEMA`（10 分区 / 39 字段）输出**单个 JSON 对象**，顶层 key 必须是分区 id。由 **主模型**（`role="main"`）调用，返回结果只作为**草稿**给前端预览，用户「采用草稿」后才落库。
+> **设计要点**：严格按 `CARD_SCHEMA`（10 分区 / 36 字段；v2.6 已删除 `social.attitude_l3/l2/l1`，仅保留 `group_role`）输出**单个 JSON 对象**，顶层 key 必须是分区 id。由 **主模型**（`role="main"`）调用，返回结果只作为**草稿**给前端预览，用户「采用草稿」后才落库。
 
 ```markdown
 你是资深角色设定师，请为一位「AI 数字网友」生成一张《详细角色卡》。
@@ -129,7 +127,7 @@ Persona 名称：{persona_name}
 
 ## 二、 🔄 输入驱动的受限日程状态微调 Prompt (`BOUNDED_STATE_MUTATION_PROMPT`)
 
-> **触发条件**：仅当 `今日已微调次数 < max_mutations_per_day(2)`、`距离上次微调 > 120分钟`、且外部真实输入（**读取到的用户消息** 或 **刚刷到的高分视频**）冲击力 `Impact > 当前卡片护甲 Armor` 时调用！
+> **触发条件**：仅当 `今日已微调次数 < max_mutations_per_day(2)`、`距离上次微调 > 120分钟`、且外部真实输入（**读取到的用户消息** 或 **刚刷到的高分视频**）冲击力 `Impact > 当前卡片护甲 Armor` 时调用！其中 `Armor` 在 v2.6 为**行动类型固定档位**（`SLEEP=80 / BUSY_TASK=65 / SURF=40 / IDLE_ROAM=25`，用户不可手动设置），模板中的 `{current_armor}` 仅作为内部提示词数值传入。
 
 ```markdown
 角色【{soul_name}】正在按今日随机生成的 24h 动态时间轴行事，但刚刚收到了一个高冲击力的【外部真实输入】，打破了她当前的定力护甲！
@@ -258,7 +256,7 @@ Persona 名称：{persona_name}
 | 1 | `_takeover_persona(req, soul)` | 三分支替换 Persona 段（见下） |
 | 2 | `req.contexts.clear()` + 注入插件滑窗 | 完全接管上下文（剔除与当前 prompt 重复的最新一条） |
 | 3 | 记忆混合打分 + 硬预算裁剪 | `0.40*关键词 + 0.35*时间新鲜度 + 0.25*重要度` |
-| 4 | 追加三态指令 / 变卦独白 / 记忆块 | 见 §二、§三 |
+| 4 | 追加三态指令 / 变卦独白 / **关系上下文（v2.6）** / 记忆块 | 见 §二、§三、§3.4 |
 
 三个替换分支（`core/context_budget.py`）：
 
@@ -272,7 +270,43 @@ Persona 名称：{persona_name}
 \n# Persona Instructions\n\n{render_persona_prompt(soul.card)}\n
 ```
 
-> `render_persona_prompt(card, max_chars=2000)` 规则：首行固定 `你正在扮演「{name}」。`；随后按 10 个分区输出 Markdown（只渲染非空字段）；超预算时按 `examples > background > appearance > extra > rhythm > interests` 丢弃，极端超长时再按 `social > personality > speech` 丢弃（`identity` 始终保留），最后硬截断保证不超预算；`native_persona_prompt` 永不参与渲染。
+> `render_persona_prompt(card, max_chars=2000)` 规则：首行固定 `你正在扮演「{name}」。`；随后按 10 个分区输出 Markdown（只渲染非空字段）；超预算时按 `examples > background > appearance > extra > rhythm > interests` 丢弃，极端超长时再按 `social > personality > speech` 丢弃（`identity` 始终保留），最后硬截断保证不超预算；`native_persona_prompt` 与 `identity.avatar`（可能是 Base64 Data URL）永不参与渲染。
+
+---
+
+### 3.4 用户关系等级与专属态度注入 (`USER_RELATION_CONTEXT_PROMPT`)
+
+> **设计要点（v2.6）**：角色卡不再保存「对 L1/L2/L3 的固定态度」，改为在用户档案 `UserProfile.attitude` 中按单人定义；本模板在每次 LLM 请求时由 `ContextBudgetManager._render_user_relation_context()` 组装并追加到 System Prompt 的三态指令之后、记忆块之前。整段 `try/except` 兜底，任何异常都静默降级为空 block，绝不阻塞请求。
+
+```markdown
+[用户关系等级与重要度法则]:
+你身边的联系人按亲疏与重要程度分为三个等级（消息前缀中会标注）：
+- 【★L3 核心用户】：对你最重要、最亲近的核心偏爱对象，优先级最高。即使在繁忙或休息边缘，你也最在意对方的话，愿意为其破例、展示最真实私密的一面。
+- 【◆L2 重要熟人】：聊得来、彼此熟悉的群友或朋友，重要度居中。交流自然熟稔、有梗有默契。
+- 【L1 普通群友】：泛泛之交或刚认识的普通网友，重要度普通。保持符合你人设的日常社交分寸感。
+
+[当前对话对象档案]:
+- 对话人：{display_name} (ID: {global_uid}) | 关系等级：{tier_label} (亲密度 {intimacy})
+- 专属称呼：{nickname_text}
+- 你对 Ta 的专属态度：{attitude_text}
+- 关系备注：{notes_text}{window_peers_block}
+```
+
+| 占位符 | 取值来源 | 缺省回退 |
+| :--- | :--- | :--- |
+| `{display_name}` / `{global_uid}` | 当前 `UserProfile` | — |
+| `{tier_label}` / `{intimacy}` | `user.tier.label` / `round(user.affinity, 1)` | — |
+| `{nickname_text}` | `user.nickname` | `默认自然称呼` |
+| `{attitude_text}` | `user.attitude`（关系页可编辑，≤ 300 字） | `按关系等级与你的人设性格自然相处` |
+| `{notes_text}` | `getattr(user, "relation_notes", "")`（当前无 DB 列，getattr 兜底） | `无` |
+| `{window_peers_block}` | `UserRelationManager.list_users()` 中当前 UMO 滑窗内其他活跃对话者（排除本人、仅保留 nickname/attitude 非空者，最多 4 条） | 空字符串 |
+
+`window_peers_block` 追加格式：
+
+```markdown
+\n\n[当前群聊其他活跃对话者档案]:
+- 姓名 (ID: uid) | 关系等级：label | 专属称呼：x | 专属态度：y
+```
 
 ---
 
@@ -311,8 +345,8 @@ sequenceDiagram
     end
 
     rect rgb(255, 245, 235)
-    Note over Gate,Surfer: 时间块四：15:30 - 18:00 【原定 🔥 繁忙主业：写报告 (护甲 55)】 -> 触发输入微调！
-    Private->>Gate: [★L3核心用户] 连续发来消息吐槽今天遇到的奇葩事 (Impact: 85 > 护甲 55)
+    Note over Gate,Surfer: 时间块四：15:30 - 18:00 【原定 🔥 繁忙主业：写报告 (护甲 65 = BUSY_TASK 固定档位)】 -> 触发输入微调！
+    Private->>Gate: [★L3核心用户] 连续发来消息吐槽今天遇到的奇葩事 (Impact: 85 > 护甲 65)
     Gate->>Deck: 💥 满足微调限制 (今日微调 0/2 次) -> 在最近半点将当前 BUSY_TASK 块一分为二：<br/>前半段立即结算“被打断”的 Tier1 完成结果，后半段切为 IDLE_ROAM！
     Gate->>Private: “本来在写报告的，看你这么气，不写了先听你骂完！！那人也太离谱了吧”
     end
@@ -321,7 +355,7 @@ sequenceDiagram
     Note over Gate,Surfer: 时间块五：00:30 - 07:30 【💤 睡觉卡 (SLEEP)：呼呼大睡】
     Group->>Gate: 深夜夜猫子群友水群...
     Gate-->>Group: ❌ 状态为 RESTING -> 全部静默拦截不回，后台零任务
-    Private->>Gate: ★L3 私聊连续强呼叫 (Impact 88 > 护甲 65)
+    Private->>Gate: ★L3 私聊连续强呼叫 (Impact 88 > 护甲 80 = SLEEP 固定档位)
     Gate->>Deck: 💥 击穿护甲 -> 从当前时刻切出一小段 IDLE_ROAM 清醒窗（其余睡眠段保留）
     end
 ```

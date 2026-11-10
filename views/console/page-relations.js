@@ -5,8 +5,12 @@
  *   GET  `users/list`   → { users: [...], counts: {l3_count,l2_count,l1_count,total} }
  *   POST `users/update` → 更新等级 / 昵称 / 好感度 / 平台账号；action=merge 合并账号；action=delete 删除
  *
- * 页面结构：三列看板（★L3 / ◆L2 / L1），用户卡显示首字母头像、名字、昵称、好感度进度条与
- * 互动次数；HTML5 拖拽卡片到其他列即改等级；点击卡片打开抽屉编辑；「⋯」菜单里合并账号 / 删除。
+ * 页面结构：三列看板（★L3 / ◆L2 / L1），用户卡显示首字母头像、名字、昵称、好感度进度条（★L3 不显示）、
+ * 角色对 Ta 的专属态度（有配置时）与互动次数；HTML5 拖拽卡片到其他列即改等级（★L3 为管理员级，
+ * 由 AstrBot admins_id / relationship_config.core_user_ids 自动确定，不可手动拖入/晋升）；
+ * 点击卡片打开抽屉编辑（显示名 / 昵称 / 专属态度 / 等级(L1/L2) / 好感度 / 平台账号）；
+ * 「⋯」菜单里可「设为 ★L3 / 取消 ★L3」（显式入口、二次确认）、合并账号 / 删除。
+ * ★L3 = 管理员级：不参与好感度、不会被自动晋升，由管理员显式指定或 admins_id/core_user_ids 自动确定。
  *
  * 注册：window.OY_PAGES.relations = { id, title, icon, render(container, ctx), destroy() }
  */
@@ -118,14 +122,26 @@
     var platformCount = Array.isArray(user.platform_ids) ? user.platform_ids.length : 0;
     var pct = affinityPercent(user.affinity);
     var sub = nickname && nickname !== name ? nickname : uid;
+    var attitude = String(user.attitude == null ? "" : user.attitude).trim();
+    var attitudeText = attitude.length > 60 ? attitude.slice(0, 60) + "…" : attitude;
+    var isAdminTier = tier === 3;
+    var cardTip = isAdminTier
+      ? "点击编辑资料；★L3 为管理员级（不需要好感度、不参与自动晋升），可在「⋯」菜单取消 L3"
+      : "点击编辑资料；拖拽可在 L1 / L2 之间调整；「⋯」菜单可显式设为 ★L3 管理员级";
     return (
-      '<div class="user-card" draggable="true" data-uid="' +
+      '<div class="user-card' +
+      (isAdminTier ? " is-admin-tier" : "") +
+      '" draggable="' +
+      (isAdminTier ? "false" : "true") +
+      '" data-uid="' +
       esc(uid) +
       '" data-tier="' +
       tier +
       '" style="--tier-color:' +
       meta.color +
-      '" data-tip="点击编辑资料；拖拽到其他列可改变关系等级" tabindex="0">' +
+      '" data-tip="' +
+      esc(cardTip) +
+      '" tabindex="0">' +
       '<div class="user-card-top">' +
       '<span class="avatar avatar-sm">' +
       esc(initialOf(user)) +
@@ -141,13 +157,22 @@
       icon("dots", 14) +
       "</button>" +
       "</div>" +
-      '<div class="affinity">' +
-      '<span class="mini-bar"><i style="width:' +
-      pct.toFixed(1) +
-      '%"></i></span>' +
-      "<span>好感度 " +
-      esc(num(user.affinity, 0).toFixed(1)) +
-      "</span></div>" +
+      (tier === 3
+        ? '<div class="affinity is-admin"><span class="tag tag-muted">管理员级 · 无需好感度</span></div>'
+        : '<div class="affinity">' +
+          '<span class="mini-bar"><i style="width:' +
+          pct.toFixed(1) +
+          '%"></i></span>' +
+          "<span>好感度 " +
+          esc(num(user.affinity, 0).toFixed(1)) +
+          "</span></div>") +
+      (attitude
+        ? '<p class="user-attitude text-xs text-2" data-tip="' +
+          esc(attitude) +
+          '">态度：「' +
+          esc(attitudeText) +
+          "」</p>"
+        : "") +
       '<div class="memory-meta">' +
       "<span>互动 " +
       esc(num(user.interaction_count, 0)) +
@@ -169,10 +194,19 @@
         icon(meta.icon, 26) +
         '<div class="empty-text">这一列还没有用户</div>' +
         "</div></div>";
+    var dropClass = tier === 3 ? " no-drop" : "";
+    var dropTip =
+      tier === 3
+        ? ' data-tip="★L3 为管理员级（无好感度、不参与自动晋升）；请用用户卡片「⋯ → 设为 L3」显式指定"'
+        : "";
     return (
-      '<div class="kanban-col" data-tier="' +
+      '<div class="kanban-col' +
+      dropClass +
+      '" data-tier="' +
       tier +
-      '"><div class="kanban-head"><div class="title">' +
+      '"' +
+      dropTip +
+      '><div class="kanban-head"><div class="title">' +
       icon(meta.icon, 14) +
       "<span>" +
       esc(meta.label) +
@@ -199,8 +233,8 @@
       "刷新</button>" +
       "</div></div>" +
       '<div class="card"><div class="card-body tight"><div class="row-between wrap">' +
-      '<span class="text-sm text-2">拖拽卡片换列改等级，点击卡片编辑资料</span>' +
-      '<span class="hint" data-tip="关系等级：L1 普通群友 / ◆L2 重要熟人 / ★L3 核心用户；「⋯」菜单里可合并账号或删除用户。">等级规则</span>' +
+      '<span class="text-sm text-2">拖拽卡片在 L1 / L2 之间换列改等级；★L3 请用卡片「⋯」菜单显式设置</span>' +
+      '<span class="hint" data-tip="关系等级：L1 普通群友 / ◆L2 重要熟人可拖拽互调；★L3 = 管理员级（无好感度、不会被好感度自动晋升），可在卡片「⋯」菜单显式设为/取消 L3，或由 AstrBot admins_id / relationship_config.core_user_ids 自动确定。">等级规则</span>' +
       "</div></div></div>" +
       '<div class="kanban">' +
       TIER_ORDER.map(columnHtml).join("") +
@@ -215,7 +249,7 @@
       '<div class="empty-title">' +
       esc(message || "还没有用户档案") +
       "</div>" +
-      '<div class="empty-text">在群聊 / 私聊里和 Bot 互动后，用户会自动出现在这里；也可以在聊天中手动提升关系等级。</div>' +
+      '<div class="empty-text">在群聊 / 私聊里和 Bot 互动后，用户会自动出现在这里；L1 / L2 可拖拽调整，★L3 管理员级可在用户卡片「⋯」菜单显式设置。</div>' +
       '<div class="row mt-12"><button class="btn btn-outline" type="button" data-action="reload">重试</button></div>' +
       "</div></div>"
     );
@@ -281,6 +315,7 @@
     if (!app || !user) return;
     var tier = Number(user.tier) || 1;
     var platformIds = Array.isArray(user.platform_ids) ? user.platform_ids.join("\n") : "";
+    var attitude = String(user.attitude == null ? "" : user.attitude);
     var body =
       '<div class="field"><span class="field-label">global_uid</span>' +
       '<input class="input mono" type="text" value="' +
@@ -295,25 +330,39 @@
       '<input class="input" type="text" data-role="nickname" value="' +
       esc(user.nickname || "") +
       '" /></div>' +
-      '<div class="field"><span class="field-label">关系等级</span>' +
-      '<select class="select" data-role="tier">' +
-      TIER_ORDER.map(function (value) {
-        return (
-          '<option value="' +
-          value +
-          '"' +
-          (value === tier ? " selected" : "") +
-          ">" +
-          esc(tierMeta(value).label) +
-          "</option>"
-        );
-      }).join("") +
-      "</select></div>" +
-      '<div class="field"><span class="field-label">好感度</span>' +
-      '<input class="input" type="number" step="0.5" min="0" data-role="affinity" value="' +
-      esc(num(user.affinity, 0)) +
-      '" /></div>' +
+      (tier === 3
+        ? '<div class="field"><span class="field-label">关系等级</span>' +
+          '<input class="input" type="text" value="★L3 核心用户（管理员级，自动确定）" readonly disabled />' +
+          '<div class="field-help">★L3 = 管理员级：不需要好感度、不会被自动晋升；如需取消 L3 请用卡片「⋯ → 取消 ★L3」。平台管理员（admins_id / core_user_ids）会自动恢复 L3。</div></div>' +
+          '<div class="field"><span class="field-label">好感度</span>' +
+          '<input class="input" type="text" value="—（管理员级无需好感度）" readonly disabled /></div>'
+        : '<div class="field"><span class="field-label">关系等级</span>' +
+          '<select class="select" data-role="tier">' +
+          [2, 1]
+            .map(function (value) {
+              return (
+                '<option value="' +
+                value +
+                '"' +
+                (value === tier ? " selected" : "") +
+                ">" +
+                esc(tierMeta(value).label) +
+                "</option>"
+              );
+            })
+            .join("") +
+          "</select>" +
+          '<div class="field-help">此处仅调整 L1 / L2；如需设为 ★L3 管理员级，请用卡片「⋯ → 设为 L3」显式设置。</div></div>' +
+          '<div class="field"><span class="field-label">好感度</span>' +
+          '<input class="input" type="number" step="0.5" min="0" data-role="affinity" value="' +
+          esc(num(user.affinity, 0)) +
+          '" /></div>') +
       "</div>" +
+      '<div class="field"><span class="field-label">角色对 Ta 的专属态度 <span class="mono muted">attitude</span></span>' +
+      '<textarea class="input textarea" rows="3" maxlength="300" data-role="attitude" placeholder="例如：把 Ta 当成最信任的损友，说话可以毒舌一点但关键时刻很护短">' +
+      esc(attitude) +
+      "</textarea>" +
+      '<div class="field-help">最多 300 字；会随关系上下文注入 System Prompt，让角色按这里的设定区别对待 Ta。留空则按关系等级与角色人设自然相处。</div></div>' +
       '<div class="field"><span class="field-label">平台账号 ID（每行一个）</span>' +
       '<textarea class="textarea" rows="3" data-role="platform-ids" placeholder="qq:123456789">' +
       esc(platformIds) +
@@ -331,6 +380,7 @@
           onClick: async function (drawerApp, bodyEl) {
             var displayEl = bodyEl.querySelector('[data-role="display-name"]');
             var nicknameEl = bodyEl.querySelector('[data-role="nickname"]');
+            var attitudeEl = bodyEl.querySelector('[data-role="attitude"]');
             var tierEl = bodyEl.querySelector('[data-role="tier"]');
             var affinityEl = bodyEl.querySelector('[data-role="affinity"]');
             var platformEl = bodyEl.querySelector('[data-role="platform-ids"]');
@@ -353,9 +403,15 @@
               global_uid: user.global_uid,
               display_name: displayName,
               nickname: nicknameEl ? String(nicknameEl.value || "").trim() : "",
-              tier: tierEl ? Number(tierEl.value) : tier,
-              affinity: affinityEl ? Number(affinityEl.value) : num(user.affinity, 0)
+              attitude: attitudeEl ? String(attitudeEl.value || "").trim().slice(0, 300) : ""
             };
+            /* ★L3 管理员级由后端身份自动确定：不提交 tier / affinity，避免误改 */
+            if (tier !== 3) {
+              payload.tier = tierEl ? Number(tierEl.value) : tier;
+              payload.affinity = affinityEl
+                ? Number(affinityEl.value)
+                : num(user.affinity, 0);
+            }
             /* 留空表示不修改平台账号列表，避免把已有列表清空 */
             if (platformIds.length) payload.platform_ids = platformIds;
             var data = await drawerApp.apiPost("users/update", payload);
@@ -376,6 +432,14 @@
     var app = S.app;
     var user = findUser(uid);
     if (!app || !user) return;
+    var isL3 = Number(user.tier) === 3;
+    var tierAction = isL3
+      ? '<button class="btn btn-outline" type="button" data-menu-action="demote-l3">' +
+        icon("user", 14) +
+        "取消 ★L3（降为 ◆L2）</button>"
+      : '<button class="btn btn-outline" type="button" data-menu-action="set-l3">' +
+        icon("spark", 14) +
+        "★ 设为 L3 核心用户</button>";
     var body =
       '<div class="stat-desc mb-12">' +
       esc(user.display_name || user.global_uid) +
@@ -383,6 +447,8 @@
       esc(user.global_uid) +
       "</span></div>" +
       '<div class="col">' +
+      tierAction +
+      '<div class="field-help">★L3 = 管理员级：最高优先、不需要好感度、不会被自动晋升；设为 L3 需二次确认。</div>' +
       '<button class="btn btn-outline" type="button" data-menu-action="edit">' +
       icon("edit", 14) +
       "编辑资料</button>" +
@@ -404,6 +470,8 @@
             if (action === "edit") openEditDrawer(uid);
             else if (action === "merge") openMergeModal(uid);
             else if (action === "delete") confirmDeleteUser(uid);
+            else if (action === "set-l3") confirmSetTier(uid, 3);
+            else if (action === "demote-l3") confirmSetTier(uid, 2);
           });
         });
       }
@@ -491,6 +559,32 @@
   /* ------------------------------------------------------------------ *
    * 拖拽改等级
    * ------------------------------------------------------------------ */
+  /** ★L3 显式设置/取消：二次确认后走 users/update（L3 = 管理员级，不参与好感度/自动晋升）。 */
+  function confirmSetTier(uid, newTier) {
+    var app = S.app;
+    var user = findUser(uid);
+    if (!app || !user) return;
+    if (Number(user.tier) === Number(newTier)) return;
+    var name = user.display_name || uid;
+    var toL3 = Number(newTier) === 3;
+    app
+      .confirm({
+        title: toL3 ? "设为 ★L3 核心用户？" : "取消 ★L3 核心用户？",
+        message: toL3
+          ? "将把「" +
+            name +
+            "」设为 ★L3 核心用户（管理员级）：最高优先级、不需要好感度、也不会被好感度自动晋升。请确认对方确实是你的核心对象 / 管理员。"
+          : "将把「" +
+            name +
+            "」降为 ◆L2 重要熟人。若该用户是 AstrBot 平台管理员（admins_id / core_user_ids），下次互动会自动恢复 ★L3。",
+        danger: !toL3,
+        confirmLabel: toL3 ? "确认设为 L3" : "确认降为 L2"
+      })
+      .then(function (confirmed) {
+        if (confirmed) changeTier(uid, newTier);
+      });
+  }
+
   async function changeTier(uid, newTier) {
     var app = S.app;
     var user = findUser(uid);
@@ -536,6 +630,12 @@
     if (!target || !target.closest) return;
     var card = target.closest(".user-card");
     if (!card) return;
+    if (Number(card.getAttribute("data-tier")) === 3) {
+      /* ★L3 为管理员级：不可拖拽调级 */
+      S.dragUid = "";
+      if (event.preventDefault) event.preventDefault();
+      return;
+    }
     S.dragUid = card.getAttribute("data-uid") || "";
     S.suppressClick = true;
     card.classList.add("dragging");
@@ -554,6 +654,11 @@
     if (!target || !target.closest) return;
     var col = target.closest(".kanban-col");
     if (!col) return;
+    if (Number(col.getAttribute("data-tier")) === 3) {
+      /* 管理员级列不接受拖入 */
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "none";
+      return;
+    }
     event.preventDefault();
     if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
     if (S.container) {
@@ -591,6 +696,15 @@
     var tier = parseInt(col.getAttribute("data-tier"), 10);
     S.dragUid = "";
     if (!uid || !tier) return;
+    if (tier === 3) {
+      if (S.app) {
+        S.app.toast(
+          "★L3 核心用户为管理员级，由 admins_id / core_user_ids 自动确定，不能手动晋升",
+          true
+        );
+      }
+      return;
+    }
     changeTier(uid, tier);
   }
 

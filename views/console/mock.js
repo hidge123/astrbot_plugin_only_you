@@ -12,6 +12,11 @@
  *  - 卡池返回 custom_cards / general_cards / action_types / chronotype，无奇遇卡字段；
  *  - dashboard/overview 的 state 带 action_type / action_type_label / progress_pct / busy_results。
  *
+ * v2.6 同步：models 配置带 `inherit` / `inherit_from`（可选继承，关闭且留空即停用）；
+ *  users 带 `attitude` 专属态度；action_types / 时间块带固定档位 `armor` / `armor_tier`
+ *  （25/40/65/80，前端不再手动设置）；角色卡 schema 为 10 分区 / 36 字段，头像支持
+ *  `data:image/...` Data URL；记忆页为分层分组列表（memories/list 返回结构不变）。
+ *
  * 用途：无 AstrBot 后端时直接双击打开 `index.html?mock=1` 即可渲染所有页面 / 截图验收。
  * 数据是可变的：force_state / reroll / cards 增删改 / 默认角色 / UMO 绑定等操作都会更新内存状态。
  *
@@ -118,11 +123,12 @@
   /* ================================================================== *
    * 1. 常量：四类行动 / 今日基调 / 默认行动卡池
    * ================================================================== */
+  /* v2.6：护甲不再由用户手动设置，按四类行动固定为 25 / 40 / 65 / 80 四档 */
   var ACTION_TYPE_DEFINITIONS = [
-    { value: "SLEEP", label: "睡觉 / 休眠", state: "RESTING", min_hours: 1.0, max_hours: 7.5 },
-    { value: "SURF", label: "冲浪刷片", state: "IDLE", min_hours: 0.5, max_hours: 2.0 },
-    { value: "IDLE_ROAM", label: "空闲闲逛", state: "IDLE", min_hours: 0.5, max_hours: 2.0 },
-    { value: "BUSY_TASK", label: "繁忙主业", state: "BUSY", min_hours: 1.0, max_hours: 3.0 }
+    { value: "SLEEP", label: "睡觉 / 休眠", state: "RESTING", min_hours: 1.0, max_hours: 7.5, desc: "后台完全静默，什么都不做", armor: 80, armor_tier: 4 },
+    { value: "SURF", label: "冲浪刷片", state: "IDLE", min_hours: 0.5, max_hours: 2.0, desc: "真实刷 B站/抖音，看片打分并分享", armor: 40, armor_tier: 2 },
+    { value: "IDLE_ROAM", label: "空闲闲逛", state: "IDLE", min_hours: 0.5, max_hours: 2.0, desc: "翻群记录吃瓜，或发呆记忆联想", armor: 25, armor_tier: 1 },
+    { value: "BUSY_TASK", label: "繁忙主业", state: "BUSY", min_hours: 1.0, max_hours: 3.0, desc: "当前行为记忆 + 进度条 + 每日随机完成结果", armor: 65, armor_tier: 3 }
   ];
   var ACTION_TYPE_MAP = {};
   ACTION_TYPE_DEFINITIONS.forEach(function (def) {
@@ -133,6 +139,12 @@
   function coerceActionType(value) {
     var key = String(value == null ? "" : value).toUpperCase();
     return ACTION_TYPE_MAP[key] ? key : "";
+  }
+
+  /** 行动类型 → 固定档位护甲（v2.6：IDLE_ROAM=25 / SURF=40 / BUSY_TASK=65 / SLEEP=80） */
+  function fixedArmorOf(actionType) {
+    var def = ACTION_TYPE_MAP[coerceActionType(actionType)];
+    return def ? def.armor : 25;
   }
 
   /** 旧数据兜底：无 action_type 时按 state / title 推导（与后端 from_dict 迁移规则一致） */
@@ -177,7 +189,8 @@
       /* 保留旧字段仅为兼容旧 UI / 旧数据，排轴不再使用 */
       valid_slots: [],
       base_weight: clamp(raw.base_weight, 1, 100),
-      armor: clamp(raw.armor, 0, 100),
+      /* v2.6：护甲由 action_type 固定档位决定，忽略旧数据 / 请求里的手动 armor */
+      armor: fixedArmorOf(actionType),
       synergy_tags: raw.synergy_tags || {}
     };
   }
@@ -191,41 +204,42 @@
 
   /* 默认内置卡池：每个 action_type 至少 2 张（顺序即展示顺序） */
   var GENERAL_CARDS = [
-    { card_id: "evt_general_sleep_1", title: "关灯睡觉", action_type: "SLEEP", min_hours: 4.0, max_hours: 7.5, base_weight: 80, armor: 90, synergy_tags: {} },
-    { card_id: "evt_general_sleep_2", title: "趴着补个回笼觉", action_type: "SLEEP", min_hours: 1.0, max_hours: 2.0, base_weight: 50, armor: 70, synergy_tags: {} },
-    { card_id: "evt_general_surf_1", title: "窝在沙发里刷短视频", action_type: "SURF", min_hours: 0.5, max_hours: 2.0, base_weight: 70, armor: 35, synergy_tags: { lazy: 1.2 } },
-    { card_id: "evt_general_surf_2", title: "深夜刷 B 站鬼畜区", action_type: "SURF", min_hours: 0.5, max_hours: 2.0, base_weight: 60, armor: 28, synergy_tags: {} },
-    { card_id: "evt_general_roam_1", title: "在群里潜水窥屏", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 2.0, base_weight: 60, armor: 40, synergy_tags: {} },
-    { card_id: "evt_general_roam_2", title: "泡杯茶发呆", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.5, base_weight: 45, armor: 45, synergy_tags: {} },
-    { card_id: "evt_general_busy_1", title: "埋头赶工作进度", action_type: "BUSY_TASK", min_hours: 1.0, max_hours: 3.0, base_weight: 65, armor: 80, synergy_tags: { focus: 1.4 } },
-    { card_id: "evt_general_busy_2", title: "被临时拉去开会", action_type: "BUSY_TASK", min_hours: 1.0, max_hours: 2.5, base_weight: 45, armor: 75, synergy_tags: {} }
+    { card_id: "evt_general_sleep_1", title: "关灯睡觉", action_type: "SLEEP", min_hours: 4.0, max_hours: 7.5, base_weight: 80, synergy_tags: {} },
+    { card_id: "evt_general_sleep_2", title: "趴着补个回笼觉", action_type: "SLEEP", min_hours: 1.0, max_hours: 2.0, base_weight: 50, synergy_tags: {} },
+    { card_id: "evt_general_surf_1", title: "窝在沙发里刷短视频", action_type: "SURF", min_hours: 0.5, max_hours: 2.0, base_weight: 70, synergy_tags: { lazy: 1.2 } },
+    { card_id: "evt_general_surf_2", title: "深夜刷 B 站鬼畜区", action_type: "SURF", min_hours: 0.5, max_hours: 2.0, base_weight: 60, synergy_tags: {} },
+    { card_id: "evt_general_roam_1", title: "在群里潜水窥屏", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 2.0, base_weight: 60, synergy_tags: {} },
+    { card_id: "evt_general_roam_2", title: "泡杯茶发呆", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.5, base_weight: 45, synergy_tags: {} },
+    { card_id: "evt_general_busy_1", title: "埋头赶工作进度", action_type: "BUSY_TASK", min_hours: 1.0, max_hours: 3.0, base_weight: 65, synergy_tags: { focus: 1.4 } },
+    { card_id: "evt_general_busy_2", title: "被临时拉去开会", action_type: "BUSY_TASK", min_hours: 1.0, max_hours: 2.5, base_weight: 45, synergy_tags: {} }
   ].map(normalizeCard);
 
   /* 角色专属行动卡（酒狐：夜猫子插画师） */
   var DEFAULT_CUSTOM_CARDS = [
-    { card_id: "evt_custom_sleep_1", title: "裹着被子呼呼大睡", action_type: "SLEEP", min_hours: 4.0, max_hours: 7.5, base_weight: 85, armor: 88, synergy_tags: {} },
-    { card_id: "evt_custom_sleep_2", title: "午睡回血", action_type: "SLEEP", min_hours: 1.0, max_hours: 2.0, base_weight: 45, armor: 65, synergy_tags: {} },
-    { card_id: "evt_custom_surf_1", title: "窝在沙发里刷 B 站视频", action_type: "SURF", min_hours: 0.5, max_hours: 2.0, base_weight: 72, armor: 35, synergy_tags: { lazy: 1.2 } },
-    { card_id: "evt_custom_surf_2", title: "深夜刷鬼畜区停不下来", action_type: "SURF", min_hours: 0.5, max_hours: 2.0, base_weight: 58, armor: 26, synergy_tags: {} },
-    { card_id: "evt_custom_roam_1", title: "在群里潜水窥屏", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.5, base_weight: 58, armor: 42, synergy_tags: {} },
-    { card_id: "evt_custom_roam_2", title: "下楼买杯冰美式", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.0, base_weight: 48, armor: 45, synergy_tags: {} },
-    { card_id: "evt_custom_busy_1", title: "赶稿画商稿", action_type: "BUSY_TASK", min_hours: 1.5, max_hours: 3.0, base_weight: 70, armor: 82, synergy_tags: { focus: 1.5 } },
-    { card_id: "evt_custom_busy_2", title: "被甲方拉着改需求", action_type: "BUSY_TASK", min_hours: 1.0, max_hours: 2.5, base_weight: 55, armor: 74, synergy_tags: {} }
+    { card_id: "evt_custom_sleep_1", title: "裹着被子呼呼大睡", action_type: "SLEEP", min_hours: 4.0, max_hours: 7.5, base_weight: 85, synergy_tags: {} },
+    { card_id: "evt_custom_sleep_2", title: "午睡回血", action_type: "SLEEP", min_hours: 1.0, max_hours: 2.0, base_weight: 45, synergy_tags: {} },
+    { card_id: "evt_custom_surf_1", title: "窝在沙发里刷 B 站视频", action_type: "SURF", min_hours: 0.5, max_hours: 2.0, base_weight: 72, synergy_tags: { lazy: 1.2 } },
+    { card_id: "evt_custom_surf_2", title: "深夜刷鬼畜区停不下来", action_type: "SURF", min_hours: 0.5, max_hours: 2.0, base_weight: 58, synergy_tags: {} },
+    { card_id: "evt_custom_roam_1", title: "在群里潜水窥屏", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.5, base_weight: 58, synergy_tags: {} },
+    { card_id: "evt_custom_roam_2", title: "下楼买杯冰美式", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.0, base_weight: 48, synergy_tags: {} },
+    { card_id: "evt_custom_busy_1", title: "赶稿画商稿", action_type: "BUSY_TASK", min_hours: 1.5, max_hours: 3.0, base_weight: 70, synergy_tags: { focus: 1.5 } },
+    { card_id: "evt_custom_busy_2", title: "被甲方拉着改需求", action_type: "BUSY_TASK", min_hours: 1.0, max_hours: 2.5, base_weight: 55, synergy_tags: {} }
   ].map(normalizeCard);
 
   /* 角色专属行动卡（小满：早起型大学生） */
   var DEFAULT_XIAOMAN_CARDS = [
-    { card_id: "evt_xm_sleep_1", title: "早早睡觉养精神", action_type: "SLEEP", min_hours: 4.0, max_hours: 7.5, base_weight: 85, armor: 90, synergy_tags: {} },
-    { card_id: "evt_xm_sleep_2", title: "午睡一小时", action_type: "SLEEP", min_hours: 0.5, max_hours: 2.0, base_weight: 50, armor: 62, synergy_tags: {} },
-    { card_id: "evt_xm_surf_1", title: "刷会儿短视频放松", action_type: "SURF", min_hours: 0.5, max_hours: 1.5, base_weight: 55, armor: 30, synergy_tags: {} },
-    { card_id: "evt_xm_roam_1", title: "和室友拼饭", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.5, base_weight: 65, armor: 40, synergy_tags: {} },
-    { card_id: "evt_xm_roam_2", title: "食堂干饭 + 操场散步", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.5, base_weight: 50, armor: 42, synergy_tags: {} },
-    { card_id: "evt_xm_busy_1", title: "泡图书馆自习", action_type: "BUSY_TASK", min_hours: 1.0, max_hours: 3.0, base_weight: 70, armor: 70, synergy_tags: {} },
-    { card_id: "evt_xm_busy_2", title: "写课程作业", action_type: "BUSY_TASK", min_hours: 1.0, max_hours: 2.5, base_weight: 60, armor: 68, synergy_tags: {} }
+    { card_id: "evt_xm_sleep_1", title: "早早睡觉养精神", action_type: "SLEEP", min_hours: 4.0, max_hours: 7.5, base_weight: 85, synergy_tags: {} },
+    { card_id: "evt_xm_sleep_2", title: "午睡一小时", action_type: "SLEEP", min_hours: 0.5, max_hours: 2.0, base_weight: 50, synergy_tags: {} },
+    { card_id: "evt_xm_surf_1", title: "刷会儿短视频放松", action_type: "SURF", min_hours: 0.5, max_hours: 1.5, base_weight: 55, synergy_tags: {} },
+    { card_id: "evt_xm_roam_1", title: "和室友拼饭", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.5, base_weight: 65, synergy_tags: {} },
+    { card_id: "evt_xm_roam_2", title: "食堂干饭 + 操场散步", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.5, base_weight: 50, synergy_tags: {} },
+    { card_id: "evt_xm_busy_1", title: "泡图书馆自习", action_type: "BUSY_TASK", min_hours: 1.0, max_hours: 3.0, base_weight: 70, synergy_tags: {} },
+    { card_id: "evt_xm_busy_2", title: "写课程作业", action_type: "BUSY_TASK", min_hours: 1.0, max_hours: 2.5, base_weight: 60, synergy_tags: {} }
   ].map(normalizeCard);
 
   /* ================================================================== *
-   * 2. 角色卡 schema（10 分区 / 39 字段，与 core/character_card.py CARD_SCHEMA 对齐）
+   * 2. 角色卡 schema（10 分区 / 36 字段，与 core/character_card.py CARD_SCHEMA 对齐；
+   *    v2.6 删除 social.attitude_l3/l2/l1，态度改由用户档案 users.attitude 承载）
    * ================================================================== */
   var MBTI_OPTIONS = [
     ["INTJ", "INTJ · 建筑师"], ["INTP", "INTP · 逻辑学家"], ["ENTJ", "ENTJ · 指挥官"],
@@ -265,7 +279,13 @@
         field("birthday", "生日", "text", "如：03-14"),
         field("occupation", "职业 / 身份", "text", "如：自由插画师"),
         field("city", "所在城市", "text", "如：杭州"),
-        field("avatar", "头像（emoji 或首字母）", "text", "如：酒")
+        field(
+          "avatar",
+          "头像标识",
+          "text",
+          "🌙 或 星（支持本地上传图片 / 图片链接）",
+          "支持 Emoji / 短字符、本地上传图片（Data URL）与图片链接，用于控制台头像展示"
+        )
       ]
     },
     {
@@ -330,9 +350,7 @@
       id: "social",
       title: "社交关系",
       fields: [
-        field("attitude_l3", "对 ★L3 核心用户的态度与称呼", "text", "如：叫“老板”，会认真听"),
-        field("attitude_l2", "对 ◆L2 重要熟人的态度", "text", "如：会主动接梗、偶尔互损"),
-        field("attitude_l1", "对 L1 普通群友的态度", "text", "如：礼貌但保持距离"),
+        /* v2.6：按等级的固定态度已移除，改为在「关系页」为用户逐个设置专属 attitude */
         field("group_role", "群聊中的角色定位", "text", "如：气氛组 / 潜水员 / 百科")
       ]
     },
@@ -400,6 +418,11 @@
   /* ================================================================== *
    * 3. 初始 Mock 数据
    * ================================================================== */
+  /* v2.6：identity.avatar 支持 data:image Data URL（前端 Canvas 裁剪压缩产出）。
+   * 下面是 48×48 暖色渐变 PNG（约 600 字节），仅用于本地 mock 预览图片头像渲染。 */
+  var TINY_PNG_AVATAR =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAIAAADYYG7QAAACI0lEQVR42s3W51ITYRTG8XOhMSEhEGIBNGyyCXbF3qX3GogFC6Agdr2ebG9+OZ53FSYTipP13cmZ+V/A78O+ex6oqwlROVGvJOqDJ+rnwy4ktYtJ7VJSu0yltCsp7WpKu9ahXe/QqaG0fiOt30zrt6iMfjuj38kYdzuNe53GfSprPMgaD7PGo6zxuMuknnSZT7vN4W5zhMqZozlzLGeN56yJHtFkjzWVt6bz1kzenj0JrDQhiJPGniPQsRocLeDYAI6HTShxa+x5Ah2mweECjhSaNDip4JSC01QxJo29cAoiaHCmiLPFODT24h9Q6xqcK+F8SbomBEXV4AKlytXYS6eh8StuVYOLqlyNs0ygo9/UPzW4pMrVOCsE+g8NLqu4UpaocaoC9PfvF00jQPI0TvUM7P+Lo2mwWpaocVYJtHcZomlwtSJR46wRaO9ORdPgWkWixqn1QuPVbLvGedYLjTe8VQ3WKnI1rgA1LIpWNVgblKtxn/dB06Jor8Z9QaAD+6aNGvclgQ5bW+3SuOsCdNz2i/tNNWnc9X6Ib/tF0LivCMRJ477uB1Ya781ZYKXx3hKIk8bbECBGGm/jHLDSeJsE4qTxtgjESeO9IxAnjfe+AKw0vgBx0vjbBOKk8XcGgJXG/0AgThp/V4AYafxdBVhp/I8E4qTxPynAShN8JhAnTfClCKw0IYiTJvhKIE6a4FsJWGmC7wTipAl+lICV5tdP9Tem6Qx1uJSqLAAAAABJRU5ErkJggg==";
+
   function buildCardJiu() {
     var card = emptyCard();
     card.identity = {
@@ -411,7 +434,8 @@
       birthday: "03-14",
       occupation: "自由插画师",
       city: "杭州",
-      avatar: "酒"
+      /* 图片头像示例（Data URL）；小满保留 emoji 头像，两种形态都覆盖 */
+      avatar: TINY_PNG_AVATAR
     };
     card.appearance = {
       appearance: "酒红色短发，琥珀色眼睛，常穿一件洗得发白的灰色卫衣，尾巴尖有一撮白毛。",
@@ -445,9 +469,7 @@
       banned_expressions: ["作为 AI 语言模型", "我无法回答"]
     };
     card.social = {
-      attitude_l3: "叫“老板”，嘴上嫌弃但会认真听，遇到好事第一个分享。",
-      attitude_l2: "会主动接梗、互相损两句，是群里最熟的那批人。",
-      attitude_l1: "礼貌但保持距离，偶尔附和一下，不太主动搭话。",
+      /* v2.6：per-tier attitude 已从角色卡移除，这里只保留群聊定位 */
       group_role: "气氛组潜水员，平时窥屏，有好玩的才冒泡。"
     };
     card.rhythm = {
@@ -512,9 +534,6 @@
       banned_expressions: ["随便吧", "都行"]
     };
     card.social = {
-      attitude_l3: "当作可靠的学长学姐，会认真道谢。",
-      attitude_l2: "一起自习、拼饭的老熟人，会主动分享零食。",
-      attitude_l1: "礼貌热情，但也知道分寸。",
       group_role: "活跃气氛的班级小太阳"
     };
     card.rhythm = {
@@ -562,13 +581,13 @@
       },
       defaultUmoTarget: "qq:GroupMessage:88481234",
       users: [
-        { global_uid: "core_tester", display_name: "阿泽", nickname: "阿泽", tier: 3, tier_label: "★L3核心用户", interaction_count: 328, affinity: 92.5, platform_ids: ["qq:123456789", "telegram:987654321"] },
-        { global_uid: "admin_luna", display_name: "Luna", nickname: "月姐", tier: 3, tier_label: "★L3核心用户", interaction_count: 194, affinity: 88.0, platform_ids: ["qq:222333444"] },
-        { global_uid: "l2_tester", display_name: "老王", nickname: "老王", tier: 2, tier_label: "◆L2重要熟人", interaction_count: 86, affinity: 64.0, platform_ids: ["qq:333444555"] },
-        { global_uid: "l2_mikan", display_name: "蜜柑", nickname: "小橘子", tier: 2, tier_label: "◆L2重要熟人", interaction_count: 61, affinity: 57.5, platform_ids: ["qq:444555666"] },
-        { global_uid: "l1_passerby", display_name: "路过的群友", nickname: "", tier: 1, tier_label: "L1普通群友", interaction_count: 9, affinity: 12.0, platform_ids: ["qq:555666777"] },
-        { global_uid: "l1_bob", display_name: "Bob", nickname: "", tier: 1, tier_label: "L1普通群友", interaction_count: 4, affinity: 6.5, platform_ids: ["qq:666777888"] },
-        { global_uid: "l1_anon", display_name: "匿名网友", nickname: "", tier: 1, tier_label: "L1普通群友", interaction_count: 1, affinity: 2.0, platform_ids: [] }
+        { global_uid: "core_tester", display_name: "阿泽", nickname: "阿泽", attitude: "把 Ta 当成最信任的损友，嘴上嫌弃但每次都秒回帮他兜底，愿意分享最真实的心情。", tier: 3, tier_label: "★L3核心用户", interaction_count: 328, affinity: 92.5, platform_ids: ["qq:123456789", "telegram:987654321"] },
+        { global_uid: "admin_luna", display_name: "Luna", nickname: "月姐", attitude: "当作靠谱的前辈，偶尔撒个娇求助，正经事上很听她的。", tier: 3, tier_label: "★L3核心用户", interaction_count: 194, affinity: 88.0, platform_ids: ["qq:222333444"] },
+        { global_uid: "l2_tester", display_name: "老王", nickname: "老王", attitude: "一起开黑互损的老熟人，说话可以没大没小。", tier: 2, tier_label: "◆L2重要熟人", interaction_count: 86, affinity: 64.0, platform_ids: ["qq:333444555"] },
+        { global_uid: "l2_mikan", display_name: "蜜柑", nickname: "小橘子", attitude: "", tier: 2, tier_label: "◆L2重要熟人", interaction_count: 61, affinity: 57.5, platform_ids: ["qq:444555666"] },
+        { global_uid: "l1_passerby", display_name: "路过的群友", nickname: "", attitude: "", tier: 1, tier_label: "L1普通群友", interaction_count: 9, affinity: 12.0, platform_ids: ["qq:555666777"] },
+        { global_uid: "l1_bob", display_name: "Bob", nickname: "", attitude: "", tier: 1, tier_label: "L1普通群友", interaction_count: 4, affinity: 6.5, platform_ids: ["qq:666777888"] },
+        { global_uid: "l1_anon", display_name: "匿名网友", nickname: "", attitude: "", tier: 1, tier_label: "L1普通群友", interaction_count: 1, affinity: 2.0, platform_ids: [] }
       ],
       memories: [
         { id: 101, soul_id: "default_soul", user_id: "core_tester", user_tier: 3, memory_tier: 3, content: "阿泽严重海鲜过敏，聚餐千万别点海鲜。", keywords: "海鲜过敏,饮食,健康", importance: 10, vitality: 100, access_count: 12, created_at: nowSeconds() - 86400 * 40, last_accessed_at: nowSeconds() - 3600 },
@@ -593,8 +612,8 @@
       ],
       modelConfig: {
         main: { source_id: "deepseek", model: "deepseek-chat" },
-        decision: { inherit: true, source_id: "", model: "" },
-        vision: { inherit: true, source_id: "", model: "" },
+        decision: { inherit: true, inherit_from: "main", source_id: "", model: "" },
+        vision: { inherit: true, inherit_from: "main", source_id: "", model: "" },
         tts: { mode: "off", source_id: "", model: "", voice: "", provider_id: "", probability: 1.0, scope: "private", dual_output: false }
       },
       sources: [
@@ -687,84 +706,85 @@
     return db.souls[0] || null;
   }
 
-  /* 24h 动态积木时间轴模板：[时长(h), action_type, 标题, 护甲]
-   * 每个模板都从 0.0 连续拼到 24.0（0.5h 网格），块数 10~11，覆盖四类行动。 */
+  /* 24h 动态积木时间轴模板：[时长(h), action_type, 标题]
+   * 每个模板都从 0.0 连续拼到 24.0（0.5h 网格），块数 10~11，覆盖四类行动。
+   * 护甲不入模板：v2.6 起按 action_type 固定档位（25/40/65/80）自动应用。 */
   var RUN_PATTERNS = {
     night_owl: [
-      [7.5, "SLEEP", "裹着被子呼呼大睡", 88],
-      [1.0, "IDLE_ROAM", "赖床刷手机", 40],
-      [2.5, "BUSY_TASK", "赶稿画商稿", 82],
-      [1.5, "IDLE_ROAM", "下楼买杯冰美式", 38],
-      [2.5, "BUSY_TASK", "被甲方拉着改需求", 76],
-      [2.0, "SURF", "躺沙发刷 B 站", 30],
-      [1.5, "IDLE_ROAM", "在群里潜水窥屏", 42],
-      [2.5, "BUSY_TASK", "埋头赶工作进度", 78],
-      [2.0, "SURF", "深夜刷 B 站鬼畜区", 26],
-      [1.0, "IDLE_ROAM", "窝床上刷手机", 35]
+      [7.5, "SLEEP", "裹着被子呼呼大睡"],
+      [1.0, "IDLE_ROAM", "赖床刷手机"],
+      [2.5, "BUSY_TASK", "赶稿画商稿"],
+      [1.5, "IDLE_ROAM", "下楼买杯冰美式"],
+      [2.5, "BUSY_TASK", "被甲方拉着改需求"],
+      [2.0, "SURF", "躺沙发刷 B 站"],
+      [1.5, "IDLE_ROAM", "在群里潜水窥屏"],
+      [2.5, "BUSY_TASK", "埋头赶工作进度"],
+      [2.0, "SURF", "深夜刷 B 站鬼畜区"],
+      [1.0, "IDLE_ROAM", "窝床上刷手机"]
     ],
     night_owl_reroll: [
-      [6.5, "SLEEP", "熬夜后补个长觉", 85],
-      [1.5, "IDLE_ROAM", "迷迷糊糊摸手机", 32],
-      [2.0, "SURF", "早餐配短视频", 34],
-      [3.0, "BUSY_TASK", "集中赶稿冲刺", 80],
-      [1.0, "IDLE_ROAM", "泡杯咖啡发呆", 44],
-      [2.0, "BUSY_TASK", "和甲方对需求", 72],
-      [2.0, "SURF", "午后刷 B 站摸鱼", 33],
-      [2.5, "BUSY_TASK", "继续埋头赶工", 74],
-      [2.0, "IDLE_ROAM", "下楼散步买宵夜", 40],
-      [1.5, "SURF", "深夜短视频上瘾", 28]
+      [6.5, "SLEEP", "熬夜后补个长觉"],
+      [1.5, "IDLE_ROAM", "迷迷糊糊摸手机"],
+      [2.0, "SURF", "早餐配短视频"],
+      [3.0, "BUSY_TASK", "集中赶稿冲刺"],
+      [1.0, "IDLE_ROAM", "泡杯咖啡发呆"],
+      [2.0, "BUSY_TASK", "和甲方对需求"],
+      [2.0, "SURF", "午后刷 B 站摸鱼"],
+      [2.5, "BUSY_TASK", "继续埋头赶工"],
+      [2.0, "IDLE_ROAM", "下楼散步买宵夜"],
+      [1.5, "SURF", "深夜短视频上瘾"]
     ],
     early: [
-      [6.0, "SLEEP", "早早睡觉养精神", 90],
-      [1.0, "IDLE_ROAM", "起床洗漱收拾书包", 45],
-      [2.5, "BUSY_TASK", "泡图书馆自习", 70],
-      [1.0, "IDLE_ROAM", "和室友拼饭", 40],
-      [2.0, "BUSY_TASK", "上午专业课程", 72],
-      [1.0, "SLEEP", "午睡回血", 60],
-      [3.0, "BUSY_TASK", "写课程作业", 68],
-      [1.5, "SURF", "刷会儿短视频放松", 32],
-      [2.0, "IDLE_ROAM", "食堂干饭 + 操场散步", 42],
-      [2.0, "BUSY_TASK", "复习英语", 66],
-      [2.0, "SLEEP", "准时上床睡觉", 88]
+      [6.0, "SLEEP", "早早睡觉养精神"],
+      [1.0, "IDLE_ROAM", "起床洗漱收拾书包"],
+      [2.5, "BUSY_TASK", "泡图书馆自习"],
+      [1.0, "IDLE_ROAM", "和室友拼饭"],
+      [2.0, "BUSY_TASK", "上午专业课程"],
+      [1.0, "SLEEP", "午睡回血"],
+      [3.0, "BUSY_TASK", "写课程作业"],
+      [1.5, "SURF", "刷会儿短视频放松"],
+      [2.0, "IDLE_ROAM", "食堂干饭 + 操场散步"],
+      [2.0, "BUSY_TASK", "复习英语"],
+      [2.0, "SLEEP", "准时上床睡觉"]
     ],
     early_reroll: [
-      [6.5, "SLEEP", "一觉睡到自然醒", 88],
-      [1.5, "SURF", "早起刷校园视频", 33],
-      [2.5, "BUSY_TASK", "去教室抢前排", 68],
-      [1.5, "IDLE_ROAM", "课间和同学聊天", 40],
-      [2.0, "BUSY_TASK", "小组作业讨论", 70],
-      [1.5, "SLEEP", "午睡回血", 58],
-      [2.5, "BUSY_TASK", "图书馆自习", 66],
-      [2.0, "SURF", "刷 B 站学习区", 30],
-      [2.0, "IDLE_ROAM", "操场散步", 44],
-      [1.0, "IDLE_ROAM", "回宿舍洗漱", 46],
-      [2.0, "SLEEP", "准时睡觉", 90]
+      [6.5, "SLEEP", "一觉睡到自然醒"],
+      [1.5, "SURF", "早起刷校园视频"],
+      [2.5, "BUSY_TASK", "去教室抢前排"],
+      [1.5, "IDLE_ROAM", "课间和同学聊天"],
+      [2.0, "BUSY_TASK", "小组作业讨论"],
+      [1.5, "SLEEP", "午睡回血"],
+      [2.5, "BUSY_TASK", "图书馆自习"],
+      [2.0, "SURF", "刷 B 站学习区"],
+      [2.0, "IDLE_ROAM", "操场散步"],
+      [1.0, "IDLE_ROAM", "回宿舍洗漱"],
+      [2.0, "SLEEP", "准时睡觉"]
     ],
     normal: [
-      [7.0, "SLEEP", "按时睡觉", 88],
-      [1.0, "IDLE_ROAM", "起床刷牙吃早饭", 45],
-      [2.5, "BUSY_TASK", "上午处理正事", 78],
-      [1.0, "IDLE_ROAM", "午休前刷会儿手机", 38],
-      [1.5, "SLEEP", "午睡一会儿", 62],
-      [2.0, "BUSY_TASK", "下午继续干活", 75],
-      [1.5, "SURF", "摸鱼刷短视频", 32],
-      [2.0, "BUSY_TASK", "收尾今天的工作", 72],
-      [2.0, "IDLE_ROAM", "晚饭后散步", 42],
-      [1.5, "SURF", "睡前刷 B 站", 30],
-      [2.0, "IDLE_ROAM", "窝着发呆", 36]
+      [7.0, "SLEEP", "按时睡觉"],
+      [1.0, "IDLE_ROAM", "起床刷牙吃早饭"],
+      [2.5, "BUSY_TASK", "上午处理正事"],
+      [1.0, "IDLE_ROAM", "午休前刷会儿手机"],
+      [1.5, "SLEEP", "午睡一会儿"],
+      [2.0, "BUSY_TASK", "下午继续干活"],
+      [1.5, "SURF", "摸鱼刷短视频"],
+      [2.0, "BUSY_TASK", "收尾今天的工作"],
+      [2.0, "IDLE_ROAM", "晚饭后散步"],
+      [1.5, "SURF", "睡前刷 B 站"],
+      [2.0, "IDLE_ROAM", "窝着发呆"]
     ],
     normal_reroll: [
-      [6.5, "SLEEP", "踏实睡一觉", 86],
-      [1.5, "IDLE_ROAM", "慢慢悠悠起床", 46],
-      [2.0, "SURF", "晨间刷手机", 34],
-      [3.0, "BUSY_TASK", "上午攻坚", 76],
-      [1.5, "IDLE_ROAM", "午休散步", 42],
-      [1.0, "SLEEP", "午睡 1 小时", 60],
-      [2.5, "BUSY_TASK", "下午推进项目", 74],
-      [2.0, "IDLE_ROAM", "处理杂事", 44],
-      [2.0, "BUSY_TASK", "下班前收尾", 70],
-      [1.5, "SURF", "晚饭后刷视频", 32],
-      [1.5, "IDLE_ROAM", "洗漱发呆", 38]
+      [6.5, "SLEEP", "踏实睡一觉"],
+      [1.5, "IDLE_ROAM", "慢慢悠悠起床"],
+      [2.0, "SURF", "晨间刷手机"],
+      [3.0, "BUSY_TASK", "上午攻坚"],
+      [1.5, "IDLE_ROAM", "午休散步"],
+      [1.0, "SLEEP", "午睡 1 小时"],
+      [2.5, "BUSY_TASK", "下午推进项目"],
+      [2.0, "IDLE_ROAM", "处理杂事"],
+      [2.0, "BUSY_TASK", "下班前收尾"],
+      [1.5, "SURF", "晚饭后刷视频"],
+      [1.5, "IDLE_ROAM", "洗漱发呆"]
     ]
   };
 
@@ -826,7 +846,8 @@
         title: item[2],
         state: boundStateOf(actionType),
         action_type: actionType,
-        armor: clamp(item[3], 0, 100),
+        /* v2.6：时间块护甲固定取 action_type 档位，不再来自模板 / 调用方 */
+        armor: fixedArmorOf(actionType),
         mutated: false,
         mutation_monologue: "",
         /* 旧字段保留（新时间轴不再使用） */
@@ -1034,54 +1055,66 @@
   }
 
   function buildModelStatus() {
-    var cfg = db.modelConfig || {};
-    var main = cfg.main || {};
-    var configured = !!(main.source_id && main.model);
-    function statusFor(role, inherited) {
-      if (!configured) {
-        return {
-          role: role,
-          configured: false,
-          inherited: inherited,
-          source_id: "",
-          model: "",
-          provider_id: "",
-          mode: "unconfigured",
-          label: inherited ? "继承主模型（主模型未配置）" : "未配置",
-          ok: false
-        };
-      }
-      var reuse = (main.source_id === "deepseek" && main.model === "deepseek-chat");
-      return {
+    var cfg = normalizeModelConfig(db.modelConfig || {});
+    var status = {};
+    ["main", "decision", "vision"].forEach(function (role) {
+      var entry = cfg[role] || {};
+      var inheritFrom = role === "main" ? "" : String(entry.inherit_from || "");
+      var pair = resolveModelPair(cfg, role);
+      var item = {
         role: role,
-        configured: true,
-        inherited: inherited,
-        source_id: main.source_id,
-        model: main.model,
-        provider_id: reuse ? "deepseek/deepseek-chat" : "onlyyou::chat::" + main.source_id + "::" + main.model,
-        mode: reuse ? "reuse" : "plugin",
-        label: (reuse ? "复用实例" : "插件自建") + " · " + main.source_id + " / " + main.model,
-        ok: true
+        configured: !!pair,
+        /* v2.6：仅当开启继承且确实解析到父角色模型时 inherited 才为 true */
+        inherited: !!(inheritFrom && pair),
+        inherit: !!inheritFrom,
+        inherit_from: inheritFrom,
+        source_id: pair ? pair.source_id : "",
+        model: pair ? pair.model : "",
+        provider_id: "",
+        mode: "unconfigured",
+        label: "未配置",
+        ok: false
       };
-    }
+      if (!pair) {
+        status[role] = item;
+        return;
+      }
+      var reuse = pair.source_id === "deepseek" && pair.model === "deepseek-chat";
+      item.mode = reuse ? "reuse" : "plugin";
+      item.provider_id = reuse
+        ? "deepseek/deepseek-chat"
+        : role === "main"
+        ? "onlyyou::main"
+        : "onlyyou::chat::" + pair.source_id + "::" + pair.model;
+      item.ok = true;
+      item.label =
+        pair.source_id +
+        " / " +
+        pair.model +
+        "（" +
+        (reuse ? "复用 AstrBot 实例" : "插件自建实例") +
+        "）";
+      if (item.inherited) {
+        item.label += inheritFrom === "decision" ? " · 继承轻量决策模型" : " · 继承主模型";
+      }
+      status[role] = item;
+    });
     var ttsCfg = cfg.tts || {};
     var ttsMode = ttsCfg.mode || "off";
-    return {
-      main: statusFor("main", false),
-      decision: statusFor("decision", true),
-      vision: statusFor("vision", true),
-      tts: {
-        role: "tts",
-        configured: ttsMode !== "off",
-        inherited: false,
-        source_id: ttsCfg.source_id || "",
-        model: ttsCfg.model || "",
-        provider_id: ttsCfg.provider_id || "",
-        mode: ttsMode,
-        label: ttsMode === "off" ? "已关闭" : ttsMode === "provider" ? "AstrBot TTS · " + (ttsCfg.provider_id || "") : "自建 TTS · " + (ttsCfg.model || ""),
-        ok: ttsMode !== "off"
-      }
+    status.tts = {
+      role: "tts",
+      configured: ttsMode !== "off",
+      inherited: false,
+      inherit: false,
+      inherit_from: "",
+      source_id: ttsCfg.source_id || "",
+      model: ttsCfg.model || "",
+      provider_id: ttsCfg.provider_id || "",
+      mode: ttsMode,
+      label: ttsMode === "off" ? "已关闭" : ttsMode === "provider" ? "AstrBot TTS · " + (ttsCfg.provider_id || "") : "自建 TTS · " + (ttsCfg.model || ""),
+      ok: ttsMode !== "off"
     };
+    return status;
   }
 
   function buildOverview(soulId) {
@@ -1237,11 +1270,11 @@
     var deck = deckOf(soul.soul_id);
     var stamp = Date.now();
     var generatedCards = [
-      { card_id: "evt_ai_" + stamp + "_1", title: "边看番边吃宵夜", action_type: "SURF", min_hours: 0.5, max_hours: 2.0, base_weight: 62, armor: 32, synergy_tags: {} },
-      { card_id: "evt_ai_" + stamp + "_2", title: "被甲方临时改需求", action_type: "BUSY_TASK", min_hours: 1.0, max_hours: 2.5, base_weight: 55, armor: 78, synergy_tags: {} },
-      { card_id: "evt_ai_" + stamp + "_3", title: "出门买杯冰美式", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.0, base_weight: 48, armor: 40, synergy_tags: {} },
-      { card_id: "evt_ai_" + stamp + "_4", title: "戴着耳机发呆", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.5, base_weight: 36, armor: 68, synergy_tags: {} },
-      { card_id: "evt_ai_" + stamp + "_5", title: "补个长长的回笼觉", action_type: "SLEEP", min_hours: 1.0, max_hours: 3.0, base_weight: 42, armor: 75, synergy_tags: {} }
+      { card_id: "evt_ai_" + stamp + "_1", title: "边看番边吃宵夜", action_type: "SURF", min_hours: 0.5, max_hours: 2.0, base_weight: 62, synergy_tags: {} },
+      { card_id: "evt_ai_" + stamp + "_2", title: "被甲方临时改需求", action_type: "BUSY_TASK", min_hours: 1.0, max_hours: 2.5, base_weight: 55, synergy_tags: {} },
+      { card_id: "evt_ai_" + stamp + "_3", title: "出门买杯冰美式", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.0, base_weight: 48, synergy_tags: {} },
+      { card_id: "evt_ai_" + stamp + "_4", title: "戴着耳机发呆", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.5, base_weight: 36, synergy_tags: {} },
+      { card_id: "evt_ai_" + stamp + "_5", title: "补个长长的回笼觉", action_type: "SLEEP", min_hours: 1.0, max_hours: 3.0, base_weight: 42, synergy_tags: {} }
     ].map(normalizeCard);
     generatedCards.forEach(function (card) {
       var exists = false;
@@ -1274,6 +1307,8 @@
       section.fields.forEach(function (fieldDef) {
         var value = values[fieldDef.key];
         if (fieldDef.readonly) return;
+        /* identity.avatar 是纯视觉元数据（可能是超长 Data URL），绝不进入 Persona Prompt */
+        if (section.id === "identity" && fieldDef.key === "avatar") return;
         if (Array.isArray(value)) {
           if (!value.length) return;
           if (fieldDef.type === "dialogs") {
@@ -1346,6 +1381,102 @@
   /* ================================================================== *
    * 7. 默认角色 / UMO 绑定 / 模型配置
    * ================================================================== */
+  /* v2.6 可选继承：decision / vision 的合法 inherit_from 取值 */
+  var INHERIT_FROM_OPTIONS = {
+    decision: ["", "main"],
+    vision: ["", "main", "decision"]
+  };
+
+  function toBool(value, fallback) {
+    if (value === true || value === false) return value;
+    if (value == null) return !!fallback;
+    return ["1", "true", "yes", "on", "y"].indexOf(String(value).trim().toLowerCase()) >= 0;
+  }
+
+  /** decision / vision 的 inherit_from 归一化（与 core/model_hub.py §1.1 同规则）。 */
+  function normalizeInheritFrom(role, raw) {
+    raw = raw && typeof raw === "object" ? raw : {};
+    var options = INHERIT_FROM_OPTIONS[role] || ["", "main"];
+    var has = Object.prototype.hasOwnProperty;
+    var candidate = "";
+    if (has.call(raw, "inherit_from") && raw.inherit_from != null) {
+      candidate = String(raw.inherit_from).trim().toLowerCase();
+      if (options.indexOf(candidate) < 0) candidate = toBool(raw.inherit, true) ? "main" : "";
+    } else if (has.call(raw, "inherit")) {
+      candidate = toBool(raw.inherit, true) ? "main" : "";
+    } else {
+      /* 旧配置（两个键都没有）：向后兼容默认继承主模型 */
+      candidate = "main";
+    }
+    return candidate;
+  }
+
+  /** 四角色模型配置归一化：decision / vision 恒带 inherit + inherit_from 且两者同步。 */
+  function normalizeModelConfig(raw) {
+    raw = raw && typeof raw === "object" ? raw : {};
+    var main = raw.main && typeof raw.main === "object" ? raw.main : {};
+    var out = {
+      main: {
+        source_id: String(main.source_id == null ? "" : main.source_id).trim(),
+        model: String(main.model == null ? "" : main.model).trim()
+      }
+    };
+    ["decision", "vision"].forEach(function (role) {
+      var roleRaw = raw[role] && typeof raw[role] === "object" ? raw[role] : {};
+      var inheritFrom = normalizeInheritFrom(role, roleRaw);
+      out[role] = {
+        inherit: !!inheritFrom,
+        inherit_from: inheritFrom,
+        source_id: String(roleRaw.source_id == null ? "" : roleRaw.source_id).trim(),
+        model: String(roleRaw.model == null ? "" : roleRaw.model).trim()
+      };
+    });
+    var tts = raw.tts && typeof raw.tts === "object" ? raw.tts : {};
+    var mode = String(tts.mode == null ? "off" : tts.mode).trim().toLowerCase();
+    if (["off", "source", "provider"].indexOf(mode) < 0) mode = "off";
+    var scope = String(tts.scope == null ? "private" : tts.scope).trim().toLowerCase();
+    if (["private", "l3", "all"].indexOf(scope) < 0) scope = "private";
+    var probability = Number(tts.probability);
+    out.tts = {
+      mode: mode,
+      source_id: String(tts.source_id == null ? "" : tts.source_id).trim(),
+      model: String(tts.model == null ? "" : tts.model).trim(),
+      voice: String(tts.voice == null ? "" : tts.voice).trim(),
+      provider_id: String(tts.provider_id == null ? "" : tts.provider_id).trim(),
+      probability: isFinite(probability) ? Math.max(0, Math.min(1, probability)) : 1,
+      scope: scope,
+      dual_output: toBool(tts.dual_output, false)
+    };
+    return out;
+  }
+
+  /**
+   * 角色当前生效的 (source_id, model)：独立配置取自己；继承按父角色递归解析，
+   * 最多 2 跳（vision -> decision -> main）并防环；解析不到返回 null（该角色停用）。
+   */
+  function resolveModelPair(cfg, role, hops) {
+    hops = hops || 0;
+    cfg = cfg || {};
+    if (role === "main") {
+      var main = cfg.main || {};
+      return main.source_id && main.model
+        ? { source_id: main.source_id, model: main.model }
+        : null;
+    }
+    var entry = cfg[role] || {};
+    var inheritFrom = String(entry.inherit_from || "");
+    if (!inheritFrom) {
+      return entry.source_id && entry.model
+        ? { source_id: entry.source_id, model: entry.model }
+        : null;
+    }
+    if (inheritFrom === "main") return resolveModelPair(cfg, "main", hops + 1);
+    if ((inheritFrom === "decision" || inheritFrom === "vision") && hops < 2) {
+      return resolveModelPair(cfg, inheritFrom, hops + 1);
+    }
+    return null;
+  }
+
   function saveSoul(soulId, body) {
     var soul = findSoul(soulId);
     if (!soul && body.card) {
@@ -1411,7 +1542,7 @@
     card.identity.name = targetId;
     card.identity.nickname = targetId;
     card.identity.tagline = "从 AstrBot 原生人格「" + personaName + "」导入的角色";
-    card.identity.avatar = targetId.slice(0, 1);
+    card.identity.avatar = String(body.avatar == null ? "" : body.avatar).trim() || targetId.slice(0, 1);
     card.extra.native_persona_prompt = found ? found.prompt : String(body.native_prompt || "");
     card.rhythm.daily_routine = "白天忙自己的事，晚上刷手机水群。";
     var soul = { soul_id: targetId, card: card };
@@ -1518,6 +1649,10 @@
       newState = String(body.new_state || "").toUpperCase();
       if (newState !== "IDLE" && newState !== "BUSY" && newState !== "RESTING") newState = slot.state;
       actionType = newState === "RESTING" ? "SLEEP" : newState === "BUSY" ? "BUSY_TASK" : "IDLE_ROAM";
+      /* 与后端一致：裸 `state IDLE`（未给新标题）保留当前 SURF 行动 */
+      if (newState === "IDLE" && slot.action_type === "SURF" && !String(body.new_title || "").trim()) {
+        actionType = "SURF";
+      }
     }
     slot.action_type = actionType;
     slot.state = newState;
@@ -1528,9 +1663,8 @@
     slot.completion_result = "";
     slot.mutated = false;
     slot.mutation_monologue = "";
-    if (body.armor != null && String(body.armor) !== "") {
-      slot.armor = clamp(body.armor, 0, 100);
-    }
+    /* v2.6：忽略调用方传入的 armor，强制按行动类型固定档位（25/40/65/80） */
+    slot.armor = fixedArmorOf(actionType);
     return {
       updated_slot: slotWithProgress(slot),
       schedule: buildSchedulePayload(soul.soul_id)
@@ -1575,6 +1709,8 @@
       if (!primary || !secondary) throw new Error("待合并账号不存在");
       primary.platform_ids = (primary.platform_ids || []).concat(secondary.platform_ids || []);
       primary.interaction_count += secondary.interaction_count;
+      /* v2.6：合并时主账号没有专属态度则继承被合并账号的 */
+      if (!primary.attitude && secondary.attitude) primary.attitude = secondary.attitude;
       db.users = db.users.filter(function (user) {
         return user.global_uid !== secondary.global_uid;
       });
@@ -1603,7 +1739,8 @@
         tier_label: "L1普通群友",
         interaction_count: 0,
         affinity: 0,
-        platform_ids: []
+        platform_ids: [],
+        attitude: ""
       };
       db.users.push(target);
     }
@@ -1615,6 +1752,10 @@
     }
     if (body.affinity != null && body.affinity !== "") {
       target.affinity = clamp(body.affinity, 0, 100);
+    }
+    /* v2.6：角色对 Ta 的专属态度，去首尾空白并截断到 300 字（与后端一致） */
+    if (body.attitude != null) {
+      target.attitude = String(body.attitude).trim().slice(0, 300);
     }
     if (Array.isArray(body.platform_ids)) target.platform_ids = body.platform_ids.slice();
     if (typeof body.platform_ids === "string") {
@@ -1892,10 +2033,11 @@
       case "models/config":
         if (method === "POST") {
           var incoming = payload.model_config && typeof payload.model_config === "object" ? payload.model_config : payload;
-          db.modelConfig = deepMerge(db.modelConfig, incoming);
+          /* v2.6：保存时归一化 inherit / inherit_from，返回完整 canonical 配置 */
+          db.modelConfig = normalizeModelConfig(incoming);
           return { model_config: clone(db.modelConfig), status: buildModelStatus() };
         }
-        return { model_config: clone(db.modelConfig), status: buildModelStatus() };
+        return { model_config: clone(normalizeModelConfig(db.modelConfig || {})), status: buildModelStatus() };
       case "models/test": {
         var role = String(payload.role || "main");
         if (role === "tts") {

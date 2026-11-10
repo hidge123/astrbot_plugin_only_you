@@ -3,11 +3,13 @@
  *
  * 数据源：GET `dashboard/overview`（新 24h 动态时间轴契约见 .team/NEW_TIMELINE_CONTRACT.md §6.3）。
  * 内容：
- *  ① 状态主卡：SVG 环形护甲表 + 状态名 + 四类行动徽章 + 当前活动 +
+ *  ① 状态主卡：SVG 环形「当前时间块进度」表 + 状态名 + 四类行动徽章 + 当前活动 +
  *     BUSY_TASK 实时进度条 / 其它行动剩余时间进度条 + 右侧下一时间块预告；
- *  ② 24h 动态积木日程轴（OYCharts.scheduleAxis），点击色块弹「行动类型 + 标题 + 护甲」并 POST schedule/force_state；
+ *  ② 24h 动态积木日程轴（OYCharts.scheduleAxis），点击色块弹「行动类型 + 标题」并 POST schedule/force_state；
+ *     定力护甲数值不对用户暴露（由行动类型固定档位自动应用）。
  *  ③ 小卡：今日基调（含作息类型 chronotype）/ 微调配额 / 今日繁忙成果（Tier 1 短时记忆）/
  *     关系环形 / 记忆分级条形 / 模型健康灯。
+ *  v2.6：角色画像区使用 app.renderAvatarInner 渲染图片头像（app.js 未提供时回退首字）。
  *
  * 注册：window.OY_PAGES.overview = { id,title,icon,render(container,ctx),destroy() }，ctx 即 window.app。
  */
@@ -174,17 +176,48 @@
   /* ------------------------------------------------------------------ *
    * 片段构建
    * ------------------------------------------------------------------ */
+  /** 状态主卡环形表：v2.6 改为「当前时间块进度」（value=state.progress_pct） */
   function ringBlock(state, slot) {
     var meta = getApp().stateMeta(state.state);
-    var armor = Math.max(0, Math.min(100, num(state.armor, 0)));
+    var progressPct = Math.max(
+      0,
+      Math.min(100, Math.round(num(state.progress_pct, 0)))
+    );
     return charts().ringGauge({
-      value: armor,
+      value: progressPct,
       max: 100,
       label: meta.label,
-      sublabel: "护甲 " + armor,
+      sublabel: "进度 " + progressPct + "%",
       color: meta.color,
       size: 132
     });
+  }
+
+  /** 进度阶段描述：替代旧的「护甲很厚 / 一般 / 很薄」文案 */
+  function progressHint(pct) {
+    var value = Math.max(0, Math.min(100, Math.round(num(pct, 0))));
+    if (value >= 100) return "已收尾";
+    if (value >= 75) return "快收尾";
+    if (value >= 15) return "进行中";
+    return "刚开工";
+  }
+
+  /** 角色画像小头像：图片头像由 app.renderAvatarInner 统一渲染（fe-avatar 提供） */
+  function avatarHtml(app, soul, soulName) {
+    var fallback = String(soulName || "?").trim() || "?";
+    var inner;
+    if (app && typeof app.renderAvatarInner === "function") {
+      inner = app.renderAvatarInner((soul && soul.avatar) || "", fallback);
+    } else {
+      inner = esc(fallback.charAt(0));
+    }
+    return (
+      '<span class="avatar avatar-sm" data-tip="' +
+      esc(fallback) +
+      '">' +
+      inner +
+      "</span>"
+    );
   }
 
   var _app = null;
@@ -370,8 +403,6 @@
       '<div class="next-preview-meta">' +
       icon("clock", 12) +
       esc(fmtHour(nextSlot.start_hour) + "-" + fmtHour(nextSlot.end_hour)) +
-      " · 护甲 " +
-      num(nextSlot.armor, 0) +
       (nextSlot.mutated ? " · 已微调" : "") +
       "</div>"
     );
@@ -386,7 +417,6 @@
     var state = data.state || {};
     var slot = currentSlot(data);
     var stateMeta = app.stateMeta(state.state || (slot && slot.state));
-    var armor = Math.max(0, Math.min(100, num(state.armor, num(slot && slot.armor, 0))));
     var remaining = num(state.remaining_seconds, 0);
     var elapsedPct =
       state.progress != null ? clamp01(num(state.progress, 0)) : remainingRatio(state, slot);
@@ -438,7 +468,9 @@
     html += '<div class="ring-wrap">' + ringBlock(state, slot) + "</div>";
     html += '<div class="status-info">';
     html +=
-      '<div class="status-head"><span class="state-badge ' +
+      '<div class="status-head">' +
+      avatarHtml(app, soul, soulName) +
+      '<span class="state-badge ' +
       stateMeta.cls +
       '">' +
       stateMeta.label +
@@ -472,7 +504,7 @@
         "</strong>% · 剩余 <strong data-role=\"remaining-text\">" +
         esc(app.formatDuration(remaining)) +
         "</strong></span><span>" +
-        esc(armor >= 70 ? "护甲很厚" : armor >= 40 ? "护甲一般" : "护甲很薄") +
+        esc(progressHint(elapsedDisplayPct)) +
         "</span></div>";
       if (completionResult) {
         html +=
@@ -493,7 +525,7 @@
         "</strong>（已过 " +
         Math.round(elapsedPct * 100) +
         "%）</span><span>" +
-        esc(armor >= 70 ? "护甲很厚" : armor >= 40 ? "护甲一般" : "护甲很薄") +
+        esc(progressHint(elapsedPct * 100)) +
         "</span></div></div>";
     }
     html +=
@@ -511,7 +543,7 @@
     html +=
       '<div class="card-title">' +
       icon("calendar", 15) +
-      '24 小时日程轴<span class="card-sub">动态时间块 · 点击色块切换行动类型与护甲</span></div>';
+      '24 小时日程轴<span class="card-sub">动态时间块 · 点击色块切换行动类型</span></div>';
     html +=
       '<div class="axis-legend"><span class="legend-item"><span class="legend-dot" style="background:var(--state-idle)"></span>空闲</span>' +
       '<span class="legend-item"><span class="legend-dot" style="background:var(--state-busy)"></span>繁忙</span>' +
@@ -593,7 +625,6 @@
       title: state.title || "",
       state: state.state || "IDLE",
       action_type: state.action_type || "",
-      armor: state.armor,
       start_hour: state.start_hour,
       end_hour: state.end_hour,
       progress_pct: state.progress_pct,
@@ -615,7 +646,8 @@
   }
 
   /* ------------------------------------------------------------------ *
-   * 交互：点击时间块 → 行动类型 + 标题 + 护甲（POST schedule/force_state）
+   * 交互：点击时间块 → 行动类型 + 标题（POST schedule/force_state）
+   * v2.6：不再提供护甲滑条，护甲由所选行动类型固定档位自动应用
    * ------------------------------------------------------------------ */
   function actionTypeDefs() {
     var defs = charts().ACTION_TYPES;
@@ -625,7 +657,6 @@
   function actionFormHtml(app, slot) {
     var currentType = resolveActionType(null, slot) || "IDLE_ROAM";
     var currentState = actionStateOf(currentType) || (slot && slot.state) || "IDLE";
-    var armor = slot && slot.armor != null ? Math.max(0, Math.min(100, num(slot.armor, 50))) : 50;
     var html = "";
     html += '<div class="field"><span class="field-label">行动类型</span><div class="segmented" data-role="action-seg">';
     actionTypeDefs().forEach(function (def) {
@@ -646,20 +677,12 @@
     html +=
       '<div class="field-help">绑定状态：<span class="tag" data-role="action-state-hint">' +
       esc(STATE_LABELS[String(currentState).toUpperCase()] || "空闲") +
-      "</span></div></div>";
+      "</span> · 该行动类型自带固定护甲档位（由后端自动应用）</div></div>";
     html +=
       '<div class="field"><span class="field-label">正在做的事（活动标题）</span>' +
       '<input class="input" data-role="activity-input" maxlength="120" placeholder="如：埋头赶稿 / 躺沙发刷 B 站" value="' +
       esc((slot && slot.title) || "") +
       '" /></div>';
-    html +=
-      '<div class="field"><span class="field-label">定力护甲</span>' +
-      '<div class="slider-row"><input class="slider" type="range" min="0" max="100" step="1" data-role="armor-slider" value="' +
-      armor +
-      '" /><span class="slider-value" data-role="armor-value">' +
-      armor +
-      "</span></div>" +
-      '<div class="field-help">护甲越高越不容易被普通消息打断；L3 核心用户的高 Impact 消息仍可能击穿护甲并触发微调。</div></div>';
     return html;
   }
 
@@ -682,24 +705,14 @@
         }
       });
     }
-    var slider = container.querySelector('[data-role="armor-slider"]');
-    var valueEl = container.querySelector('[data-role="armor-value"]');
-    if (slider && valueEl) {
-      slider.addEventListener("input", function () {
-        valueEl.textContent = slider.value;
-      });
-    }
   }
 
   function readActionForm(container) {
     var active = container ? container.querySelector('[data-role="action-seg"] .seg-btn.active') : null;
-    var slider = container ? container.querySelector('[data-role="armor-slider"]') : null;
     var titleEl = container ? container.querySelector('[data-role="activity-input"]') : null;
     var actionType = active ? active.getAttribute("data-action-type") : "IDLE_ROAM";
     return {
       action_type: actionType,
-      new_state: actionStateOf(actionType) || "IDLE",
-      armor: slider ? Number(slider.value) : 50,
       new_title: titleEl ? String(titleEl.value || "").trim() : ""
     };
   }
@@ -728,13 +741,11 @@
           icon: "save",
           onClick: async function () {
             var form = readActionForm(body);
+            /* v2.6：护甲由行动类型固定档位自动应用，POST 不再携带 armor */
             var data = await app.apiPost("schedule/force_state", {
               soul_id: app.state.currentSoulId,
               slot_key: slot.slot_key,
               action_type: form.action_type,
-              /* new_state 兼容旧后端；新后端优先 action_type */
-              new_state: form.new_state,
-              armor: form.armor,
               new_title: form.new_title
             });
             if (data && data.schedule) app.state.activeSchedule = data.schedule;

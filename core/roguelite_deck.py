@@ -132,6 +132,8 @@ class DayVigorCard:
     description: str
     tag: str
     state_bias: dict[str, float] = field(default_factory=dict)
+    # Deprecated since v2.6: armor is a fixed tier per ``ActionType``, so the
+    # vigor offset is kept only for old serialized data and no longer applied.
     armor_offset: int = 0
 
 
@@ -149,7 +151,11 @@ class StateEventCard:
     state: BotState = BotState.IDLE
     valid_slots: list[str] = field(default_factory=list)
     base_weight: int = 50
-    armor: int = 50
+    # v2.6: ``None`` means "use the fixed armor tier of ``action_type``".  An
+    # explicit value is still honored here for old persisted data / test helpers,
+    # but every business entry point (deck draw / force_state / cards save)
+    # overwrites it with ``action.fixed_armor``.
+    armor: Optional[int] = None
     synergy_tags: dict[str, float] = field(default_factory=dict)
     action_type: Optional[ActionType] = None
     min_hours: float = 1.0
@@ -167,7 +173,10 @@ class StateEventCard:
         if self.max_hours < self.min_hours:
             self.max_hours = self.min_hours
         self.base_weight = max(1, min(100, int(self.base_weight or 50)))
-        self.armor = max(0, min(100, int(self.armor if self.armor is not None else 50)))
+        if self.armor is None:
+            self.armor = derived.fixed_armor
+        else:
+            self.armor = max(0, min(100, int(self.armor)))
         self.valid_slots = [str(item) for item in (self.valid_slots or []) if str(item).strip()]
         self.synergy_tags = {
             str(key): float(value) for key, value in (self.synergy_tags or {}).items()
@@ -209,18 +218,26 @@ class StateEventCard:
             max_hours = default_max
         if max_hours < min_hours:
             max_hours = min_hours
-        return cls(
-            card_id=str(data.get("card_id", f"evt_{random.randint(1000, 9999)}")),
-            title=title,
-            state=action.bound_state,
-            valid_slots=list(data.get("valid_slots") or []),
-            base_weight=int(data.get("base_weight", 50) or 50),
-            armor=int(data.get("armor", 45) or 45),
-            synergy_tags=dict(data.get("synergy_tags") or {}),
-            action_type=action,
-            min_hours=min_hours,
-            max_hours=max_hours,
-        )
+        kwargs: dict[str, Any] = {
+            "card_id": str(data.get("card_id", f"evt_{random.randint(1000, 9999)}")),
+            "title": title,
+            "state": action.bound_state,
+            "valid_slots": list(data.get("valid_slots") or []),
+            "base_weight": int(data.get("base_weight", 50) or 50),
+            "synergy_tags": dict(data.get("synergy_tags") or {}),
+            "action_type": action,
+            "min_hours": min_hours,
+            "max_hours": max_hours,
+        }
+        # v2.6: only keep an explicitly provided armor value (legacy cards / tests);
+        # missing / None / blank -> leave it to ``__post_init__`` (fixed tier).
+        raw_armor = data.get("armor")
+        if raw_armor is not None and str(raw_armor).strip() != "":
+            try:
+                kwargs["armor"] = int(float(raw_armor))
+            except (TypeError, ValueError):
+                pass
+        return cls(**kwargs)
 
 
 @dataclass
@@ -396,13 +413,19 @@ class DailyScheduleRun:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "DailyScheduleRun":
         data = data if isinstance(data, dict) else {}
+        slots = [SlotInstance.from_dict(s) for s in data.get("slots", [])]
+        # v2.6 integration fix: armor is a fixed per-action tier now, so a run
+        # persisted by an older version is normalized on load instead of keeping
+        # stale 0~100 values that would desync the mutation impact gate.
+        for slot in slots:
+            slot.armor = slot.action.fixed_armor
         return cls(
             soul_id=str(data["soul_id"]),
             date_str=str(data["date_str"]),
             vigor_id=str(data.get("vigor_id", "vigor_normal")),
             vigor_title=str(data.get("vigor_title", "元气满满")),
             vigor_desc=str(data.get("vigor_desc", "作息平稳的普通一天")),
-            slots=[SlotInstance.from_dict(s) for s in data.get("slots", [])],
+            slots=slots,
             encounters=[],  # legacy encounter cards are intentionally dropped
             mutations_used=int(data.get("mutations_used", 0) or 0),
             last_mutation_ts=float(data.get("last_mutation_ts", 0.0) or 0.0),
@@ -470,7 +493,6 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
         min_hours=4.0,
         max_hours=7.5,
         base_weight=75,
-        armor=70,
     ),
     StateEventCard(
         card_id="gen_sleep_nap",
@@ -480,7 +502,6 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
         min_hours=1.0,
         max_hours=2.0,
         base_weight=35,
-        armor=60,
         synergy_tags={"deadline": 1.3},
     ),
     # ---- BUSY_TASK ----
@@ -492,7 +513,6 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
         min_hours=1.5,
         max_hours=3.0,
         base_weight=65,
-        armor=60,
         synergy_tags={"deadline": 1.7},
     ),
     StateEventCard(
@@ -503,7 +523,6 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
         min_hours=1.0,
         max_hours=2.5,
         base_weight=55,
-        armor=55,
         synergy_tags={"deadline": 1.8},
     ),
     StateEventCard(
@@ -514,7 +533,6 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
         min_hours=1.0,
         max_hours=2.0,
         base_weight=30,
-        armor=50,
     ),
     # ---- SURF ----
     StateEventCard(
@@ -525,7 +543,6 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
         min_hours=0.5,
         max_hours=2.0,
         base_weight=80,
-        armor=25,
         synergy_tags={"energetic": 1.5, "slacker": 1.5, "night_owl": 1.5},
     ),
     StateEventCard(
@@ -536,7 +553,6 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
         min_hours=0.5,
         max_hours=1.5,
         base_weight=55,
-        armor=25,
         synergy_tags={"energetic": 1.4, "slacker": 1.4},
     ),
     StateEventCard(
@@ -547,7 +563,6 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
         min_hours=0.5,
         max_hours=1.5,
         base_weight=30,
-        armor=35,
         synergy_tags={"night_owl": 2.2},
     ),
     # ---- IDLE_ROAM ----
@@ -559,7 +574,6 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
         min_hours=0.5,
         max_hours=1.5,
         base_weight=45,
-        armor=35,
         synergy_tags={"energetic": 1.5},
     ),
     StateEventCard(
@@ -570,7 +584,6 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
         min_hours=0.5,
         max_hours=1.5,
         base_weight=45,
-        armor=30,
         synergy_tags={"slacker": 1.7, "energetic": 1.3},
     ),
     StateEventCard(
@@ -581,7 +594,6 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
         min_hours=0.5,
         max_hours=2.0,
         base_weight=55,
-        armor=30,
         synergy_tags={"slacker": 1.6, "energetic": 1.4},
     ),
     StateEventCard(
@@ -592,7 +604,6 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
         min_hours=0.5,
         max_hours=1.5,
         base_weight=35,
-        armor=40,
     ),
 ]
 
@@ -961,7 +972,9 @@ class RogueliteDeckEngine:
                 title=card.title,
                 label=action.label,
                 action_type=action,
-                armor=max(0, min(100, int(card.armor) + int(vigor.armor_offset))),
+                # v2.6: armor is a fixed tier of the action type; the DayVigor
+                # card's ``armor_offset`` no longer participates in scheduling.
+                armor=action.fixed_armor,
             )
             blocks.append(block)
 
@@ -1062,9 +1075,11 @@ class RogueliteDeckEngine:
             block.end_hour = midpoint
             result.insert(index + 1, clone)
 
-        # Re-index the canonical slot keys after merging/splitting.
+        # Re-index the canonical slot keys after merging/splitting and pin every
+        # block to the fixed v2.6 armor tier of its (possibly merged) action type.
         for index, block in enumerate(result):
             block.slot_key = f"block_{index}"
+            block.armor = block.action.fixed_armor
         if result:
             result[-1].end_hour = 24.0
         return result
@@ -1080,7 +1095,7 @@ class RogueliteDeckEngine:
                 card_id="static_sleep",
                 title="夜间休息",
                 action_type=ActionType.SLEEP,
-                armor=70,
+                armor=ActionType.SLEEP.fixed_armor,
             ),
             SlotInstance(
                 slot_key="block_1",
@@ -1090,7 +1105,7 @@ class RogueliteDeckEngine:
                 card_id="static_roam",
                 title="日常在线随时闲聊",
                 action_type=ActionType.IDLE_ROAM,
-                armor=50,
+                armor=ActionType.IDLE_ROAM.fixed_armor,
             ),
             SlotInstance(
                 slot_key="block_2",
@@ -1100,7 +1115,7 @@ class RogueliteDeckEngine:
                 card_id="static_surf",
                 title="晚上躺沙发刷视频",
                 action_type=ActionType.SURF,
-                armor=35,
+                armor=ActionType.SURF.fixed_armor,
             ),
         ]
 
@@ -1280,7 +1295,13 @@ class RogueliteDeckEngine:
         now_dt: Optional[datetime] = None,
         action_type: Optional[Any] = None,
     ) -> SlotInstance:
-        """Manually override the current (or specified ``slot_key``) block."""
+        """Manually override the current (or specified ``slot_key``) block.
+
+        ``armor`` is deprecated since v2.6: every block's guard armor is a fixed
+        tier derived from its ``action_type`` (``SLEEP=80`` / ``BUSY_TASK=65`` /
+        ``SURF=40`` / ``IDLE_ROAM=25``), so the parameter is kept only for call-site
+        signature compatibility and is ignored.
+        """
         run, current_slot, _ = await self.get_current_and_next_slot(
             soul_id=soul_id, now_dt=now_dt
         )
@@ -1315,8 +1336,8 @@ class RogueliteDeckEngine:
 
         if new_title:
             target_slot.title = str(new_title)
-        if armor is not None:
-            target_slot.armor = max(0, min(100, int(armor)))
+        # v2.6: ignore the caller-provided armor, always pin the fixed tier.
+        target_slot.armor = target_slot.action.fixed_armor
         target_slot.mutated = False
         target_slot.mutation_monologue = ""
         target_slot.delay_minutes = 0

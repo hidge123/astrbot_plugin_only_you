@@ -129,6 +129,166 @@
 
   OnlyYouConsoleApp.prototype.icon = icon;
 
+  /* ------------------------------ 通用头像工具 ------------------------------ */
+
+  /** 判断头像值是否为图片（Data URL / http(s) URL / 站点绝对路径） */
+  OnlyYouConsoleApp.prototype.isImageAvatar = function (value) {
+    var v = String(value == null ? "" : value).trim();
+    return /^data:image\//i.test(v) || /^https?:\/\//i.test(v) || /^\/[^\s]/i.test(v);
+  };
+
+  /**
+   * 渲染头像内部 HTML：图片 → `<img class="avatar-img">`；否则 → Emoji / 首字文本。
+   * avatarVal 为空时回退 fallbackName 首字，仍为空显示 "?"。
+   */
+  OnlyYouConsoleApp.prototype.renderAvatarInner = function (avatarVal, fallbackName) {
+    var raw = String(avatarVal == null ? "" : avatarVal).trim();
+    if (this.isImageAvatar(raw)) {
+      var label = String(fallbackName == null ? "" : fallbackName).trim();
+      return (
+        '<img class="avatar-img" src="' +
+        esc(raw) +
+        '" alt="' +
+        esc(label ? label + "的头像" : "角色头像") +
+        '" loading="lazy" />'
+      );
+    }
+    if (raw) return esc(raw);
+    var name = String(fallbackName == null ? "" : fallbackName).trim();
+    return esc(name ? name.slice(0, 1) : "?");
+  };
+
+  /**
+   * 选择本地图片 → 居中裁剪为 size×size 正方形 → 压缩为 Data URL。
+   * 返回 Promise<string>：用户取消 / 读取或编码失败时 resolve("")。
+   * options: { size: 160 }（可选，默认 160）
+   */
+  OnlyYouConsoleApp.prototype.pickAvatarImage = function (options) {
+    options = options || {};
+    var size = Math.max(32, Math.min(640, Math.round(Number(options.size) || 160)));
+    return new Promise(function (resolve) {
+      var input = document.createElement("input");
+      input.type = "file";
+      input.accept = "image/png,image/jpeg,image/webp,image/gif";
+      input.setAttribute("aria-hidden", "true");
+      input.style.position = "fixed";
+      input.style.left = "-9999px";
+      input.style.top = "0";
+      input.style.width = "1px";
+      input.style.height = "1px";
+      input.style.opacity = "0";
+
+      var settled = false;
+      var focusTimer = null;
+
+      function cleanup() {
+        if (focusTimer) {
+          clearTimeout(focusTimer);
+          focusTimer = null;
+        }
+        window.removeEventListener("focus", onWindowFocus);
+        if (input.parentNode) input.parentNode.removeChild(input);
+      }
+
+      function finish(value) {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(value || "");
+      }
+
+      /* 文件选择框关闭后若没有选中文件，视为用户取消 */
+      function onWindowFocus() {
+        if (focusTimer) clearTimeout(focusTimer);
+        focusTimer = setTimeout(function () {
+          if (settled) return;
+          var files = input.files;
+          if (!files || !files.length) finish("");
+        }, 600);
+      }
+
+      function toDataUrl(img) {
+        var canvas = document.createElement("canvas");
+        canvas.width = size;
+        canvas.height = size;
+        var ctx = canvas.getContext ? canvas.getContext("2d") : null;
+        if (!ctx) return "";
+        var width = Number(img.naturalWidth || img.width) || 0;
+        var height = Number(img.naturalHeight || img.height) || 0;
+        if (!width || !height) return "";
+        /* object-fit: cover 居中裁剪：按长边铺满后居中偏移 */
+        var scale = Math.max(size / width, size / height);
+        var drawWidth = width * scale;
+        var drawHeight = height * scale;
+        var offsetX = (size - drawWidth) / 2;
+        var offsetY = (size - drawHeight) / 2;
+        ctx.clearRect(0, 0, size, size);
+        ctx.drawImage(img, offsetX, offsetY, drawWidth, drawHeight);
+        var dataUrl = "";
+        try {
+          dataUrl = canvas.toDataURL("image/webp", 0.86);
+        } catch (err) {
+          dataUrl = "";
+        }
+        if (!/^data:image\/webp/i.test(dataUrl)) {
+          /* 浏览器不支持 webp（toDataURL 会回退 png）：白底重绘后再导出 jpeg */
+          try {
+            ctx.clearRect(0, 0, size, size);
+            ctx.fillStyle = "#ffffff";
+            ctx.fillRect(0, 0, size, size);
+            ctx.drawImage(img, offsetX, offsetY, drawWidth, drawHeight);
+            dataUrl = canvas.toDataURL("image/jpeg", 0.9);
+          } catch (err) {
+            dataUrl = "";
+          }
+        }
+        return /^data:image\//i.test(dataUrl) ? dataUrl : "";
+      }
+
+      input.addEventListener("change", function () {
+        var file = input.files && input.files[0];
+        if (!file || !/^image\//i.test(String(file.type || ""))) {
+          finish("");
+          return;
+        }
+        var reader = new FileReader();
+        reader.onerror = function () {
+          finish("");
+        };
+        reader.onload = function () {
+          var img = new Image();
+          img.onerror = function () {
+            finish("");
+          };
+          img.onload = function () {
+            var dataUrl = "";
+            try {
+              dataUrl = toDataUrl(img);
+            } catch (err) {
+              dataUrl = "";
+            }
+            finish(dataUrl);
+          };
+          img.src = String(reader.result || "");
+        };
+        reader.readAsDataURL(file);
+      });
+
+      /* 新版浏览器在用户取消选择时派发 cancel 事件 */
+      input.addEventListener("cancel", function () {
+        finish("");
+      });
+
+      window.addEventListener("focus", onWindowFocus);
+      document.body.appendChild(input);
+      try {
+        input.click();
+      } catch (err) {
+        finish("");
+      }
+    });
+  };
+
   OnlyYouConsoleApp.prototype.charts = function () {
     return window.OYCharts || {};
   };
@@ -526,6 +686,11 @@
 
   OnlyYouConsoleApp.prototype.selectSoul = async function (soulId) {
     if (!soulId || soulId === this.state.currentSoulId) return;
+    var canLeave = await this._confirmDiscardDirty("切换角色");
+    if (!canLeave) {
+      this._renderSoulSelect();
+      return;
+    }
     this.state.currentSoulId = soulId;
     try {
       sessionStorage.setItem(SOUL_KEY, soulId);
@@ -605,15 +770,52 @@
 
   OnlyYouConsoleApp.prototype.navigate = function (routeId) {
     if (!routeId) return;
+    var self = this;
     var target = "#/" + routeId;
-    if (window.location.hash === target) {
-      this.route = routeId;
-      this._renderNav();
-      this._renderCurrentRoute();
-      return;
+    var same = window.location.hash === target;
+    this._confirmDiscardDirty("切换页面").then(function (ok) {
+      if (!ok) return;
+      if (same) {
+        self.route = routeId;
+        self._renderNav();
+        self._renderCurrentRoute();
+        return;
+      }
+      /* 先更新 route 再改 hash：hashchange 里看到 nextRoute === route 就不会重复弹确认 */
+      self.route = routeId;
+      window.location.hash = target;
+    });
+  };
+
+  /** 当前页面是否声明了未保存修改（页面导出 isDirty 钩子）。 */
+  OnlyYouConsoleApp.prototype._pageDirty = function () {
+    var pages = this.pages ? this.pages() : window.OY_PAGES || {};
+    var page = pages && pages[this.route];
+    if (!page || typeof page.isDirty !== "function") return false;
+    try {
+      return !!page.isDirty();
+    } catch (err) {
+      return false;
     }
-    this.route = routeId;
-    window.location.hash = target;
+  };
+
+  /**
+   * 离开当前页面前的未保存修改确认。
+   * @param {string} actionLabel 触发动作描述（切换页面 / 切换角色 / 重新加载）
+   * @returns {Promise<boolean>} true = 允许继续（无改动或用户确认放弃）
+   */
+  OnlyYouConsoleApp.prototype._confirmDiscardDirty = function (actionLabel) {
+    if (!this._pageDirty()) return Promise.resolve(true);
+    return this.confirm({
+      title: "有未保存的修改",
+      message:
+        "当前页面存在尚未保存的修改，" +
+        (actionLabel || "离开") +
+        "后这些修改会丢失。确定要放弃修改继续吗？",
+      danger: true,
+      confirmLabel: "放弃修改并继续",
+      cancelLabel: "留在此页"
+    });
   };
 
   OnlyYouConsoleApp.prototype._renderTopbarIcons = function () {
@@ -1101,121 +1303,6 @@
     });
   };
 
-  /* ------------------------------ 日程状态干预公用逻辑 ------------------------------ */
-
-  /** 生成「状态切换 + 护甲滑条 + 活动标题」表单 HTML（概览页弹窗 / 日程页抽屉共用） */
-  OnlyYouConsoleApp.prototype.slotStateFormHtml = function (slot) {
-    slot = slot || {};
-    var stateMeta = this.stateMeta(slot.state);
-    var armor = slot.armor == null ? 50 : Math.max(0, Math.min(100, Number(slot.armor) || 0));
-    var html = "";
-    html +=
-      '<div class="field"><span class="field-label">状态</span><div class="segmented" data-role="state-seg">';
-    ["IDLE", "BUSY", "RESTING"].forEach(function (id) {
-      var meta = {
-        IDLE: { label: "空闲", icon: "zap" },
-        BUSY: { label: "繁忙", icon: "activity" },
-        RESTING: { label: "休息", icon: "moon" }
-      }[id];
-      html +=
-        '<button type="button" class="seg-btn' +
-        (stateMeta.id === id ? " active" : "") +
-        '" data-state="' +
-        id +
-        '">' +
-        icon(meta.icon, 13) +
-        meta.label +
-        "</button>";
-    });
-    html += "</div></div>";
-    html +=
-      '<div class="field"><span class="field-label">正在做的事（活动标题）</span>' +
-      '<input class="input" data-role="activity-input" maxlength="120" placeholder="如：窝在沙发里刷 B 站 / 苦逼赶稿中" value="' +
-      esc(slot.title || "") +
-      '" /></div>';
-    html +=
-      '<div class="field"><span class="field-label">定力护甲</span>' +
-      '<div class="slider-row"><input class="slider" type="range" min="0" max="100" step="1" data-role="armor-slider" value="' +
-      armor +
-      '" /><span class="slider-value" data-role="armor-value">' +
-      armor +
-      "</span></div>" +
-      '<div class="field-help">护甲越高越不容易被普通消息打断；L3 核心用户的高 Impact 消息仍可能击穿护甲并触发微调。</div></div>';
-    return html;
-  };
-
-  OnlyYouConsoleApp.prototype.bindSlotStateForm = function (container) {
-    if (!container) return;
-    var seg = container.querySelector('[data-role="state-seg"]');
-    if (seg) {
-      seg.addEventListener("click", function (event) {
-        var btn = event.target.closest("[data-state]");
-        if (!btn) return;
-        seg.querySelectorAll(".seg-btn").forEach(function (el) {
-          el.classList.remove("active");
-        });
-        btn.classList.add("active");
-      });
-    }
-    var slider = container.querySelector('[data-role="armor-slider"]');
-    var valueEl = container.querySelector('[data-role="armor-value"]');
-    if (slider && valueEl) {
-      slider.addEventListener("input", function () {
-        valueEl.textContent = slider.value;
-      });
-    }
-  };
-
-  OnlyYouConsoleApp.prototype.readSlotStateForm = function (container) {
-    var active = container ? container.querySelector('[data-role="state-seg"] .seg-btn.active') : null;
-    var slider = container ? container.querySelector('[data-role="armor-slider"]') : null;
-    var titleEl = container ? container.querySelector('[data-role="activity-input"]') : null;
-    return {
-      new_state: active ? active.getAttribute("data-state") : "IDLE",
-      armor: slider ? Number(slider.value) : 50,
-      new_title: titleEl ? String(titleEl.value || "").trim() : ""
-    };
-  };
-
-  /** POST schedule/force_state，并同步本地 activeSchedule */
-  OnlyYouConsoleApp.prototype.forceState = async function (payload) {
-    var body = {
-      soul_id: this.state.currentSoulId,
-      new_state: payload.new_state || "IDLE",
-      armor: payload.armor == null ? 50 : Number(payload.armor),
-      new_title: payload.new_title || "",
-      slot_key: payload.slot_key || ""
-    };
-    var data = await this.apiPost("schedule/force_state", body);
-    if (data && data.schedule) {
-      this.state.activeSchedule = data.schedule;
-    } else if (data && data.updated_slot) {
-      this._applyUpdatedSlot(data.updated_slot);
-    }
-    if (data && data.updated_slot && data.schedule && data.schedule.run) {
-      this._applyUpdatedSlot(data.updated_slot);
-    }
-    return data;
-  };
-
-  OnlyYouConsoleApp.prototype._applyUpdatedSlot = function (updatedSlot) {
-    var schedule = this.state.activeSchedule;
-    if (!schedule || !schedule.run || !Array.isArray(schedule.run.slots)) return;
-    if (!updatedSlot || !updatedSlot.slot_key) return;
-    var replaced = false;
-    schedule.run.slots = schedule.run.slots.map(function (slot) {
-      if (slot.slot_key === updatedSlot.slot_key) {
-        replaced = true;
-        return Object.assign({}, slot, updatedSlot);
-      }
-      return slot;
-    });
-    if (!replaced) schedule.run.slots.push(updatedSlot);
-    if (schedule.current_slot && schedule.current_slot.slot_key === updatedSlot.slot_key) {
-      schedule.current_slot = Object.assign({}, schedule.current_slot, updatedSlot);
-    }
-  };
-
   /* ------------------------------ 事件绑定 ------------------------------ */
 
   OnlyYouConsoleApp.prototype._bindStaticEvents = function () {
@@ -1243,9 +1330,41 @@
     }
 
     window.addEventListener("hashchange", function () {
-      self.route = self._parseHash();
-      self._renderNav();
-      self._renderCurrentRoute();
+      var nextRoute = self._parseHash();
+      if (self._revertingHash) {
+        self._revertingHash = false;
+        return;
+      }
+      if (nextRoute === self.route) {
+        self._renderNav();
+        self._renderCurrentRoute();
+        return;
+      }
+      var prevRoute = self.route;
+      self._confirmDiscardDirty("切换页面").then(function (ok) {
+        if (ok) {
+          self.route = nextRoute;
+          self._renderNav();
+          self._renderCurrentRoute();
+        } else {
+          /* 用户取消：把地址栏 hash 还原到当前页面 */
+          self._revertingHash = true;
+          var target = "#/" + (prevRoute || self._parseHash());
+          if (window.location.hash === target) {
+            self._revertingHash = false;
+            return;
+          }
+          window.location.hash = target;
+        }
+      });
+    });
+
+    /* 刷新 / 关闭标签页时，若有未保存修改，浏览器弹出原生离开确认 */
+    window.addEventListener("beforeunload", function (event) {
+      if (!self._pageDirty()) return undefined;
+      event.preventDefault();
+      event.returnValue = "当前页面有未保存的修改，离开将丢失。";
+      return event.returnValue;
     });
 
     var nav = document.getElementById("sidebar-nav");

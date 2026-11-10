@@ -31,7 +31,9 @@ EXPECTED_FIELD_COUNTS = {
     "background": 3,
     "interests": 4,
     "speech": 6,
-    "social": 4,
+    # v2.6: ``social`` keeps only ``group_role``; attitude_l3/l2/l1 moved to
+    # per-user ``UserProfile.attitude`` (10 sections / 36 fields).
+    "social": 1,
     "rhythm": 2,
     "examples": 1,
     "extra": 2,
@@ -80,6 +82,8 @@ def rich_card():
             "banned_expressions": ["作为一个AI"],
         },
         social={
+            # v2.6 retired per-tier attitudes: normalize_card must silently drop
+            # these legacy keys while keeping ``group_role``.
             "attitude_l3": "会撒娇、直呼昵称，消息秒回",
             "attitude_l2": "熟络但不越界",
             "attitude_l1": "礼貌但有距离感",
@@ -100,7 +104,7 @@ def rich_card():
 
 
 class TestCardSchema(unittest.TestCase):
-    def test_ten_sections_and_forty_fields(self):
+    def test_ten_sections_and_thirty_six_fields(self):
         assert len(cc.CARD_SCHEMA) == 10
         assert [section["id"] for section in cc.CARD_SCHEMA] == EXPECTED_SECTIONS
         assert cc.CARD_SECTION_IDS == EXPECTED_SECTIONS
@@ -112,7 +116,9 @@ class TestCardSchema(unittest.TestCase):
             total_fields += len(section["fields"])
             keys = [field["key"] for field in section["fields"]]
             assert len(keys) == len(set(keys))
-        assert total_fields == 39
+        # v2.6: ``social.attitude_l3/l2/l1`` were retired (moved to per-user
+        # ``UserProfile.attitude``), so the schema is now 10 sections / 36 fields.
+        assert total_fields == 36
 
     def test_field_definitions_are_well_formed(self):
         allowed_types = {"text", "textarea", "tags", "list", "select", "dialogs"}

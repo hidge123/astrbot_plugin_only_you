@@ -14,6 +14,7 @@
  * （0.5h 网格，连续覆盖 0~24），宽度按 (end-start)/24 弹性渲染；
  * 块可带 action_type（SLEEP/SURF/IDLE_ROAM/BUSY_TASK）、progress_pct、
  * busy_settled、completion_result 等新字段（旧 6 时段过夜数据自动兜底拆段）。
+ * v2.6：tooltip 不再展示定力护甲数值，改为展示当前时间块「进度 X%」（有 progress_pct 时）。
  */
 (function () {
   "use strict";
@@ -113,7 +114,7 @@
   }
 
   /* ------------------------------------------------------------------ *
-   * 1) 环形护甲表：0–100 圆弧 + 中心文字
+   * 1) 环形仪表图：0–max 圆弧 + 中心文字（v2.6 概览页用于「当前时间块进度」）
    * ------------------------------------------------------------------ */
   function ringGauge(opts) {
     opts = opts || {};
@@ -234,17 +235,18 @@
       var actionType = actionTypeOf(slot);
       var state = String(slot.state || actionState(actionType) || "").toUpperCase();
       var isCurrent = !!currentKey && slot.slot_key === currentKey;
+      /* v2.6：隐藏护甲数值；时间块进度（后端 _enrich_slot 对每块都会下发 progress_pct） */
       var progressPct = null;
-      if (actionType === "BUSY_TASK" && slot.progress_pct != null && slot.progress_pct !== "") {
+      if (slot.progress_pct != null && slot.progress_pct !== "") {
         progressPct = Math.max(0, Math.min(100, Math.round(num(slot.progress_pct, 0))));
       }
+      var busyProgressPct = actionType === "BUSY_TASK" ? progressPct : null;
 
       var tipParts = [
         slot.label || actionLabel(actionType, false) || slot.slot_key || "",
         stateLabel(state),
         slot.title || "",
-        fmtHour(seg.start) + "-" + fmtHour(seg.end),
-        "护甲 " + Math.round(num(slot.armor, 0))
+        fmtHour(seg.start) + "-" + fmtHour(seg.end)
       ];
       if (progressPct != null) tipParts.push("进度 " + progressPct + "%");
       if (slot.busy_settled && slot.completion_result) {
@@ -277,7 +279,7 @@
       /* 宽度足够时显示标题 + 行动 label；过窄只留小色块（避免文字溢出） */
       if (width >= 8 && spanHours >= 1) {
         var metaText = actionLabel(actionType, true) || stateLabel(state);
-        if (progressPct != null) metaText += " · " + progressPct + "%";
+        if (busyProgressPct != null) metaText += " · " + busyProgressPct + "%";
         if (slot.mutated) metaText += " · 已微调";
         html += '<span class="sched-seg-name">' + esc(slot.title || slot.label || slot.slot_key) + "</span>";
         html += '<span class="sched-seg-meta">' + esc(metaText) + "</span>";

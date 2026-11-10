@@ -2,11 +2,21 @@
  * OnlyYou Plugin Pages — 记忆页 (`views/console/page-memory.js`)
  *
  * 数据源：
- *   GET  `memories/list`   → { memories: [...], stats: {...} }（支持 memory_tier / keyword / soul_id）
+ *   GET  `memories/list`   → { memories: [...], stats: {...} }（支持 memory_tier / keyword / user_id / soul_id）
+ *   GET  `users/list`      → { users: [...] }（关联用户筛选下拉；失败时降级为使用记忆里的 user_id）
  *   POST `memories/mutate` → action = add / edit / delete / pin_core / extract / gc
  *
- * 页面结构：顶部工具栏（Tier 分段 + 搜索 + 提炼 / GC / 新增 / 刷新），下方记忆卡片网格。
- * 卡片显示内容、关键词标签、重要度、活力值进度条、召回次数；操作：编辑、钉选核心、删除。
+ * 页面结构（v2.6 Phase 4「分层分组 + 结构化列表」）：
+ *  ① 顶部层级分布概览条 .memory-summary-strip：全部 / T3 / T2 / T1 计数 + 彩色占比条，点击即切换筛选；
+ *  ② 工具栏：关联用户筛选 + 搜索（400ms 防抖）+ 上下文注入预算提示；
+ *  ③ 按 T3 → T2 → T1 分组的 .memory-group（分组头可点击折叠，空分组显示 .memory-group-empty 并默认收起）；
+ *     每条记忆为四列 .memory-row：
+ *       列1 层级/重要度（.tier-badge + .memory-importance）
+ *       列2 内容/关键词（.memory-row-content + .memory-row-keywords > .kw）
+ *       列3 关联用户/活力/召回（.memory-user + .memory-vitality + .memory-recall）
+ *       列4 升降级 + 编辑 + 删除（.tier-switch 只显示当前层级以外的按钮）
+ *  旧 .memory-grid 卡片矩阵已废弃，但保留全部既有能力：新增 / 编辑 / 删除 / 提炼 / GC /
+ *  搜索防抖 / 关联用户筛选 / 刷新 / 注入预算提示 / 空态。
  *
  * 注册：window.OY_PAGES.memory = { id, title, icon, render(container, ctx), destroy() }
  */
@@ -14,16 +24,33 @@
   "use strict";
 
   var TIER_META = {
-    3: { label: "T3 核心", desc: "核心永久记忆", cls: "tier-3" },
-    2: { label: "T2 近期", desc: "近期记忆（会随时间衰减）", cls: "tier-2" },
-    1: { label: "T1 瞬时", desc: "瞬时记忆（48 小时后过期）", cls: "tier-1" }
+    3: {
+      label: "T3 核心",
+      short: "T3",
+      title: "💎 Tier 3 · 核心长效记忆",
+      desc: "核心永久记忆（永久保留）",
+      cls: "tier-3",
+      hint: "永久保留 · 免疫每日遗忘清理 GC"
+    },
+    2: {
+      label: "T2 近期",
+      short: "T2",
+      title: "📅 Tier 2 · 近期情节记忆",
+      desc: "近期记忆（会随时间衰减）",
+      cls: "tier-2",
+      hint: "按活力值衰减 · 高频召回可晋升 T3"
+    },
+    1: {
+      label: "T1 瞬时",
+      short: "T1",
+      title: "🕒 Tier 1 · 瞬时短时记忆",
+      desc: "瞬时记忆（48 小时后过期）",
+      cls: "tier-1",
+      hint: "48 小时过期 · 今日繁忙成果/短期碎片快速代谢"
+    }
   };
-  var TIER_FILTERS = [
-    { value: "", label: "全部" },
-    { value: "3", label: "T3 核心" },
-    { value: "2", label: "T2 近期" },
-    { value: "1", label: "T1 瞬时" }
-  ];
+  /* 分组渲染顺序：T3 → T2 → T1 */
+  var TIER_ORDER = [3, 2, 1];
 
   var S = {
     app: null,
@@ -31,10 +58,14 @@
     destroyed: false,
     memories: [],
     stats: null,
+    users: [],
     tier: "",
     keyword: "",
+    userId: "",
     busy: false,
-    searchTimer: null
+    searchTimer: null,
+    /* 分组折叠状态：{ "3": true } 表示用户手动折叠该分组；未记录时非空分组默认展开、空分组默认收起 */
+    collapsed: {}
   };
 
   /* ------------------------------------------------------------------ *
@@ -96,45 +127,130 @@
   }
 
   /* ------------------------------------------------------------------ *
-   * HTML
+   * 统计 / 概览条
    * ------------------------------------------------------------------ */
-  function tierSegmentedHtml() {
+  /** 层级计数：优先使用后端 data.stats（全局计数），缺失时按当前 memories 统计 */
+  function statCounts() {
+    var stats = S.stats || {};
+    var local = { 3: 0, 2: 0, 1: 0 };
+    S.memories.forEach(function (memory) {
+      var tier = Number(memory.memory_tier) || 2;
+      if (local[tier] != null) local[tier] += 1;
+    });
+    var tier3 = stats.tier3_count != null ? num(stats.tier3_count, 0) : local[3];
+    var tier2 = stats.tier2_count != null ? num(stats.tier2_count, 0) : local[2];
+    var tier1 = stats.tier1_count != null ? num(stats.tier1_count, 0) : local[1];
+    var total =
+      stats.total != null ? num(stats.total, 0) : tier3 + tier2 + tier1 || S.memories.length;
+    return { "3": tier3, "2": tier2, "1": tier1, total: total };
+  }
+
+  function summaryItemHtml(value, label, count) {
+    var current = value === "all" ? "" : String(value);
+    var active = current === String(S.tier);
     return (
-      '<div class="segmented" data-role="tier-seg">' +
-      TIER_FILTERS.map(function (item) {
-        var active = String(item.value) === String(S.tier);
-        return (
-          '<button type="button" class="seg-btn' +
-          (active ? " active" : "") +
-          '" data-action="set-tier" data-tier="' +
-          esc(item.value) +
-          '">' +
-          esc(item.label) +
-          "</button>"
-        );
-      }).join("") +
+      '<button type="button" class="memory-summary-item' +
+      (active ? " is-active" : "") +
+      '" data-action="set-tier" data-tier="' +
+      esc(value) +
+      '" aria-pressed="' +
+      (active ? "true" : "false") +
+      '"><span>' +
+      esc(label) +
+      "</span><b>" +
+      esc(count) +
+      "</b></button>"
+    );
+  }
+
+  function summaryBarHtml(counts) {
+    var total = num(counts["3"], 0) + num(counts["2"], 0) + num(counts["1"], 0);
+    if (total <= 0) {
+      return '<div class="memory-summary-bar is-empty" aria-hidden="true"></div>';
+    }
+    var items = [
+      { cls: "seg-t3", value: num(counts["3"], 0) },
+      { cls: "seg-t2", value: num(counts["2"], 0) },
+      { cls: "seg-t1", value: num(counts["1"], 0) }
+    ];
+    return (
+      '<div class="memory-summary-bar" aria-hidden="true">' +
+      items
+        .map(function (item) {
+          if (item.value <= 0) return "";
+          var width = (item.value / total) * 100;
+          return (
+            '<i class="seg ' + item.cls + '" style="width:' + width.toFixed(2) + '%"></i>'
+          );
+        })
+        .join("") +
       "</div>"
     );
   }
 
-  function statsTagsHtml() {
-    var stats = S.stats || {};
+  function summaryStripHtml() {
+    var counts = statCounts();
     return (
-      '<div class="row wrap" data-role="stats-tags" style="gap:6px">' +
-      '<span class="tier-pill tier-3">T3 ' +
-      esc(num(stats.tier3_count, 0)) +
-      "</span>" +
-      '<span class="tier-pill tier-2">T2 ' +
-      esc(num(stats.tier2_count, 0)) +
-      "</span>" +
-      '<span class="tier-pill tier-1">T1 ' +
-      esc(num(stats.tier1_count, 0)) +
-      "</span>" +
-      '<span class="tag tag-muted">共 ' +
-      esc(num(stats.total, S.memories.length)) +
-      " 条</span>" +
+      '<div class="memory-summary-strip" data-role="memory-summary">' +
+      '<div class="memory-summary-items">' +
+      summaryItemHtml("all", "全部", counts.total) +
+      summaryItemHtml("3", "💎 T3 核心", counts["3"]) +
+      summaryItemHtml("2", "📅 T2 近期", counts["2"]) +
+      summaryItemHtml("1", "🕒 T1 瞬时", counts["1"]) +
+      "</div>" +
+      summaryBarHtml(counts) +
       "</div>"
     );
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 工具栏（关联用户筛选 / 搜索 / 注入预算）
+   * ------------------------------------------------------------------ */
+  function userNameOf(uid) {
+    var key = String(uid || "").trim();
+    if (!key) return "";
+    for (var i = 0; i < S.users.length; i++) {
+      var user = S.users[i] || {};
+      var userKey = String(user.global_uid || user.user_id || user.id || "").trim();
+      if (userKey !== key) continue;
+      return String(user.display_name || user.nickname || "").trim();
+    }
+    return "";
+  }
+
+  function userOptionsHtml() {
+    var options = '<option value="">全部用户</option>';
+    var known = {};
+    S.users.forEach(function (user) {
+      user = user || {};
+      var uid = String(user.global_uid || user.user_id || user.id || "").trim();
+      if (!uid || known[uid]) return;
+      known[uid] = true;
+      var name = String(user.display_name || user.nickname || "").trim() || uid;
+      options +=
+        '<option value="' +
+        esc(uid) +
+        '"' +
+        (uid === S.userId ? " selected" : "") +
+        ">" +
+        esc(name + "（" + uid + "）") +
+        "</option>";
+    });
+    /* 记忆里出现、但用户表里没有的 user_id 也补进下拉，保证筛选能力不丢 */
+    S.memories.forEach(function (memory) {
+      var uid = String((memory && memory.user_id) || "").trim();
+      if (!uid || known[uid]) return;
+      known[uid] = true;
+      options +=
+        '<option value="' +
+        esc(uid) +
+        '"' +
+        (uid === S.userId ? " selected" : "") +
+        ">" +
+        esc(uid) +
+        "</option>";
+    });
+    return options;
   }
 
   function injectionBudgetHint() {
@@ -157,8 +273,260 @@
     );
   }
 
+  function toolbarHtml() {
+    return (
+      '<div class="card" data-role="memory-toolbar"><div class="card-body tight">' +
+      '<div class="row wrap grow">' +
+      '<div class="row" style="gap:6px;flex:0 0 auto">' +
+      icon("filter", 13) +
+      '<select class="select input-sm memory-user-select" data-role="user-filter" data-tip="按关联用户筛选记忆">' +
+      userOptionsHtml() +
+      "</select>" +
+      "</div>" +
+      '<div class="row grow" style="min-width:180px;max-width:340px">' +
+      icon("search", 14) +
+      '<input class="input input-sm" type="text" data-role="search-input" placeholder="搜索记忆内容 / 关键词，回车立即搜索" value="' +
+      esc(S.keyword) +
+      '" />' +
+      "</div>" +
+      '<div class="row grow" style="justify-content:flex-end">' +
+      injectionBudgetHint() +
+      "</div>" +
+      "</div>" +
+      '<div class="row-between mt-8"><span class="text-xs muted" data-tip="Tier 1 瞬时记忆 48 小时后过期；Tier 2 近期记忆活力值随时间衰减；Tier 3 核心记忆永久保留并优先注入。">T1 48h 过期 · T2 活力衰减 · T3 永久保留</span>' +
+      '<span class="text-xs muted">分组头可点击折叠 / 展开</span>' +
+      "</div></div></div>"
+    );
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 分层分组列表
+   * ------------------------------------------------------------------ */
+  function userLabelHtml(memory) {
+    var uid = String((memory && memory.user_id) || "").trim();
+    if (!uid) {
+      return (
+        '<span class="memory-user" data-tip="无关联用户（全局 / 自身记忆）">🌐 全局/自身</span>'
+      );
+    }
+    var name = userNameOf(uid) || uid;
+    return (
+      '<span class="memory-user" data-tip="' +
+      esc("关联用户 " + uid) +
+      '">👤 ' +
+      esc(name) +
+      "</span>"
+    );
+  }
+
+  function vitalityHtml(memory, tier) {
+    if (Number(tier) === 3) {
+      return (
+        '<span class="memory-vitality is-permanent" data-tip="Tier 3 核心记忆永久保留，免疫每日遗忘清理">永久保存</span>'
+      );
+    }
+    var vitality = Math.max(0, Math.min(100, num(memory.vitality, 0)));
+    return (
+      '<span class="memory-vitality" data-tip="活力值：随时间衰减，低于 0 会被遗忘清理 GC 物理删除">' +
+      '<span class="mini-bar"><i style="width:' +
+      vitality.toFixed(1) +
+      "%;background:" +
+      vitalityColor(vitality) +
+      '"></i></span><span class="memory-vitality-pct">' +
+      Math.round(vitality) +
+      "%</span></span>"
+    );
+  }
+
+  function tierSwitchHtml(memory, tier) {
+    var current = Number(tier) || 2;
+    var buttons = TIER_ORDER.filter(function (value) {
+      return value !== current;
+    })
+      .sort(function (a, b) {
+        return a - b;
+      })
+      .map(function (value) {
+        var meta = tierMeta(value);
+        var direction = value > current ? " is-up" : " is-down";
+        var tip = value > current ? "提升为 " + meta.label + " 记忆" : "降级为 " + meta.label + " 记忆";
+        return (
+          '<button type="button" class="tier-btn' +
+          direction +
+          '" data-action="switch-tier" data-id="' +
+          esc(memory.id) +
+          '" data-tier="' +
+          esc(value) +
+          '" data-tip="' +
+          esc(tip) +
+          '" aria-label="' +
+          esc(tip) +
+          '">' +
+          esc(meta.short) +
+          "</button>"
+        );
+      })
+      .join("");
+    return '<span class="tier-switch" data-role="tier-switch">' + buttons + "</span>";
+  }
+
+  function memoryRowHtml(memory) {
+    var tier = Number(memory.memory_tier) || 2;
+    var meta = tierMeta(tier);
+    var importance = Math.max(1, Math.min(10, Math.round(num(memory.importance, 5))));
+    var content = String(memory.content == null ? "" : memory.content);
+    var keywords = splitKeywords(memory.keywords);
+    var keywordHtml = keywords
+      .map(function (keyword) {
+        return '<span class="kw">#' + esc(keyword) + "</span>";
+      })
+      .join("");
+    var recall = Math.max(0, Math.round(num(memory.access_count, 0)));
+    var when = fmtAgo(memory.last_accessed_at) || fmtAgo(memory.created_at);
+    var recallText = "召回 " + recall + " 次" + (when ? " · " + when : "");
+    return (
+      '<div class="memory-row" data-memory-id="' +
+      esc(memory.id) +
+      '" data-tier="' +
+      esc(tier) +
+      '">' +
+      /* 列1：层级 + 重要度 */
+      '<div class="memory-row-tier">' +
+      '<span class="tier-badge ' +
+      meta.cls +
+      '">' +
+      esc(meta.short) +
+      "</span>" +
+      '<span class="memory-importance" data-tip="重要度 1-10，影响记忆注入优先级">★ ' +
+      esc(importance) +
+      "/10</span></div>" +
+      /* 列2：正文 + 关键词 */
+      '<div class="memory-row-main">' +
+      '<p class="memory-row-content" data-tip="' +
+      esc(content) +
+      '">' +
+      esc(content) +
+      "</p>" +
+      (keywordHtml
+        ? '<div class="memory-row-keywords">' + keywordHtml + "</div>"
+        : "") +
+      "</div>" +
+      /* 列3：关联用户 + 活力 + 召回 */
+      '<div class="memory-row-meta">' +
+      userLabelHtml(memory) +
+      vitalityHtml(memory, tier) +
+      '<span class="memory-recall">' +
+      esc(recallText) +
+      "</span></div>" +
+      /* 列4：升降级 + 编辑 + 删除 */
+      '<div class="memory-row-actions">' +
+      tierSwitchHtml(memory, tier) +
+      '<button class="icon-btn" type="button" data-action="edit-memory" data-id="' +
+      esc(memory.id) +
+      '" data-tip="编辑记忆" aria-label="编辑记忆">' +
+      icon("edit", 13) +
+      "</button>" +
+      '<button class="icon-btn" type="button" data-action="delete-memory" data-id="' +
+      esc(memory.id) +
+      '" data-tip="删除记忆" aria-label="删除记忆">' +
+      icon("trash", 13) +
+      "</button>" +
+      "</div></div>"
+    );
+  }
+
+  function isGroupCollapsed(tier, rows) {
+    var key = String(tier);
+    if (Object.prototype.hasOwnProperty.call(S.collapsed, key)) {
+      return S.collapsed[key] === true;
+    }
+    /* 空分组默认收起；非空分组默认展开 */
+    return !rows || rows.length === 0;
+  }
+
+  function groupHtml(tier) {
+    var meta = tierMeta(tier);
+    var counts = statCounts();
+    var rows = S.memories.filter(function (memory) {
+      return (Number(memory.memory_tier) || 2) === Number(tier);
+    });
+    var count = counts[String(tier)] != null ? counts[String(tier)] : rows.length;
+    var collapsed = isGroupCollapsed(tier, rows);
+    var body = rows.length
+      ? rows.map(memoryRowHtml).join("")
+      : '<div class="memory-group-empty">暂无 ' +
+        esc(meta.label) +
+        " 记忆" +
+        (S.keyword || S.userId ? "（当前筛选条件下）" : "") +
+        "</div>";
+    return (
+      '<div class="memory-group' +
+      (collapsed ? " is-collapsed" : "") +
+      '" data-tier="' +
+      esc(tier) +
+      '">' +
+      '<button type="button" class="memory-group-head" data-role="group-toggle" data-tier="' +
+      esc(tier) +
+      '" aria-expanded="' +
+      (collapsed ? "false" : "true") +
+      '">' +
+      '<span class="memory-group-caret" aria-hidden="true"></span>' +
+      '<span class="memory-group-title">' +
+      esc(meta.title) +
+      "</span>" +
+      '<span class="memory-group-count">' +
+      esc(count) +
+      "</span>" +
+      '<span class="memory-group-hint">' +
+      esc(meta.hint) +
+      "</span></button>" +
+      '<div class="memory-group-body">' +
+      body +
+      "</div></div>"
+    );
+  }
+
+  function emptyStateHtml() {
+    var filtering = !!(S.keyword || S.tier || S.userId);
+    return (
+      '<div class="card" data-role="memory-empty"><div class="empty">' +
+      icon("memory", 32) +
+      '<div class="empty-title">' +
+      (filtering ? "没有符合筛选条件的记忆" : "还没有任何记忆") +
+      "</div>" +
+      '<div class="empty-text">' +
+      (filtering
+        ? "试试切换层级 / 关联用户，或清空搜索关键词。"
+        : "可以在会话页点「提炼」让决策模型从聊天滑窗里总结记忆，也可以手动新增一条。") +
+      "</div>" +
+      '<div class="row mt-12">' +
+      '<button class="btn btn-outline" type="button" data-action="extract">' +
+      icon("wand", 13) +
+      "从会话提炼</button>" +
+      '<button class="btn btn-outline" type="button" data-action="create">' +
+      icon("plus", 13) +
+      "新增记忆</button></div>" +
+      "</div></div>"
+    );
+  }
+
+  function listHtml() {
+    if (!S.memories.length) return emptyStateHtml();
+    var tiers = S.tier ? [Number(S.tier)] : TIER_ORDER;
+    return (
+      '<div class="memory-groups" data-role="memory-groups">' +
+      tiers
+        .filter(function (tier) {
+          return TIER_META[tier] != null;
+        })
+        .map(groupHtml)
+        .join("") +
+      "</div>"
+    );
+  }
+
   function pageHeadHtml() {
-    var total = S.stats ? num(S.stats.total, S.memories.length) : S.memories.length;
+    var total = statCounts().total;
     return (
       '<div class="page-head"><h1 class="page-title">' +
       icon("memory", 18) +
@@ -183,142 +551,15 @@
     );
   }
 
-  function toolbarHtml() {
-    return (
-      '<div class="card"><div class="card-body tight">' +
-      '<div class="row wrap grow">' +
-      tierSegmentedHtml() +
-      '<div class="row grow" style="min-width:180px;max-width:330px">' +
-      icon("search", 14) +
-      '<input class="input input-sm" type="text" data-role="search-input" placeholder="搜索记忆内容 / 关键词，回车立即搜索" value="' +
-      esc(S.keyword) +
-      '" />' +
-      "</div>" +
-      '<div class="row grow" style="justify-content:flex-end">' +
-      statsTagsHtml() +
-      "</div>" +
-      "</div>" +
-      '<div class="row-between mt-8"><span class="text-xs muted" data-tip="Tier 1 瞬时记忆 48 小时后过期；Tier 2 近期记忆活力值随时间衰减；Tier 3 核心记忆永久保留并优先注入。">T1 48h 过期 · T2 活力衰减 · T3 永久保留</span>' +
-      injectionBudgetHint() +
-      "</div></div></div>"
-    );
-  }
-
-  function memoryCardHtml(memory) {
-    var tier = Number(memory.memory_tier) || 2;
-    var meta = tierMeta(tier);
-    var keywords = splitKeywords(memory.keywords);
-    var keywordHtml = keywords
-      .slice(0, 6)
-      .map(function (keyword) {
-        return '<span class="tag">' + esc(keyword) + "</span>";
-      })
-      .join("");
-    var moreKeywords =
-      keywords.length > 6 ? '<span class="tag tag-muted">+' + (keywords.length - 6) + "</span>" : "";
-    var vitality = Math.max(0, Math.min(100, num(memory.vitality, 0)));
-    var userLabel = memory.user_id ? String(memory.user_id) : "全局记忆";
-    return (
-      '<div class="memory-card" data-id="' +
-      esc(memory.id) +
-      '" data-tier="' +
-      tier +
-      '">' +
-      '<div class="memory-card-head">' +
-      '<div class="row wrap" style="gap:6px">' +
-      '<span class="tier-pill ' +
-      meta.cls +
-      '">' +
-      esc(meta.label) +
-      "</span>" +
-      '<span class="tag tag-muted" data-tip="重要度 1-10，影响记忆注入优先级">重要度 ' +
-      esc(num(memory.importance, 5)) +
-      "</span>" +
-      '<span class="tag tag-scope">' +
-      esc(userLabel) +
-      "</span>" +
-      "</div>" +
-      '<div class="row" style="gap:2px">' +
-      '<button class="icon-btn" type="button" style="width:24px;height:24px" data-action="edit-memory" data-id="' +
-      esc(memory.id) +
-      '" data-tip="编辑记忆" aria-label="编辑记忆">' +
-      icon("edit", 13) +
-      "</button>" +
-      (tier !== 3
-        ? '<button class="icon-btn" type="button" style="width:24px;height:24px" data-action="pin-memory" data-id="' +
-          esc(memory.id) +
-          '" data-tip="钉选为核心记忆（Tier 3）" aria-label="钉选核心">' +
-          icon("spark", 13) +
-          "</button>"
-        : "") +
-      '<button class="icon-btn" type="button" style="width:24px;height:24px" data-action="delete-memory" data-id="' +
-      esc(memory.id) +
-      '" data-tip="删除记忆" aria-label="删除记忆">' +
-      icon("trash", 13) +
-      "</button>" +
-      "</div></div>" +
-      '<div class="memory-content" data-tip="' +
-      esc(memory.content) +
-      '">' +
-      esc(memory.content) +
-      "</div>" +
-      (keywordHtml
-        ? '<div class="row wrap" style="gap:4px">' + keywordHtml + moreKeywords + "</div>"
-        : "") +
-      '<div class="vitality">' +
-      '<span class="mini-bar"><i style="width:' +
-      vitality.toFixed(1) +
-      "%;background:" +
-      vitalityColor(vitality) +
-      '"></i></span>' +
-      "<span>活力 " +
-      esc(vitality.toFixed(1)) +
-      "</span>" +
-      "<span>召回 " +
-      esc(num(memory.access_count, 0)) +
-      " 次</span>" +
-      '<span class="grow" style="text-align:right">' +
-      esc(fmtAgo(memory.created_at)) +
-      "</span></div></div>"
-    );
-  }
-
-  function gridHtml() {
-    if (!S.memories.length) {
-      return (
-        '<div class="card"><div class="empty">' +
-        icon("memory", 32) +
-        '<div class="empty-title">' +
-        (S.keyword || S.tier ? "没有符合筛选条件的记忆" : "还没有任何记忆") +
-        "</div>" +
-        '<div class="empty-text">' +
-        (S.keyword || S.tier
-          ? "试试切换 Tier 或清空搜索关键词。"
-          : "可以在会话页点「提炼」让决策模型从聊天滑窗里总结记忆，也可以手动新增一条。") +
-        "</div>" +
-        '<div class="row mt-12">' +
-        '<button class="btn btn-outline" type="button" data-action="extract">' +
-        icon("wand", 13) +
-        "从会话提炼</button>" +
-        '<button class="btn btn-outline" type="button" data-action="create">' +
-        icon("plus", 13) +
-        "新增记忆</button></div>" +
-        "</div></div>"
-      );
-    }
-    return (
-      '<div class="memory-grid" data-role="memory-grid">' +
-      S.memories.map(memoryCardHtml).join("") +
-      "</div>"
-    );
-  }
-
   function pageHtml() {
     return (
       pageHeadHtml() +
+      '<div data-role="memory-summary-wrap">' +
+      summaryStripHtml() +
+      "</div>" +
       toolbarHtml() +
-      '<div data-role="memory-grid-wrap">' +
-      gridHtml() +
+      '<div data-role="memory-list-wrap">' +
+      listHtml() +
       "</div>"
     );
   }
@@ -331,29 +572,40 @@
     if (soulId()) params.soul_id = soulId();
     if (S.tier) params.memory_tier = S.tier;
     if (S.keyword) params.keyword = S.keyword;
+    if (S.userId) params.user_id = S.userId;
     var data = await app.apiGet("memories/list", params);
     if (!data || typeof data !== "object") throw new Error("GET memories/list 返回为空");
     S.memories = Array.isArray(data.memories) ? data.memories : [];
     S.stats = data.stats && typeof data.stats === "object" ? data.stats : null;
   }
 
-  function refreshGrid() {
+  /** 关联用户下拉数据源：失败时静默降级（用记忆里的 user_id 充当选项） */
+  async function fetchUsers(app) {
+    try {
+      if (!app || typeof app.apiGet !== "function") return;
+      var data = await app.apiGet("users/list", {});
+      S.users = data && Array.isArray(data.users) ? data.users : [];
+    } catch (err) {
+      S.users = [];
+      console.warn("[OnlyYou] 记忆页加载用户列表失败（关联用户筛选降级为 uid）：", err);
+    }
+  }
+
+  function refreshView() {
     if (!S.container || S.destroyed) return;
-    var wrap = S.container.querySelector('[data-role="memory-grid-wrap"]');
-    if (wrap) wrap.innerHTML = gridHtml();
-    var statsEl = S.container.querySelector('[data-role="stats-tags"]');
-    if (statsEl) statsEl.outerHTML = statsTagsHtml();
+    var summaryWrap = S.container.querySelector('[data-role="memory-summary-wrap"]');
+    var listWrap = S.container.querySelector('[data-role="memory-list-wrap"]');
+    if (!summaryWrap && !listWrap) {
+      /* 加载失败态下重试成功：容器里还没有列表骨架，直接整页重绘 */
+      paint();
+      return;
+    }
+    if (summaryWrap) summaryWrap.innerHTML = summaryStripHtml();
+    if (listWrap) listWrap.innerHTML = listHtml();
     var titleSub = S.container.querySelector(".page-head .card-sub");
-    if (titleSub) {
-      var total = S.stats ? num(S.stats.total, S.memories.length) : S.memories.length;
-      titleSub.textContent = total + " 条分级记忆";
-    }
-    var seg = S.container.querySelector('[data-role="tier-seg"]');
-    if (seg) {
-      seg.querySelectorAll(".seg-btn").forEach(function (btn) {
-        btn.classList.toggle("active", String(btn.getAttribute("data-tier")) === String(S.tier));
-      });
-    }
+    if (titleSub) titleSub.textContent = statCounts().total + " 条分级记忆";
+    var userSelect = S.container.querySelector('[data-role="user-filter"]');
+    if (userSelect) userSelect.value = S.userId;
   }
 
   function paint() {
@@ -368,7 +620,7 @@
     if (!S.app) return;
     try {
       await fetchMemories(S.app);
-      refreshGrid();
+      refreshView();
       if (showToast) S.app.toast("记忆列表已刷新");
     } catch (err) {
       S.app.toast("刷新记忆失败：" + (err.message || err), true);
@@ -536,7 +788,7 @@
   }
 
   /* ------------------------------------------------------------------ *
-   * 提炼 / GC / 钉选 / 删除
+   * 提炼 / GC / 改级 / 删除
    * ------------------------------------------------------------------ */
   function openExtractModal() {
     var app = S.app;
@@ -562,7 +814,7 @@
       options +
       "</select>" +
       '<div class="field-help">调用决策模型从最近 15 轮对话中提炼值得长期记住的事实与偏好；不指定 UMO 时自动选择最近活跃会话。</div></div>' +
-      '<div class="card" style="background:var(--surface-2);border:0"><div class="card-body tight"><div class="text-xs muted">提示：提炼只读取会话滑窗，不会重复写入已有记忆；结果可以在列表里继续编辑或删除。</div></div></div>';
+      '<div class="card" style="background:var(--surface-2);border:0"><div class="card-body tight"><div class="text-xs muted">提示：提炼只读取会话滑窗，不会重复写入已有记忆；结果可以在列表里继续编辑、升降级或删除。</div></div></div>';
     app.modal({
       title: "从会话滑窗提炼记忆",
       body: body,
@@ -633,24 +885,36 @@
       });
   }
 
-  async function pinMemory(id) {
+  /** 升降级：改级沿用既有 memories/mutate API（升 T3 走 pin_core，降级走 edit.memory_tier） */
+  async function switchTier(memoryId, tier, buttonEl) {
     var app = S.app;
     if (!app) return;
-    var button = S.container
-      ? S.container.querySelector('[data-action="pin-memory"][data-id="' + id + '"]')
-      : null;
-    if (button) button.classList.add("is-loading");
+    var targetTier = Number(tier);
+    if (targetTier !== 1 && targetTier !== 2 && targetTier !== 3) return;
+    var memory = findMemory(memoryId);
+    var meta = tierMeta(targetTier);
+    if (buttonEl) buttonEl.classList.add("is-loading");
     try {
-      await app.apiPost("memories/mutate", {
-        action: "pin_core",
-        id: Number(id),
-        soul_id: soulId()
-      });
-      app.toast("已将该记忆锁定为 Tier 3 核心记忆");
+      if (targetTier === 3) {
+        await app.apiPost("memories/mutate", {
+          action: "pin_core",
+          id: Number(memoryId),
+          soul_id: soulId()
+        });
+      } else {
+        await app.apiPost("memories/mutate", {
+          action: "edit",
+          id: Number(memoryId),
+          soul_id: soulId(),
+          memory_tier: targetTier
+        });
+      }
+      app.toast("已将记忆 #" + memoryId + " 调整为 " + meta.label);
       await reloadMemories(false);
     } catch (err) {
-      app.toast("钉选核心失败：" + (err.message || err), true);
-      if (button) button.classList.remove("is-loading");
+      app.toast("调整记忆分级失败：" + (err.message || err), true);
+      if (buttonEl) buttonEl.classList.remove("is-loading");
+      if (memory) console.warn("[OnlyYou] 调整记忆分级失败：", memory);
     }
   }
 
@@ -683,14 +947,31 @@
   /* ------------------------------------------------------------------ *
    * 事件
    * ------------------------------------------------------------------ */
+  function toggleGroup(tier) {
+    if (!S.container || S.destroyed) return;
+    var group = S.container.querySelector('.memory-group[data-tier="' + tier + '"]');
+    if (!group) return;
+    var collapsed = group.classList.toggle("is-collapsed");
+    var head = group.querySelector('[data-role="group-toggle"]');
+    if (head) head.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    S.collapsed[String(tier)] = collapsed;
+  }
+
   function handleClick(event) {
     var target = event.target;
     if (!target || !target.closest) return;
+    var app = S.app;
+    if (!app) return;
+
+    var groupHead = target.closest('[data-role="group-toggle"]');
+    if (groupHead) {
+      toggleGroup(groupHead.getAttribute("data-tier"));
+      return;
+    }
+
     var actionEl = target.closest("[data-action]");
     if (!actionEl) return;
     var action = actionEl.getAttribute("data-action");
-    var app = S.app;
-    if (!app) return;
     if (action === "reload") {
       reloadMemories(true);
     } else if (action === "create") {
@@ -699,25 +980,30 @@
       openExtractModal();
     } else if (action === "gc") {
       confirmGc();
+    } else if (action === "set-tier") {
+      setTier(actionEl.getAttribute("data-tier"));
     } else if (action === "edit-memory") {
       openEditModal(actionEl.getAttribute("data-id"));
     } else if (action === "delete-memory") {
       confirmDeleteMemory(actionEl.getAttribute("data-id"));
-    } else if (action === "pin-memory") {
-      pinMemory(actionEl.getAttribute("data-id"));
-    } else if (action === "set-tier") {
-      setTier(actionEl.getAttribute("data-tier"));
+    } else if (action === "switch-tier") {
+      switchTier(
+        actionEl.getAttribute("data-id"),
+        actionEl.getAttribute("data-tier"),
+        actionEl
+      );
     }
   }
 
   async function setTier(tier) {
-    var next = tier == null ? "" : String(tier);
+    var next = tier == null || tier === "all" ? "" : String(tier);
     if (next === String(S.tier)) return;
     S.tier = next;
+    S.collapsed = {};
     if (!S.app) return;
     try {
       await fetchMemories(S.app);
-      refreshGrid();
+      refreshView();
     } catch (err) {
       S.app.toast("切换记忆分级失败：" + (err.message || err), true);
     }
@@ -732,11 +1018,20 @@
       S.searchTimer = null;
       if (!S.app || S.destroyed) return;
       fetchMemories(S.app)
-        .then(refreshGrid)
+        .then(refreshView)
         .catch(function (err) {
           if (S.app) S.app.toast("搜索记忆失败：" + (err.message || err), true);
         });
     }, 400);
+  }
+
+  function applyUserFilter(app) {
+    if (!app || S.destroyed) return;
+    fetchMemories(app)
+      .then(refreshView)
+      .catch(function (err) {
+        app.toast("按关联用户筛选失败：" + (err.message || err), true);
+      });
   }
 
   function bindEvents(container, app) {
@@ -748,6 +1043,13 @@
         S.keyword = String(target.value || "").trim();
         scheduleSearch();
       }
+    });
+    container.addEventListener("change", function (event) {
+      var target = event.target;
+      if (!target || !target.getAttribute) return;
+      if (target.getAttribute("data-role") !== "user-filter") return;
+      S.userId = String(target.value || "").trim();
+      applyUserFilter(app);
     });
     container.addEventListener("keydown", function (event) {
       var target = event.target;
@@ -762,7 +1064,7 @@
       }
       if (!S.app) return;
       fetchMemories(S.app)
-        .then(refreshGrid)
+        .then(refreshView)
         .catch(function (err) {
           if (S.app) S.app.toast("搜索记忆失败：" + (err.message || err), true);
         });
@@ -778,9 +1080,12 @@
     S.destroyed = false;
     S.memories = [];
     S.stats = null;
+    S.users = [];
     S.tier = "";
     S.keyword = "";
+    S.userId = "";
     S.busy = false;
+    S.collapsed = {};
     if (S.searchTimer) {
       clearTimeout(S.searchTimer);
       S.searchTimer = null;
@@ -790,7 +1095,8 @@
       '<div class="loading"><span class="spinner"></span><span>加载记忆库…</span></div>';
     bindEvents(container, app);
     try {
-      await fetchMemories(app);
+      await Promise.all([fetchMemories(app), fetchUsers(app)]);
+      if (S.destroyed) return;
       paint();
     } catch (err) {
       console.error("[OnlyYou] 记忆页渲染失败：", err);
@@ -819,9 +1125,12 @@
     S.container = null;
     S.memories = [];
     S.stats = null;
+    S.users = [];
     S.busy = false;
     S.keyword = "";
     S.tier = "";
+    S.userId = "";
+    S.collapsed = {};
   }
 
   window.OY_PAGES = window.OY_PAGES || {};

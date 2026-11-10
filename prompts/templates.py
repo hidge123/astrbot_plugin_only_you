@@ -19,7 +19,7 @@ Persona 名称：{persona_name}
 4. `BUSY_TASK`（绑定 `state: "BUSY"`）：100% 贴合角色职业/主业/世界观的正事卡（此状态下只抽空简短回复 ◆L2/★L3，带 0%~100% 进度条，每次完成或被中途打断都会随机生成当天不同的一句话结果，写入短时记忆）。时长通常为 `1.0~3.0h`。
 
 ## 输出要求
-1. `state_event_cards` 共 8~12 张，四类行动每类至少 2 张；`min_hours` / `max_hours` 按上述区间填写（0.5h 步长，`min_hours <= max_hours`）；`armor` 为 20~90 的整数，`base_weight` 为 30~90 的整数。
+1. `state_event_cards` 共 8~12 张，四类行动每类至少 2 张；`min_hours` / `max_hours` 按上述区间填写（0.5h 步长，`min_hours <= max_hours`）；`base_weight` 为 30~90 的整数。
 2. 卡名 `title` 必须贴合角色身份/职业/爱好/世界观，写具体到可执行的事（15 字以内），禁止空泛的“忙碌/休息/空闲”。
 3. 不要生成 `encounter_talk_cards` 或任何奇遇谈资字段。
 4. 请仅输出合法的 JSON 格式（不要带多余解释，不要用 Markdown 代码块）：
@@ -36,7 +36,6 @@ Persona 名称：{persona_name}
       "action_type": "BUSY_TASK",
       "min_hours": 1.5,
       "max_hours": 3.0,
-      "armor": 70,
       "base_weight": 60
     }},
     {{
@@ -46,7 +45,6 @@ Persona 名称：{persona_name}
       "action_type": "IDLE_ROAM",
       "min_hours": 0.5,
       "max_hours": 1.5,
-      "armor": 30,
       "base_weight": 70
     }},
     {{
@@ -56,7 +54,6 @@ Persona 名称：{persona_name}
       "action_type": "SURF",
       "min_hours": 0.5,
       "max_hours": 2.0,
-      "armor": 35,
       "base_weight": 75
     }},
     {{
@@ -66,7 +63,6 @@ Persona 名称：{persona_name}
       "action_type": "SLEEP",
       "min_hours": 4.0,
       "max_hours": 7.5,
-      "armor": 65,
       "base_weight": 80
     }}
   ]
@@ -146,6 +142,22 @@ BOUNDED_STATE_MUTATION_PROMPT = """角色【{soul_name}】正在按今日随机�
   "delay_next_slot_minutes": 0,
   "mutation_reason_monologue": "第一人称变卦心理活动（如：'本来在忙着写东西的，看你们聊得这么起劲，不管了先摸鱼水会儿群！'）"
 }}"""
+
+# ==============================================================================
+# 二·补充、 用户关系等级重要度与单人专属态度注入 Prompt（v2.6 Phase 2）
+# 说明：ContextBudgetManager 会格式化后拼进 System Prompt；占位符不可改名。
+# ==============================================================================
+USER_RELATION_CONTEXT_PROMPT = """[用户关系等级与重要度法则]:
+你身边的联系人按亲疏与重要程度分为三个等级（消息前缀中会标注）：
+- 【★L3 核心用户】：对你最重要、最亲近的核心偏爱对象，优先级最高。即使在繁忙或休息边缘，你也最在意对方的话，愿意为其破例、展示最真实私密的一面。
+- 【◆L2 重要熟人】：聊得来、彼此熟悉的群友或朋友，重要度居中。交流自然熟稔、有梗有默契。
+- 【L1 普通群友】：泛泛之交或刚认识的普通网友，重要度普通。保持符合你人设的日常社交分寸感。
+
+[当前对话对象档案]:
+- 对话人：{display_name} (ID: {global_uid}) | 关系等级：{tier_label} (亲密度 {intimacy})
+- 专属称呼：{nickname_text}
+- 你对 Ta 的专属态度：{attitude_text}
+- 关系备注：{notes_text}{window_peers_block}"""
 
 # ==============================================================================
 # 三、 四类行动卡的状态注入、繁忙结果结算与空闲游荡 Prompt

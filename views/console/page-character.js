@@ -10,8 +10,8 @@
  *   POST `souls/save` / `souls/rename` / `souls/delete`
  *
  * 页面结构：
- *   左栏：头像 / 名字 / 一句话定位 / 10 分区完成度导航 / 操作（AI 生成整卡、从 AstrBot 导入、
- *         Prompt 预览、⋯ 新建·改 ID·删除）。
+ *   左栏：头像（支持点击上传本地图片）/ 名字 / 一句话定位 / 10 分区完成度导航 / 操作
+ *         （AI 生成整卡、从 AstrBot 导入、Prompt 预览、⋯ 新建·改 ID·删除）。
  *   右栏：按 CARD_SCHEMA 动态渲染 10 个分区卡片，支持 text / textarea / tags / list / select /
  *         dialogs 六种编辑器；每个分区「AI 补全」；AI 结果先作为草稿填入（青绿描边），
  *         可「采用 / 放弃草稿」；底部固定保存栏在有改动时显示「未保存修改」。
@@ -103,6 +103,124 @@
   function helpText(field) {
     var help = field ? field.help : "";
     return typeof help === "string" ? help : "";
+  }
+
+  /* ------------------------------ 头像工具 ------------------------------ */
+
+  /** 头像值是否为图片（优先走 app.isImageAvatar，保证与全局组件判定一致） */
+  function isImageAvatarValue(value) {
+    if (S.app && typeof S.app.isImageAvatar === "function") return S.app.isImageAvatar(value);
+    var v = String(value == null ? "" : value).trim();
+    return /^data:image\//i.test(v) || /^https?:\/\//i.test(v) || /^\/[^\s]/i.test(v);
+  }
+
+  /** 头像内部 HTML：图片 → <img class="avatar-img">；否则 → Emoji / 首字文本 */
+  function renderAvatarInner(avatarVal, fallbackName) {
+    if (S.app && typeof S.app.renderAvatarInner === "function") {
+      return S.app.renderAvatarInner(avatarVal, fallbackName);
+    }
+    var raw = String(avatarVal == null ? "" : avatarVal).trim();
+    if (isImageAvatarValue(raw)) {
+      return (
+        '<img class="avatar-img" src="' +
+        esc(raw) +
+        '" alt="' +
+        esc(fallbackName ? String(fallbackName) + "的头像" : "角色头像") +
+        '" loading="lazy" />'
+      );
+    }
+    if (raw) return esc(raw);
+    var name = String(fallbackName == null ? "" : fallbackName).trim();
+    return esc(name ? name.slice(0, 1) : "?");
+  }
+
+  /** 选择本地图片（由 app.pickAvatarImage 统一裁剪压缩），取消 / 失败 resolve("") */
+  function pickAvatarImage(options) {
+    if (!S.app || typeof S.app.pickAvatarImage !== "function") return Promise.resolve("");
+    return S.app.pickAvatarImage(options || {});
+  }
+
+  /** 头像展示的兜底名字：identity.name → 角色名 → Soul ID */
+  function fallbackAvatarName() {
+    var name = identityValue("name");
+    if (name) return name;
+    var soul = metaSoul();
+    if (soul && soul.name) return String(soul.name);
+    return S.soulId || "?";
+  }
+
+  /** 左侧画像卡头像展示值（角色卡 identity.avatar，未设置时回退名字首字） */
+  function displayAvatarValue() {
+    return identityValue("avatar");
+  }
+
+  /** 头像上传选择器 HTML（导入 / 新建弹窗共用） */
+  function avatarPickerHtml(prefix, fallbackName, help) {
+    return (
+      '<div class="avatar-picker" data-role="' +
+      esc(prefix) +
+      '-picker">' +
+      '<span class="avatar avatar-lg avatar-preview" data-role="' +
+      esc(prefix) +
+      '-preview">' +
+      renderAvatarInner("", fallbackName) +
+      "</span>" +
+      '<div class="avatar-picker-actions">' +
+      '<button class="btn btn-outline btn-sm" type="button" data-role="' +
+      esc(prefix) +
+      '-upload">' +
+      icon("upload", 13) +
+      "上传图片</button>" +
+      '<button class="btn btn-ghost btn-sm" type="button" data-role="' +
+      esc(prefix) +
+      '-clear">' +
+      icon("close", 13) +
+      "清除图片</button>" +
+      "</div></div>" +
+      (help ? '<div class="field-help">' + esc(help) + "</div>" : "")
+    );
+  }
+
+  /** 绑定头像选择器（弹窗内使用）：返回 { value, render, picking } 可变状态 */
+  function bindAvatarPicker(root, prefix, state, getFallbackName) {
+    state = state || { value: "", picking: false };
+    state.picking = false;
+    var previewEl = root ? root.querySelector('[data-role="' + prefix + '-preview"]') : null;
+    var uploadBtn = root ? root.querySelector('[data-role="' + prefix + '-upload"]') : null;
+    var clearBtn = root ? root.querySelector('[data-role="' + prefix + '-clear"]') : null;
+    state.render = function () {
+      if (!previewEl) return;
+      var fallback = typeof getFallbackName === "function" ? getFallbackName() : "";
+      previewEl.innerHTML = renderAvatarInner(state.value, fallback);
+    };
+    if (uploadBtn) {
+      uploadBtn.addEventListener("click", function () {
+        if (state.picking) return;
+        state.picking = true;
+        pickAvatarImage({ size: 160 })
+          .then(function (dataUrl) {
+            state.picking = false;
+            if (!dataUrl) return; /* 用户取消 */
+            if (!/^data:image\//i.test(dataUrl) || dataUrl.length > 120000) {
+              if (S.app) S.app.toast("头像图片处理失败或体积过大，请换一张图片重试", true);
+              return;
+            }
+            state.value = dataUrl;
+            state.render();
+          })
+          .catch(function () {
+            state.picking = false;
+          });
+      });
+    }
+    if (clearBtn) {
+      clearBtn.addEventListener("click", function () {
+        state.value = "";
+        state.render();
+      });
+    }
+    state.render();
+    return state;
   }
 
   function findSection(sectionId) {
@@ -253,14 +371,6 @@
     return String(identity[key] == null ? "" : identity[key]).trim();
   }
 
-  function avatarText() {
-    var avatar = identityValue("avatar");
-    if (avatar) return avatar;
-    var name = identityValue("name");
-    if (name) return name.slice(0, 1);
-    return (S.soulId || "?").slice(0, 1).toUpperCase();
-  }
-
   function asideHtml() {
     var name = identityValue("name") || (metaSoul() && metaSoul().name) || S.soulId || "未命名角色";
     var tagline = identityValue("tagline") || (metaSoul() && metaSoul().archetype) || "";
@@ -292,8 +402,11 @@
     return (
       '<aside class="char-aside">' +
       '<div class="card char-profile">' +
-      '<span class="avatar avatar-xl" data-role="profile-avatar">' +
-      esc(avatarText()) +
+      '<span class="char-avatar is-clickable" data-action="upload-profile-avatar" data-tip="点击上传或更换头像图片" role="button" tabindex="0" aria-label="点击上传或更换头像图片">' +
+      '<span class="avatar avatar-xl char-avatar-face" data-role="profile-avatar">' +
+      renderAvatarInner(displayAvatarValue(), fallbackAvatarName()) +
+      "</span>" +
+      '<span class="char-avatar-hint" aria-hidden="true">更换头像</span>' +
       "</span>" +
       '<div class="char-name" data-role="profile-name">' +
       esc(name) +
@@ -366,10 +479,58 @@
     return section ? section.title || section.id : S.draft.sections[0];
   }
 
+  /** identity.avatar 图文混合控件：缩略图预览 + 上传 / 清除 + 文本输入框 */
+  function avatarControlHtml(section, field, value) {
+    var raw = String(value == null ? "" : value).trim();
+    /* 仅本地压缩上传的 Data URL 隐藏原文；http(s) / 站点路径仍以文本形式可编辑 */
+    var localImage = /^data:image\//i.test(raw);
+    var imageMode = isImageAvatarValue(raw);
+    var inputHtml;
+    if (localImage) {
+      /* 本地上传图片：输入框只读展示标签，绝不暴露 Base64 文本 */
+      inputHtml =
+        '<input class="input avatar-text-input is-image" type="text" value="已设置本地上传图片" readonly aria-label="头像已设置为本地图片" />';
+    } else {
+      inputHtml =
+        '<input class="input avatar-text-input" type="text" data-section="' +
+        esc(section.id) +
+        '" data-field="' +
+        esc(field.key) +
+        '" data-field-type="text" maxlength="500" placeholder="' +
+        esc(field.placeholder || "🌙 或 星，也可以粘贴图片 URL") +
+        '" value="' +
+        esc(raw) +
+        '" />';
+    }
+    return (
+      '<div class="avatar-picker avatar-field" data-avatar-mode="' +
+      (localImage ? "local-image" : imageMode ? "image-url" : "text") +
+      '">' +
+      '<span class="avatar avatar-lg avatar-preview" data-role="avatar-field-preview">' +
+      renderAvatarInner(raw, fallbackAvatarName()) +
+      "</span>" +
+      '<div class="avatar-field-main">' +
+      '<div class="avatar-picker-actions">' +
+      '<button class="btn btn-outline btn-sm" type="button" data-action="upload-avatar">' +
+      icon("upload", 13) +
+      "上传图片</button>" +
+      '<button class="btn btn-ghost btn-sm" type="button" data-action="clear-avatar">' +
+      icon("close", 13) +
+      "清除图片</button>" +
+      "</div>" +
+      inputHtml +
+      '<div class="field-help">支持 Emoji / 首字母 / 图片 URL；上传的本地图片会自动裁剪压缩，仅保存缩略图 Data URL（不展示原始文本）。</div>' +
+      "</div></div>"
+    );
+  }
+
   function controlHtml(section, field) {
     var type = fieldType(field);
     var value = getValue(section.id, field.key);
     var readonly = isReadonly(field);
+    if (section.id === "identity" && field.key === "avatar") {
+      return avatarControlHtml(section, field, value);
+    }
     var attrs =
       ' data-section="' +
       esc(section.id) +
@@ -540,7 +701,9 @@
 
   function fieldHtml(section, field) {
     var type = fieldType(field);
-    var span2 = type === "textarea" || type === "tags" || type === "dialogs" || type === "list";
+    var isAvatarField = section.id === "identity" && field.key === "avatar";
+    var span2 =
+      isAvatarField || type === "textarea" || type === "tags" || type === "dialogs" || type === "list";
     var changed = isFieldChanged(section.id, field.key);
     var help = helpText(field);
     var label =
@@ -707,7 +870,9 @@
     var taglineEl = S.container.querySelector('[data-role="profile-tagline"]');
     if (taglineEl) taglineEl.textContent = tagline || "还没有一句话定位，给角色写一句吧";
     var avatarEl = S.container.querySelector('[data-role="profile-avatar"]');
-    if (avatarEl) avatarEl.textContent = avatarText();
+    if (avatarEl) {
+      avatarEl.innerHTML = renderAvatarInner(displayAvatarValue(), fallbackAvatarName());
+    }
     var stateEl = S.container.querySelector('[data-role="profile-state"]');
     if (stateEl) {
       stateEl.textContent = S.dirty ? "有未保存修改" : "已同步";
@@ -767,6 +932,53 @@
     refreshNav();
   }
 
+  /** 局部刷新头像预览（画像卡大图 / identity.avatar 缩略图），不重建整个页面 */
+  function updateAvatarPreviews() {
+    if (!S.container) return;
+    var fallback = fallbackAvatarName();
+    var profileEl = S.container.querySelector('[data-role="profile-avatar"]');
+    if (profileEl) profileEl.innerHTML = renderAvatarInner(displayAvatarValue(), fallback);
+    var fieldEl = S.container.querySelector('[data-role="avatar-field-preview"]');
+    if (fieldEl) fieldEl.innerHTML = renderAvatarInner(identityValue("avatar"), fallback);
+  }
+
+  /** 上传 / 更换角色头像：裁剪压缩后写入 identity.avatar（保存走既有 save-card） */
+  function uploadAvatar() {
+    var app = S.app;
+    if (!app || typeof app.pickAvatarImage !== "function" || S._pickingAvatar) return;
+    S._pickingAvatar = true;
+    pickAvatarImage({ size: 160 })
+      .then(function (dataUrl) {
+        S._pickingAvatar = false;
+        if (!dataUrl || S.destroyed || !S.container) return; /* 用户取消 / 页面已卸载 */
+        if (!/^data:image\//i.test(dataUrl)) {
+          app.toast("头像图片处理失败，请换一张图片重试", true);
+          return;
+        }
+        if (dataUrl.length > 120000) {
+          app.toast("头像图片体积过大（超过 120000 字符），请换一张更小的图片", true);
+          return;
+        }
+        setValue("identity", "avatar", dataUrl);
+        S.dirty = computeDirty();
+        paint();
+        app.toast("头像已更新，记得点「保存角色卡」");
+      })
+      .catch(function (err) {
+        S._pickingAvatar = false;
+        app.toast("头像处理失败：" + ((err && (err.message || err)) || "未知错误"), true);
+      });
+  }
+
+  /** 清除头像图片（回空字符串，保存后生效） */
+  function clearAvatar() {
+    if (!S.card) return;
+    setValue("identity", "avatar", "");
+    S.dirty = computeDirty();
+    paint();
+    if (S.app) S.app.toast("已清除头像图片，记得点「保存角色卡」");
+  }
+
   function scrollToSection(sectionId) {
     if (!S.container) return;
     var el = S.container.querySelector('[data-section-card="' + sectionId + '"]');
@@ -814,6 +1026,16 @@
 
   async function reloadAll(showToast) {
     if (!S.app || S.busy) return;
+    if (computeDirty()) {
+      var discard = await S.app.confirm({
+        title: "放弃未保存修改？",
+        message: "当前角色卡有尚未保存的修改，重新加载会从后端覆盖这些修改并丢失。",
+        danger: true,
+        confirmLabel: "放弃并重新加载",
+        cancelLabel: "取消"
+      });
+      if (!discard) return;
+    }
     S.busy = true;
     try {
       paint();
@@ -1122,12 +1344,20 @@
       })
       .join("");
     var first = personas[0] && personas[0].persona_name ? String(personas[0].persona_name) : "";
+    var avatarState = { value: "", picking: false };
     var body =
       '<div class="field"><span class="field-label">选择 AstrBot 原生 Persona</span>' +
       '<select class="select" data-role="persona-select">' +
       options +
       "</select>" +
       '<div class="field-help">导入会新建一个角色卡，并把 Persona 原文记录到「补充设定 → 原生人设原文」。</div></div>' +
+      '<div class="field"><span class="field-label">角色头像（可选）</span>' +
+      avatarPickerHtml(
+        "import-avatar",
+        first,
+        "支持本地图片，自动居中裁剪压缩为 160×160；未上传时显示所选 Persona 名称首字。"
+      ) +
+      "</div>" +
       '<div class="field"><span class="field-label">目标 Soul ID</span>' +
       '<input class="input mono" type="text" data-role="target-soul" value="' +
       esc(first) +
@@ -1165,7 +1395,8 @@
               persona_name: personaName,
               target_soul_id: targetSoulId || personaName,
               auto_generate_cards: !!(autoEl && autoEl.checked),
-              ai_generate_card: !!(aiEl && aiEl.checked)
+              ai_generate_card: !!(aiEl && aiEl.checked),
+              avatar: String(avatarState.value || "").trim()
             });
             if (data && Array.isArray(data.souls)) {
               modalApp.applySouls(data.souls, data.soul || null);
@@ -1183,9 +1414,13 @@
       onMount: function (bodyEl) {
         var selectEl = bodyEl.querySelector('[data-role="persona-select"]');
         var targetEl = bodyEl.querySelector('[data-role="target-soul"]');
+        bindAvatarPicker(bodyEl, "import-avatar", avatarState, function () {
+          return selectEl ? String(selectEl.value || "").trim() || first : first;
+        });
         if (selectEl && targetEl) {
           selectEl.addEventListener("change", function () {
             targetEl.value = selectEl.value;
+            avatarState.render();
           });
         }
       }
@@ -1247,13 +1482,21 @@
   function openCreateModal() {
     var app = S.app;
     if (!app) return;
+    var avatarState = { value: "", picking: false };
     var body =
       '<div class="field"><span class="field-label">Soul ID <span class="req">*</span></span>' +
       '<input class="input mono" type="text" data-role="new-soul-id" placeholder="例如：soul_jiuhu" />' +
       '<div class="field-help">唯一标识，创建后可通过「修改 Soul ID」重命名；建议使用 ASCII 字符。</div></div>' +
       '<div class="field"><span class="field-label">名字（可选）</span>' +
       '<input class="input" type="text" data-role="new-soul-name" placeholder="例如：酒狐" />' +
-      '<div class="field-help">留空则使用 Soul ID 作为名字，之后可在角色卡里修改。</div></div>';
+      '<div class="field-help">留空则使用 Soul ID 作为名字，之后可在角色卡里修改。</div></div>' +
+      '<div class="field"><span class="field-label">角色头像（可选）</span>' +
+      avatarPickerHtml(
+        "create-avatar",
+        "?",
+        "支持本地图片，自动居中裁剪压缩为 160×160；未上传时显示名字首字。"
+      ) +
+      "</div>";
     app.modal({
       title: "新建角色卡",
       body: body,
@@ -1279,7 +1522,8 @@
             var card = emptyCardFromSchema();
             card.identity = card.identity || {};
             card.identity.name = newName || newId;
-            card.identity.avatar = (newName || newId).slice(0, 1);
+            card.identity.avatar =
+              String(avatarState.value || "").trim() || (newName || newId).slice(0, 1);
             var data = await modalApp.apiPost("souls/save", { soul_id: newId, card: card });
             if (data && Array.isArray(data.souls)) {
               modalApp.applySouls(data.souls, data.soul || null);
@@ -1291,7 +1535,19 @@
             return true;
           }
         }
-      ]
+      ],
+      onMount: function (bodyEl) {
+        var nameEl = bodyEl.querySelector('[data-role="new-soul-name"]');
+        bindAvatarPicker(bodyEl, "create-avatar", avatarState, function () {
+          var name = nameEl ? String(nameEl.value || "").trim() : "";
+          return name || "?";
+        });
+        if (nameEl) {
+          nameEl.addEventListener("input", function () {
+            avatarState.render();
+          });
+        }
+      }
     });
   }
 
@@ -1397,6 +1653,7 @@
     if (type === "list") value = splitLines(value);
     setValue(sectionId, fieldKey, value);
     S.dirty = computeDirty();
+    if (sectionId === "identity" && fieldKey === "avatar") updateAvatarPreviews();
     refreshSavebar();
   }
 
@@ -1492,6 +1749,15 @@
   function handleKeydown(event) {
     var el = event.target;
     if (!el || !el.getAttribute) return;
+    /* 左侧头像可点击上传：键盘 Enter / 空格等价于点击 */
+    if (
+      (event.key === "Enter" || event.key === " " || event.key === "Spacebar") &&
+      el.getAttribute("data-action") === "upload-profile-avatar"
+    ) {
+      event.preventDefault();
+      uploadAvatar();
+      return;
+    }
     var type = el.getAttribute("data-field-type");
     if (type !== "tags") return;
     var key = event.key;
@@ -1556,6 +1822,10 @@
       addDialog(actionEl);
     } else if (action === "remove-dialog") {
       removeDialog(actionEl);
+    } else if (action === "upload-profile-avatar" || action === "upload-avatar") {
+      uploadAvatar();
+    } else if (action === "clear-avatar") {
+      clearAvatar();
     }
   }
 
@@ -1614,6 +1884,7 @@
     S.savedCard = null;
     S.dirty = false;
     S.activeSection = "";
+    S._pickingAvatar = false;
     S.soulId = (app.state && app.state.currentSoulId) || "";
 
     container.innerHTML =
@@ -1641,14 +1912,22 @@
     S.schema = [];
     S.draft = null;
     S.busy = false;
+    S._pickingAvatar = false;
   }
 
   window.OY_PAGES = window.OY_PAGES || {};
+  function isDirty() {
+    if (!S.card || !S.savedCard) return false;
+    return computeDirty();
+  }
+
   window.OY_PAGES.character = {
     id: "character",
     title: "角色卡",
     icon: "character",
     render: render,
-    destroy: destroy
+    destroy: destroy,
+    /* 供 app.js 的路由守卫判断「未保存修改」 */
+    isDirty: isDirty
   };
 })();

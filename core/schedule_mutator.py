@@ -88,9 +88,11 @@ class BoundedScheduleMutator:
     三重防失控硬性限制：
     1. 每日最大微调次数配额 `run.mutations_used < max_mutations_per_day` (默认 2 次)
     2. 微调冷却时间锁 `time.time() - run.last_mutation_ts >= mutation_cooldown_seconds` (默认 120 分钟)
-    3. 定力护甲门槛 `impact > current_slot.armor`
+    3. 定力护甲门槛 `impact > current_slot.armor`（v2.6 起 armor 由动作类型固定四档派生：
+       IDLE_ROAM=25 / SURF=40 / BUSY_TASK=65 / SLEEP=80，不再手工设置）
 
-    微调成功后按当前时间块的 ``ActionType`` 分支重排 24h 动态时间轴（见模块 docstring）。
+    微调成功后按当前时间块的 ``ActionType`` 分支重排 24h 动态时间轴（见模块 docstring），
+    且所有微调产物（切分前半 / 后半 / 唤醒窗 / 加钟块）都回收为各自动作的固定护甲档位。
     """
 
     def __init__(
@@ -594,9 +596,10 @@ class BoundedScheduleMutator:
         )
 
         if can_split:
-            # 前半块（已完成部分）保留 BUSY_TASK
+            # 前半块（已完成部分）保留 BUSY_TASK，护甲回落固定档位 65
             block.end_hour = split_h
-            # 后半块（当前生效块）转为 IDLE_ROAM 并插入时间轴
+            block.armor = ActionType.BUSY_TASK.fixed_armor
+            # 后半块（当前生效块）转为 IDLE_ROAM 并插入时间轴，护甲固定档位 25
             tail = SlotInstance(
                 slot_key=f"block_{index + 1}",
                 start_hour=split_h,
@@ -606,7 +609,7 @@ class BoundedScheduleMutator:
                 title=new_title,
                 label=ActionType.IDLE_ROAM.label,
                 action_type=ActionType.IDLE_ROAM,
-                armor=int(getattr(block, "armor", 50) or 50),
+                armor=ActionType.IDLE_ROAM.fixed_armor,
                 mutated=True,
                 mutation_monologue=monologue,
                 delay_minutes=0,
@@ -665,7 +668,9 @@ class BoundedScheduleMutator:
 
         original_title = self._slot_title(block)
         original_card_id = str(getattr(block, "card_id", "evt_default") or "evt_default")
-        original_armor = int(getattr(block, "armor", 50) or 50)
+        # v2.6: remaining sleep segments keep the fixed SLEEP tier (80); the carved
+        # 0.5h waking window is IDLE_ROAM (25, applied by ``_convert_to_idle_roam``).
+        sleep_armor = ActionType.SLEEP.fixed_armor
 
         replacement: list[SlotInstance] = []
         if awake_block_start > start:
@@ -679,7 +684,7 @@ class BoundedScheduleMutator:
                     title=original_title,
                     label=ActionType.SLEEP.label,
                     action_type=ActionType.SLEEP,
-                    armor=original_armor,
+                    armor=sleep_armor,
                 )
             )
 
@@ -701,7 +706,7 @@ class BoundedScheduleMutator:
                     title=original_title,
                     label=ActionType.SLEEP.label,
                     action_type=ActionType.SLEEP,
-                    armor=original_armor,
+                    armor=sleep_armor,
                 )
             )
 
@@ -723,6 +728,8 @@ class BoundedScheduleMutator:
             block.title = new_title
         block.mutation_monologue = monologue
         block.delay_minutes = 0
+        # v2.6: the extended block keeps the fixed armor tier of its action type.
+        block.armor = self._slot_action(block).fixed_armor
 
         index = self._find_slot_index(run, block)
         if index < 0:
@@ -784,10 +791,12 @@ class BoundedScheduleMutator:
     def _convert_to_idle_roam(
         block: SlotInstance, new_title: str, monologue: str, keep_busy_result: bool = False
     ) -> None:
-        """Flip a block into ``IDLE_ROAM`` (state/title/label/mutated bookkeeping)."""
+        """Flip a block into ``IDLE_ROAM`` (state/title/label/armor/mutated bookkeeping)."""
         block.action_type = ActionType.IDLE_ROAM
         block.state = BotState.IDLE
         block.label = ActionType.IDLE_ROAM.label
+        # v2.6: the mutated block takes the fixed IDLE_ROAM armor tier (25).
+        block.armor = ActionType.IDLE_ROAM.fixed_armor
         if new_title:
             block.title = new_title
         block.mutated = True
@@ -859,6 +868,12 @@ class BoundedScheduleMutator:
             try:
                 slot.label = slot.action.label
             except AttributeError:  # pragma: no cover - stub tolerance
+                pass
+            # v2.6: every block's guard armor follows its action type's fixed tier,
+            # so a mutation can never leave a stale hand-tuned armor value behind.
+            try:
+                slot.armor = BoundedScheduleMutator._slot_action(slot).fixed_armor
+            except (AttributeError, TypeError):  # pragma: no cover - stub tolerance
                 pass
             previous_end = end
 

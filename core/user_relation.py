@@ -21,12 +21,15 @@ class UserProfile:
     affinity: float = 0.0
     platform_ids: list[str] = field(default_factory=list)
     nickname: str = ""
+    # v2.6: the character's custom attitude / tone reserved for this exact user.
+    attitude: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "global_uid": self.global_uid,
             "display_name": self.display_name,
             "nickname": self.nickname,
+            "attitude": self.attitude,
             "tier": int(self.tier.value),
             "tier_label": self.tier.label,
             "interaction_count": self.interaction_count,
@@ -162,6 +165,7 @@ class UserRelationManager:
                     affinity=float(row.get("affinity", 0.0)),
                     platform_ids=pids,
                     nickname=str(row.get("nickname") or ""),
+                    attitude=str(row.get("attitude") or ""),
                 )
             else:
                 profile = UserProfile(
@@ -172,6 +176,7 @@ class UserRelationManager:
                     affinity=0.0,
                     platform_ids=[uid],
                     nickname="",
+                    attitude="",
                 )
 
         if name and name != uid:
@@ -214,9 +219,9 @@ class UserRelationManager:
         await self.db.execute(
             """
             INSERT INTO users (
-                global_uid, display_name, nickname, tier, interaction_count, affinity, platform_ids_json, updated_at
+                global_uid, display_name, nickname, tier, interaction_count, affinity, platform_ids_json, attitude, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(global_uid) DO UPDATE SET
                 display_name = excluded.display_name,
                 nickname = excluded.nickname,
@@ -224,6 +229,7 @@ class UserRelationManager:
                 interaction_count = excluded.interaction_count,
                 affinity = excluded.affinity,
                 platform_ids_json = excluded.platform_ids_json,
+                attitude = excluded.attitude,
                 updated_at = excluded.updated_at
             """,
             (
@@ -234,6 +240,7 @@ class UserRelationManager:
                 profile.interaction_count,
                 profile.affinity,
                 json.dumps(profile.platform_ids, ensure_ascii=False),
+                profile.attitude,
                 int(time.time()),
             ),
         )
@@ -273,6 +280,7 @@ class UserRelationManager:
                 affinity=float(r.get("affinity", 0.0)),
                 platform_ids=pids,
                 nickname=str(r.get("nickname") or ""),
+                attitude=str(r.get("attitude") or ""),
             )
             self._cache[u.global_uid] = u
             users.append(u)
@@ -286,8 +294,9 @@ class UserRelationManager:
         tier: Optional[int] = None,
         affinity: Optional[float] = None,
         platform_ids: Optional[list[str]] = None,
+        attitude: Optional[str] = None,
     ) -> UserProfile:
-        """Create or update a user's tier, affinity, nickname, display_name, and platform_ids."""
+        """Create or update a user's tier, affinity, nickname, display_name, platform_ids, attitude."""
         profile = await self.get_or_create_user(
             user_id=global_uid, display_name=display_name or ""
         )
@@ -295,6 +304,9 @@ class UserRelationManager:
             profile.display_name = display_name.strip()
         if nickname is not None:
             profile.nickname = nickname.strip()
+        if attitude is not None:
+            # v2.6: per-user custom attitude, hard-capped at 300 chars.
+            profile.attitude = attitude.strip()[:300]
         if tier in (1, 2, 3):
             profile.tier = UserTier(int(tier))
         if affinity is not None:
@@ -334,6 +346,8 @@ class UserRelationManager:
         primary.affinity = min(100.0, max(primary.affinity, secondary.affinity) + secondary.affinity * 0.5)
         if not primary.nickname and secondary.nickname:
             primary.nickname = secondary.nickname
+        if not primary.attitude and secondary.attitude:
+            primary.attitude = secondary.attitude
 
         await self.save_user(primary)
         await self.db.execute(

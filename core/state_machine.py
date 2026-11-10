@@ -46,6 +46,51 @@ class ActionType(str, Enum):
             ActionType.BUSY_TASK: BotState.BUSY,
         }[self]
 
+    @property
+    def fixed_armor(self) -> int:
+        """Fixed guard-armor value bound to this action type (v2.6 four tiers).
+
+        Users can no longer hand-tune armor: every schedule block derives it from
+        its ``action_type`` so the ``impact > armor`` mutation threshold stays in
+        lockstep with the impact system in ``core/schedule_mutator.py``.
+        """
+        return {
+            ActionType.IDLE_ROAM: 25,
+            ActionType.SURF: 40,
+            ActionType.BUSY_TASK: 65,
+            ActionType.SLEEP: 80,
+        }[self]
+
+    @property
+    def armor_tier(self) -> int:
+        """Armor tier (1=very low .. 4=very high) of this action type."""
+        return {
+            ActionType.IDLE_ROAM: 1,
+            ActionType.SURF: 2,
+            ActionType.BUSY_TASK: 3,
+            ActionType.SLEEP: 4,
+        }[self]
+
+    def to_meta_dict(self) -> dict[str, Any]:
+        """Web-API metadata entry (``ACTION_TYPE_DEFINITIONS`` shape) for this type."""
+        matched: Optional[dict[str, Any]] = None
+        for definition in ACTION_TYPE_DEFINITIONS:
+            if definition.get("value") == self.value:
+                matched = dict(definition)
+                break
+        if matched is None:
+            matched = {
+                "value": self.value,
+                "label": self.label,
+                "state": self.bound_state.value,
+                "min_hours": 0.5,
+                "max_hours": 8.0,
+                "desc": "",
+            }
+        matched["armor"] = self.fixed_armor
+        matched["armor_tier"] = self.armor_tier
+        return matched
+
     @classmethod
     def coerce(
         cls, value: Any, default: Optional["ActionType"] = None
@@ -60,6 +105,8 @@ class ActionType(str, Enum):
 
 
 # Four action archetypes used by the Web UI editor / badges / charts.
+# ``armor`` / ``armor_tier`` are the v2.6 fixed guard-armor tiers bound to each
+# action type (they can no longer be hand-tuned from the Pages console).
 ACTION_TYPE_DEFINITIONS: list[dict[str, Any]] = [
     {
         "value": "SLEEP",
@@ -68,6 +115,8 @@ ACTION_TYPE_DEFINITIONS: list[dict[str, Any]] = [
         "min_hours": 1.0,
         "max_hours": 7.5,
         "desc": "后台完全静默，什么都不做",
+        "armor": 80,
+        "armor_tier": 4,
     },
     {
         "value": "SURF",
@@ -76,6 +125,8 @@ ACTION_TYPE_DEFINITIONS: list[dict[str, Any]] = [
         "min_hours": 0.5,
         "max_hours": 2.0,
         "desc": "真实刷 B站/抖音，看片打分并分享",
+        "armor": 40,
+        "armor_tier": 2,
     },
     {
         "value": "IDLE_ROAM",
@@ -84,6 +135,8 @@ ACTION_TYPE_DEFINITIONS: list[dict[str, Any]] = [
         "min_hours": 0.5,
         "max_hours": 2.0,
         "desc": "翻群记录吃瓜，或发呆记忆联想",
+        "armor": 25,
+        "armor_tier": 1,
     },
     {
         "value": "BUSY_TASK",
@@ -92,6 +145,8 @@ ACTION_TYPE_DEFINITIONS: list[dict[str, Any]] = [
         "min_hours": 1.0,
         "max_hours": 3.0,
         "desc": "当前行为记忆 + 进度条 + 每日随机完成结果",
+        "armor": 65,
+        "armor_tier": 3,
     },
 ]
 

@@ -2,7 +2,7 @@
 
 Single source of truth for the OnlyYou "角色卡" (character card):
 
-1. ``CARD_SCHEMA``  10 sections / 39 fields. It is consumed by:
+1. ``CARD_SCHEMA``  10 sections / 36 fields. It is consumed by:
    - backend: ``normalize_card`` / ``render_persona_prompt`` / ``card_completion``
    - frontend: ``GET card/schema`` （WebAPI 负责人下发，前端据此动态生成表单）
 2. ``normalize_card``  is the defensive entry point: it coerces types, splits
@@ -139,10 +139,10 @@ CARD_SCHEMA: list[dict[str, Any]] = [
             },
             {
                 "key": "avatar",
-                "label": "头像",
+                "label": "头像标识",
                 "type": "text",
-                "placeholder": "🌙 或 星",
-                "help": "emoji 或首字母，用于控制台头像展示",
+                "placeholder": "🌙 或 星（支持本地上传图片 / 图片链接）",
+                "help": "支持 Emoji / 短字符、本地上传图片（Data URL）与图片链接，用于控制台头像展示",
             },
         ],
     },
@@ -330,27 +330,6 @@ CARD_SCHEMA: list[dict[str, Any]] = [
         "title": "社交关系",
         "fields": [
             {
-                "key": "attitude_l3",
-                "label": "对 ★L3 核心用户的态度与称呼",
-                "type": "text",
-                "placeholder": "会撒娇、直呼昵称，消息秒回",
-                "help": "",
-            },
-            {
-                "key": "attitude_l2",
-                "label": "对 ◆L2 重要熟人的态度",
-                "type": "text",
-                "placeholder": "熟络但不越界，会互相玩梗",
-                "help": "",
-            },
-            {
-                "key": "attitude_l1",
-                "label": "对 L1 普通群友的态度",
-                "type": "text",
-                "placeholder": "礼貌但有距离感，主要看心情接话",
-                "help": "",
-            },
-            {
                 "key": "group_role",
                 "label": "群聊中的角色定位",
                 "type": "text",
@@ -432,6 +411,23 @@ _LEGACY_FLAT_KEYS = (
     "surfing_preferences",
     "native_persona_prompt",
 )
+
+# v2.6 (contract §2.1): the per-tier attitude fields used to live in the `social`
+# section. They are superseded by the per-user ``UserProfile.attitude`` (see
+# ``core/user_relation.py``); stale keys from old cards are explicitly dropped
+# during normalization so they can never leak into the rendered persona prompt.
+_DROPPED_SECTION_KEYS: dict[str, tuple[str, ...]] = {
+    "social": ("attitude_l3", "attitude_l2", "attitude_l1"),
+}
+
+# v2.6 (contract §5.1): ``identity.avatar`` accepts an emoji/short text, an image
+# Data URL (front-end canvas crop/compress) or an image URL.
+_AVATAR_DATA_URL_RE = re.compile(
+    r"^data:image/(?:png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=\s]+$"
+)
+_AVATAR_DATA_URL_MAX_CHARS = 120000
+_AVATAR_URL_MAX_CHARS = 500
+_AVATAR_TEXT_MAX_CHARS = 32
 
 # 优先级：identity / speech / personality / social 优先保留；
 # 超出预算时按 examples > background > appearance > extra/rhythm > interests 顺序丢弃。
@@ -583,8 +579,43 @@ def _as_dialogs(value: Any) -> list[dict[str, str]]:
     return [pair for pair in result if pair["user"] or pair["character"]]
 
 
+def _coerce_avatar(value: Any) -> str:
+    """Normalize ``identity.avatar`` (contract §5.1).
+
+    Accepted shapes:
+    - ``data:image/(png|jpeg|jpg|webp|gif);base64,...`` (<= 120000 chars after
+      stripping embedded whitespace; malformed / oversized -> ``""``; any other
+      ``data:`` URL such as ``data:text/html`` is rejected -> ``""``);
+    - ``http://`` / ``https://`` / ``/`` image path (<= 500 chars, else ``""``);
+    - anything else (emoji / short text) trimmed and cut to 32 chars.
+    """
+    text = _as_text(value)
+    if not text:
+        return ""
+    if text[:11].lower() == "data:image/":
+        compact = re.sub(r"\s+", "", text)
+        if (
+            len(compact) <= _AVATAR_DATA_URL_MAX_CHARS
+            and _AVATAR_DATA_URL_RE.match(compact)
+        ):
+            return compact
+        return ""
+    # Reject any other Data URL (data:text/html, data:image/svg+xml, ...) instead of
+    # silently truncating it into the 32-char plain-text fallback: an avatar is
+    # either a supported image Data URL or it is invalid.
+    if text[:5].lower() == "data:":
+        return ""
+    if text.startswith(("http://", "https://", "/")):
+        return text if len(text) <= _AVATAR_URL_MAX_CHARS else ""
+    return text[:_AVATAR_TEXT_MAX_CHARS]
+
+
 def _coerce_field_value(section_id: str, field_key: str, field_type: str, value: Any) -> Any:
     """Coerce one field value according to its schema type."""
+    # v2.6: the avatar keeps its own length / shape rules instead of the 32-char
+    # default text coercion, otherwise an uploaded Data URL would be truncated.
+    if section_id == "identity" and field_key == "avatar":
+        return _coerce_avatar(value)
     if field_type == "tags":
         return _as_list(value)
     if field_type == "list":
@@ -615,6 +646,8 @@ def normalize_card(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
       ``{user, character}`` or ``{role, content}`` shapes, numbers to strings.
     - **Keeps unknown keys**: unknown top-level keys, unknown keys inside known
       sections and fields added by a newer frontend are preserved untouched.
+    - **Drops the retired ``social.attitude_l3/l2/l1`` keys** (v2.6): the per-tier
+      attitudes moved to ``UserProfile.attitude``; stale values must never render.
     """
     card = empty_card()
 
@@ -637,7 +670,10 @@ def normalize_card(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
         if not isinstance(raw_section, dict):
             continue
         target = card[section_id]
+        dropped_keys = _DROPPED_SECTION_KEYS.get(section_id, ())
         for key, value in raw_section.items():
+            if key in dropped_keys:
+                continue
             field_type = _type_of(section_id, key)
             if field_type is None:
                 # Unknown field key inside a known section -> preserve verbatim.
@@ -782,6 +818,10 @@ def _render_section(
     for field_def in section["fields"]:
         # native_persona_prompt is the import source only: never rendered.
         if field_def["key"] == "native_persona_prompt":
+            continue
+        # identity.avatar is pure visual metadata (possibly a huge image Data URL):
+        # it must never be injected into the System Prompt / persona budget.
+        if section["id"] == "identity" and field_def["key"] == "avatar":
             continue
         line = _render_field_line(field_def, data, character_name)
         if line:

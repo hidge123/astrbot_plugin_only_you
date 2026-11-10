@@ -323,11 +323,18 @@ class SoulProfile:
         for item in data.get("state_event_cards") or []:
             try:
                 if isinstance(item, StateEventCard):
-                    cards.append(item)
+                    state_card = item
                 elif isinstance(item, dict):
-                    cards.append(StateEventCard.from_dict(item))
+                    state_card = StateEventCard.from_dict(item)
+                else:
+                    continue
+                cards.append(state_card)
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"[OnlyYou] Failed to parse stored state event card: {e}")
+        # v2.6: armor is a fixed per-action tier now; normalize cards persisted by
+        # an older version on load so cards/list & the UI never surface stale values.
+        for state_card in cards:
+            state_card.armor = state_card.action.fixed_armor
 
         return cls(
             soul_id=_clean_text(data.get("soul_id")) or DEFAULT_SOUL_ID,
@@ -687,7 +694,6 @@ class SoulManager:
         card["speech"]["speaking_style"] = "口语化短句，像微信/QQ好友一样自然随性"
         card["speech"]["reply_length"] = "short"
         card["interests"]["surfing_preferences"] = list(_DEFAULT_SURFING_PREFERENCES)
-        card["social"]["attitude_l3"] = "会主动分享日常，语气亲昵自然"
         return normalize_card(card)
 
     @staticmethod
@@ -881,23 +887,24 @@ class SoulManager:
             else f"{short_name}窝在被窝刷短视频"
         )
 
-        # (title, action_type, min_hours, max_hours, base_weight, armor)
-        specs: list[tuple[str, ActionType, float, float, int, int]] = [
-            (busy_title_1, ActionType.BUSY_TASK, 1.0, 3.0, 60, 70),
-            (busy_title_2, ActionType.BUSY_TASK, 1.5, 3.0, 55, 65),
-            (f"{short_name}关起门来专注赶进度", ActionType.BUSY_TASK, 1.0, 2.5, 50, 60),
-            (f"{short_name}瘫沙发刷B站视频", ActionType.SURF, 0.5, 2.0, 75, 30),
-            (surf_title_2, ActionType.SURF, 1.0, 2.0, 70, 35),
-            (f"{short_name}趴着发呆放空", ActionType.IDLE_ROAM, 0.5, 2.0, 70, 30),
-            (f"{short_name}翻群记录偷偷吃瓜", ActionType.IDLE_ROAM, 1.0, 2.0, 65, 25),
-            (f"{short_name}泡杯茶悠闲摸鱼", ActionType.IDLE_ROAM, 0.5, 1.5, 60, 35),
-            (f"{short_name}戴眼罩呼呼大睡", ActionType.SLEEP, 4.0, 7.5, 80, 80),
-            (f"{short_name}趴桌上小憩一会儿", ActionType.SLEEP, 1.0, 2.0, 60, 55),
+        # (title, action_type, min_hours, max_hours, base_weight)
+        # 护甲不再由卡池配置：卡片自动取 action_type.fixed_armor（v2.6 四档固定护甲）。
+        specs: list[tuple[str, ActionType, float, float, int]] = [
+            (busy_title_1, ActionType.BUSY_TASK, 1.0, 3.0, 60),
+            (busy_title_2, ActionType.BUSY_TASK, 1.5, 3.0, 55),
+            (f"{short_name}关起门来专注赶进度", ActionType.BUSY_TASK, 1.0, 2.5, 50),
+            (f"{short_name}瘫沙发刷B站视频", ActionType.SURF, 0.5, 2.0, 75),
+            (surf_title_2, ActionType.SURF, 1.0, 2.0, 70),
+            (f"{short_name}趴着发呆放空", ActionType.IDLE_ROAM, 0.5, 2.0, 70),
+            (f"{short_name}翻群记录偷偷吃瓜", ActionType.IDLE_ROAM, 1.0, 2.0, 65),
+            (f"{short_name}泡杯茶悠闲摸鱼", ActionType.IDLE_ROAM, 0.5, 1.5, 60),
+            (f"{short_name}戴眼罩呼呼大睡", ActionType.SLEEP, 4.0, 7.5, 80),
+            (f"{short_name}趴桌上小憩一会儿", ActionType.SLEEP, 1.0, 2.0, 60),
         ]
 
         cards: list[StateEventCard] = []
         for index, spec in enumerate(specs, start=1):
-            title, action_type, min_hours, max_hours, base_weight, armor = spec
+            title, action_type, min_hours, max_hours, base_weight = spec
             cards.append(
                 StateEventCard(
                     card_id=f"evt_fallback_{action_type.value.lower()}_{index}",
@@ -908,7 +915,6 @@ class SoulManager:
                     max_hours=max_hours,
                     valid_slots=[],
                     base_weight=base_weight,
-                    armor=armor,
                 )
             )
         return cards
@@ -923,6 +929,7 @@ class SoulManager:
         auto_generate_cards: bool = True,
         override_prompt: Optional[str] = None,
         ai_generate_card: bool = False,
+        avatar: str = "",
     ) -> SoulProfile:
         """Import an AstrBot native Persona as a SoulProfile.
 
@@ -933,6 +940,9 @@ class SoulManager:
         - ``auto_generate_cards=True``: ask the **decision** model for the four-type
           action card pool (8~12 cards, no encounter cards); on failure or an empty
           result, use ``build_fallback_custom_deck``.
+        - ``avatar`` (optional): emoji / short text / image URL / ``data:image/...``
+          Base64 avatar; written into ``card["identity"]["avatar"]`` (normalized)
+          after the card is inferred or AI-generated, then persisted with the soul.
         - Encounter cards are gone from the system: imported souls always store
           ``encounter_talk_cards = []``.
         """
@@ -962,6 +972,13 @@ class SoulManager:
             if isinstance(draft, dict):
                 card = normalize_card(draft)
                 card["extra"]["native_persona_prompt"] = native_prompt
+
+        # The user-supplied avatar (uploaded image / emoji / URL) wins over the
+        # inferred or AI-generated one; normalize_card then validates it (§5.1).
+        clean_avatar = _clean_text(avatar)
+        if clean_avatar:
+            card["identity"]["avatar"] = clean_avatar
+            card = normalize_card(card)
 
         state_cards: list[StateEventCard] = []
 

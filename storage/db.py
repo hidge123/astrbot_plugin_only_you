@@ -95,6 +95,7 @@ class DatabaseManager:
                 interaction_count INTEGER NOT NULL DEFAULT 0,
                 affinity REAL NOT NULL DEFAULT 0.0,
                 platform_ids_json TEXT NOT NULL DEFAULT '[]',
+                attitude TEXT NOT NULL DEFAULT '',
                 updated_at INTEGER NOT NULL
             );
             """
@@ -102,6 +103,19 @@ class DatabaseManager:
         # Safe migration for existing databases without `nickname` column
         try:
             await self.execute("ALTER TABLE users ADD COLUMN nickname TEXT NOT NULL DEFAULT '';")
+        except Exception:
+            pass
+
+        # Safe idempotent migration for existing databases without the per-user
+        # `attitude` column (v2.6 Phase 2: character-carried tier attitudes were
+        # replaced by a single per-user custom attitude).
+        try:
+            columns = await self.fetchall("PRAGMA table_info(users);")
+            column_names = {str(row.get("name") or "") for row in columns or []}
+            if "attitude" not in column_names:
+                await self.execute(
+                    "ALTER TABLE users ADD COLUMN attitude TEXT NOT NULL DEFAULT '';"
+                )
         except Exception:
             pass
 

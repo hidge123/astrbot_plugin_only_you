@@ -1,6 +1,6 @@
-# OnlyYou (只有你) —— 技术架构与 AstrBot 实现方案设计 (v2.5)
+# OnlyYou (只有你) —— 技术架构与 AstrBot 实现方案设计 (v2.6)
 
-> 本文档紧密结合 [AstrBot 插件开发指南 (`Star` 规范)](https://docs.astrbot.app/dev/star/plugin-new.html)，详细定义 `astrbot_plugin_only_you` 的核心工程设计，重点包含：**三态门禁（休息中 / 繁忙中 / 空闲中）× 四类可执行行动卡（`SLEEP` / `SURF` / `IDLE_ROAM` / `BUSY_TASK`）**、**基于作息曲线的 24h 动态弹性时间轴**、**基于外部输入的时间块切分 / 延展微调（含繁忙半途结算）**、参考并精简自 `livingmemory` 的 **分级记忆、定时自动遗忘清理 (`Forgetting GC`) 与简易上下文预算管理器 (`Context Budget Manager`)**，以及 v2.4 引入、v2.5 延续的 **详细角色卡（10 分区 × 39 字段）接管原生 Persona** 与 **插件自治四角色模型体系（`ProviderFactory` + `ModelHub` + `selected_provider`）**。
+> 本文档紧密结合 [AstrBot 插件开发指南 (`Star` 规范)](https://docs.astrbot.app/dev/star/plugin-new.html)，详细定义 `astrbot_plugin_only_you` 的核心工程设计，重点包含：**三态门禁（休息中 / 繁忙中 / 空闲中）× 四类可执行行动卡（`SLEEP` / `SURF` / `IDLE_ROAM` / `BUSY_TASK`）**、**基于作息曲线的 24h 动态弹性时间轴**、**基于外部输入的时间块切分 / 延展微调（含繁忙半途结算）**、参考并精简自 `livingmemory` 的 **分级记忆、定时自动遗忘清理 (`Forgetting GC`) 与简易上下文预算管理器 (`Context Budget Manager`)**，以及 v2.4 引入、v2.5 延续的 **详细角色卡（10 分区 × 36 字段）接管原生 Persona** 与 **插件自治四角色模型体系（`ProviderFactory` + `ModelHub` + `selected_provider`）**；v2.6 进一步带来 **ModelHub 可选继承（`inherit_from`）、按单用户自定义态度 + 关系等级提示词注入、四类行动绑定的四档固定护甲（25/40/65/80）、Pages 记忆面板分层结构化列表、以及支持 Data URL 的角色图片头像（绝不注入 Persona）**。
 
 ---
 
@@ -68,16 +68,16 @@ astrbot_plugin_only_you/
 ├── requirements.txt             # 依赖库 (httpx, aiosqlite, pillow, imageio-ffmpeg)
 ├── main.py                      # 插件入口类 OnlyYouPlugin(Star)：三态门禁 + selected_provider + on_decorating_result TTS + 生命周期
 ├── core/
-│   ├── state_machine.py         # 🚦 三态枚举 (RESTING/BUSY/IDLE) + 四类行动卡枚举 ActionType 门禁控制器
+│   ├── state_machine.py         # 🚦 三态枚举 (RESTING/BUSY/IDLE) + 四类行动卡枚举 ActionType（含固定护甲 fixed_armor / armor_tier）门禁控制器
 │   ├── roguelite_deck.py        # 🎲 24h 动态积木时间轴引擎（角色专属四类卡池 / 作息曲线 / 弹性块拼接 / 繁忙完成结果字段）
 │   ├── schedule_mutator.py      # 🔄 输入驱动的受限微调器（BUSY_TASK 半点切分半途结算 / SLEEP 唤醒窗 / IDLE 加钟 + 三重门禁）
-│   ├── character_card.py        # 🎭 详细角色卡单一数据源：CARD_SCHEMA(10 分区/39 字段)、normalize/migrate、Persona Prompt 渲染
+│   ├── character_card.py        # 🎭 详细角色卡单一数据源：CARD_SCHEMA(10 分区/36 字段)、normalize/migrate（含 avatar Data URL 归一化）、Persona Prompt 渲染（头像不注入）
 │   ├── soul_manager.py          # 角色卡(Soul)管理：SoulProfile.card、会话路由、AI 造卡(generate_card)、原生 Persona 导入
-│   ├── user_relation.py         # 三级用户关系管理 (L1普通 / L2重要熟人 / ★L3核心用户) 与跨平台映射
+│   ├── user_relation.py         # 三级用户关系管理 (L1普通 / L2重要熟人 / ★L3核心用户) + 单用户专属态度 attitude + 跨平台映射
 │   ├── memory_manager.py        # 🧠 精简版分级记忆引擎 (Tier1瞬时/Tier2近期/Tier3核心 + 定时遗忘GC)
-│   ├── context_budget.py        # 🛡️ 上下文/记忆预算管理器 + _takeover_persona 三分支接管原生 Persona 段
+│   ├── context_budget.py        # 🛡️ 上下文/记忆预算管理器 + _takeover_persona 三分支 + USER_RELATION_CONTEXT_PROMPT 关系上下文注入
 │   ├── provider_factory.py      # 🔧 唯一触碰 AstrBot Provider 内部结构的封装（复用/自建实例、inst_map、TTS、dispose）
-│   ├── model_hub.py             # 🔌 插件自治四角色模型网关 (main/decision/vision/tts，配置存 plugin_settings.model_config)
+│   ├── model_hub.py             # 🔌 插件自治四角色模型网关 (main/decision/vision/tts，可选继承 inherit_from，配置存 plugin_settings.model_config)
 │   ├── platform_bridge.py       # 🤝 AstrBot 平台配置协同桥 (原生分段回复 segmented_reply、流式、语音主动消息)
 │   ├── web_api.py               # 🖥️ 27 条 Plugin Pages Web API 路由 (17 条兼容旧版 + 10 条新增)
 │   └── atmosphere_reader.py     # 群聊主战场：防抖等待窗口、多人对话“解线团”、五维读空气器
@@ -90,11 +90,11 @@ astrbot_plugin_only_you/
 │       ├── charts.js            # 纯 SVG 环形表 / 24h 弹性动态时间轴（浮点时间 / 行动徽章 / 进度 tooltip）/ 环形图 / 条形图
 │       ├── page-overview.js     # 概览：状态环形表 + 24h 弹性轴 + 行动徽章/繁忙进度条/今日繁忙成果(Tier1) + 基调/配额/关系/记忆/模型小卡
 │       ├── page-schedule.js     # 日程：24h 弹性时间轴 + 四类行动卡网格/筛选/编辑器（已无奇遇卡） + 重抽/强制切换
-│       ├── page-character.js    # 角色卡：10 分区动态表单 + AI 整卡生成/分区补全 + Prompt 预览
-│       ├── page-relations.js    # 关系：★L3 / ◆L2 / L1 三列看板 + 拖拽改级 + 合并账号
-│       ├── page-memory.js       # 记忆：Tier 分段 + 搜索 + 提炼/GC/钉选核心
+│       ├── page-character.js    # 角色卡：10 分区动态表单 + AI 整卡生成/分区补全 + Prompt 预览 + 图片头像上传（Canvas 裁剪压缩）
+│       ├── page-relations.js    # 关系：★L3 / ◆L2 / L1 三列看板 + L1/L2 拖拽改级 + 合并账号 + 专属态度 attitude（★L3 管理员级无好感度/不自动晋升，「⋯」菜单显式设置）
+│       ├── page-memory.js       # 记忆：v2.6 分层列表（层级概览条 + T3/T2/T1 分组折叠 + 结构化 memory-row）+ 搜索/提炼/GC
 │       ├── page-surfing.js      # 冲浪：视频卡片墙 + 分享/删除 + 手动触发冲浪
-│       ├── page-models.js       # 模型：四角色卡片 + 源/模型拉取 + 继承开关 + 测试 + TTS 试听
+│       ├── page-models.js       # 模型：四角色卡片 + 源/模型拉取 + 模型来源模式（独立配置/继承） + 测试 + TTS 试听
 │       ├── page-sessions.js     # 会话：插件默认角色 + UMO 绑定表
 │       └── mock.js              # ?mock=1 / file:// 打开时的本地 Mock bridge（离线预览与截图）
 ├── surfing/
@@ -149,7 +149,7 @@ class StateEventCard:
     state: BotState = BotState.IDLE   # 绑定的唯一状态（由 action_type 强制同步）
     valid_slots: list[str] = field(default_factory=list)  # 仅旧数据兼容字段，排轴已不再使用
     base_weight: int = 50             # 基础抽取权重
-    armor: int = 50                   # 定力护甲 (0~100)，决定该时间块多难被外部输入改变
+    armor: Optional[int] = None       # v2.6 起默认 None -> __post_init__ 取 action.fixed_armor；字段保留仅为旧数据兼容
     synergy_tags: dict[str, float] = field(default_factory=dict)  # 相邻卡片连携系数
     action_type: Optional[ActionType] = None  # SLEEP | SURF | IDLE_ROAM | BUSY_TASK（显式优先）
     min_hours: float = 1.0            # 随机最短时长（小时，0.5h 网格，0.5 ~ 8.0）
@@ -158,6 +158,8 @@ class StateEventCard:
 # from_dict() 旧数据迁移：无 action_type 时按 state + title 推导
 #   RESTING -> SLEEP / BUSY -> BUSY_TASK / IDLE 且标题含"刷 B站 抖音 视频 冲浪" -> SURF / 其余 IDLE -> IDLE_ROAM
 # 显式 action_type 优先并强制 state = action_type.bound_state；时长夹取到 0.5h 网格且 min <= max。
+# v2.6 固定护甲：ActionType.fixed_armor -> SLEEP=80 / BUSY_TASK=65 / SURF=40 / IDLE_ROAM=25，
+#                 ActionType.armor_tier -> 4 / 3 / 2 / 1；排轴、force_state、cards/save、cards/ai_generate 一律按档位覆盖。
 
 @dataclass
 class SlotInstance:
@@ -170,7 +172,7 @@ class SlotInstance:
     title: str = "日常摸鱼"           # 当前正在做的事（繁忙卡即作为【当前行为记忆】）
     label: str = ""                   # 行动类型中文标签，如 "繁忙主业"
     action_type: Optional[ActionType] = None  # SLEEP | SURF | IDLE_ROAM | BUSY_TASK
-    armor: int = 50                   # 当前护甲
+    armor: int = 50                   # 固定档位护甲（v2.6：由 action_type 决定 25/40/65/80，非用户可调）
     mutated: bool = False             # 是否因外部输入发生过微调
     mutation_monologue: str = ""      # 微调心理独白
     delay_minutes: int = 0            # 旧字段保留，新时间轴恒为 0
@@ -324,9 +326,9 @@ async def on_any_message(self, event: AstrMessageEvent):
 机器人如何根据**读取到的用户消息**或**刷到的视频**动态微调自己的 24h 弹性时间轴，同时保证不失控？
 
 #### 1. 触发微调的两类输入与动态时间块切分规则
-| 输入来源 | 触发条件（输入冲击力 `Impact > 当前卡片护甲 Armor`） | 动态时间轴微调效果（Block Split / Delay） |
+| 输入来源 | 触发条件（输入冲击力 `Impact > 当前卡片护甲 Armor`，v2.6 起 Armor 恒为 action_type 固定档位 25/40/65/80） | 动态时间轴微调效果（Block Split / Delay） |
 | :--- | :--- | :--- |
-| **输入一：读取到的用户消息** | **场景 1（摸鱼突变 + 繁忙半途结算）**：当前为 `🔥 BUSY_TASK`，收到 ★L3 核心用户呼叫，或群内多位 ◆L2 熟人高热度爆发聊大瓜 | 在当前时刻 `now_h` 将原 `BUSY_TASK` 时间块一分为二：<br/>① 前半段（`start_h ~ now_h`）按当前进度百分比结算一条**半途被打断的完成结果记忆**写入 Tier 1；<br/>② 后半段（`now_h ~ end_h`）切分为 **`IDLE_ROAM（空闲中）`**（放下手头正事，专心水群/陪聊） |
+| **输入一：读取到的用户消息** | **场景 1（摸鱼突变 + 繁忙半途结算）**：当前为 `🔥 BUSY_TASK`，收到 ★L3 核心用户呼叫，或群内多位 ◆L2 熟人高热度爆发聊大瓜 | 在当前时刻 `now_h` 将原 `BUSY_TASK` 时间块一分为二：<br/>① 前半段（`start_h ~ now_h`）按当前进度百分比结算一条**半途被打断的完成结果记忆**写入 Tier 1；<br/>② 后半段（`now_h ~ end_h`）切分为 **`IDLE_ROAM（空闲中）`**（放下手头正事，专心水群/陪聊）。切分后前半段护甲固定为 `BUSY_TASK=65`、后半段固定为 `IDLE_ROAM=25` |
 | **输入一：读取到的用户消息** | **场景 2（热聊熬夜）**：当前为 `☕ SURF / IDLE_ROAM` 且即将进入下一时间块 `💤 SLEEP`，但正与 ★L3 核心用户或熟人群热聊 | 将当前空闲块的 `end_hour` 延长 `0.5 ~ 1.0 小时`，并将下一块 `SLEEP` 的 `start_hour` 同步向后推迟 |
 | **输入一：读取到的用户消息** | **场景 3（核心唤醒）**：当前为 `💤 SLEEP`，★L3 核心用户在私聊连续发消息强呼叫（普通/重要用户无法触发） | 从当前时刻 `now_h` 切分出一段 `0.5 ~ 1.0 小时` 的 **`IDLE_ROAM`**（迷迷糊糊醒来回复核心用户） |
 | **输入二：刚刷到的抖音/B站视频** | **场景 4（刷片上头）**：当前在 `☕ SURF` 刷到了多模态评分 `>= 88` 的超搞笑/高能神作，且下一块原本要进入 `BUSY_TASK` 或 `SLEEP` | 触发“再刷亿会儿”：将当前 `SURF` 块延长 `0.5 ~ 1.0 小时`、推迟下一块 `BUSY_TASK / SLEEP` 的开始时间，并立刻把该视频分享出去！ |
@@ -343,7 +345,8 @@ class BoundedScheduleMutator:
         if time.time() - run.last_mutation_ts < self.config.mutation_cooldown_seconds:
             return False
 
-        # 限制 3：定力护甲门槛（输入冲击力必须严格大于当前卡片的定力护甲）
+        # 限制 3：定力护甲门槛（输入冲击力必须严格大于当前卡片的固定档位护甲，
+        #         v2.6：armor 由 action_type 决定，不再接受用户手动设置）
         if impact <= current_slot.armor:
             return False
 
@@ -508,7 +511,9 @@ class ContextBudgetManager:
             req.system_prompt += "\n\n[脑海中的相关记忆 (精简注入)]:\n" + "\n".join(selected_lines)
 ```
 
-> 完整的 `apply_context_and_memory_budget()` 执行顺序为：**① 角色卡接管 Persona 段（`_takeover_persona`）→ ② `req.contexts.clear()` 并注入插件滑窗 → ③ 记忆混合打分与硬预算裁剪 → ④ 追加三态指令 / 变卦独白 / 记忆块**。其中第 ① 步见 §4.5。
+> **v2.6 关系上下文注入**：在追加记忆块之前，`ContextBudgetManager` 还会用 `USER_RELATION_CONTEXT_PROMPT` 组装并注入「三级关系重要度法则 + 当前对话人档案 + 群聊其他活跃对话者摘要」，其中包含当前用户的 `tier_label / affinity / nickname / attitude / relation_notes`（缺省分别回退「默认自然称呼」「按关系等级与你的人设性格自然相处」「无」）；`window_peers_block` 由 `UserRelationManager.list_users()` 结合当前 UMO 滑窗中的 sender 过滤得到（最多 4 条），整段用 try/except 包裹、失败静默跳过。`ContextBudgetManager` 通过构造参数 `user_relation` 注入该依赖（默认 None 时跳过 peers 段）。
+
+> 完整的 `apply_context_and_memory_budget()` 执行顺序为：**① 角色卡接管 Persona 段（`_takeover_persona`）→ ② `req.contexts.clear()` 并注入插件滑窗 → ③ 记忆混合打分与硬预算裁剪 → ④ 追加三态指令 / 变卦独白 / 关系上下文（v2.6）/ 记忆块**。其中第 ① 步见 §4.5。
 
 ---
 
@@ -560,11 +565,13 @@ req.system_prompt = new_sp if n else card_block + sp
 
 配套设计：
 
-1. **单一数据源 `CARD_SCHEMA`**（`core/character_card.py`）：10 个分区 / 39 个字段，同时供后端渲染 Prompt 与前端 `GET card/schema` 动态生成表单。
+1. **单一数据源 `CARD_SCHEMA`**（`core/character_card.py`）：10 个分区 / 36 个字段（v2.6 删除 `social.attitude_l3/l2/l1`，仅保留 `group_role`），同时供后端渲染 Prompt 与前端 `GET card/schema` 动态生成表单。
 2. **`SoulProfile.card`**：角色卡数据唯一来源；旧的 `name / archetype / speaking_style / surfing_preferences / native_persona_prompt` 退化为读写 `card` 的兼容 `@property`，旧档案经 `migrate_legacy()` 自动迁移。
 3. **渲染预算与优先级**（`render_persona_prompt(card, max_chars=2000)`）：只渲染非空字段、按分区输出 Markdown；优先保留 `identity / speech / personality / social`，超预算时按 `examples > background > appearance > extra > rhythm > interests` 顺序丢弃低优先级分区，最后硬截断保证 `len(result) <= max_chars`；`native_persona_prompt` 只作导入来源记录，**不参与**渲染。
 4. **会话路由 `resolve_soul(umo)`**：`UMO 绑定 → plugin_settings.default_soul_id → 最近更新的角色 → 创建默认角色`；不再读取平台 `default_personality`、不做 `persona_hash` 匹配，聊天路径上也不再用 LLM 播种卡池。
-5. **AI 造卡**：`generate_card(seed_text, base_card, section)` 用**主模型**生成整卡或单个分区草稿（不落库）；`import_native_persona()` 把原生人设原文写入 `card["extra"]["native_persona_prompt"]`，可选 AI 整卡生成；四类专属行动卡池由**决策模型**生成（奇遇卡已移除）。
+5. **AI 造卡**：`generate_card(seed_text, base_card, section)` 用**主模型**生成整卡或单个分区草稿（不落库）；`import_native_persona(..., avatar="")` 把原生人设原文写入 `card["extra"]["native_persona_prompt"]`，可选 AI 整卡生成；四类专属行动卡池由**决策模型**生成（奇遇卡已移除）。
+6. **头像视觉元数据（v2.6）**：`identity.avatar` 经 `_coerce_avatar()` 归一化为「Emoji/短字符 ≤32 字 / `data:image/(png|jpeg|jpg|webp|gif);base64,...` ≤120000 字符 / 图片 URL ≤500 字符」三选一，非法形态归空；`_render_section()` 显式跳过 `identity.avatar`，因此图片 Base64 **绝不进入 System Prompt / Persona 预算**，仅由 Pages 前端 `app.renderAvatarInner()` 渲染。
+7. **关系态度提示词（v2.6）**：系统提示词新增 `USER_RELATION_CONTEXT_PROMPT`（见 `prompts/templates.py`），由 `ContextBudgetManager` 按当前用户与群聊窗口动态填充 `{display_name} / {global_uid} / {tier_label} / {intimacy} / {nickname_text} / {attitude_text} / {notes_text} / {window_peers_block}`；角色卡不再保存千篇一律的等级态度。
 
 ---
 
@@ -580,8 +587,8 @@ req.system_prompt = new_sp if n else card_block + sp
 | 角色 (`role`) | 用途 | 继承规则 |
 | :--- | :--- | :--- |
 | `main`（对话） | 原生管线的主对话模型；也是 AI 生成整张角色卡的创作模型 | **必填**；未配置时插件不覆盖平台默认模型 |
-| `decision`（决策） | 读空气、记忆提炼、日程微调、四类行动卡池 / 繁忙完成结果 / IDLE_ROAM 搭话生成（`small` 为兼容别名） | 未显式配置 → 继承 `main` |
-| `vision`（视频解析） | 赛博冲浪看片的多模态评分；始终使用 `role="vision"`，不再降级到决策模型 | 未显式配置 → 继承 `main` |
+| `decision`（决策） | 读空气、记忆提炼、日程微调、四类行动卡池 / 繁忙完成结果 / IDLE_ROAM 搭话生成（`small` 为兼容别名） | **可选继承（v2.6）**：`inherit_from=""`（独立配置，源/模型留空即停用）/ `"main"`；旧配置缺省兼容为继承 `main` |
+| `vision`（视频解析） | 赛博冲浪看片的多模态评分；始终使用 `role="vision"`，不再降级到决策模型 | **可选继承（v2.6）**：`inherit_from=""` / `"main"` / `"decision"`（`vision → decision → main` 递归最多 2 跳，带防环） |
 | `tts`（语音） | 插件自建语音合成 | **不继承**；`mode="off"` 即关闭 |
 
 模型配置存放在 `plugin_settings["model_config"]`（SQLite KV，见 §4.4），结构：
@@ -589,15 +596,25 @@ req.system_prompt = new_sp if n else card_block + sp
 ```json
 {
   "main":     {"source_id": "deepseek", "model": "deepseek-flash"},
-  "decision": {"inherit": true, "source_id": "", "model": ""},
-  "vision":   {"inherit": true, "source_id": "", "model": ""},
+  "decision": {"inherit": true, "inherit_from": "main", "source_id": "", "model": ""},
+  "vision":   {"inherit": true, "inherit_from": "main", "source_id": "", "model": ""},
   "tts": {"mode": "off|source|provider", "source_id": "", "model": "", "voice": "",
           "provider_id": "", "probability": 1.0, "scope": "private|l3|all", "dual_output": false}
 }
 ```
 
+> **v2.6 归一化不变量**：`decision` / `vision` 恒为 `{"inherit": bool, "inherit_from": str, "source_id": str, "model": str}` 四键结构，且 `inherit === bool(inherit_from)`。归一化顺序：显式 `inherit_from` → 显式 `inherit` → 旧配置缺省继承 `main`；非法 `inherit_from` 按「有 inherit=True 则 main，否则空」兜底。`main` / `tts` 恒补 `inherit=False, inherit_from=""`。
+
+```json
+// get_status() 每个 chat role 至少汇报以下字段（Pages 模型页据此渲染状态徽章）
+{"role": "vision", "configured": true, "inherited": true, "inherit": true,
+ "inherit_from": "decision", "source_id": "deepseek", "model": "deepseek-chat",
+ "provider_id": "onlyyou::chat::deepseek::deepseek-chat", "mode": "plugin",
+ "label": "deepseek / deepseek-chat（插件自建实例） · 继承轻量决策模型", "ok": true}
+```
+
 - `ModelHub.ROLES = ("main", "decision", "vision", "tts")`；`role="small" / "aux"` 统一归一为 `decision`。
-- `resolve_role(role)` 返回 `{source_id, model}`（TTS 返回 `{mode, ...}`）；`main` 未配置返回 `None`。
+- `resolve_role(role)` 返回 `{source_id, model}`（TTS 返回 `{mode, ...}`）；`main` 未配置返回 `None`。v2.6 起 `decision` / `vision` 按 `inherit_from` 递归解析：**关闭继承且源/模型未填时返回 `None`（该角色停用），绝不回退 `main`**；超过 2 跳 / 防环 / 未知父角色同样返回 `None`，调用方按无模型优雅降级。
 - `call_llm_text()` 直接调用实例的 `inst.text_chat(prompt=..., system_prompt=..., image_urls=...)`，不再经过 `context.llm_generate`；`call_llm_json()` 复用 `extract_json()` 容错解析。
 - `save_model_config()` 归一化并写入 `plugin_settings.model_config` 后，会立即 `unregister_main()`，下一次使用按新配置热重建实例。
 - **彻底删除**旧回退链：不再读 `context.get_config()` / `get_current_chat_provider_id()` / `default_image_caption_provider_id`；Embedding / Rerank 槽位删除。
@@ -871,15 +888,18 @@ AstrBot 的 `astr_main_agent._select_provider()` 会先读 `event.get_extra("sel
 
 ## 七、 测试与验证体系
 
-离线 `tests/` 测试套件（stdlib `unittest`，零网络依赖，不要求安装 AstrBot / pytest；当前基线 **189 tests**），覆盖：
+离线 `tests/` 测试套件（stdlib `unittest`，零网络依赖，不要求安装 AstrBot / pytest；v2.6 基线 **310 tests** 全绿），覆盖：
 
 | 测试文件 | 覆盖范围 |
 | :--- | :--- |
 | `tests/test_provider_factory.py` | fake `provider_manager`：复用已启用实例、自建实例、按 `(source, model)` 缓存、`register_main` / `dispose` 清理 `inst_map` |
-| `tests/test_model_hub.py` | `decision` / `vision` 继承 `main`、`tts` 未配置时关闭、`get_main_provider_id` 三分支、全程不调用 `context.get_config` / `get_current_chat_provider_id` |
-| `tests/test_character_card.py` | 旧档案迁移、扁平属性兼容、`render_persona_prompt` 跳过空字段并遵守预算 |
+| `tests/test_model_hub.py` | 旧配置一次性迁移（归一化后的 `inherit/inherit_from` 形状）、`decision` / `vision` 继承解析、`tts` 未配置时关闭、`get_main_provider_id` 三分支、全程不调用 `context.get_config` / `get_current_chat_provider_id` |
+| `tests/test_character_card.py` | 旧档案迁移、扁平属性兼容、v2.6 10 分区 / 36 字段、旧 `social.attitude_*` 丢弃、`render_persona_prompt` 跳过空字段/头像并遵守预算 |
 | `tests/test_persona_takeover.py` | 精确替换 / 正则兜底 / 前置三分支 |
-| `tests/test_web_api.py` | 用 `set_mock_request` 调用 27 条路由并校验 `{status, message, data}` 信封；dashboard/cards/force_state/ai_generate 按 v2.5 新 payload 断言（`action_type/progress_pct/chronotype/busy_results/action_types`） |
+| `tests/test_web_api.py` | 用 `set_mock_request` 调用 27 条路由并校验 `{status, message, data}` 信封；dashboard/cards/force_state/ai_generate 按 v2.5+ 新 payload 断言（`action_type/progress_pct/chronotype/busy_results/action_types/armor/armor_tier`） |
+| `tests/test_v26_models_armor.py` | v2.6 四档固定护甲（25/40/65/80）、`armor_tier`、排轴与微调产物、`force_state` / `cards_save` / `ai_generate` 忽略手填 armor、ModelHub 可选继承逐条链路与关闭即停用 |
+| `tests/test_v26_attitude.py` | v2.6 角色卡删除 `attitude_*` 且旧卡键丢弃、`users.attitude` 幂等迁移与持久化、`USER_RELATION_CONTEXT_PROMPT` 注入与 window peers、头像归一化（Data URL/URL/emoji/超长/非法）与 Persona 不含 Base64 |
+| `tests/test_v26_api.py` | v2.6 Web API 端到端：默认卡无 `attitude_l3`、`users/update` 的 attitude 截断/清空回读、`souls/import_persona` 与 `card/save` 的 avatar 落库、`models/config` 的 `inherit/inherit_from` 归一化、固定护甲 payload |
 | `tests/test_regressions.py` | 24h 动态时间轴不变量 / 7~11 块 / 0.5h 网格、chronotype 权重差异、旧卡与旧日程迁移、进度与时间格式化、BUSY_TASK 结算写 Tier1 且不重复、IDLE_ROAM 双分支与冷却、mutator 切分/加钟/唤醒、三态门禁矩阵、Forgetting GC、上下文预算 |
 | `tests/test_js_syntax.py` | `node --check views/console/*.js` 前端语法检查 + `index.html` 脚本清单检查（无 node 时自动 skip） |
 

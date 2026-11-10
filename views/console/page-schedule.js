@@ -8,13 +8,14 @@
  *
  * 交互（24h 动态积木时间轴 × 四类行动卡）：
  *  - 顶部时间轴：OYCharts.scheduleAxis 弹性色块；点击块打开右侧抽屉编辑
- *    行动类型 / 标题 / 护甲 → POST schedule/force_state
+ *    行动类型 / 标题 → POST schedule/force_state（定力护甲由行动类型自动固定，不向用户暴露）
  *  - 行动卡网格：左边框按绑定状态着色（IDLE 青绿 / BUSY 琥珀 / RESTING 靛蓝），
- *    显示四类行动徽章 + 卡名 + 时长胶囊 + 迷你护甲条 + 权重；
+ *    显示四类行动徽章 + 卡名 + 时长胶囊 + 权重；
  *    顶部按四类行动类型筛选（全部 / 睡觉 / 冲浪 / 闲逛 / 繁忙）
- *  - 新建 / 编辑行动卡：title / action_type / min_hours / max_hours / armor / base_weight / scope
+ *  - 新建 / 编辑行动卡：title / action_type / min_hours / max_hours / base_weight / scope
  *    → POST cards/save；删除 → POST cards/delete
  *  - 重抽日程 → POST schedule/reroll；AI 生成专属行动卡 → POST cards/ai_generate
+ *  - v2.6：隐藏手动护甲设置（行动卡 / 时间块抽屉均不再出现护甲滑条，POST 不再携带 armor）
  *  - 已移除奇遇谈资卡全部 UI 与逻辑
  *
  * 注册：window.OY_PAGES.schedule = { id,title,icon,render(container,ctx),destroy() }
@@ -218,7 +219,6 @@
     var type = cardActionType(card);
     var stateId = cardState(card);
     var meta = app.stateMeta(stateId);
-    var armor = clamp(card.armor, 0, 100);
     var weight = Math.max(1, Math.min(100, Math.round(num(card.base_weight, 50))));
     var minHours = roundHalf(card.min_hours != null ? card.min_hours : 1);
     var maxHours = roundHalf(card.max_hours != null ? card.max_hours : 2);
@@ -263,11 +263,7 @@
       '<span class="duration-pill" data-tip="该卡在日程中随机抽取的时长区间">' +
       esc(fmtHours(minHours) + " ~ " + fmtHours(maxHours)) +
       '</span><span class="tag tag-muted">时长</span></div>' +
-      '<div class="action-armor"><span>护甲</span><span class="mini-bar"><i style="width:' +
-      armor +
-      '%"></i></span><span class="action-armor-value">' +
-      armor +
-      "</span></div></div>"
+      "</div>"
     );
   }
 
@@ -410,7 +406,7 @@
   }
 
   /* ------------------------------------------------------------------ *
-   * 交互：时间块抽屉（行动类型四选一 + 标题 + 护甲）
+   * 交互：时间块抽屉（行动类型四选一 + 活动标题）
    * ------------------------------------------------------------------ */
   function findSlot(schedule, slotKey) {
     var slots = (schedule && schedule.run && schedule.run.slots) || [];
@@ -437,7 +433,6 @@
     var defs = actionTypeDefs(cards);
     var currentType = slotActionType(slot);
     var currentState = actionStateOf(currentType) || (slot && slot.state) || "IDLE";
-    var armor = slot && slot.armor != null ? clamp(slot.armor, 0, 100) : 50;
     var html = "";
     html +=
       '<div class="card-sub mb-12">' +
@@ -462,19 +457,12 @@
     html +=
       '<div class="field-help">绑定状态：<span class="tag" data-role="slot-state-hint">' +
       esc(STATE_LABELS[String(currentState).toUpperCase()] || "空闲") +
-      "</span></div></div>";
+      "</span> · 该行动类型自带固定护甲档位（由后端自动应用）</div></div>";
     html +=
       '<div class="field"><span class="field-label">正在做的事（活动标题）</span>' +
       '<input class="input" data-role="slot-title" maxlength="120" placeholder="如：埋头赶稿 / 躺沙发刷 B 站" value="' +
       esc((slot && slot.title) || "") +
-      '" /></div>';
-    html +=
-      '<div class="field"><span class="field-label">定力护甲</span>' +
-      '<div class="slider-row"><input class="slider" type="range" min="0" max="100" step="1" data-role="slot-armor" value="' +
-      armor +
-      '" /><span class="slider-value" data-role="slot-armor-value">' +
-      armor +
-      "</span></div>" +
+      '" />' +
       '<div class="field-help">保存后立即生效（POST schedule/force_state），会覆盖该时间块今日抽到的活动。</div></div>';
     return html;
   }
@@ -497,24 +485,14 @@
         }
       });
     }
-    var slider = body.querySelector('[data-role="slot-armor"]');
-    var valueEl = body.querySelector('[data-role="slot-armor-value"]');
-    if (slider && valueEl) {
-      slider.addEventListener("input", function () {
-        valueEl.textContent = slider.value;
-      });
-    }
   }
 
   function readSlotForm(body) {
     var active = body.querySelector('[data-role="slot-action-seg"] .seg-btn.active');
-    var slider = body.querySelector('[data-role="slot-armor"]');
     var titleEl = body.querySelector('[data-role="slot-title"]');
     var actionType = active ? active.getAttribute("data-action-type") : "IDLE_ROAM";
     return {
       action_type: actionType,
-      new_state: actionStateOf(actionType) || "IDLE",
-      armor: slider ? Number(slider.value) : 50,
       new_title: titleEl ? String(titleEl.value || "").trim() : ""
     };
   }
@@ -539,13 +517,11 @@
           icon: "save",
           onClick: async function () {
             var form = readSlotForm(body);
+            /* v2.6：护甲由行动类型固定档位自动应用，POST 不再携带 armor */
             var data = await app.apiPost("schedule/force_state", {
               soul_id: app.state.currentSoulId,
               slot_key: slot.slot_key,
               action_type: form.action_type,
-              /* new_state 兼容旧后端；新后端优先 action_type */
-              new_state: form.new_state,
-              armor: form.armor,
               new_title: form.new_title
             });
             if (data && data.schedule) {
@@ -647,7 +623,7 @@
   }
 
   /* ------------------------------------------------------------------ *
-   * 交互：行动卡编辑器（title / action_type / min~max / armor / weight / scope）
+   * 交互：行动卡编辑器（title / action_type / min~max / weight / scope）
    * ------------------------------------------------------------------ */
   function openCardDrawer(app, container, card) {
     var isNew = !card;
@@ -659,7 +635,6 @@
       action_type: defaultType,
       min_hours: 1.0,
       max_hours: 2.5,
-      armor: 45,
       base_weight: 50,
       scope: "soul",
       synergy_tags: {}
@@ -673,7 +648,6 @@
       minHours = maxHours;
       maxHours = swap;
     }
-    var armor = clamp(source.armor != null ? source.armor : 45, 0, 100);
     var weight = Math.max(1, Math.min(100, Math.round(num(source.base_weight, 50))));
 
     var stateOptions = (defs.length ? defs : charts().ACTION_TYPES || [])
@@ -715,12 +689,6 @@
       maxHours.toFixed(1) +
       '" /></div></div>' +
       '<div class="field-help">时长范围 0.5 ~ 8.0 小时，0.5 步进；最短 ≤ 最长。</div>' +
-      '<div class="field"><span class="field-label">定力护甲</span><div class="slider-row">' +
-      '<input class="slider" type="range" min="0" max="100" step="1" data-role="card-armor" value="' +
-      armor +
-      '" /><span class="slider-value" data-role="card-armor-value">' +
-      armor +
-      "</span></div></div>" +
       '<div class="field"><span class="field-label">抽取权重</span><div class="slider-row">' +
       '<input class="slider" type="range" min="1" max="100" step="1" data-role="card-weight" value="' +
       weight +
@@ -761,7 +729,6 @@
         });
       }
     }
-    bindSlider("card-armor", "card-armor-value");
     bindSlider("card-weight", "card-weight-value");
 
     app.drawer({
@@ -792,7 +759,6 @@
             if (minValue > maxValue) {
               throw new Error("最短时长不能大于最长时长");
             }
-            var armorEl = body.querySelector('[data-role="card-armor"]');
             var weightEl = body.querySelector('[data-role="card-weight"]');
             var scopeEl = body.querySelector('[data-role="card-scope"]');
             var scope = isNew && scopeEl ? scopeEl.value || "soul" : source.scope || "soul";
@@ -807,7 +773,6 @@
                 state: actionStateOf(actionType) || "IDLE",
                 min_hours: minValue,
                 max_hours: maxValue,
-                armor: armorEl ? Number(armorEl.value) : 45,
                 base_weight: weightEl ? Number(weightEl.value) : 50,
                 synergy_tags: source.synergy_tags || {}
               }

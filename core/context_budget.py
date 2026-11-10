@@ -17,6 +17,7 @@ from ..prompts.templates import (
     BUSY_STATE_INJECTION_PROMPT,
     IDLE_STATE_INJECTION_PROMPT,
     MUTATION_MONOLOGUE_INJECTION_PROMPT,
+    USER_RELATION_CONTEXT_PROMPT,
 )
 
 try:
@@ -24,6 +25,13 @@ try:
 except ImportError:
     import logging
     logger = logging.getLogger("onlyyou.context_budget")
+
+
+def _clean_text(value: Any) -> str:
+    """Trim any scalar into a compact string (``None`` -> ``""``)."""
+    if value is None:
+        return ""
+    return str(value).strip()
 
 
 @dataclass
@@ -383,6 +391,22 @@ class SessionBuffer:
             return "（暂无近期对话）"
         return "\n".join(m.format_for_transcript() for m in win)
 
+    def get_window_sender_ids(self, umo: str) -> list[str]:
+        """Return distinct user ``sender_id`` values of ``umo``'s window (newest first).
+
+        Used by the v2.6 user-relation context block to resolve the *other* active
+        speakers of the current group conversation into their configured
+        nickname / attitude.
+        """
+        ids: list[str] = []
+        for message in reversed(self._windows.get(umo, []) or []):
+            if message.role != "user":
+                continue
+            sender_id = str(message.sender_id or "").strip()
+            if sender_id and sender_id not in ids:
+                ids.append(sender_id)
+        return ids
+
     def get_recent_l2_l3_burst_count(self, umo: str, window_seconds: float = 180.0) -> int:
         """Count how many messages from L2/L3 users arrived in `umo` within `window_seconds`."""
         now = time.time()
@@ -443,11 +467,16 @@ class ContextBudgetManager:
         session_buffer: SessionBuffer,
         plugin_config: dict[str, Any],
         soul_manager: Any = None,
+        user_relation: Any = None,
     ):
         self.memory_manager = memory_manager
         self.session_buffer = session_buffer
         self.plugin_config = plugin_config
         self.soul_manager = soul_manager
+        # v2.6 Phase 2: optional relationship manager used to look up the current
+        # speaker's per-user attitude / nickname and the other active speakers of
+        # the current window. ``None`` keeps the legacy constructor working.
+        self.user_relation = user_relation
 
     @property
     def cfg(self) -> dict[str, Any]:
@@ -543,6 +572,102 @@ class ContextBudgetManager:
         if not lines:
             return "（今天还没忙完什么事）"
         return "\n   ".join(lines)
+
+    async def _render_window_peers_block(self, umo: str, user: UserProfile) -> str:
+        """Render the other configured active speakers of the current window.
+
+        v2.6 (contract §2.3): only speakers of ``umo``'s sliding window that have a
+        per-user ``nickname`` or ``attitude`` configured are listed (max 4, current
+        speaker excluded). Returns ``""`` when there is nothing to show; every
+        failure degrades to an empty block instead of raising.
+        """
+        if self.user_relation is None:
+            return ""
+        try:
+            sender_ids = self.session_buffer.get_window_sender_ids(umo)
+        except Exception:  # noqa: BLE001 - best-effort only
+            sender_ids = []
+        if not sender_ids:
+            return ""
+        current_uid = _clean_text(getattr(user, "global_uid", ""))
+        profiles = await self.user_relation.list_users()
+        by_uid: dict[str, Any] = {}
+        for profile in profiles or []:
+            uid = _clean_text(getattr(profile, "global_uid", ""))
+            if uid:
+                by_uid.setdefault(uid, profile)
+            for platform_id in getattr(profile, "platform_ids", None) or []:
+                pid = _clean_text(platform_id)
+                if pid:
+                    by_uid.setdefault(pid, profile)
+
+        lines: list[str] = []
+        seen: set[str] = set()
+        for sender_id in sender_ids:
+            profile = by_uid.get(_clean_text(sender_id))
+            if profile is None:
+                continue
+            uid = _clean_text(getattr(profile, "global_uid", ""))
+            if not uid or uid == current_uid or uid in seen:
+                continue
+            nickname = _clean_text(getattr(profile, "nickname", ""))
+            attitude = _clean_text(getattr(profile, "attitude", ""))
+            if not nickname and not attitude:
+                continue
+            seen.add(uid)
+            name = _clean_text(getattr(profile, "display_name", "")) or uid
+            tier = getattr(profile, "tier", None)
+            tier_label = _clean_text(getattr(tier, "label", ""))
+            lines.append(
+                f"- {name} (ID: {uid}) | 关系等级：{tier_label}"
+                f" | 专属称呼：{nickname or '默认自然称呼'}"
+                f" | 专属态度：{attitude or '按关系等级与你的人设性格自然相处'}"
+            )
+            if len(lines) >= 4:
+                break
+        if not lines:
+            return ""
+        return "\n\n[当前群聊其他活跃对话者档案]:\n" + "\n".join(lines)
+
+    async def _render_user_relation_context(self, umo: str, user: UserProfile) -> str:
+        """Render ``USER_RELATION_CONTEXT_PROMPT`` for the current speaker (v2.6).
+
+        The block documents the three-tier importance law plus the current user's
+        profile (tier / intimacy / nickname / per-user attitude / notes) and the
+        other configured speakers of the window. It never raises: any failure
+        simply yields an empty block so the LLM request is never blocked.
+        """
+        display_name = _clean_text(getattr(user, "display_name", ""))
+        global_uid = _clean_text(getattr(user, "global_uid", ""))
+        display_name = display_name or global_uid
+        tier = getattr(user, "tier", None)
+        tier_label = _clean_text(getattr(tier, "label", ""))
+        try:
+            intimacy = round(float(getattr(user, "affinity", 0.0) or 0.0), 1)
+        except (TypeError, ValueError):
+            intimacy = 0.0
+        nickname_text = _clean_text(getattr(user, "nickname", "")) or "默认自然称呼"
+        attitude_text = (
+            _clean_text(getattr(user, "attitude", ""))
+            or "按关系等级与你的人设性格自然相处"
+        )
+        # ``relation_notes`` is not a DB column yet (v2.6 freeze): getattr fallback.
+        notes_text = _clean_text(getattr(user, "relation_notes", "")) or "无"
+        try:
+            window_peers_block = await self._render_window_peers_block(umo, user)
+        except Exception as e:  # noqa: BLE001 - peers are best-effort only
+            logger.warning(f"[OnlyYou] window peers context failed: {e}")
+            window_peers_block = ""
+        return USER_RELATION_CONTEXT_PROMPT.format(
+            display_name=display_name,
+            global_uid=global_uid,
+            tier_label=tier_label,
+            intimacy=intimacy,
+            nickname_text=nickname_text,
+            attitude_text=attitude_text,
+            notes_text=notes_text,
+            window_peers_block=window_peers_block,
+        )
 
     async def apply_context_and_memory_budget(
         self,
@@ -703,6 +828,18 @@ class ContextBudgetManager:
                     mutation_monologue=current_slot.mutation_monologue
                 )
             )
+
+        # =====================================================================
+        # 第四步补充：注入用户关系等级重要度法则 + 当前对话对象专属档案（v2.6）
+        # 整段 try/except 兜底，任何异常都静默降级为空 block，绝不阻塞 LLM 请求。
+        # =====================================================================
+        try:
+            relation_block = await self._render_user_relation_context(umo, user)
+        except Exception as e:  # noqa: BLE001 - never break the LLM request hook
+            logger.warning(f"[OnlyYou] user relation context injection failed: {e}")
+            relation_block = ""
+        if relation_block:
+            additions.append(relation_block)
 
         if selected_lines:
             additions.append(

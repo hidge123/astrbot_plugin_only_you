@@ -365,7 +365,7 @@ class OnlyYouWebAPI:
                 f"{API_PREFIX}/schedule/force_state",
                 self.api_schedule_force_state,
                 ["POST"],
-                "OnlyYou: 手动强制切换当前或指定槽位的三态状态与护甲",
+                "OnlyYou: 手动强制切换当前或指定槽位的四类行动类型与标题（护甲按行动固定档位）",
             ),
             (
                 f"{API_PREFIX}/cards/list",
@@ -999,8 +999,14 @@ class OnlyYouWebAPI:
             auto_gen = bool(body.get("auto_generate_cards", True))
             ai_generate_card = bool(body.get("ai_generate_card", False))
             override_prompt = str(body.get("native_prompt") or "").strip() or None
+            # v2.6 §5.1: optional character avatar (emoji / image URL / data URL).
+            avatar = str(body.get("avatar") or "").strip()
 
             importer = self.plugin.soul_manager.import_native_persona
+            try:
+                importer_params = inspect.signature(importer).parameters
+            except (TypeError, ValueError):
+                importer_params = {}
             import_kwargs: dict[str, Any] = {
                 "persona_name": persona_name,
                 "target_soul_id": target_soul_id,
@@ -1009,12 +1015,11 @@ class OnlyYouWebAPI:
             }
             # The rewritten SoulManager supports optional AI card elaboration; keep
             # the legacy call signature working if the parameter is absent.
-            try:
-                supported = "ai_generate_card" in inspect.signature(importer).parameters
-            except (TypeError, ValueError):
-                supported = False
-            if supported:
+            if "ai_generate_card" in importer_params:
                 import_kwargs["ai_generate_card"] = ai_generate_card
+            # Same tolerant pass-through for the v2.6 `avatar` parameter.
+            if "avatar" in importer_params:
+                import_kwargs["avatar"] = avatar
             profile = await importer(**import_kwargs)
             # Build fresh schedule run with the newly imported deck
             await self.plugin.deck_engine.get_or_build_today_run(
@@ -1216,15 +1221,14 @@ class OnlyYouWebAPI:
                 new_state = BotState(raw_state)
 
             new_title = str(body.get("new_title") or "").strip() or None
-            armor_raw = body.get("armor")
-            new_armor = int(armor_raw) if armor_raw is not None and str(armor_raw) != "" else None
+            # v2.6 §3.4: armor is a fixed per-action tier now (ActionType.fixed_armor),
+            # so the legacy `armor` request field is intentionally ignored / not passed.
             slot_key = str(body.get("slot_key") or "").strip() or None
 
             updated_slot = await self.plugin.deck_engine.force_set_current_state(
                 soul_id=soul.soul_id,
                 new_state=new_state,
                 new_title=new_title,
-                armor=new_armor,
                 slot_key=slot_key,
                 action_type=action_type,
             )
@@ -1284,7 +1288,9 @@ class OnlyYouWebAPI:
             card = StateEventCard.from_dict(card_data)
             if not card.card_id:
                 card.card_id = f"evt_{int(time.time())}_{random.randint(100, 999)}"
-            card.armor = max(0, min(100, int(card.armor)))
+            # v2.6 §3.4: armor is a fixed per-action tier; any client-supplied legacy
+            # `armor` value is overwritten (never clamped/trusted).
+            card.armor = card.action.fixed_armor
             card.base_weight = max(1, min(100, int(card.base_weight)))
             # `from_dict` already derives the bound `BotState`; keep it explicit so a
             # legacy `state` field can never desync from the four action types.
@@ -1358,9 +1364,9 @@ class OnlyYouWebAPI:
                 f"- IDLE_ROAM（空闲闲逛，绑定 IDLE）：0.5~2.0 小时\n"
                 f"- BUSY_TASK（繁忙主业，绑定 BUSY）：1.0~3.0 小时\n"
                 f"每张卡需要：title（贴合角色的活动标题）、action_type、min_hours、max_hours"
-                f"（0.5 步长，min_hours <= max_hours）、armor（0~100）、base_weight（1~100）。\n"
+                f"（0.5 步长，min_hours <= max_hours）、base_weight（1~100）。\n"
                 '仅输出合法 JSON：{"state_event_cards": [{"card_id": "evt_ai_1", "title": "...", '
-                '"action_type": "BUSY_TASK", "min_hours": 1.5, "max_hours": 3.0, "armor": 60, '
+                '"action_type": "BUSY_TASK", "min_hours": 1.5, "max_hours": 3.0, '
                 '"base_weight": 55}]}'
             )
             data = await self.plugin.model_hub.call_llm_json(
@@ -1388,6 +1394,10 @@ class OnlyYouWebAPI:
                     fallback = fallback[0] if fallback else []
                 gen_cards = [c for c in (fallback or []) if isinstance(c, StateEventCard)]
             gen_cards = gen_cards[:12]
+            # v2.6 §3.2/§3.4: armor is derived from the action type, never from the
+            # LLM reply nor the fallback spec list.
+            for card in gen_cards:
+                card.armor = card.action.fixed_armor
             # Rewrite card ids so every generated card is unique per batch.
             stamp = int(time.time())
             for idx, card in enumerate(gen_cards):
@@ -1487,6 +1497,11 @@ class OnlyYouWebAPI:
             tier_val = body.get("tier")
             aff_val = body.get("affinity")
             pids_val = body.get("platform_ids")
+            # v2.7: ★L3 = 管理员级。它**不会**通过好感度/自动晋升产生（自动晋升只到 L2），
+            # 但允许管理员从控制台关系页「⋯ → 设为 L3」等显式入口手动指定 / 取消。
+            requested_tier = (
+                int(tier_val) if tier_val in (1, 2, 3, "1", "2", "3") else None
+            )
             if isinstance(pids_val, str):
                 pids_list = [x.strip() for x in pids_val.split(",") if x.strip()]
             elif isinstance(pids_val, list):
@@ -1494,14 +1509,22 @@ class OnlyYouWebAPI:
             else:
                 pids_list = None
 
-            updated = await self.plugin.user_relation.update_user_details(
-                global_uid=uid,
-                display_name=body.get("display_name"),
-                nickname=body.get("nickname"),
-                tier=int(tier_val) if tier_val in (1, 2, 3, "1", "2", "3") else None,
-                affinity=float(aff_val) if aff_val is not None and str(aff_val) != "" else None,
-                platform_ids=pids_list,
-            )
+            # v2.6 §2.2: per-user 专属态度 (max 300 chars) lives on UserProfile/DB.
+            update_kwargs: dict[str, Any] = {
+                "global_uid": uid,
+                "display_name": body.get("display_name"),
+                "nickname": body.get("nickname"),
+                "tier": requested_tier,
+                "affinity": float(aff_val) if aff_val is not None and str(aff_val) != "" else None,
+                "platform_ids": pids_list,
+            }
+            if "attitude" in body:
+                attitude_raw = body.get("attitude")
+                update_kwargs["attitude"] = (
+                    None if attitude_raw is None else str(attitude_raw).strip()[:300]
+                )
+
+            updated = await self.plugin.user_relation.update_user_details(**update_kwargs)
             users = await self.plugin.user_relation.list_users()
             return ok_response(
                 {

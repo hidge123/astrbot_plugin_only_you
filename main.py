@@ -271,6 +271,9 @@ class OnlyYouPlugin(Star):
             session_buffer=self.session_buffer,
             plugin_config=self.config,
             soul_manager=self.soul_manager,
+            # v2.6: per-user 专属称呼/专属态度 need the relation profiles for the
+            # system-prompt block (window peers included).
+            user_relation=self.user_relation,
         )
         self.atmosphere_reader = AtmosphereReader(
             session_buffer=self.session_buffer,
@@ -1390,14 +1393,14 @@ class OnlyYouPlugin(Star):
     @onlyyou.command("status")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def onlyyou_status(self, event: AstrMessageEvent):
-        """查看角色卡、24h 动态时间轴、护甲与进度、微调配额、今日繁忙成果"""
+        """查看角色卡、24h 动态时间轴、固定护甲档位与进度、微调配额、今日繁忙成果"""
         async for result in self._dispatch_onlyyou(event, "status"):
             yield result
 
     @onlyyou.command("state")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def onlyyou_state(self, event: AstrMessageEvent):
-        """强制切换当前时间块状态（RESTING|BUSY|IDLE [标题] [护甲]）"""
+        """强制切换当前时间块状态（RESTING|BUSY|IDLE [标题]；护甲按行动类型自动取固定档位）"""
         async for result in self._dispatch_onlyyou(event, "state"):
             yield result
 
@@ -1411,7 +1414,7 @@ class OnlyYouPlugin(Star):
     @onlyyou.command("tier")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def onlyyou_tier(self, event: AstrMessageEvent):
-        """查看或修改用户的三级关系等级（1=L1普通 / 2=L2重要 / 3=L3核心）"""
+        """查看或修改用户关系等级（1=L1普通 / 2=L2重要 / 3=★L3核心管理员级）"""
         async for result in self._dispatch_onlyyou(event, "tier"):
             yield result
 
@@ -1448,9 +1451,9 @@ class OnlyYouPlugin(Star):
         return (
             "OnlyYou 指令列表（别名 /oy，仅管理员可用；直接发送 /onlyyou 可查看指令树）：\n"
             "• /onlyyou status - 查看 24h 动态时间轴、繁忙进度与今日繁忙成果\n"
-            "• /onlyyou state <RESTING|BUSY|IDLE> [标题] [护甲] - 切换当前时间块状态\n"
+            "• /onlyyou state <RESTING|BUSY|IDLE> [标题] - 切换当前时间块状态（护甲按行动类型固定档位）\n"
             "• /onlyyou reroll - 重新抽取今日动态时间轴与专属行动卡\n"
-            "• /onlyyou tier [user_id] [1|2|3] - 查看或修改用户关系等级\n"
+            "• /onlyyou tier [user_id] [1|2|3] - 查看或修改用户关系等级（★L3=管理员级，无好感度）\n"
             "• /onlyyou memory [list|gc|extract|add] - 管理三级记忆与遗忘GC\n"
             "• /onlyyou surf - 在 IDLE 状态下触发一次刷视频\n"
             "• /onlyyou unread [list|flush|clear] - 查看/立即补回/清空因休息或繁忙错过的未读消息\n"
@@ -1495,7 +1498,7 @@ class OnlyYouPlugin(Star):
                 s_mut_tag = " [⚡已微调]" if s.mutated else ""
                 slot_lines.append(
                     f"{marker}{s.format_time_range()} [{s.action.label}] "
-                    f"{s.state.value} | {s.title} (护甲:{s.armor}){s_mut_tag}"
+                    f"{s.state.value} | {s.title} (护甲:Lv.{s.action.armor_tier}·{s.armor}){s_mut_tag}"
                 )
             busy_results = [
                 s for s in run.settled_busy_results() if s.completion_result
@@ -1512,7 +1515,7 @@ class OnlyYouPlugin(Star):
                 f"• 你的关系等级：{user.tier.label} (ID: {user.global_uid}, 互动:{user.interaction_count}次)\n"
                 f"• 今日基调卡：【{run.vigor_title}】{run.vigor_desc}\n"
                 f"• 当前时间块：【{cur_slot.action.label}】{cur_slot.state.value} | "
-                f"{cur_slot.title} (护甲: {cur_slot.armor}){mut_tag}\n"
+                f"{cur_slot.title} (护甲:Lv.{cur_slot.action.armor_tier}·{cur_slot.armor}){mut_tag}\n"
                 f"• 当前进度：{progress_pct}% ({start_time}-{end_time})\n"
                 f"• 今日微调配额：{run.mutations_used}/{self.schedule_mutator.max_mutations_per_day} 次\n"
                 f"• 未读消息：群聊 {self.session_buffer.get_unread_count(is_private=False)} 条 / "
@@ -1591,7 +1594,7 @@ class OnlyYouPlugin(Star):
 
         if sub == "state":
             if len(tokens) < 2:
-                yield event.plain_result("用法：/onlyyou state <RESTING|BUSY|IDLE> [事件标题] [护甲值]")
+                yield event.plain_result("用法：/onlyyou state <RESTING|BUSY|IDLE> [事件标题]（护甲按行动类型自动取固定档位）")
                 return
             state_name = tokens[1].upper()
             if state_name not in BotState.__members__:
@@ -1599,15 +1602,16 @@ class OnlyYouPlugin(Star):
                 return
             new_state = BotState(state_name)
             new_title = tokens[2] if len(tokens) >= 3 else None
-            new_armor = int(tokens[3]) if len(tokens) >= 4 and tokens[3].isdigit() else None
+            # v2.6: armor is a fixed per-action tier now (ActionType.fixed_armor);
+            # the legacy 4th token is intentionally ignored.
             slot = await self.deck_engine.force_set_current_state(
                 soul_id=soul.soul_id,
                 new_state=new_state,
                 new_title=new_title,
-                armor=new_armor,
             )
             yield event.plain_result(
-                f"✅ 已将当前时段【{slot.label}】强制切换为：{slot.state.value} —— {slot.title} (护甲: {slot.armor})"
+                f"✅ 已将当前时段【{slot.label}】强制切换为：{slot.state.value} —— {slot.title} "
+                f"(护甲档位: Lv.{slot.action.armor_tier}·{slot.armor})"
             )
             return
 
@@ -1630,25 +1634,41 @@ class OnlyYouPlugin(Star):
                 f"• 今日基调：【{run.vigor_title}】\n"
                 f"• 新时间块数量：{len(run.slots)} 块\n"
                 f"• 当前时间块：【{cur_slot.action.label}】{cur_slot.state.value} | "
-                f"{cur_slot.title} (护甲:{cur_slot.armor})"
+                f"{cur_slot.title} (护甲:Lv.{cur_slot.action.armor_tier}·{cur_slot.armor})"
             )
             return
 
         if sub == "tier":
             if len(tokens) == 1:
-                yield event.plain_result(
-                    f"💖 你的当前关系等级：{user.tier.label} (ID: {user.global_uid}, 互动:{user.interaction_count}次, 好感:{user.affinity:.1f})"
-                )
+                if user.tier == UserTier.L3_CORE:
+                    yield event.plain_result(
+                        f"💖 你的当前关系等级：{user.tier.label} (ID: {user.global_uid}, "
+                        f"互动:{user.interaction_count}次) —— ★L3 管理员级（不需要好感度；"
+                        f"可在关系页「⋯」菜单或 /onlyyou tier <uid> 3 调整）"
+                    )
+                else:
+                    yield event.plain_result(
+                        f"💖 你的当前关系等级：{user.tier.label} (ID: {user.global_uid}, "
+                        f"互动:{user.interaction_count}次, 好感:{user.affinity:.1f})"
+                    )
                 return
             if len(tokens) >= 3 and tokens[2] in ("1", "2", "3"):
                 target_uid = tokens[1]
                 new_tier = UserTier(int(tokens[2]))
                 updated = await self.user_relation.set_user_tier(target_uid, new_tier)
+                extra = ""
+                if new_tier == UserTier.L3_CORE:
+                    extra = (
+                        " —— ★L3 = 管理员级：不参与好感度、不会被自动晋升，"
+                        "请在控制台关系页「⋯」菜单管理"
+                    )
                 yield event.plain_result(
-                    f"✅ 已将用户 `{updated.global_uid}` 的关系等级设置为：{updated.tier.label}"
+                    f"✅ 已将用户 `{updated.global_uid}` 的关系等级设置为：{updated.tier.label}{extra}"
                 )
                 return
-            yield event.plain_result("用法：/onlyyou tier [user_id] [1|2|3]")
+            yield event.plain_result(
+                "用法：/onlyyou tier [user_id] [1|2|3]（1=L1普通 / 2=L2重要 / 3=★L3管理员级）"
+            )
             return
 
         if sub == "memory":

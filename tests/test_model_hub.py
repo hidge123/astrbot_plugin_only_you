@@ -452,10 +452,20 @@ class TestLegacyMigration(ModelHubTestBase):
 
         cfg = hub.get_model_config()
         assert cfg["main"] == {"source_id": "deepseek", "model": "deepseek-chat"}
+        # v2.6: migrated roles carry the normalized optional-inheritance shape
+        # (``inherit``/``inherit_from`` stay in sync; legacy explicit models do
+        # not inherit, unset roles keep inheriting ``main``).
         assert cfg["decision"] == {
             "inherit": False,
+            "inherit_from": "",
             "source_id": "deepseek",
             "model": "deepseek-reasoner",
+        }
+        assert cfg["vision"] == {
+            "inherit": True,
+            "inherit_from": "main",
+            "source_id": "",
+            "model": "",
         }
         assert cfg["vision"]["inherit"] is True
         assert await self.db.get_setting("legacy_model_migrated", False) is True

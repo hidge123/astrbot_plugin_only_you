@@ -1,14 +1,21 @@
 """Plugin-autonomous model hub: four model roles backed by ``plugin_settings``.
 
-Roles (CONTRACTS.md §2.2):
+Roles (CONTRACTS.md §2.2, v2.6 optional inheritance):
 
 * ``main``     — main chat model, required, optionally exposed to AstrBot's native
   pipeline via ``event.set_extra("selected_provider", ...)``.
 * ``decision`` — read-the-air / memory extraction / schedule mutation / deck
-  generation.  Inherits ``main`` unless configured explicitly.
-* ``vision``   — multimodal video scoring.  Inherits ``main`` unless configured.
+  generation.  Either configured independently (``inherit_from=""``) or inherited
+  from ``main`` (``inherit_from="main"``).
+* ``vision``   — multimodal video scoring.  Same as ``decision`` plus the extra
+  option to inherit from the lightweight decision model
+  (``inherit_from="decision"`` -> ``decision -> main`` at most 2 hops).
 * ``tts``      — text-to-speech, never inherited; ``mode="off"`` means disabled.
 * ``small``    — legacy alias of ``decision`` kept for old call sites.
+
+Inheritance is **optional** since v2.6: turning it off and leaving ``source_id`` /
+``model`` empty simply disables the role (``resolve_role`` returns ``None``) instead
+of silently falling back to ``main``.
 
 Everything is stored in ``plugin_settings["model_config"]`` (SQLite KV) so the
 plugin never reads AstrBot's own model selection config (``context.get_config`` /
@@ -33,8 +40,18 @@ except ImportError:  # pragma: no cover - local offline tests
 
 DEFAULT_MODEL_CONFIG: Dict[str, dict] = {
     "main": {"source_id": "", "model": ""},
-    "decision": {"inherit": True, "source_id": "", "model": ""},
-    "vision": {"inherit": True, "source_id": "", "model": ""},
+    "decision": {
+        "inherit": True,
+        "inherit_from": "main",
+        "source_id": "",
+        "model": "",
+    },
+    "vision": {
+        "inherit": True,
+        "inherit_from": "main",
+        "source_id": "",
+        "model": "",
+    },
     "tts": {
         "mode": "off",
         "source_id": "",
@@ -50,6 +67,15 @@ DEFAULT_MODEL_CONFIG: Dict[str, dict] = {
 TTS_MODES = ("off", "source", "provider")
 TTS_SCOPES = ("private", "l3", "all")
 CHAT_ROLES = ("main", "decision", "vision")
+
+#: Legal ``inherit_from`` values for the two inheritable chat roles (v2.6).
+INHERIT_FROM_OPTIONS: Dict[str, tuple] = {
+    "decision": ("", "main"),
+    "vision": ("", "main", "decision"),
+}
+
+#: Maximum inheritance hops (``vision -> decision -> main`` is exactly 2 hops).
+MAX_INHERIT_HOPS = 2
 
 
 def _clean(value: Any) -> str:
@@ -72,6 +98,27 @@ def _to_bool(value: Any, default: bool = False) -> bool:
         return default
 
 
+def _normalize_inherit_from(role: str, role_raw: dict) -> str:
+    """Normalize ``decision`` / ``vision`` inheritance target (v2.6 contract §1.1).
+
+    Rules, in order:
+
+    1. explicit ``inherit_from`` (non-None) wins; illegal values fall back to
+       ``"main"`` when ``inherit`` is truthy, otherwise to ``""``;
+    2. explicit ``inherit`` booleans map to ``"main"`` / ``""``;
+    3. legacy configs (neither key present) keep inheriting ``main``.
+    """
+    options = INHERIT_FROM_OPTIONS.get(role, ("", "main"))
+    if "inherit_from" in role_raw and role_raw.get("inherit_from") is not None:
+        candidate = _clean(role_raw.get("inherit_from")).lower()
+        if candidate in options:
+            return candidate
+        return "main" if _to_bool(role_raw.get("inherit", True), default=True) else ""
+    if "inherit" in role_raw:
+        return "main" if _to_bool(role_raw.get("inherit"), default=True) else ""
+    return "main"
+
+
 def normalize_model_config(raw: Any) -> Dict[str, dict]:
     """Coerce arbitrary stored/requested model config into the canonical shape."""
     raw = raw if isinstance(raw, dict) else {}
@@ -85,8 +132,11 @@ def normalize_model_config(raw: Any) -> Dict[str, dict]:
 
     for role in ("decision", "vision"):
         role_raw = raw.get(role) if isinstance(raw.get(role), dict) else {}
+        inherit_from = _normalize_inherit_from(role, role_raw)
         normalized[role] = {
-            "inherit": _to_bool(role_raw.get("inherit", True), default=True),
+            # ``inherit`` and ``inherit_from`` are always kept in sync.
+            "inherit": bool(inherit_from),
+            "inherit_from": inherit_from,
             "source_id": _clean(role_raw.get("source_id")),
             "model": _clean(role_raw.get("model")),
         }
@@ -313,6 +363,33 @@ class ModelHub:
             return {"source_id": source_id, "model": model}
         return None
 
+    def _inherit_from(self, role: str) -> str:
+        """Normalized inheritance target of ``decision`` / ``vision`` (``""`` == off)."""
+        entry = self._config.get(role) or {}
+        value = _clean(entry.get("inherit_from")).lower()
+        return value if value in INHERIT_FROM_OPTIONS.get(role, ("",)) else ""
+
+    def _resolve_chat_role(
+        self, role: str, hops: int = 0
+    ) -> Optional[Dict[str, str]]:
+        """Resolve ``decision`` / ``vision`` through their optional inheritance chain.
+
+        * inheritance disabled (``inherit_from=""``) -> own config only; an
+          incomplete own config returns ``None`` (**never** falls back to ``main``);
+        * ``inherit_from="main"`` -> the main pair;
+        * ``inherit_from="decision"`` (vision only) -> recurse, at most
+          ``MAX_INHERIT_HOPS`` hops and cycle-safe (a cycle exhausts the hop budget).
+        """
+        inherit_from = self._inherit_from(role)
+        if not inherit_from:
+            return self._own_chat_role(role)
+        if inherit_from == "main":
+            return self._main_pair()
+        if inherit_from in INHERIT_FROM_OPTIONS and hops < MAX_INHERIT_HOPS:
+            return self._resolve_chat_role(inherit_from, hops + 1)
+        # >2 hops / self-cycle / unknown parent role -> disabled (no main fallback).
+        return None
+
     async def resolve_role(self, role: str) -> Optional[dict]:
         """Resolve a role into a concrete provider selection dict (or ``None``)."""
         name = self._normalize_role(role)
@@ -323,13 +400,7 @@ class ModelHub:
             return self._main_pair()
 
         if name in ("decision", "vision"):
-            entry = self._config.get(name) or {}
-            own = self._own_chat_role(name)
-            inherit = _to_bool(entry.get("inherit", True), default=True)
-            if not inherit and own is not None:
-                return own
-            # default / incomplete explicit config -> inherit the main model
-            return self._main_pair()
+            return self._resolve_chat_role(name)
 
         # tts never inherits
         tts = self._config.get("tts") or {}
@@ -678,25 +749,28 @@ class ModelHub:
             return None
 
     def _chat_role_status(self, role: str) -> dict:
+        inherit_from = ""
+        inherited = False
         if role == "main":
             configured_pair = self._main_pair()
-            inherited = False
         else:
-            own = self._own_chat_role(role)
-            entry = self._config.get(role) or {}
-            inherit = _to_bool(entry.get("inherit", True), default=True)
-            if inherit or own is None:
-                configured_pair = self._main_pair()
+            inherit_from = self._inherit_from(role)
+            if inherit_from:
+                configured_pair = self._resolve_chat_role(role)
+                # ``inherited`` is True only when an enabled inheritance actually
+                # resolved through the parent role (an unconfigured parent means
+                # this role is simply disabled, not "inherited").
                 inherited = configured_pair is not None
             else:
-                configured_pair = own
-                inherited = False
+                configured_pair = self._own_chat_role(role)
 
         configured = configured_pair is not None
         status: Dict[str, Any] = {
             "role": role,
             "configured": configured,
             "inherited": inherited,
+            "inherit": bool(inherit_from),
+            "inherit_from": inherit_from,
             "source_id": "",
             "model": "",
             "provider_id": "",
@@ -727,7 +801,10 @@ class ModelHub:
             )
             status["label"] = f"{source_id} / {model}（插件自建实例）"
         if inherited:
-            status["label"] += " · 继承主模型"
+            if inherit_from == "main":
+                status["label"] += " · 继承主模型"
+            elif inherit_from == "decision":
+                status["label"] += " · 继承轻量决策模型"
         status["ok"] = True
         return status
 
@@ -738,6 +815,8 @@ class ModelHub:
             "role": "tts",
             "configured": mode != "off",
             "inherited": False,
+            "inherit": False,
+            "inherit_from": "",
             "mode": mode,
             "source_id": _clean(cfg.get("source_id")),
             "model": _clean(cfg.get("model")),
@@ -785,6 +864,8 @@ class ModelHub:
                     "role": role,
                     "configured": False,
                     "inherited": False,
+                    "inherit": False,
+                    "inherit_from": "",
                     "source_id": "",
                     "model": "",
                     "provider_id": "",
@@ -800,6 +881,8 @@ class ModelHub:
                 "role": "tts",
                 "configured": False,
                 "inherited": False,
+                "inherit": False,
+                "inherit_from": "",
                 "mode": "off",
                 "label": "已关闭",
                 "ok": False,
