@@ -59,6 +59,8 @@
     memories: [],
     stats: null,
     users: [],
+    /* v2.8：T1 瞬时记忆条数上限（来自 memories/list 的 data.tier1_limit，默认 30） */
+    tier1Limit: 30,
     tier: "",
     keyword: "",
     userId: "",
@@ -293,7 +295,11 @@
       injectionBudgetHint() +
       "</div>" +
       "</div>" +
-      '<div class="row-between mt-8"><span class="text-xs muted" data-tip="Tier 1 瞬时记忆 48 小时后过期；Tier 2 近期记忆活力值随时间衰减；Tier 3 核心记忆永久保留并优先注入。">T1 48h 过期 · T2 活力衰减 · T3 永久保留</span>' +
+      '<div class="row-between mt-8"><span class="text-xs muted" data-tip="Tier 1 瞬时记忆创建 48 小时后过期且每角色最多保留 ' +
+      esc(num(S.tier1Limit, 30)) +
+      ' 条；Tier 2 近期记忆活力值随时间衰减；Tier 3 核心记忆永久保留并优先注入。">T1 48h 过期 · 上限 ' +
+      esc(num(S.tier1Limit, 30)) +
+      " 条 · T2 活力衰减 · T3 永久保留</span>" +
       '<span class="text-xs muted">分组头可点击折叠 / 展开</span>' +
       "</div></div></div>"
     );
@@ -319,12 +325,38 @@
     );
   }
 
+  /**
+   * T1 瞬时记忆不再展示活力条：按 created_at 计算 48h 过期倒计时（契约 §5.6）。
+   * 服务端在遗忘 GC 中删除创建超过 48h 的 T1，这里展示「⏳ 剩余 Xh 清除」。
+   */
+  function tier1CountdownHtml(memory) {
+    var created = num(memory && memory.created_at, 0);
+    if (!created) {
+      return (
+        '<span class="memory-vitality" data-tip="Tier 1 瞬时记忆创建后 48 小时过期，由遗忘清理 GC 删除">⏳ 48h 内清除</span>'
+      );
+    }
+    var elapsed = Date.now() / 1000 - created;
+    if (elapsed < 0) elapsed = 0;
+    var remain = Math.max(0, 48 - elapsed / 3600);
+    var text = remain >= 10 ? String(Math.round(remain)) : remain.toFixed(1);
+    return (
+      '<span class="memory-vitality" data-tip="' +
+      esc("Tier 1 瞬时记忆创建后 48 小时过期，剩余约 " + text + " 小时由遗忘清理 GC 删除") +
+      '">⏳ 剩余 ' +
+      esc(text) +
+      "h 清除</span>"
+    );
+  }
+
   function vitalityHtml(memory, tier) {
-    if (Number(tier) === 3) {
+    var tierNum = Number(tier) || 2;
+    if (tierNum === 3) {
       return (
         '<span class="memory-vitality is-permanent" data-tip="Tier 3 核心记忆永久保留，免疫每日遗忘清理">永久保存</span>'
       );
     }
+    if (tierNum === 1) return tier1CountdownHtml(memory);
     var vitality = Math.max(0, Math.min(100, num(memory.vitality, 0)));
     return (
       '<span class="memory-vitality" data-tip="活力值：随时间衰减，低于 0 会被遗忘清理 GC 物理删除">' +
@@ -444,6 +476,16 @@
     return !rows || rows.length === 0;
   }
 
+  /** 分组头提示：T1 额外展示「上限 N 条」（v2.8 §5.6） */
+  function groupHintText(tier) {
+    var meta = tierMeta(tier);
+    var hint = String(meta.hint || "");
+    if (Number(tier) === 1) {
+      hint += " · 上限 " + num(S.tier1Limit, 30) + " 条";
+    }
+    return hint;
+  }
+
   function groupHtml(tier) {
     var meta = tierMeta(tier);
     var counts = statCounts();
@@ -478,7 +520,7 @@
       esc(count) +
       "</span>" +
       '<span class="memory-group-hint">' +
-      esc(meta.hint) +
+      esc(groupHintText(tier)) +
       "</span></button>" +
       '<div class="memory-group-body">' +
       body +
@@ -577,6 +619,8 @@
     if (!data || typeof data !== "object") throw new Error("GET memories/list 返回为空");
     S.memories = Array.isArray(data.memories) ? data.memories : [];
     S.stats = data.stats && typeof data.stats === "object" ? data.stats : null;
+    /* v2.8：T1 每角色上限（配置 memory_and_context_config.max_tier1_memories，默认 30） */
+    S.tier1Limit = data.tier1_limit != null ? Math.max(0, num(data.tier1_limit, 30)) : 30;
   }
 
   /** 关联用户下拉数据源：失败时静默降级（用记忆里的 user_id 充当选项） */
@@ -1081,6 +1125,7 @@
     S.memories = [];
     S.stats = null;
     S.users = [];
+    S.tier1Limit = 30;
     S.tier = "";
     S.keyword = "";
     S.userId = "";
@@ -1126,6 +1171,7 @@
     S.memories = [];
     S.stats = null;
     S.users = [];
+    S.tier1Limit = 30;
     S.busy = false;
     S.keyword = "";
     S.tier = "";

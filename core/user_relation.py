@@ -1,4 +1,10 @@
-"""Three-tier user relationship manager (L1 Normal / L2 Important / L3 Core)."""
+"""Three-tier user relationship manager (L1 Normal / L2 Important / L3 Core).
+
+v2.8 additionally keeps a lightweight **group profile** registry (``GroupProfile``)
+persisted in ``plugin_settings["group_profiles"]``: it backs the console
+关系页 group section and is refreshed by ``main.on_any_message`` through
+``touch_group`` (contract §4.2 / §6.3).
+"""
 
 import json
 import time
@@ -8,6 +14,26 @@ from typing import Any, Optional
 from .platform_bridge import PlatformBridge
 from .state_machine import UserTier
 from ..storage.db import DatabaseManager
+
+try:  # pragma: no cover - AstrBot runtime dependency only
+    from astrbot.api import logger
+except ImportError:  # pragma: no cover - offline test fallback
+    import logging
+
+    logger = logging.getLogger("onlyyou.user_relation")
+
+
+# plugin_settings KV key holding the persisted group profile list (contract §6.3).
+GROUP_SETTING_KEY = "group_profiles"
+
+# Existing group profile: persist the refreshed ``last_active_at`` at most this
+# often (contract §6.3: 已有群最多每 60s 持久化一次).
+GROUP_PERSIST_THROTTLE_SECONDS = 60.0
+
+# Hard caps guarding malformed client payloads (never part of the frozen contract,
+# purely defensive so one bad console edit cannot bloat plugin_settings forever).
+_GROUP_NAME_MAX_CHARS = 120
+_GROUP_NOTES_MAX_CHARS = 500
 
 
 @dataclass
@@ -38,6 +64,56 @@ class UserProfile:
         }
 
 
+@dataclass
+class GroupProfile:
+    """A discovered group chat (contract §6.3).
+
+    ``user_relation`` only records *metadata*; the sliding window / unread backlog
+    itself lives in ``SessionBuffer`` and is looked up by ``umo`` on the Web API side.
+    """
+
+    umo: str
+    group_id: str = ""
+    platform_id: str = ""
+    display_name: str = ""
+    notes: str = ""
+    bound_soul_id: str = ""
+    last_active_at: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "umo": self.umo,
+            "group_id": self.group_id,
+            "platform_id": self.platform_id,
+            "display_name": self.display_name,
+            "notes": self.notes,
+            "bound_soul_id": self.bound_soul_id,
+            "last_active_at": int(self.last_active_at or 0),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> Optional["GroupProfile"]:
+        """Best-effort parse of one stored entry (``None`` for malformed rows)."""
+        if not isinstance(data, dict):
+            return None
+        umo = str(data.get("umo") or "").strip()
+        if not umo:
+            return None
+        try:
+            last_active_at = int(data.get("last_active_at") or 0)
+        except (TypeError, ValueError):
+            last_active_at = 0
+        return cls(
+            umo=umo,
+            group_id=str(data.get("group_id") or "").strip(),
+            platform_id=str(data.get("platform_id") or "").strip(),
+            display_name=str(data.get("display_name") or "").strip(),
+            notes=str(data.get("notes") or "").strip(),
+            bound_soul_id=str(data.get("bound_soul_id") or "").strip(),
+            last_active_at=last_active_at,
+        )
+
+
 class UserRelationManager:
     """
     三级用户关系管理器:
@@ -59,6 +135,9 @@ class UserRelationManager:
         self.platform_bridge = platform_bridge
         self.plugin_config = plugin_config
         self._cache: dict[str, UserProfile] = {}
+        # ---- v2.8 group profiles (plugin_settings["group_profiles"]) ----
+        self._groups_cache: Optional[dict[str, GroupProfile]] = None
+        self._group_persist_ts: dict[str, float] = {}
 
     @property
     def cfg(self) -> dict[str, Any]:
@@ -364,3 +443,184 @@ class UserRelationManager:
             return
         self._cache.pop(uid, None)
         await self.db.execute("DELETE FROM users WHERE global_uid = ?", (uid,))
+
+    # ==================================================================
+    # v2.8 group chat profiles (contract §4.2 / §6.3)
+    # ==================================================================
+    @staticmethod
+    def _default_group_display_name(group_id: str = "", umo: str = "") -> str:
+        """``群聊 {group_id or umo tail}`` (contract §6.3 fallback display name)."""
+        name = (group_id or "").strip()
+        if not name:
+            parts = (umo or "").strip().split(":")
+            name = (parts[2].strip() if len(parts) >= 3 else (umo or "").strip()) or ""
+        return f"群聊 {name}" if name else "群聊"
+
+    async def _ensure_groups_loaded(self) -> dict[str, GroupProfile]:
+        """Load ``plugin_settings["group_profiles"]`` once (never raises)."""
+        if self._groups_cache is not None:
+            return self._groups_cache
+        groups: dict[str, GroupProfile] = {}
+        raw: Any = []
+        try:
+            raw = await self.db.get_setting(GROUP_SETTING_KEY, [])
+        except Exception as exc:  # malformed / missing storage must never break chat
+            logger.warning(f"[OnlyYou] load group_profiles failed: {exc}")
+            raw = []
+        # Tolerate an accidental mapping payload as well as a proper list.
+        if isinstance(raw, dict):
+            raw = list(raw.values())
+        if isinstance(raw, (list, tuple)):
+            for item in raw:
+                profile = GroupProfile.from_dict(item)
+                if profile is not None:
+                    groups[profile.umo] = profile
+        self._groups_cache = groups
+        return groups
+
+    async def _persist_groups(self) -> None:
+        """Flush the whole group registry to ``plugin_settings`` (never raises)."""
+        groups = await self._ensure_groups_loaded()
+        try:
+            await self.db.set_setting(
+                GROUP_SETTING_KEY, [group.to_dict() for group in groups.values()]
+            )
+        except Exception as exc:
+            logger.warning(f"[OnlyYou] persist group_profiles failed: {exc}")
+
+    async def list_groups(self, soul_id: Optional[str] = None) -> list[GroupProfile]:
+        """List group profiles (optionally only the ones governed by ``soul_id``)."""
+        try:
+            groups = list((await self._ensure_groups_loaded()).values())
+        except Exception as exc:  # pragma: no cover - purely defensive
+            logger.warning(f"[OnlyYou] list_groups failed: {exc}")
+            return []
+        wanted = (soul_id or "").strip()
+        if wanted:
+            groups = [group for group in groups if group.bound_soul_id == wanted]
+        groups.sort(key=lambda group: (-int(group.last_active_at or 0), group.umo))
+        return groups
+
+    async def get_group(self, umo: str) -> Optional[GroupProfile]:
+        """Return one group profile by its full UMO (``None`` when unknown)."""
+        clean = (umo or "").strip()
+        if not clean:
+            return None
+        try:
+            return (await self._ensure_groups_loaded()).get(clean)
+        except Exception as exc:  # pragma: no cover - purely defensive
+            logger.warning(f"[OnlyYou] get_group failed: {exc}")
+            return None
+
+    async def touch_group(
+        self,
+        umo: str,
+        group_id: str = "",
+        platform_id: str = "",
+        display_name: str = "",
+        bound_soul_id: str = "",
+    ) -> GroupProfile:
+        """Create/refresh a group profile from an incoming group message.
+
+        Called by ``main.on_any_message`` (contract §4.2) on every group message, so
+        this method is intentionally cheap and **never raises**: a new group persists
+        immediately, an existing group's ``last_active_at`` is persisted at most once
+        per :data:`GROUP_PERSIST_THROTTLE_SECONDS` (default 60s, contract §6.3).
+        """
+        clean_umo = str(umo or "").strip()
+        clean_group_id = str(group_id or "").strip()
+        clean_platform_id = str(platform_id or "").strip()
+        clean_bound = str(bound_soul_id or "").strip()
+
+        try:
+            groups = await self._ensure_groups_loaded()
+        except Exception:  # pragma: no cover - _ensure_groups_loaded never raises
+            groups = {}
+        if not clean_umo:
+            # No UMO -> nothing addressable/persistable; return a usable stand-in.
+            profile = GroupProfile(
+                umo="", group_id=clean_group_id, platform_id=clean_platform_id
+            )
+            profile.display_name = self._default_group_display_name(clean_group_id)
+            return profile
+
+        existing = groups.get(clean_umo)
+        is_new = existing is None
+        profile = existing or GroupProfile(umo=clean_umo)
+        now = int(time.time())
+
+        if clean_group_id:
+            profile.group_id = clean_group_id
+        elif not profile.group_id:
+            parts = clean_umo.split(":")
+            profile.group_id = parts[2].strip() if len(parts) >= 3 else clean_umo
+        if clean_platform_id:
+            profile.platform_id = clean_platform_id
+        elif not profile.platform_id:
+            profile.platform_id = clean_umo.split(":", 1)[0].strip()
+        if clean_bound:
+            profile.bound_soul_id = clean_bound
+
+        default_name = self._default_group_display_name(profile.group_id, profile.umo)
+        provided_name = str(display_name or "").strip()
+        if provided_name and (
+            not profile.display_name or profile.display_name.startswith("群聊 ")
+        ):
+            # Fill / upgrade the auto placeholder, but never clobber a custom name.
+            profile.display_name = provided_name[:_GROUP_NAME_MAX_CHARS]
+        if not profile.display_name:
+            profile.display_name = default_name
+        profile.last_active_at = now
+        groups[clean_umo] = profile
+        self._groups_cache = groups
+
+        last_persist = self._group_persist_ts.get(clean_umo, 0.0)
+        if is_new or (time.time() - last_persist) >= GROUP_PERSIST_THROTTLE_SECONDS:
+            self._group_persist_ts[clean_umo] = time.time()
+            await self._persist_groups()
+        return profile
+
+    async def update_group(
+        self,
+        umo: str,
+        display_name: Optional[str] = None,
+        notes: Optional[str] = None,
+    ) -> Optional[GroupProfile]:
+        """Edit a group's display name / notes (``None`` when the group is unknown)."""
+        clean = (umo or "").strip()
+        if not clean:
+            return None
+        try:
+            groups = await self._ensure_groups_loaded()
+        except Exception:  # pragma: no cover - purely defensive
+            return None
+        profile = groups.get(clean)
+        if profile is None:
+            return None
+        if display_name is not None:
+            name = str(display_name).strip()
+            profile.display_name = (
+                name[:_GROUP_NAME_MAX_CHARS]
+                if name
+                else self._default_group_display_name(profile.group_id, profile.umo)
+            )
+        if notes is not None:
+            profile.notes = str(notes).strip()[:_GROUP_NOTES_MAX_CHARS]
+        await self._persist_groups()
+        return profile
+
+    async def delete_group(self, umo: str) -> bool:
+        """Remove one group profile; returns whether it existed (never raises)."""
+        clean = (umo or "").strip()
+        if not clean:
+            return False
+        try:
+            groups = await self._ensure_groups_loaded()
+        except Exception:  # pragma: no cover - purely defensive
+            return False
+        existed = groups.pop(clean, None) is not None
+        self._groups_cache = groups
+        self._group_persist_ts.pop(clean, None)
+        if existed:
+            await self._persist_groups()
+        return existed

@@ -44,6 +44,32 @@ class CyberSurfingPipeline:
     def cfg(self) -> dict[str, Any]:
         return self.plugin_config.get("surfing_config", {}) or {}
 
+    def is_enabled(self, soul: Any = None) -> bool:
+        """Whether cyber surfing is enabled for ``soul`` (v2.8 §5.2).
+
+        The per-Soul ``settings.surfing_enabled`` value wins; when the Soul does not
+        carry that key, fall back to the global ``surfing_config.surfing_enabled``
+        (default ``True``).
+        """
+        try:
+            global_enabled = bool(self.cfg.get("surfing_enabled", True))
+        except Exception:  # noqa: BLE001 - defensive, never gate on config errors
+            global_enabled = True
+        if soul is None:
+            return global_enabled
+        settings = getattr(soul, "settings", None)
+        if isinstance(settings, dict):
+            if "surfing_enabled" in settings:
+                return bool(settings.get("surfing_enabled"))
+            return global_enabled
+        if isinstance(soul, dict) and "surfing_enabled" in soul:
+            return bool(soul.get("surfing_enabled"))
+        # Tolerate lightweight duck-typed Souls exposing the flag directly.
+        attribute = getattr(soul, "surfing_enabled", None)
+        if isinstance(attribute, bool):
+            return attribute
+        return global_enabled
+
     async def surf_once(
         self,
         soul: SoulProfile,
@@ -55,6 +81,9 @@ class CyberSurfingPipeline:
         """
         Execute one surfing cycle if `current_state == BotState.IDLE` (or `ignore_state_gate=True`).
         """
+        # v2.8 §5.2: the per-Soul / global switch gates even manual triggers.
+        if not self.is_enabled(soul):
+            return None
         if not ignore_state_gate and not StateController.can_surf_video(current_state):
             return None
 
@@ -80,7 +109,11 @@ class CyberSurfingPipeline:
         if not candidates:
             return None
 
-        chosen = next((v for v in candidates if v.video_id not in self._watched_ids), candidates[0])
+        # v2.8 §5.4: when every candidate has already been watched, return None
+        # instead of re-processing / falling back to ``candidates[0]``.
+        chosen = next((v for v in candidates if v.video_id not in self._watched_ids), None)
+        if chosen is None:
+            return None
         self._watched_ids.add(chosen.video_id)
 
         review = await self.vision_processor.watch_and_evaluate(

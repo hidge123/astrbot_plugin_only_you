@@ -1,6 +1,7 @@
 """Tiered memory engine (Tier 1 Ephemeral / Tier 2 Recent / Tier 3 Core) + Forgetting GC."""
 
 import math
+import random
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -144,7 +145,27 @@ class MemoryManager:
         now_ts = int(created_at if created_at is not None else time.time())
         kw_str = (keywords or "").strip()
 
-        return await self.db.execute(
+        # v2.8 §5.4: identical Tier 1 memory for the same soul is refreshed instead
+        # of duplicated (e.g. the very same BUSY_TASK result settled twice).
+        if mtier == MemoryTier.EPHEMERAL:
+            existing = await self.db.fetchone(
+                """
+                SELECT id FROM memories
+                WHERE soul_id = ? AND memory_tier = 1 AND content = ?
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (soul_id, clean_content),
+            )
+            if existing is not None:
+                existing_id = int(existing["id"])
+                await self.db.execute(
+                    "UPDATE memories SET last_accessed_at = ? WHERE id = ?",
+                    (now_ts, existing_id),
+                )
+                return existing_id
+
+        row_id = await self.db.execute(
             """
             INSERT INTO memories (
                 soul_id, user_id, user_tier, memory_tier, content, keywords,
@@ -165,6 +186,10 @@ class MemoryManager:
                 now_ts,
             ),
         )
+        # v2.8 §5.4: FIFO cap for Tier 1 rows (oldest by created_at / id first).
+        if mtier == MemoryTier.EPHEMERAL and row_id > 0:
+            await self._enforce_tier1_cap(soul_id)
+        return row_id
 
     async def retrieve_candidates(
         self, soul_id: str, user_id: Optional[str] = None, limit: int = 40
@@ -197,6 +222,160 @@ class MemoryManager:
                 (soul_id, limit),
             )
         return [MemoryItem.from_row(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # v2.8 §5.3 / §5.4: MEMORY_MUSE bucket rotation, T1 cap & real-time cleanup
+    # ------------------------------------------------------------------
+
+    def _tier1_limit(self) -> int:
+        """Configured ``memory_and_context_config.max_tier1_memories`` (default 30)."""
+        raw = self.cfg.get("max_tier1_memories", 30)
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 30
+
+    async def _enforce_tier1_cap(self, soul_id: str) -> int:
+        """FIFO-trim one soul's Tier 1 rows down to ``max_tier1_memories``.
+
+        Oldest rows (``created_at ASC, id ASC``) are deleted first. Returns the
+        number of deleted rows. Tier 2 / Tier 3 rows are never touched.
+        """
+        limit = self._tier1_limit()
+        rows = await self.db.fetchall(
+            """
+            SELECT id FROM memories
+            WHERE soul_id = ? AND memory_tier = 1
+            ORDER BY created_at ASC, id ASC
+            """,
+            (soul_id,),
+        )
+        overflow = len(rows) - limit
+        if overflow <= 0:
+            return 0
+        for row in rows[:overflow]:
+            await self.db.execute("DELETE FROM memories WHERE id = ?", (int(row["id"]),))
+        return overflow
+
+    @staticmethod
+    def _muse_weight(item: MemoryItem) -> float:
+        """Weight for the MEMORY_MUSE weighted draw: importance x tier bias."""
+        try:
+            importance = max(1, int(item.importance))
+        except (TypeError, ValueError):
+            importance = 1
+        tier_weight = {1: 1.0, 2: 1.5, 3: 2.0}.get(int(item.memory_tier or 1), 1.0)
+        return float(importance) * tier_weight
+
+    async def sample_muse_memories(
+        self,
+        soul_id: str,
+        exclude_ids: Optional[list[int]] = None,
+        per_bucket_limit: int = 15,
+        pick: int = 2,
+    ) -> list[MemoryItem]:
+        """Sample 1~``pick`` memories for an IDLE_ROAM MEMORY_MUSE prompt (v2.8 §5.3).
+
+        Tier 1 / Tier 2 / Tier 3 are queried **independently** (oldest-accessed
+        first, ``per_bucket_limit`` each), ``exclude_ids`` are filtered out, then a
+        weighted draw biased by importance / tier picks at most ``pick`` items.
+        """
+        if not self.enabled:
+            return []
+        try:
+            bucket_limit = max(1, int(per_bucket_limit))
+        except (TypeError, ValueError):
+            bucket_limit = 15
+        try:
+            pick_count = max(0, int(pick))
+        except (TypeError, ValueError):
+            pick_count = 2
+        if pick_count <= 0:
+            return []
+
+        excluded: set[int] = set()
+        for value in exclude_ids or []:
+            try:
+                excluded.add(int(value))
+            except (TypeError, ValueError):
+                continue
+
+        pool: list[MemoryItem] = []
+        for tier in (MemoryTier.EPHEMERAL, MemoryTier.RECENT, MemoryTier.CORE):
+            rows = await self.db.fetchall(
+                """
+                SELECT * FROM memories
+                WHERE soul_id = ? AND memory_tier = ?
+                ORDER BY COALESCE(last_accessed_at, 0) ASC, id ASC
+                LIMIT ?
+                """,
+                (soul_id, int(tier), bucket_limit),
+            )
+            for row in rows:
+                item = MemoryItem.from_row(row)
+                if item.id not in excluded:
+                    pool.append(item)
+        if not pool:
+            return []
+
+        sampled: list[MemoryItem] = []
+        remaining = list(pool)
+        for _ in range(min(pick_count, len(remaining))):
+            weights = [self._muse_weight(item) for item in remaining]
+            chosen = random.choices(remaining, weights=weights, k=1)[0]
+            sampled.append(chosen)
+            remaining.remove(chosen)
+        return sampled
+
+    async def touch_memories_for_muse(self, memory_ids: list[int]) -> None:
+        """Refresh ``last_accessed_at`` only — no access_count / vitality / tier change."""
+        if not memory_ids:
+            return
+        now = int(time.time())
+        seen: set[int] = set()
+        for value in memory_ids:
+            try:
+                memory_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if memory_id in seen:
+                continue
+            seen.add(memory_id)
+            await self.db.execute(
+                "UPDATE memories SET last_accessed_at = ? WHERE id = ?",
+                (now, memory_id),
+            )
+
+    async def cleanup_tier1(self, now_override: Optional[int] = None) -> dict[str, int]:
+        """Real-time Tier 1 cleanup (v2.8 §5.4).
+
+        Deletes Tier 1 rows older than 48h (``deleted_expired``) and FIFO-trims
+        each soul's Tier 1 rows above ``max_tier1_memories`` (``deleted_overflow``).
+        """
+        now = int(now_override if now_override is not None else time.time())
+        stats = {"deleted_expired": 0, "deleted_overflow": 0}
+
+        expired = await self.db.fetchall(
+            "SELECT id FROM memories WHERE memory_tier = 1 AND (? - created_at) > 172800",
+            (now,),
+        )
+        if expired:
+            stats["deleted_expired"] = len(expired)
+            await self.db.execute(
+                "DELETE FROM memories WHERE memory_tier = 1 AND (? - created_at) > 172800",
+                (now,),
+            )
+
+        souls = await self.db.fetchall(
+            "SELECT DISTINCT soul_id FROM memories WHERE memory_tier = 1"
+        )
+        for row in souls:
+            stats["deleted_overflow"] += await self._enforce_tier1_cap(
+                str(row["soul_id"])
+            )
+        if stats["deleted_expired"] or stats["deleted_overflow"]:
+            logger.info(f"[OnlyYou] Tier1 cleanup completed: {stats}")
+        return stats
 
     async def reinforce_memories(self, memory_ids: list[int]) -> None:
         """

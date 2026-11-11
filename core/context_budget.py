@@ -293,6 +293,60 @@ class SessionBuffer:
         self._unread_kind.clear()
         return removed
 
+    def list_window_umos(self) -> list[str]:
+        """Return every UMO that currently owns an in-memory sliding window."""
+        try:
+            return [umo for umo in self._windows.keys() if umo]
+        except Exception:
+            return []
+
+    def clear_session_memory(self, umo: str) -> dict[str, int]:
+        """Drop one session's sliding window / evicted buffer / unread backlog.
+
+        Returns ``{"window": n, "evicted": n, "unread": n}`` message counts.
+        """
+        clean = (umo or "").strip()
+        stats = {"window": 0, "evicted": 0, "unread": 0}
+        if not clean:
+            return stats
+        stats["window"] = len(self._windows.pop(clean, None) or [])
+        stats["evicted"] = len(self._evicted_buffers.pop(clean, None) or [])
+        stats["unread"] = self.ack_unread(clean)
+        return stats
+
+    def clear_platform_memory(self, platform_id: str) -> dict[str, int]:
+        """Drop **in-memory** chat state for every session of one bot platform.
+
+        Called when a Soul unbinds a bot instance (``platform_id``): all UMOs whose
+        ``<platform_id>:`` prefix matches lose their sliding window, evicted buffer
+        and unread backlog.  Durable SQLite data (memories / users / video history)
+        is intentionally preserved.
+        """
+        clean = (platform_id or "").strip()
+        stats = {"windows": 0, "evicted": 0, "unread": 0, "messages": 0}
+        if not clean:
+            return stats
+        prefix = f"{clean}:"
+        for container_key in ("_windows", "_evicted_buffers", "_unread"):
+            container = getattr(self, container_key, None)
+            if not isinstance(container, dict):
+                continue
+            doomed = [umo for umo in list(container.keys()) if str(umo).startswith(prefix)]
+            for umo in doomed:
+                removed = container.pop(umo, None) or []
+                if container_key == "_windows":
+                    stats["windows"] += 1
+                    stats["messages"] += len(removed)
+                elif container_key == "_evicted_buffers":
+                    stats["evicted"] += 1
+                    stats["messages"] += len(removed)
+                else:
+                    stats["unread"] += 1
+                    stats["messages"] += len(removed)
+        for umo in [umo for umo in list(self._unread_kind.keys()) if str(umo).startswith(prefix)]:
+            self._unread_kind.pop(umo, None)
+        return stats
+
     @staticmethod
     def format_unread_batch(batch: list[BufferedMessage], max_chars: int = 800) -> str:
         """Render an unread batch as a compact transcript snippet."""

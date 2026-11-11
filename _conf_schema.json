@@ -132,6 +132,21 @@
         "description": "优先直发无水印视频文件",
         "type": "bool",
         "default": true
+      },
+      "surfing_enabled": {
+        "description": "赛博冲浪总开关（全局默认值；每个角色可在 Pages「冲浪」页单独覆盖，关闭后 SURF 时段自动降级为空闲闲逛）",
+        "type": "bool",
+        "default": true
+      },
+      "surf_share_min_score": {
+        "description": "SURF 主动分享的最低视觉评分门槛（评分低于该值的视频只记录不主动分享）",
+        "type": "int",
+        "default": 80
+      },
+      "surf_share_cooldown_minutes": {
+        "description": "两次 SURF 主动分享之间的最小间隔（分钟）",
+        "type": "int",
+        "default": 90
       }
     }
   },
@@ -164,6 +179,11 @@
         "description": "单次对话插入记忆的最大总字数预算（汉字数，防止费用过高）",
         "type": "int",
         "default": 400
+      },
+      "max_tier1_memories": {
+        "description": "单个角色的 Tier1 瞬时记忆数量上限（超过后按创建时间 FIFO 淘汰最旧记忆，默认 30 条）",
+        "type": "int",
+        "default": 30
       }
     }
   }

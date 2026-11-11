@@ -5,9 +5,10 @@ RogueliteDeckEngine / MemoryManager / UserRelationManager / CyberSurfingPipeline
 assembled against a temporary SQLite database, plus ``set_mock_request`` so the
 handlers can be awaited without FastAPI/AstrBot request context.
 
-Covers: the 27 registered routes, the ``{status, message, data}`` envelope, the new
-``dashboard/overview`` / ``card/*`` / ``models/*`` / ``sessions/default_soul`` routes
-and the legacy routes (``souls/detail``, ``cards/list``, ``users/list``,
+Covers: the **31** registered routes (v2.8 added the four ``sessions/*`` bot-instance
+binding routes, contract §6.1), the ``{status, message, data}`` envelope, the new
+``dashboard/overview`` / ``card/*`` / ``models/*`` / ``sessions/*`` routes and the
+legacy routes (``souls/detail``, ``cards/list``, ``users/list``,
 ``memories/list``, ``surfing`` GET).
 """
 
@@ -63,7 +64,14 @@ NEW_ROUTES = [
     "/models/test",
     "/sessions/default_soul",
 ]
-ALL_ROUTES = LEGACY_ROUTES + NEW_ROUTES
+# v2.8 §6.1: AstrBot bot-instance (platform_id) binding + session memory routes.
+V28_ROUTES = [
+    "/sessions/platforms",
+    "/sessions/bind_platform",
+    "/sessions/unbind_platform",
+    "/sessions/clear_memory",
+]
+ALL_ROUTES = LEGACY_ROUTES + NEW_ROUTES + V28_ROUTES
 
 
 class WebApiTestBase(DatabaseAsyncTestCase):
@@ -110,11 +118,11 @@ class WebApiTestBase(DatabaseAsyncTestCase):
 
 
 class TestRouteRegistration(WebApiTestBase):
-    async def test_registers_27_routes(self):
+    async def test_registers_31_routes(self):
         self.plugin.context.registered_routes.clear()
         self.api.register_routes()
         routes = self.plugin.context.registered_routes
-        assert len(routes) == 27
+        assert len(routes) == 31
         paths = [item["route"] for item in routes]
         assert len(paths) == len(set(paths))
         for path in paths:
@@ -140,6 +148,15 @@ class TestRouteRegistration(WebApiTestBase):
         assert mapping["/card/save"]["methods"] == ["POST"]
         assert mapping["/models/config"]["methods"] == ["GET", "POST"]
         assert mapping["/sessions/default_soul"]["methods"] == ["POST"]
+        # v2.8 bot-instance binding routes
+        assert mapping["/sessions/platforms"]["methods"] == ["GET"]
+        for route in (
+            "/sessions/bind_platform",
+            "/sessions/unbind_platform",
+            "/sessions/clear_memory",
+        ):
+            assert mapping[route]["methods"] == ["POST"]
+            assert mapping[route]["description"]
 
 
 class TestInitSummary(WebApiTestBase):

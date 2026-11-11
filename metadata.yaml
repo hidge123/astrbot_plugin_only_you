@@ -3,7 +3,7 @@ desc: OnlyYou (只有你) —— 具备生命节律、三级记忆与赛博冲�
 help: |
   OnlyYou (只有你) 插件核心指令（指令组，别名 /oy，**仅管理员可用**；直接发送 /onlyyou 可查看完整指令树）：
   /onlyyou status - 查看当前角色卡、24h 动态时间轴、繁忙进度、微调配额与今日繁忙成果
-  /onlyyou state <RESTING|BUSY|IDLE> [标题] [护甲] - 手动强制切换当前时间块状态（调试/控制）
+  /onlyyou state <RESTING|BUSY|IDLE> [标题] - 手动强制切换当前时间块状态（护甲按行动类型固定档位，调试/控制）
   /onlyyou reroll - 按角色专属卡池与作息曲线重新抽取今日 24h 动态时间轴
   /onlyyou memory [list|add|extract|gc] - 查看记忆列表、添加测试记忆、立即提炼或触发遗忘清理(GC)
   /onlyyou tier <user_id> <1|2|3> - 查看或设置用户的三级关系等级 (L1/L2/L3)

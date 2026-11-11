@@ -79,6 +79,48 @@ def _as_str_list(value: Any) -> list[str]:
     return []
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    """Coerce a JSON payload value (bool/int/str) into a bool with a safe default."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("1", "true", "yes", "on", "enable", "enabled"):
+            return True
+        if text in ("0", "false", "no", "off", "disable", "disabled", ""):
+            return False
+        return default
+    return default
+
+
+def _umo_kind(umo: Any) -> str:
+    """``"group"`` / ``"private"`` from an AstrBot UMO (contract §6.2 session item)."""
+    parts = str(umo or "").split(":")
+    if len(parts) >= 2 and "group" in parts[1].strip().lower():
+        return "group"
+    return "private"
+
+
+# In-memory chat-memory cleanup statistics (contract §6.2 / §4.1).
+CLEAR_STAT_KEYS = ("windows", "evicted", "unread", "messages")
+
+
+def _normalize_clear_stats(value: Any) -> dict[str, int]:
+    """Normalize a ``SessionBuffer`` cleanup result into ``{windows, evicted, unread, messages}``."""
+    stats: dict[str, int] = {key: 0 for key in CLEAR_STAT_KEYS}
+    if isinstance(value, dict):
+        for key in CLEAR_STAT_KEYS:
+            try:
+                stats[key] = int(value.get(key) or 0)
+            except (TypeError, ValueError):
+                stats[key] = 0
+    return stats
+
+
 def _ensure_section(card: dict[str, Any], key: str) -> dict[str, Any]:
     """Return `card[key]` as a dict, replacing invalid values with a fresh dict."""
     section = card.get(key)
@@ -258,9 +300,10 @@ def _busy_results_payload(run: Any, now_dt: Optional[datetime] = None) -> list[d
 
 class OnlyYouWebAPI:
     """
-    🖥️ Registers and handles all 27 RESTful Web API routes for the revamped
+    🖥️ Registers and handles all 31 RESTful Web API routes for the revamped
     `views/console` AstrBot Plugin Pages (17 legacy routes kept for compatibility
-    plus 10 new dashboard / character-card / model / session routes).
+    plus 10 new dashboard / character-card / model / session routes and the four
+    v2.8 bot-platform binding routes in `register_routes`).
     """
 
     def __init__(self, plugin: "OnlyYouPlugin"):
@@ -311,7 +354,7 @@ class OnlyYouWebAPI:
         return dict(self._mock_body)
 
     def register_routes(self) -> None:
-        """Register all 27 WebUI Console routes with `self.plugin.context.register_web_api`."""
+        """Register all 31 WebUI Console routes with `self.plugin.context.register_web_api`."""
         ctx = getattr(self.plugin, "context", None)
         register_fn = getattr(ctx, "register_web_api", None) if ctx is not None else None
         if not callable(register_fn):
@@ -485,6 +528,35 @@ class OnlyYouWebAPI:
                 ["POST"],
                 "OnlyYou: 设置插件默认角色（用于未绑定 UMO 的会话路由）",
             ),
+            # ------------------------------------------------------------------
+            # v2.8 bot-platform binding routes (contract §6.1): one AstrBot bot
+            # instance (platform_id) belongs to exactly one Soul; unbinding also
+            # clears that platform's in-memory chat state.
+            # ------------------------------------------------------------------
+            (
+                f"{API_PREFIX}/sessions/platforms",
+                self.api_sessions_platforms,
+                ["GET"],
+                "OnlyYou: 机器人接口列表 / 角色绑定关系 / 当前角色管辖的活跃会话内存概览",
+            ),
+            (
+                f"{API_PREFIX}/sessions/bind_platform",
+                self.api_sessions_bind_platform,
+                ["POST"],
+                "OnlyYou: 将 AstrBot 机器人接口（platform_id）绑定到指定角色（平台互斥）",
+            ),
+            (
+                f"{API_PREFIX}/sessions/unbind_platform",
+                self.api_sessions_unbind_platform,
+                ["POST"],
+                "OnlyYou: 解绑机器人接口并清理该平台的内存滑窗与未读",
+            ),
+            (
+                f"{API_PREFIX}/sessions/clear_memory",
+                self.api_sessions_clear_memory,
+                ["POST"],
+                "OnlyYou: 清空单个会话或整个机器人接口平台的内存滑窗与未读队列",
+            ),
         ]
 
         for route_path, handler, methods, desc in routes:
@@ -599,6 +671,488 @@ class OnlyYouWebAPI:
                 }
             )
         return items
+
+    # ==========================================================================
+    # v2.8 platform binding / session memory / group profile helpers (§6.2/§6.3)
+    # ==========================================================================
+    def _session_buffer(self) -> Any:
+        return getattr(self.plugin, "session_buffer", None)
+
+    def _window_map(self) -> dict[str, list[Any]]:
+        windows = getattr(self._session_buffer(), "_windows", None)
+        return windows if isinstance(windows, dict) else {}
+
+    def _unread_map(self) -> dict[str, list[Any]]:
+        unread = getattr(self._session_buffer(), "_unread", None)
+        return unread if isinstance(unread, dict) else {}
+
+    def _platform_id_of(self, umo: Any) -> str:
+        """``<platform_id>:...`` first segment via the contract PlatformBridge helper."""
+        bridge = getattr(self.plugin, "platform_bridge", None)
+        extract = getattr(bridge, "extract_platform_id", None)
+        if callable(extract):
+            try:
+                return str(extract(umo) or "").strip()
+            except Exception:  # pragma: no cover - defensive only
+                pass
+        text = str(umo or "").strip()
+        return text.split(":", 1)[0].strip() if text else ""
+
+    def _known_umos_for_ui(self) -> list[str]:
+        """Every UMO the console may need to list (windows + known group/L3 sessions)."""
+        umos: list[str] = []
+        buffer = self._session_buffer()
+        lister = getattr(buffer, "list_window_umos", None)
+        if callable(lister):
+            try:
+                umos.extend(list(lister() or []))
+            except Exception:  # pragma: no cover - defensive only
+                pass
+        if not umos:
+            umos.extend(list(self._window_map().keys()))
+        known_group = getattr(self.plugin, "_known_group_umos", None)
+        if isinstance(known_group, (set, list, tuple)):
+            umos.extend([str(item) for item in known_group])
+        known_l3 = getattr(self.plugin, "_known_l3_umos", None)
+        if isinstance(known_l3, dict):
+            umos.extend([str(item) for item in known_l3.values()])
+        elif isinstance(known_l3, (set, list, tuple)):
+            umos.extend([str(item) for item in known_l3])
+        seen: set[str] = set()
+        result: list[str] = []
+        for umo in umos:
+            clean = str(umo or "").strip()
+            if clean and clean not in seen:
+                seen.add(clean)
+                result.append(clean)
+        return result
+
+    async def _safe_list_souls(self) -> list[Any]:
+        manager = getattr(self.plugin, "soul_manager", None)
+        lister = getattr(manager, "list_souls", None) if manager is not None else None
+        if not callable(lister):
+            return []
+        try:
+            value = lister()
+            if inspect.isawaitable(value):
+                value = await value
+            return list(value or [])
+        except Exception as exc:
+            logger.warning(f"[OnlyYou] list_souls failed: {exc}")
+            return []
+
+    async def _platform_bindings(self) -> dict[str, str]:
+        """``{platform_id: soul_id}`` via the contract SoulManager API (defensive)."""
+        manager = getattr(self.plugin, "soul_manager", None)
+        getter = (
+            getattr(manager, "get_platform_bindings", None)
+            if manager is not None
+            else None
+        )
+        if callable(getter):
+            try:
+                value = getter()
+                if inspect.isawaitable(value):
+                    value = await value
+                if isinstance(value, dict):
+                    bindings = {
+                        str(platform_id).strip(): str(soul_id).strip()
+                        for platform_id, soul_id in value.items()
+                        if str(platform_id).strip()
+                    }
+                    return bindings
+            except Exception as exc:
+                logger.warning(f"[OnlyYou] get_platform_bindings failed: {exc}")
+        # Fallback: rebuild from the SoulProfile `bound_platforms` passthrough field
+        # (covers a partially-landed SoulManager implementation).
+        bindings = {}
+        for soul in await self._safe_list_souls():
+            soul_id = str(getattr(soul, "soul_id", "") or "").strip()
+            for platform_id in _as_str_list(getattr(soul, "bound_platforms", None)):
+                bindings.setdefault(platform_id, soul_id)
+        return bindings
+
+    async def _bound_platforms_of(self, soul_id: str) -> list[str]:
+        """Platform ids owned by one Soul (contract §1.3 ``get_bound_platforms``)."""
+        clean = (soul_id or "").strip()
+        if not clean:
+            return []
+        manager = getattr(self.plugin, "soul_manager", None)
+        getter = (
+            getattr(manager, "get_bound_platforms", None)
+            if manager is not None
+            else None
+        )
+        if callable(getter):
+            try:
+                value = getter(clean)
+                if inspect.isawaitable(value):
+                    value = await value
+                return list(dict.fromkeys(_as_str_list(value)))
+            except Exception as exc:
+                logger.warning(f"[OnlyYou] get_bound_platforms failed: {exc}")
+        bindings = await self._platform_bindings()
+        return [platform_id for platform_id, owner in bindings.items() if owner == clean]
+
+    async def _soul_name_map(self) -> dict[str, str]:
+        names: dict[str, str] = {}
+        for soul in await self._safe_list_souls():
+            soul_id = str(getattr(soul, "soul_id", "") or "").strip()
+            if soul_id:
+                names[soul_id] = str(
+                    getattr(soul, "name", "") or soul_id
+                ).strip() or soul_id
+        return names
+
+    async def _soul_summaries(self) -> list[dict[str, Any]]:
+        """``[{soul_id, name, bound_platforms}]`` (contract §6.2 sessions/platforms)."""
+        summaries: list[dict[str, Any]] = []
+        for soul in await self._safe_list_souls():
+            soul_id = str(getattr(soul, "soul_id", "") or "").strip()
+            summaries.append(
+                {
+                    "soul_id": soul_id,
+                    "name": str(getattr(soul, "name", "") or soul_id),
+                    "bound_platforms": await self._bound_platforms_of(soul_id),
+                }
+            )
+        return summaries
+
+    def _session_window_count(self, umo: str) -> int:
+        return len(self._window_map().get(umo) or [])
+
+    def _session_unread_count(self, umo: str) -> int:
+        buffer = self._session_buffer()
+        getter = getattr(buffer, "get_unread_batch", None)
+        if callable(getter):
+            try:
+                return len(getter(umo) or [])
+            except Exception:  # pragma: no cover - defensive only
+                pass
+        return len(self._unread_map().get(umo) or [])
+
+    def _session_last_active_at(self, umo: str) -> int:
+        latest = 0.0
+        for msg in list(self._window_map().get(umo) or []) + list(
+            self._unread_map().get(umo) or []
+        ):
+            try:
+                latest = max(latest, float(getattr(msg, "timestamp", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                continue
+        return int(latest)
+
+    def _session_item(
+        self, umo: str, bindings: dict[str, str], l3_umos: set[str]
+    ) -> dict[str, Any]:
+        platform_id = self._platform_id_of(umo)
+        return {
+            "umo": umo,
+            "kind": _umo_kind(umo),
+            "platform_id": platform_id,
+            "bound_soul_id": bindings.get(platform_id, ""),
+            "window_messages": self._session_window_count(umo),
+            "is_l3_private": umo in l3_umos,
+            "last_active_at": self._session_last_active_at(umo),
+        }
+
+    def _l3_umos(self) -> set[str]:
+        known_l3 = getattr(self.plugin, "_known_l3_umos", None)
+        if isinstance(known_l3, dict):
+            return {str(umo) for umo in known_l3.values() if str(umo).strip()}
+        if isinstance(known_l3, (set, list, tuple)):
+            return {str(umo) for umo in known_l3 if str(umo).strip()}
+        return set()
+
+    async def _session_entries(self, soul: Any) -> list[dict[str, Any]]:
+        """In-memory session overview for the platforms governed by ``soul``."""
+        soul_id = str(getattr(soul, "soul_id", "") or "").strip()
+        bindings = await self._platform_bindings()
+        bound_platforms = await self._bound_platforms_of(soul_id)
+        l3_umos = self._l3_umos()
+        entries: list[dict[str, Any]] = []
+        for umo in self._known_umos_for_ui():
+            platform_id = self._platform_id_of(umo)
+            if bound_platforms:
+                if platform_id not in bound_platforms:
+                    continue
+            else:
+                # Unbound fallback Soul: only sessions whose platform is not owned by
+                # another Soul are actually governed by it (contract §6.2).
+                owner = bindings.get(platform_id, "")
+                if owner and owner != soul_id:
+                    continue
+            entries.append(self._session_item(umo, bindings, l3_umos))
+        entries.sort(key=lambda item: (-int(item["last_active_at"] or 0), item["umo"]))
+        return entries
+
+    async def _platforms_payload(self) -> list[dict[str, Any]]:
+        """Bot instances (contract §3) merged with Soul bindings + session counters."""
+        observed_umos = self._known_umos_for_ui()
+        bridge = getattr(self.plugin, "platform_bridge", None)
+        lister = getattr(bridge, "list_platform_instances", None)
+        raw_instances: list[dict[str, Any]] = []
+        if callable(lister):
+            try:
+                try:
+                    value = lister(observed_umos)
+                except TypeError:  # legacy / partial helper without the argument
+                    value = lister()
+                if inspect.isawaitable(value):
+                    value = await value
+                if isinstance(value, list):
+                    raw_instances = [item for item in value if isinstance(item, dict)]
+            except Exception as exc:
+                logger.warning(f"[OnlyYou] list_platform_instances failed: {exc}")
+        if not raw_instances:
+            # Defensive fallback: infer platforms from known UMO observations.
+            seen: set[str] = set()
+            for umo in observed_umos:
+                platform_id = self._platform_id_of(umo)
+                if platform_id and platform_id not in seen:
+                    seen.add(platform_id)
+                    raw_instances.append(
+                        {
+                            "platform_id": platform_id,
+                            "platform_type": platform_id,
+                            "name": platform_id,
+                            "enabled": True,
+                            "running": False,
+                            "source": "observed",
+                        }
+                    )
+
+        bindings = await self._platform_bindings()
+        name_map = await self._soul_name_map()
+        session_counts: dict[str, int] = {}
+        for umo in observed_umos:
+            platform_id = self._platform_id_of(umo)
+            if platform_id:
+                session_counts[platform_id] = session_counts.get(platform_id, 0) + 1
+
+        def _item(platform_id: str, raw: dict[str, Any], source: str = "") -> dict[str, Any]:
+            bound_soul_id = bindings.get(platform_id, "")
+            return {
+                "platform_id": platform_id,
+                "platform_type": str(raw.get("platform_type") or platform_id),
+                "name": str(raw.get("name") or platform_id),
+                "enabled": bool(raw.get("enabled", True)),
+                "running": bool(raw.get("running", False)),
+                "source": source or str(raw.get("source") or "observed"),
+                "bound_soul_id": bound_soul_id,
+                "bound_soul_name": name_map.get(bound_soul_id, ""),
+                "session_count": int(session_counts.get(platform_id, 0) or 0),
+            }
+
+        result: list[dict[str, Any]] = []
+        seen_pids: set[str] = set()
+        for raw in raw_instances:
+            platform_id = str(raw.get("platform_id") or "").strip()
+            if not platform_id or platform_id in seen_pids:
+                continue
+            seen_pids.add(platform_id)
+            result.append(_item(platform_id, raw))
+        # A manually pre-bound platform id may not be reported by AstrBot yet, but the
+        # sessions page must still show the binding it just created.
+        for platform_id in bindings:
+            if platform_id in seen_pids:
+                continue
+            seen_pids.add(platform_id)
+            result.append(
+                _item(
+                    platform_id,
+                    {"platform_id": platform_id, "enabled": True, "running": False},
+                    source="observed",
+                )
+            )
+        result.sort(key=lambda item: (not bool(item["running"]), item["platform_id"]))
+        return result
+
+    async def _sessions_payload(self, soul: Any) -> dict[str, Any]:
+        """Frozen GET ``sessions/platforms`` data payload (contract §6.2)."""
+        return {
+            "current_soul_id": str(getattr(soul, "soul_id", "") or ""),
+            "default_soul_id": await self._safe_default_soul_id(),
+            "souls": await self._soul_summaries(),
+            "platforms": await self._platforms_payload(),
+            "sessions": await self._session_entries(soul),
+        }
+
+    async def _group_items(self) -> list[dict[str, Any]]:
+        """Frozen ``GroupItem`` list for ``users/list`` (contract §6.2 / §6.3)."""
+        manager = getattr(self.plugin, "user_relation", None)
+        lister = getattr(manager, "list_groups", None) if manager is not None else None
+        if not callable(lister):
+            return []
+        try:
+            groups = lister()
+            if inspect.isawaitable(groups):
+                groups = await groups
+            groups = list(groups or [])
+        except Exception as exc:
+            logger.warning(f"[OnlyYou] list_groups failed: {exc}")
+            return []
+        bindings = await self._platform_bindings()
+        name_map = await self._soul_name_map()
+        items: list[dict[str, Any]] = []
+        for group in groups:
+            to_dict = getattr(group, "to_dict", None)
+            data = dict(to_dict()) if callable(to_dict) else {}
+            umo = str(data.get("umo") or getattr(group, "umo", "") or "").strip()
+            if not umo:
+                continue
+            platform_id = str(data.get("platform_id") or "").strip() or self._platform_id_of(umo)
+            bound_soul_id = str(data.get("bound_soul_id") or "").strip() or bindings.get(
+                platform_id, ""
+            )
+            items.append(
+                {
+                    "umo": umo,
+                    "group_id": str(data.get("group_id") or "").strip(),
+                    "platform_id": platform_id,
+                    "display_name": str(data.get("display_name") or "").strip(),
+                    "notes": str(data.get("notes") or "").strip(),
+                    "bound_soul_id": bound_soul_id,
+                    "bound_soul_name": name_map.get(bound_soul_id, ""),
+                    "window_count": self._session_window_count(umo),
+                    "unread_count": self._session_unread_count(umo),
+                    "last_active_at": int(data.get("last_active_at") or 0),
+                }
+            )
+        items.sort(key=lambda item: (-int(item["last_active_at"] or 0), item["umo"]))
+        return items
+
+    @staticmethod
+    def _counts_from_users(users: list[Any]) -> dict[str, int]:
+        return {
+            "l3_count": sum(1 for user in users if getattr(user, "tier", None) == UserTier.L3_CORE),
+            "l2_count": sum(
+                1 for user in users if getattr(user, "tier", None) == UserTier.L2_IMPORTANT
+            ),
+            "l1_count": sum(
+                1 for user in users if getattr(user, "tier", None) == UserTier.L1_NORMAL
+            ),
+            "total": len(users),
+        }
+
+    async def _user_counts(self) -> dict[str, int]:
+        manager = getattr(self.plugin, "user_relation", None)
+        lister = getattr(manager, "list_users", None) if manager is not None else None
+        if not callable(lister):
+            return self._counts_from_users([])
+        try:
+            value = lister(tier_filter=None)
+            if inspect.isawaitable(value):
+                value = await value
+            return self._counts_from_users(list(value or []))
+        except Exception as exc:
+            logger.warning(f"[OnlyYou] list_users for counts failed: {exc}")
+            return self._counts_from_users([])
+
+    def _tier1_limit(self) -> int:
+        """``memory_and_context_config.max_tier1_memories`` (default 30, contract §5.6)."""
+        config = getattr(self.plugin, "config", None)
+        try:
+            mem_cfg = config.get("memory_and_context_config") if isinstance(config, dict) else None
+        except Exception:  # pragma: no cover - exotic config mapping
+            mem_cfg = None
+        if not isinstance(mem_cfg, dict):
+            return 30
+        try:
+            return max(1, int(mem_cfg.get("max_tier1_memories", 30)))
+        except (TypeError, ValueError):
+            return 30
+
+    def _soul_surfing_enabled(self, soul: Any) -> bool:
+        """Effective ``surfing_enabled``: Soul setting -> global config -> True."""
+        value = getattr(soul, "surfing_enabled", None)
+        if isinstance(value, bool):
+            return value
+        settings = getattr(soul, "settings", None)
+        if isinstance(settings, dict) and "surfing_enabled" in settings:
+            return _as_bool(settings.get("surfing_enabled"), default=True)
+        config = getattr(self.plugin, "config", None)
+        try:
+            surf_cfg = config.get("surfing_config") if isinstance(config, dict) else None
+        except Exception:  # pragma: no cover - exotic config mapping
+            surf_cfg = None
+        if isinstance(surf_cfg, dict) and "surfing_enabled" in surf_cfg:
+            return _as_bool(surf_cfg.get("surfing_enabled"), default=True)
+        return True
+
+    async def _clear_umo_memory(self, umo: str) -> dict[str, int]:
+        """Drop one session's sliding window / evicted buffer / unread backlog."""
+        stats: dict[str, int] = {key: 0 for key in CLEAR_STAT_KEYS}
+        buffer = self._session_buffer()
+        if buffer is None or not umo:
+            return stats
+        clear_session = getattr(buffer, "clear_session_memory", None)
+        if callable(clear_session):
+            try:
+                value = clear_session(umo)
+                if inspect.isawaitable(value):
+                    value = await value
+                if isinstance(value, dict):
+                    window_count = int(value.get("window") or 0)
+                    stats["windows"] = 1 if window_count > 0 else 0
+                    stats["evicted"] = int(value.get("evicted") or 0)
+                    stats["unread"] = int(value.get("unread") or 0)
+                    stats["messages"] = (
+                        window_count
+                        + int(value.get("evicted") or 0)
+                        + int(value.get("unread") or 0)
+                    )
+                    return stats
+            except Exception as exc:
+                logger.warning(f"[OnlyYou] clear_session_memory failed: {exc}")
+        windows = getattr(buffer, "_windows", None)
+        if isinstance(windows, dict):
+            removed = windows.pop(umo, None) or []
+            stats["windows"] = 1 if removed else 0
+            stats["messages"] += len(removed)
+        evicted_map = getattr(buffer, "_evicted_buffers", None)
+        if isinstance(evicted_map, dict):
+            removed = evicted_map.pop(umo, None) or []
+            stats["evicted"] = 1 if removed else 0
+            stats["messages"] += len(removed)
+        clear_unread = getattr(buffer, "clear_unread", None)
+        if callable(clear_unread):
+            try:
+                removed_unread = clear_unread(umo)
+                if inspect.isawaitable(removed_unread):
+                    removed_unread = await removed_unread
+                stats["unread"] = int(removed_unread or 0)
+                stats["messages"] += stats["unread"]
+            except Exception as exc:
+                logger.warning(f"[OnlyYou] clear_unread failed: {exc}")
+        return stats
+
+    async def _clear_platform_memory(self, platform_id: str) -> dict[str, int]:
+        """Clear all in-memory chat state of one bot platform (contract §4.1)."""
+        clean = (platform_id or "").strip()
+        if not clean:
+            return _normalize_clear_stats(None)
+        clearer = getattr(self.plugin, "clear_platform_memory_state", None)
+        if callable(clearer):
+            try:
+                value = clearer(clean)
+                if inspect.isawaitable(value):
+                    value = await value
+                return _normalize_clear_stats(value)
+            except Exception as exc:
+                logger.warning(f"[OnlyYou] clear_platform_memory_state failed: {exc}")
+        # Defensive fallback for a runtime still being written by the Lead.
+        buffer = self._session_buffer()
+        clearer = getattr(buffer, "clear_platform_memory", None) if buffer is not None else None
+        if callable(clearer):
+            try:
+                value = clearer(clean)
+                if inspect.isawaitable(value):
+                    value = await value
+                return _normalize_clear_stats(value)
+            except Exception as exc:
+                logger.warning(f"[OnlyYou] session_buffer.clear_platform_memory failed: {exc}")
+        return _normalize_clear_stats(None)
 
     # ==========================================================================
     # Shared helpers for the new Plugin Pages routes: character cards, soul
@@ -814,17 +1368,26 @@ class OnlyYouWebAPI:
             raise RuntimeError("ProviderFactory 未初始化（请检查 main.py 接线）")
         return factory
 
-    async def _safe_model_status(self) -> dict[str, Any]:
-        """`await model_hub.get_status()` with graceful degradation to an empty dict."""
+    async def _safe_model_status(self, soul_id: Optional[str] = None) -> dict[str, Any]:
+        """``await model_hub.get_status(soul_id)`` with graceful degradation to ``{}``."""
         hub = getattr(self.plugin, "model_hub", None)
         if hub is None:
             return {}
+        getter = getattr(hub, "get_status", None)
+        if not callable(getter):
+            return {}
         try:
-            status = await hub.get_status()
+            try:
+                value = getter(soul_id=soul_id) if soul_id else getter()
+            except TypeError:
+                # Legacy/partial signature: fall back to the positional/no-arg call.
+                value = getter(soul_id) if soul_id else getter()
+            if inspect.isawaitable(value):
+                value = await value
         except Exception as exc:
             logger.warning(f"[OnlyYou] model_hub.get_status failed: {exc}")
             return {}
-        return status if isinstance(status, dict) else {}
+        return value if isinstance(value, dict) else {}
 
     async def _safe_default_soul_id(self) -> str:
         """Read `plugin_settings.default_soul_id` through the contract SoulManager API."""
@@ -838,14 +1401,25 @@ class OnlyYouWebAPI:
             logger.warning(f"[OnlyYou] get_default_soul_id failed: {exc}")
             return ""
 
-    async def _read_model_config(self, hub: Any) -> dict[str, Any]:
-        """Read the current four-role model config from ModelHub (sync/async tolerant)."""
-        for attr in ("get_model_config_async", "get_model_config"):
+    async def _read_model_config(
+        self, hub: Any, soul_id: Optional[str] = None
+    ) -> dict[str, Any]:
+        """Read the four-role model config (soul-scoped when ``soul_id`` is given)."""
+        for attr in (
+            "get_config",
+            "get_config_sync",
+            "get_model_config_async",
+            "get_model_config",
+        ):
             getter = getattr(hub, attr, None)
             if not callable(getter):
                 continue
             try:
-                value = getter()
+                try:
+                    value = getter(soul_id=soul_id) if soul_id else getter()
+                except TypeError:
+                    # Legacy / partial signature without the `soul_id` keyword.
+                    value = getter()
                 if inspect.isawaitable(value):
                     value = await value
                 if isinstance(value, dict):
@@ -853,6 +1427,64 @@ class OnlyYouWebAPI:
             except Exception as exc:
                 logger.warning(f"[OnlyYou] model_hub.{attr} failed: {exc}")
         return {}
+
+    async def _save_hub_model_config(
+        self, hub: Any, cfg: dict[str, Any], soul_id: Optional[str] = None
+    ) -> dict[str, Any]:
+        """Save the four-role model config through ModelHub (contract §2.2, soul-aware)."""
+        for attr in ("save_config", "save_model_config"):
+            saver = getattr(hub, attr, None)
+            if not callable(saver):
+                continue
+            try:
+                try:
+                    value = saver(cfg, soul_id=soul_id) if soul_id else saver(cfg)
+                except TypeError:
+                    # Legacy / partial signature without the `soul_id` keyword.
+                    value = saver(cfg)
+                if inspect.isawaitable(value):
+                    value = await value
+                return value if isinstance(value, dict) else {}
+            except Exception as exc:
+                raise RuntimeError(f"保存模型配置失败: {exc}") from exc
+        raise RuntimeError("ModelHub 未实现 save_model_config")
+
+    @staticmethod
+    def _apply_soul_passthrough(profile: Any, body: dict[str, Any]) -> None:
+        """v2.8 ``souls/save`` compatibility: optional model/binding/settings passthrough."""
+        if not isinstance(body, dict):
+            return
+        raw_model = body.get("model_config")
+        if isinstance(raw_model, dict) and raw_model:
+            normalized: dict[str, Any] = dict(raw_model)
+            try:
+                from .model_hub import normalize_model_config
+
+                normalized = normalize_model_config(raw_model)
+            except Exception:  # pragma: no cover - partial model_hub during refactor
+                normalized = dict(raw_model)
+            try:
+                profile.model_config = normalized
+            except Exception:  # pragma: no cover - defensive only
+                pass
+        raw_platforms = body.get("bound_platforms")
+        if raw_platforms is not None:
+            platforms = list(dict.fromkeys(_as_str_list(raw_platforms)))
+            try:
+                profile.bound_platforms = platforms
+            except Exception:  # pragma: no cover - defensive only
+                pass
+        raw_settings = body.get("settings")
+        if isinstance(raw_settings, dict):
+            try:
+                settings = dict(getattr(profile, "settings", None) or {})
+            except Exception:  # pragma: no cover - defensive only
+                settings = {}
+            settings.update(raw_settings)
+            try:
+                profile.settings = settings
+            except Exception:  # pragma: no cover - defensive only
+                pass
 
     async def _relation_counts(self) -> dict[str, int]:
         """Dashboard relation counters derived from `user_relation.list_users()`."""
@@ -944,12 +1576,15 @@ class OnlyYouWebAPI:
             sched_payload = await self._build_schedule_payload(active_soul)
             model_status = await self._safe_model_status()
             default_soul_id = await self._safe_default_soul_id()
+            platform_bindings = await self._platform_bindings()
 
             return ok_response(
                 {
                     "souls": [s.to_dict() for s in souls],
                     "native_personas": native_personas,
                     "umo_bindings": bindings,
+                    # v2.8: {platform_id: soul_id} bot-instance ownership (contract §6.2).
+                    "platform_bindings": platform_bindings,
                     "known_umos": self._collect_known_umos(bindings),
                     "active_soul_id": active_soul.soul_id,
                     "active_schedule": sched_payload,
@@ -983,6 +1618,8 @@ class OnlyYouWebAPI:
                     "card_schema": self._card_schema(),
                     "schedule": sched_payload,
                     "umo_bindings": bindings,
+                    # v2.8 data extension (contract §6.1): platform ownership map.
+                    "platform_bindings": await self._platform_bindings(),
                     "known_umos": self._collect_known_umos(bindings),
                 }
             )
@@ -1090,6 +1727,8 @@ class OnlyYouWebAPI:
                 profile = SoulProfile.from_dict(payload)
                 profile = self._apply_card_to_profile(profile, card)
 
+            # v2.8 §6.2: tolerate optional soul-scoped config passthrough fields.
+            self._apply_soul_passthrough(profile, body)
             await manager.save_soul(profile)
 
             # Optional UMO routing binding updates (legacy console contract)
@@ -1447,26 +2086,74 @@ class OnlyYouWebAPI:
                 if tier_filter is None
                 else await self.plugin.user_relation.list_users(tier_filter=None)
             )
-            counts = {
-                "l3_count": sum(1 for u in all_users if u.tier == UserTier.L3_CORE),
-                "l2_count": sum(1 for u in all_users if u.tier == UserTier.L2_IMPORTANT),
-                "l1_count": sum(1 for u in all_users if u.tier == UserTier.L1_NORMAL),
-                "total": len(all_users),
-            }
             return ok_response(
                 {
                     "users": [u.to_dict() for u in users],
-                    "counts": counts,
+                    "counts": self._counts_from_users(list(all_users)),
+                    # v2.8: discovered group chats (contract §6.2 GroupItem).
+                    "groups": await self._group_items(),
                 }
             )
         except Exception as e:
             return err_response(f"获取用户关系列表失败: {e}")
+
+    async def _handle_group_action(self, action: str, body: dict[str, Any]) -> dict[str, Any]:
+        """v2.8 ``users/update`` group actions (contract §6.2)."""
+        manager = getattr(self.plugin, "user_relation", None)
+        if manager is None:
+            return err_response("UserRelationManager 未初始化")
+        umo = str(body.get("umo") or "").strip()
+        if not umo:
+            return err_response("群聊 UMO 不能为空")
+
+        if action == "update_group":
+            updater = getattr(manager, "update_group", None)
+            if not callable(updater):
+                return err_response("UserRelationManager 未实现 update_group")
+            group = updater(
+                umo,
+                display_name=body.get("display_name"),
+                notes=body.get("notes"),
+            )
+            if inspect.isawaitable(group):
+                group = await group
+            if group is None:
+                return err_response(f"未找到群聊档案: {umo}")
+            message = f"已更新群聊 {getattr(group, 'display_name', '') or umo}"
+        elif action == "clear_group_memory":
+            cleared = await self._clear_umo_memory(umo)
+            message = (
+                f"已清空群聊 {umo} 的内存滑窗与未读"
+                f"（{cleared['messages']} 条消息）"
+            )
+        else:  # delete_group
+            deleter = getattr(manager, "delete_group", None)
+            if not callable(deleter):
+                return err_response("UserRelationManager 未实现 delete_group")
+            deleted = deleter(umo)
+            if inspect.isawaitable(deleted):
+                deleted = await deleted
+            if not deleted:
+                return err_response(f"未找到群聊档案: {umo}")
+            message = f"已移除群聊档案 {umo}"
+
+        return ok_response(
+            {
+                "groups": await self._group_items(),
+                "counts": await self._user_counts(),
+            },
+            message=message,
+        )
 
     async def api_users_update(self) -> dict[str, Any]:
         try:
             await self.plugin._ensure_initialized()
             body = await self._get_json_body()
             action = str(body.get("action") or "update").strip().lower()
+
+            # v2.8 group profile actions (contract §6.2).
+            if action in ("update_group", "clear_group_memory", "delete_group"):
+                return await self._handle_group_action(action, body)
 
             if action == "merge":
                 primary_uid = str(body.get("primary_uid") or "").strip()
@@ -1573,6 +2260,8 @@ class OnlyYouWebAPI:
                 {
                     "memories": [m.to_dict() for m in items],
                     "stats": stats,
+                    # v2.8 §5.6: T1 capacity shown by the Pages memory panel.
+                    "tier1_limit": self._tier1_limit(),
                 }
             )
         except Exception as e:
@@ -1712,6 +2401,7 @@ class OnlyYouWebAPI:
             method = self._get_method()
 
             if method == "GET":
+                soul = await self._resolve_soul(self._get_query_param("soul_id"))
                 soul_id = self._get_query_param("soul_id") or None
                 items = await self.plugin.surfing_pipeline.list_history(soul_id=soul_id, limit=30)
                 bindings = await self.plugin.soul_manager.get_umo_bindings()
@@ -1719,6 +2409,9 @@ class OnlyYouWebAPI:
                     {
                         "videos": items,
                         "known_umos": self._collect_known_umos(bindings),
+                        # v2.8 §5.2: per-soul cyber-surfing master switch.
+                        "surfing_enabled": self._soul_surfing_enabled(soul),
+                        "soul_id": str(getattr(soul, "soul_id", "") or ""),
                     }
                 )
 
@@ -1728,6 +2421,39 @@ class OnlyYouWebAPI:
             soul = await self.plugin.soul_manager.get_soul_by_id(soul_id)
             if soul is None:
                 soul = (await self.plugin.soul_manager.list_souls())[0]
+
+            if action == "toggle_surfing":
+                enabled = _as_bool(body.get("enabled", True), default=True)
+                setter = getattr(self.plugin.soul_manager, "set_soul_setting", None)
+                if callable(setter):
+                    try:
+                        updated = setter(soul.soul_id, "surfing_enabled", enabled)
+                        if inspect.isawaitable(updated):
+                            updated = await updated
+                        if updated is not None:
+                            soul = updated
+                    except Exception as exc:
+                        return err_response(f"保存冲浪总开关失败: {exc}")
+                else:
+                    # Defensive fallback for a partially-landed SoulManager.
+                    settings = getattr(soul, "settings", None)
+                    settings = dict(settings) if isinstance(settings, dict) else {}
+                    settings["surfing_enabled"] = enabled
+                    try:
+                        soul.settings = settings
+                        await self.plugin.soul_manager.save_soul(soul)
+                    except Exception as exc:  # pragma: no cover - defensive only
+                        return err_response(f"保存冲浪总开关失败: {exc}")
+                effective = self._soul_surfing_enabled(soul)
+                to_dict = getattr(soul, "to_dict", None)
+                return ok_response(
+                    {
+                        "soul_id": str(getattr(soul, "soul_id", "") or soul_id),
+                        "surfing_enabled": effective,
+                        "soul": to_dict() if callable(to_dict) else {},
+                    },
+                    message=("已开启" if effective else "已关闭") + "赛博冲浪总开关",
+                )
 
             if action == "delete":
                 vid_id = str(body.get("video_id") or "").strip() or None
@@ -2078,34 +2804,56 @@ class OnlyYouWebAPI:
             return err_response(f"获取模型列表失败: {e}")
 
     async def api_models_config(self) -> dict[str, Any]:
-        """GET: read the four-role model config; POST: save it and hot-rebuild instances."""
+        """GET: read the four-role model config; POST: save it and hot-rebuild instances.
+
+        v2.8 (contract §6.2): soul-aware — ``GET ?soul_id=`` / ``POST {soul_id, model_config}``.
+        Without ``soul_id`` ModelHub resolves the default soul (or keeps the legacy
+        global config when ``attach_soul_manager`` was never called).
+        """
         try:
             await self.plugin._ensure_initialized()
             hub = getattr(self.plugin, "model_hub", None)
             if hub is None:
                 return err_response("ModelHub 未初始化")
             method = self._get_method()
+            requested_soul_id = ""
             saved: dict[str, Any] = {}
 
             if method == "POST":
                 body = await self._get_json_body()
+                requested_soul_id = str(body.get("soul_id") or "").strip()
                 raw_cfg = body.get("model_config")
                 if not isinstance(raw_cfg, dict):
                     # Tolerate raw config bodies: {"main": {...}, "decision": {...}, ...}
                     if any(key in body for key in ("main", "decision", "vision", "tts")):
-                        raw_cfg = body
+                        raw_cfg = {
+                            key: body.get(key)
+                            for key in ("main", "decision", "vision", "tts")
+                            if key in body
+                        }
                 if not isinstance(raw_cfg, dict):
                     return err_response("请求体缺少 model_config 对象")
-                saver = getattr(hub, "save_model_config", None)
-                if not callable(saver):
-                    return err_response("ModelHub 未实现 save_model_config")
-                result = await saver(raw_cfg)
-                saved = result if isinstance(result, dict) else {}
+                try:
+                    saved = await self._save_hub_model_config(
+                        hub, raw_cfg, requested_soul_id or None
+                    )
+                except RuntimeError as exc:
+                    return err_response(str(exc))
+            else:
+                requested_soul_id = self._get_query_param("soul_id")
 
-            model_config = saved if saved else await self._read_model_config(hub)
-            status = await self._safe_model_status()
+            model_config = (
+                saved
+                if saved
+                else await self._read_model_config(hub, requested_soul_id or None)
+            )
+            status = await self._safe_model_status(requested_soul_id or None)
+            soul_id = requested_soul_id or await self._safe_default_soul_id()
             message = "模型配置已保存并热重建实例" if method == "POST" else "ok"
-            return ok_response({"model_config": model_config, "status": status}, message=message)
+            return ok_response(
+                {"soul_id": soul_id, "model_config": model_config, "status": status},
+                message=message,
+            )
         except Exception as e:
             logger.warning(f"[OnlyYou] api_models_config error: {e}")
             return err_response(f"读取/保存模型配置失败: {e}")
@@ -2116,6 +2864,7 @@ class OnlyYouWebAPI:
             await self.plugin._ensure_initialized()
             body = await self._get_json_body()
             role = str(body.get("role") or "main").strip().lower()
+            soul_id = str(body.get("soul_id") or "").strip() or None
             hub = getattr(self.plugin, "model_hub", None)
             if hub is None:
                 return err_response("ModelHub 未初始化")
@@ -2129,7 +2878,17 @@ class OnlyYouWebAPI:
             tester = getattr(hub, "test_role", None)
             if not callable(tester):
                 return err_response("ModelHub 未实现 test_role")
-            result = await tester(role)
+            try:
+                try:
+                    value = tester(role, soul_id=soul_id) if soul_id else tester(role)
+                except TypeError:
+                    # Legacy / partial signature without the `soul_id` keyword.
+                    value = tester(role)
+                if inspect.isawaitable(value):
+                    value = await value
+            except Exception as exc:
+                return err_response(f"模型测试失败: {exc}")
+            result = value
             if result is None:
                 return err_response("模型测试未返回结果")
             if isinstance(result, dict):
@@ -2176,3 +2935,129 @@ class OnlyYouWebAPI:
         except Exception as e:
             logger.warning(f"[OnlyYou] api_sessions_default_soul error: {e}")
             return err_response(f"设置默认角色失败: {e}")
+
+    # ==========================================================================
+    # 10. Bot-instance (platform) binding & session memory (v2.8, contract §6.2)
+    # ==========================================================================
+    async def api_sessions_platforms(self) -> dict[str, Any]:
+        """GET ``sessions/platforms?soul_id=`` — bot instances, bindings & sessions."""
+        try:
+            await self.plugin._ensure_initialized()
+            soul = await self._resolve_soul(self._get_query_param("soul_id"))
+            return ok_response(await self._sessions_payload(soul))
+        except Exception as e:
+            logger.warning(f"[OnlyYou] api_sessions_platforms error: {e}")
+            return err_response(f"加载机器人接口与会话内存失败: {e}")
+
+    async def api_sessions_bind_platform(self) -> dict[str, Any]:
+        """POST ``sessions/bind_platform`` ``{soul_id, platform_id}`` (exclusive binding)."""
+        try:
+            await self.plugin._ensure_initialized()
+            body = await self._get_json_body()
+            soul_id = str(body.get("soul_id") or "").strip()
+            platform_id = str(body.get("platform_id") or "").strip()
+            if not soul_id:
+                return err_response("缺少 soul_id")
+            if not platform_id:
+                return err_response("缺少 platform_id")
+            manager = getattr(self.plugin, "soul_manager", None)
+            if manager is None:
+                return err_response("SoulManager 未初始化")
+            soul = await manager.get_soul_by_id(soul_id)
+            if soul is None:
+                return err_response(f"角色不存在: {soul_id}")
+            binder = getattr(manager, "bind_platform", None)
+            if not callable(binder):
+                return err_response("SoulManager 未实现 bind_platform（机器人接口绑定不可用）")
+            try:
+                bound = binder(soul_id, platform_id)
+                if inspect.isawaitable(bound):
+                    bound = await bound
+                if bound is not None:
+                    soul = bound
+            except ValueError as exc:
+                # Exact mutual-exclusion message required by contract §6.2.
+                return err_response(str(exc))
+            payload = {
+                "soul_id": soul_id,
+                "platform_id": platform_id,
+                "souls": await self._soul_summaries(),
+                "platforms": await self._platforms_payload(),
+            }
+            soul_name = str(getattr(soul, "name", "") or soul_id)
+            return ok_response(
+                payload, message=f"已将机器人接口 {platform_id} 绑定到角色 {soul_name}"
+            )
+        except Exception as e:
+            logger.warning(f"[OnlyYou] api_sessions_bind_platform error: {e}")
+            return err_response(f"绑定机器人接口失败: {e}")
+
+    async def api_sessions_unbind_platform(self) -> dict[str, Any]:
+        """POST ``sessions/unbind_platform`` ``{platform_id}`` + memory cleanup."""
+        try:
+            await self.plugin._ensure_initialized()
+            body = await self._get_json_body()
+            platform_id = str(body.get("platform_id") or "").strip()
+            if not platform_id:
+                return err_response("缺少 platform_id")
+            manager = getattr(self.plugin, "soul_manager", None)
+            if manager is None:
+                return err_response("SoulManager 未初始化")
+            unbinder = getattr(manager, "unbind_platform", None)
+            if not callable(unbinder):
+                return err_response("SoulManager 未实现 unbind_platform（机器人接口解绑不可用）")
+            try:
+                previous_soul_id = unbinder(platform_id)
+                if inspect.isawaitable(previous_soul_id):
+                    previous_soul_id = await previous_soul_id
+                previous_soul_id = str(previous_soul_id or "").strip()
+            except ValueError as exc:
+                return err_response(str(exc))
+            # Always drop the platform's in-memory chat state (contract §4.1/§6.2).
+            cleared = await self._clear_platform_memory(platform_id)
+            soul = await self._resolve_soul(str(body.get("soul_id") or ""))
+            payload = {
+                "platform_id": platform_id,
+                "previous_soul_id": previous_soul_id,
+                "cleared": cleared,
+                "souls": await self._soul_summaries(),
+                "platforms": await self._platforms_payload(),
+            }
+            return ok_response(
+                payload,
+                message=(
+                    f"已解绑机器人接口 {platform_id}"
+                    f"（清理 {cleared['messages']} 条内存消息）"
+                ),
+            )
+        except Exception as e:
+            logger.warning(f"[OnlyYou] api_sessions_unbind_platform error: {e}")
+            return err_response(f"解绑机器人接口失败: {e}")
+
+    async def api_sessions_clear_memory(self) -> dict[str, Any]:
+        """POST ``sessions/clear_memory`` ``{umo?}`` / ``{platform_id?}``."""
+        try:
+            await self.plugin._ensure_initialized()
+            body = await self._get_json_body()
+            umo = str(body.get("umo") or "").strip()
+            platform_id = str(body.get("platform_id") or "").strip()
+            if not umo and not platform_id:
+                return err_response("请提供 umo 或 platform_id")
+            if umo:
+                cleared = await self._clear_umo_memory(umo)
+                target = f"会话 {umo}"
+            else:
+                cleared = await self._clear_platform_memory(platform_id)
+                target = f"平台 {platform_id}"
+            soul = await self._resolve_soul(str(body.get("soul_id") or ""))
+            return ok_response(
+                {"cleared": cleared, "sessions": await self._session_entries(soul)},
+                message=(
+                    f"已清空{target}的内存滑窗与未读"
+                    f"（{cleared['messages']} 条消息）"
+                ),
+            )
+        except Exception as e:
+            logger.warning(f"[OnlyYou] api_sessions_clear_memory error: {e}")
+            return err_response(f"清空会话内存失败: {e}")
+

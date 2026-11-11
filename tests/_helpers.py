@@ -17,6 +17,7 @@ instead.
 """
 
 import copy
+import inspect
 import json
 import os
 import shutil
@@ -344,6 +345,8 @@ class FakeContext:
     def __init__(self, provider_manager=None):
         self.provider_manager = provider_manager or FakeProviderManager()
         self.persona_manager = None
+        # AstrBot ``platform_manager`` (bot-instance discovery, contract §3).
+        self.platform_manager = None
         self.config = {}
         self.registered_routes = []
         self.tts_providers = []
@@ -478,9 +481,82 @@ class FakePlugin:
         self._known_group_umos = set()
         self._last_idle_roam_ts = {}
         self._busy_settling = set()
+        # ---- v2.8 runtime state (mirrors ``OnlyYouPlugin.__init__``) ----
+        # Platform-bound memory cleanup needs the two unread-backlog cooldown maps;
+        # the surf/MEMORY_MUSE gates need the per-soul sharing/muse bookkeeping.
+        self._last_group_lurk_ts = {}
+        self._last_private_catchup_ts = {}
+        self._shared_video_ids = {}
+        self._last_surf_share_ts = {}
+        # Per-Soul collections (real main.py uses ``dict[soul_id, ...]``).
+        self._mused_busy_keys = {}
+        self._mused_memory_ids = {}
 
     async def _ensure_initialized(self):
         return None
+
+    async def clear_platform_memory_state(self, platform_id: str) -> dict:
+        """Stub mirror of ``OnlyYouPlugin.clear_platform_memory_state`` (contract §4.1).
+
+        Delegates the sliding-window/unread cleanup to the real
+        ``SessionBuffer.clear_platform_memory`` when available (Lead implements it in
+        ``core/context_budget.py``; guarded so this helper keeps working before it
+        lands) and then filters the per-UMO runtime maps for ``platform_id:`` keys.
+        Persistent memory / users / surfing history are intentionally untouched.
+        """
+        stats = {
+            "windows": 0,
+            "evicted": 0,
+            "unread": 0,
+            "messages": 0,
+            "groups": 0,
+            "l3": 0,
+            "caches": 0,
+        }
+        platform_id = str(platform_id or "")
+        buffer = getattr(self, "session_buffer", None)
+        clear_fn = getattr(buffer, "clear_platform_memory", None)
+        if callable(clear_fn):
+            try:
+                result = clear_fn(platform_id)
+                if inspect.isawaitable(result):
+                    result = await result
+                if isinstance(result, dict):
+                    stats.update(result)
+            except Exception:
+                pass
+        if platform_id:
+            prefix = platform_id + ":"
+
+            def _match(value: object) -> bool:
+                return str(value).startswith(prefix)
+
+            # ``_known_l3_umos`` maps ``{global_uid: umo}`` -- filter it by its
+            # UMO **values**; the other runtime maps/sets are keyed by UMO.
+            known_l3 = getattr(self, "_known_l3_umos", None)
+            if isinstance(known_l3, dict):
+                doomed_l3 = [k for k, v in known_l3.items() if _match(v)]
+                for uid in doomed_l3:
+                    known_l3.pop(uid, None)
+                stats["l3"] = len(doomed_l3)
+            group_umos = getattr(self, "_known_group_umos", None)
+            if isinstance(group_umos, set):
+                doomed_groups = [u for u in list(group_umos) if _match(u)]
+                for umo in doomed_groups:
+                    group_umos.discard(umo)
+                stats["groups"] = len(doomed_groups)
+            elif isinstance(group_umos, list):
+                doomed_groups = [u for u in group_umos if _match(u)]
+                group_umos[:] = [u for u in group_umos if not _match(u)]
+                stats["groups"] = len(doomed_groups)
+            for attr in ("_last_group_lurk_ts", "_last_private_catchup_ts"):
+                container = getattr(self, attr, None)
+                if isinstance(container, dict):
+                    doomed_keys = [k for k in container if _match(k)]
+                    for key in doomed_keys:
+                        container.pop(key, None)
+                    stats["caches"] += len(doomed_keys)
+        return stats
 
     async def settle_busy_block(
         self, soul, run, block, progress_pct=100, interrupted_by=""
@@ -493,7 +569,9 @@ class FakePlugin:
         ``test_regressions.TestBusyTaskSettlement``)."""
         return []
 
-    async def _run_idle_roam_action(self, soul, run, current_slot):
+    async def _run_idle_roam_action(
+        self, soul, run, current_slot, allowed_platforms=None, blocked_platforms=None
+    ):
         return False
 
 

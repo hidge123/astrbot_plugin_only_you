@@ -197,6 +197,137 @@ except ImportError:  # pragma: no cover - character_card is created in parallel
 
 
 
+# ==========================================================================
+# v2.8 module-level helpers (usable from ``OnlyYouPlugin`` unbound methods that
+# offline tests bind onto lightweight SimpleNamespace fakes).
+# ==========================================================================
+async def _hub_call_json(
+    model_hub: Any,
+    prompt: str,
+    role: str = "decision",
+    umo: Optional[str] = None,
+    default: Any = None,
+    soul: Any = None,
+) -> Any:
+    """``model_hub.call_llm_json`` with an optional per-Soul config (TypeError safe)."""
+    soul_id = str(getattr(soul, "soul_id", "") or "").strip()
+    kwargs: dict[str, Any] = {"prompt": prompt, "role": role, "umo": umo, "default": default}
+    if soul_id:
+        try:
+            return await model_hub.call_llm_json(soul_id=soul_id, **kwargs)
+        except TypeError:
+            pass
+    return await model_hub.call_llm_json(**kwargs)
+
+
+async def _hub_call_text(
+    model_hub: Any,
+    prompt: str,
+    role: str = "decision",
+    umo: Optional[str] = None,
+    soul: Any = None,
+) -> str:
+    """``model_hub.call_llm_text`` with an optional per-Soul config (TypeError safe)."""
+    soul_id = str(getattr(soul, "soul_id", "") or "").strip()
+    kwargs: dict[str, Any] = {"prompt": prompt, "role": role, "umo": umo}
+    if soul_id:
+        try:
+            return await model_hub.call_llm_text(soul_id=soul_id, **kwargs)
+        except TypeError:
+            pass
+    return await model_hub.call_llm_text(**kwargs)
+
+
+def _hub_tts_config(model_hub: Any, soul: Any = None) -> dict:
+    """Read the TTS config of one Soul (falls back to the old no-arg signature)."""
+    soul_id = str(getattr(soul, "soul_id", "") or "").strip()
+    if soul_id:
+        try:
+            return dict(model_hub.get_tts_config(soul_id=soul_id) or {})
+        except TypeError:
+            pass
+    try:
+        return dict(model_hub.get_tts_config() or {})
+    except Exception:
+        return {}
+
+
+async def _hub_synthesize(model_hub: Any, text: str, soul: Any = None) -> Optional[str]:
+    """Synthesize proactive speech with the Soul's TTS config (TypeError safe)."""
+    soul_id = str(getattr(soul, "soul_id", "") or "").strip()
+    if soul_id:
+        try:
+            return await model_hub.synthesize(text, soul_id=soul_id)
+        except TypeError:
+            pass
+    return await model_hub.synthesize(text)
+
+
+async def _hub_main_provider_id(model_hub: Any, soul: Any = None) -> str:
+    """Resolve the native-pipeline ``selected_provider`` id for one Soul."""
+    soul_id = str(getattr(soul, "soul_id", "") or "").strip()
+    if soul_id:
+        try:
+            return str(await model_hub.get_main_provider_id(soul_id=soul_id) or "")
+        except TypeError:
+            pass
+    return str(await model_hub.get_main_provider_id() or "")
+
+
+def _extract_group_meta(event: Any, umo: str) -> tuple[str, str]:
+    """Best-effort ``(group_id, group_name)`` of a group event / UMO."""
+    group_id = ""
+    group_name = ""
+    for attr in ("get_group_id",):
+        getter = getattr(event, attr, None)
+        if callable(getter):
+            try:
+                group_id = str(getter() or "").strip()
+            except Exception:
+                group_id = ""
+            if group_id:
+                break
+    if not group_id:
+        try:
+            parts = str(umo or "").split(":")
+            if len(parts) >= 3 and "group" in parts[1].lower():
+                group_id = parts[2].split("!")[0].strip()
+        except Exception:
+            group_id = ""
+    for attr in ("get_group_name",):
+        getter = getattr(event, attr, None)
+        if callable(getter):
+            try:
+                group_name = str(getter() or "").strip()
+            except Exception:
+                group_name = ""
+            if group_name:
+                break
+    if not group_name:
+        group_name = str(getattr(event, "group_name", "") or "").strip()
+    return group_id, group_name
+
+
+def _umo_in_platform_scope(
+    umo: str, allowed_platforms: Any = None, blocked_platforms: Any = None
+) -> bool:
+    """Whether a UMO belongs to a Soul's bot-platform scope (None = no filter)."""
+    platform_id = PlatformBridge.extract_platform_id(umo)
+    if allowed_platforms is not None:
+        try:
+            if platform_id not in set(allowed_platforms):
+                return False
+        except Exception:
+            return False
+    if blocked_platforms is not None:
+        try:
+            if platform_id in set(blocked_platforms):
+                return False
+        except Exception:
+            pass
+    return True
+
+
 @register(
     "astrbot_plugin_only_you",
     "hidge123",
@@ -251,6 +382,8 @@ class OnlyYouPlugin(Star):
         self.soul_manager = SoulManager(
             context=self.context, db=self.db, model_hub=self.model_hub
         )
+        # v2.8: four-role model configs live in each Soul's own JSON file.
+        self.model_hub.attach_soul_manager(self.soul_manager)
         self.deck_engine = RogueliteDeckEngine(db=self.db, plugin_config=self.config)
         self.schedule_mutator = BoundedScheduleMutator(
             deck_engine=self.deck_engine,
@@ -314,6 +447,15 @@ class OnlyYouPlugin(Star):
         self._busy_settling: set[tuple[str, str]] = set()
         self.schedule_mutator.busy_settler = self.settle_busy_block
 
+        # ---- v2.8 proactive-message / memory runtime state ----
+        # SURF sharing gates: shared video ids + last share timestamp per Soul.
+        self._shared_video_ids: dict[str, set[str]] = {}
+        self._last_surf_share_ts: dict[str, float] = {}
+        # MEMORY_MUSE rotation: busy results already mused (slot keys) and the
+        # recently mused memory ids per Soul (ring buffer, keeps the buckets rotating).
+        self._mused_busy_keys: dict[str, set[str]] = {}
+        self._mused_memory_ids: dict[str, list[int]] = {}
+
     async def _ensure_initialized(self) -> None:
         if self._initialized:
             return
@@ -326,6 +468,16 @@ class OnlyYouPlugin(Star):
     async def initialize(self) -> None:
         """AstrBot Star lifecycle initialization hook."""
         await self._ensure_initialized()
+        # v2.8: migrate legacy per-UMO bindings into bot-instance (platform) bindings
+        # and catch up a missed daily Forgetting GC after a restart.
+        try:
+            await self.soul_manager.migrate_legacy_umo_bindings()
+        except Exception as exc:  # noqa: BLE001 - migration must never block startup
+            logger.warning(f"[OnlyYou] legacy umo binding migration failed: {exc}")
+        try:
+            await self._maybe_run_scheduled_gc()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[OnlyYou] startup Forgetting GC failed: {exc}")
         self.web_api.register_routes()
         self._bg_tasks.append(asyncio.create_task(self._heartbeat_loop()))
         self._bg_tasks.append(asyncio.create_task(self._daily_gc_loop()))
@@ -347,13 +499,128 @@ class OnlyYouPlugin(Star):
     # ==========================================================================
     # 0. BUSY_TASK 每日随机完成结果结算 + IDLE_ROAM 空闲游荡主动行为 (Phase 3)
     # ==========================================================================
-    def _latest_l3_umo(self) -> str:
+    def _latest_l3_umo(self, allowed_platforms: Any = None) -> str:
         """Return the most recently seen ★L3 private-chat UMO (empty if none)."""
         try:
             values = list(self._known_l3_umos.values())
         except Exception:
             return ""
-        return values[-1] if values else ""
+        for umo in reversed(values):
+            if _umo_in_platform_scope(str(umo or ""), allowed_platforms=allowed_platforms):
+                return str(umo or "")
+        return ""
+
+    def _surfing_enabled(self, soul: Any) -> bool:
+        """Per-Soul cyber-surfing switch (``settings.surfing_enabled``, default True)."""
+        try:
+            return bool(getattr(soul, "surfing_enabled", True))
+        except Exception:
+            return True
+
+    async def clear_platform_memory_state(self, platform_id: str) -> dict[str, int]:
+        """Drop all **in-memory** chat state of one bot instance (Soul unbind).
+
+        Persisted data (SQLite memories / users / surfing_history) is untouched.
+        """
+        clean = str(platform_id or "").strip()
+        stats: dict[str, int] = {
+            "windows": 0,
+            "evicted": 0,
+            "unread": 0,
+            "messages": 0,
+            "groups": 0,
+            "l3": 0,
+            "caches": 0,
+        }
+        if not clean:
+            return stats
+        prefix = f"{clean}:"
+
+        clearer = getattr(self.session_buffer, "clear_platform_memory", None)
+        if callable(clearer):
+            try:
+                raw = clearer(clean) or {}
+                for key in ("windows", "evicted", "unread", "messages"):
+                    stats[key] = int(raw.get(key, 0) or 0)
+            except Exception as exc:  # noqa: BLE001 - unbind must never crash
+                logger.warning(f"[OnlyYou] clear_platform_memory failed: {exc}")
+
+        for attr in ("_last_group_lurk_ts", "_last_private_catchup_ts"):
+            mapping = getattr(self, attr, None)
+            if isinstance(mapping, dict):
+                doomed = [key for key in mapping.keys() if str(key).startswith(prefix)]
+                for key in doomed:
+                    mapping.pop(key, None)
+                stats["caches"] += len(doomed)
+
+        l3 = getattr(self, "_known_l3_umos", None)
+        if isinstance(l3, dict):
+            doomed_l3 = [key for key, value in l3.items() if str(value).startswith(prefix)]
+            for key in doomed_l3:
+                l3.pop(key, None)
+            stats["l3"] = len(doomed_l3)
+
+        groups = getattr(self, "_known_group_umos", None)
+        if isinstance(groups, set):
+            doomed_groups = [umo for umo in list(groups) if str(umo).startswith(prefix)]
+            for umo in doomed_groups:
+                groups.discard(umo)
+            stats["groups"] = len(doomed_groups)
+
+        if stats["windows"] or stats["unread"] or stats["groups"]:
+            logger.info(f"[OnlyYou] Cleared platform memory of {clean}: {stats}")
+        return stats
+
+    async def _maybe_run_scheduled_gc(self) -> dict[str, int]:
+        """Persisted daily Forgetting GC + realtime T1 trimming (restart safe)."""
+        stats: dict[str, int] = {
+            "gc_ran": 0,
+            "deleted_expired": 0,
+            "deleted_overflow": 0,
+            "deleted_tier1": 0,
+            "deleted_tier2": 0,
+            "decayed_tier2": 0,
+            "promoted_to_tier3": 0,
+        }
+        cleaner = getattr(self.memory_manager, "cleanup_tier1", None)
+        if callable(cleaner):
+            try:
+                trimmed = await cleaner()
+                if isinstance(trimmed, dict):
+                    for key in ("deleted_expired", "deleted_overflow"):
+                        stats[key] = int(trimmed.get(key, 0) or 0)
+            except Exception as exc:  # noqa: BLE001 - never break the heartbeat
+                logger.warning(f"[OnlyYou] realtime T1 cleanup failed: {exc}")
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        last_date = ""
+        try:
+            last_date = str(await self.db.get_setting("last_forgetting_gc_date", "") or "")
+        except Exception:
+            last_date = ""
+        if last_date == today:
+            return stats
+
+        runner = getattr(self.memory_manager, "run_forgetting_gc", None)
+        if callable(runner):
+            try:
+                full = await runner()
+                if isinstance(full, dict):
+                    for key in (
+                        "deleted_tier1",
+                        "deleted_tier2",
+                        "decayed_tier2",
+                        "promoted_to_tier3",
+                    ):
+                        stats[key] = int(full.get(key, 0) or 0)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[OnlyYou] daily Forgetting GC failed: {exc}")
+        stats["gc_ran"] = 1
+        try:
+            await self.db.set_setting("last_forgetting_gc_date", today)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[OnlyYou] persist forgetting gc date failed: {exc}")
+        return stats
 
     def _idle_roam_cooldown_seconds(self) -> int:
         """IDLE_ROAM proactive-action cooldown in seconds (`idle_roam_cooldown_minutes`)."""
@@ -556,6 +823,9 @@ class OnlyYouPlugin(Star):
 
     def _pick_group_unread_candidate(
         self,
+        allowed_platforms: Any = None,
+        blocked_platforms: Any = None,
+        soul_id: str = "",
     ) -> Optional[tuple[str, list[Any], str]]:
         """Pick the group with the most / freshest **unread backlog**.
 
@@ -573,6 +843,12 @@ class OnlyYouPlugin(Star):
         candidates: list[tuple[str, list[Any], str]] = []
         for umo, batch in chats:
             if not umo or umo == "default_umo" or not batch:
+                continue
+            if not _umo_in_platform_scope(
+                umo,
+                allowed_platforms=allowed_platforms,
+                blocked_platforms=blocked_platforms,
+            ):
                 continue
             if cooldown > 0 and (now - self._last_group_lurk_ts.get(umo, 0.0)) < cooldown:
                 continue
@@ -640,8 +916,8 @@ class OnlyYouPlugin(Star):
                 surfing_preferences="、".join(getattr(soul, "surfing_preferences", []) or [])
                 or "（无）",
             )
-            data = await self.model_hub.call_llm_json(
-                prompt=prompt, role="decision", umo=umo, default=None
+            data = await _hub_call_json(
+                self.model_hub, prompt, role="decision", umo=umo, default=None, soul=soul
             )
         except Exception as exc:  # noqa: BLE001 - never break the heartbeat
             logger.warning(f"[OnlyYou] group unread decision failed: {exc}")
@@ -661,7 +937,9 @@ class OnlyYouPlugin(Star):
         message = message.strip("\"'“”「」")
         return message[:60]
 
-    def _resolve_idle_roam_target(self, data: Any, group_hint: str = "") -> str:
+    def _resolve_idle_roam_target(
+        self, data: Any, group_hint: str = "", allowed_platforms: Any = None
+    ) -> str:
         """Resolve the LLM ``target`` (``GROUP`` / ``PRIVATE_L3``) into a concrete UMO."""
         if not isinstance(data, dict):
             return ""
@@ -673,15 +951,17 @@ class OnlyYouPlugin(Star):
                 groups = [
                     umo
                     for umo in self._known_group_umos
-                    if umo and umo != "default_umo"
+                    if umo
+                    and umo != "default_umo"
+                    and _umo_in_platform_scope(str(umo), allowed_platforms=allowed_platforms)
                 ]
             except Exception:
                 groups = []
             return random.choice(groups) if groups else ""
         if target in ("PRIVATE_L3", "PRIVATE"):
-            return self._latest_l3_umo()
+            return self._latest_l3_umo(allowed_platforms=allowed_platforms)
         if not target:
-            return group_hint or self._latest_l3_umo()
+            return group_hint or self._latest_l3_umo(allowed_platforms=allowed_platforms)
         return ""
 
     @staticmethod
@@ -713,13 +993,20 @@ class OnlyYouPlugin(Star):
         return random.sample(pool, k=count)
 
     async def _run_idle_roam_action(
-        self, soul: Any, run: Any, current_slot: Any
+        self,
+        soul: Any,
+        run: Any,
+        current_slot: Any,
+        allowed_platforms: Any = None,
+        blocked_platforms: Any = None,
     ) -> bool:
         """Execute one ``IDLE_ROAM`` proactive action (GROUP_LURK or MEMORY_MUSE).
 
         Branch A lurk: pick a known group with recent user messages, feed its sliding
         window to ``IDLE_ROAM_PROACTIVE_PROMPT`` and bubble up there or DM ★L3.
-        Branch B muse: pick 1~2 memories (BUSY_TASK results first) and DM ★L3.
+        Branch B muse (v2.8): consume today's settled BUSY_TASK results **once**; when
+        exhausted, rotate memories sampled independently across the T1/T2/T3 buckets
+        and refresh only their ``last_accessed_at`` after a successful send.
         Returns True only when a proactive message was actually sent.
         """
         try:
@@ -731,11 +1018,16 @@ class OnlyYouPlugin(Star):
             ):
                 return False
 
+            soul_id = str(getattr(soul, "soul_id", "") or "")
             slot_title = str(getattr(current_slot, "title", "") or "发呆闲逛")
             current_time = datetime.now().strftime("%H:%M")
 
             # ---- 分支 A：翻群记录吃瓜 (GROUP_LURK，先决策后回复) ----
-            lurked = self._pick_group_unread_candidate()
+            lurked = self._pick_group_unread_candidate(
+                allowed_platforms=allowed_platforms,
+                blocked_platforms=blocked_platforms,
+                soul_id=soul_id,
+            )
             if lurked is not None:
                 umo, batch, transcript = lurked
                 seqs = [int(getattr(message, "seq", 0) or 0) for message in batch]
@@ -755,17 +1047,26 @@ class OnlyYouPlugin(Star):
                         ),
                         current_time=current_time,
                     )
-                    data = await self.model_hub.call_llm_json(
-                        prompt=prompt, role="decision", umo=umo, default=None
+                    data = await _hub_call_json(
+                        self.model_hub,
+                        prompt,
+                        role="decision",
+                        umo=umo,
+                        default=None,
+                        soul=soul,
                     )
-                    target_umo = self._resolve_idle_roam_target(data, group_hint=umo)
+                    target_umo = self._resolve_idle_roam_target(
+                        data, group_hint=umo, allowed_platforms=allowed_platforms
+                    )
                     message = self._extract_idle_roam_message(data)
                     if target_umo and message:
+                        audio_path = await self._maybe_synthesize_proactive(message, soul)
                         sent = await self.platform_bridge.send_proactive_message(
                             umo=target_umo,
                             text=message,
                             session_buffer=self.session_buffer,
                             soul_name=soul.name,
+                            audio_path=audio_path,
                         )
                         if sent:
                             self._last_idle_roam_ts[soul.soul_id] = now
@@ -794,19 +1095,66 @@ class OnlyYouPlugin(Star):
                     )
 
             # ---- 分支 B：发呆记忆联想 (MEMORY_MUSE) ----
-            memories = await self.memory_manager.list_memories(
-                soul_id=soul.soul_id, limit=10
-            )
-            if not memories:
-                logger.info(
-                    "[OnlyYou] IDLE_ROAM skipped: no active group and no memories"
-                )
-                return False
+            # v2.8: each settled BUSY_TASK result is mused at most once per Soul.
+            mused_busy = getattr(self, "_mused_busy_keys", None)
+            if not isinstance(mused_busy, dict):
+                mused_busy = {}
+                try:
+                    self._mused_busy_keys = mused_busy
+                except Exception:
+                    pass
+            used_keys = mused_busy.setdefault(soul.soul_id, set())
+            busy_picks: list[tuple[str, str]] = []
+            try:
+                for settled_slot in run.settled_busy_results():
+                    text = str(getattr(settled_slot, "completion_result", "") or "").strip()
+                    slot_key = str(getattr(settled_slot, "slot_key", "") or "")
+                    if not text or not slot_key or slot_key in used_keys:
+                        continue
+                    busy_picks.append((slot_key, text))
+            except Exception:
+                busy_picks = []
+            busy_picks = busy_picks[:2]
 
-            picks = self._pick_memory_muse_material(run, memories)
-            context_material = "\n".join(
-                f"- {getattr(item, 'content', '')}" for item in picks
-            )
+            picked_memories: list[Any] = []
+            use_busy = bool(busy_picks)
+            if use_busy:
+                context_material = "\n".join(
+                    f"- 【今日繁忙成果】{text}" for _key, text in busy_picks
+                )
+            else:
+                sampler = getattr(self.memory_manager, "sample_muse_memories", None)
+                if callable(sampler):
+                    recent_ids = list(
+                        (getattr(self, "_mused_memory_ids", None) or {}).get(soul.soul_id, [])
+                    )
+                    try:
+                        picked_memories = await sampler(
+                            soul_id=soul.soul_id, exclude_ids=recent_ids, pick=2
+                        )
+                    except TypeError:
+                        picked_memories = await sampler(soul.soul_id)
+                    except Exception as exc:  # noqa: BLE001 - never break the heartbeat
+                        logger.warning(f"[OnlyYou] sample_muse_memories failed: {exc}")
+                        picked_memories = []
+                if not picked_memories:
+                    try:
+                        fallback_pool = await self.memory_manager.list_memories(
+                            soul_id=soul.soul_id, limit=10
+                        )
+                    except Exception:
+                        fallback_pool = []
+                    picked_memories = self._pick_memory_muse_material(run, fallback_pool)
+                if not picked_memories:
+                    logger.info(
+                        "[OnlyYou] IDLE_ROAM skipped: no active group, no busy result "
+                        "and no memory"
+                    )
+                    return False
+                context_material = "\n".join(
+                    f"- {getattr(item, 'content', '')}" for item in picked_memories
+                )
+
             prompt = IDLE_ROAM_PROACTIVE_PROMPT.format(
                 soul_name=soul.name,
                 speaking_style=soul.speaking_style or "自然口语短句",
@@ -815,23 +1163,52 @@ class OnlyYouPlugin(Star):
                 context_material=context_material,
                 current_time=current_time,
             )
-            data = await self.model_hub.call_llm_json(
-                prompt=prompt, role="decision", default=None
+            data = await _hub_call_json(
+                self.model_hub, prompt, role="decision", default=None, soul=soul
             )
-            target_umo = self._resolve_idle_roam_target(data, group_hint="")
+            target_umo = self._resolve_idle_roam_target(
+                data, group_hint="", allowed_platforms=allowed_platforms
+            )
             message = self._extract_idle_roam_message(data)
             if target_umo and message:
+                audio_path = await self._maybe_synthesize_proactive(message, soul)
                 sent = await self.platform_bridge.send_proactive_message(
                     umo=target_umo,
                     text=message,
                     session_buffer=self.session_buffer,
                     soul_name=soul.name,
+                    audio_path=audio_path,
                 )
                 if sent:
                     self._last_idle_roam_ts[soul.soul_id] = now
+                    if use_busy:
+                        for slot_key, _text in busy_picks:
+                            used_keys.add(slot_key)
+                    else:
+                        memory_ids = [
+                            int(getattr(item, "id", 0) or 0) for item in picked_memories
+                        ]
+                        memory_ids = [mid for mid in memory_ids if mid > 0]
+                        toucher = getattr(
+                            self.memory_manager, "touch_memories_for_muse", None
+                        )
+                        if memory_ids and callable(toucher):
+                            try:
+                                await toucher(memory_ids)
+                            except Exception as exc:  # noqa: BLE001
+                                logger.debug(f"[OnlyYou] touch muse memories failed: {exc}")
+                        muse_ids = getattr(self, "_mused_memory_ids", None)
+                        if not isinstance(muse_ids, dict):
+                            muse_ids = {}
+                            try:
+                                self._mused_memory_ids = muse_ids
+                            except Exception:
+                                pass
+                        ring = list(muse_ids.get(soul.soul_id, [])) + memory_ids
+                        muse_ids[soul.soul_id] = ring[-30:]
                     logger.info(
                         "[OnlyYou] IDLE_ROAM(MEMORY_MUSE) proactive message sent "
-                        f"to {target_umo}"
+                        f"to {target_umo} (source={'BUSY_RESULT' if use_busy else 'MEMORY'})"
                     )
                     return True
             logger.info(
@@ -859,6 +1236,8 @@ class OnlyYouPlugin(Star):
         soul: Any,
         run: Any = None,
         current_slot: Any = None,
+        allowed_platforms: Any = None,
+        blocked_platforms: Any = None,
     ) -> int:
         """Proactively catch up private chats whose messages were missed.
 
@@ -891,6 +1270,12 @@ class OnlyYouPlugin(Star):
                 break
             if not umo or not batch:
                 continue
+            if not _umo_in_platform_scope(
+                umo,
+                allowed_platforms=allowed_platforms,
+                blocked_platforms=blocked_platforms,
+            ):
+                continue
             if cooldown > 0 and (now - self._last_private_catchup_ts.get(umo, 0.0)) < cooldown:
                 continue
             # cool down even if the send fails, so we never tight-loop a broken chat
@@ -914,8 +1299,8 @@ class OnlyYouPlugin(Star):
                     unread_messages_text=self.session_buffer.format_unread_batch(batch),
                     recent_window_text=recent_text,
                 )
-                msg = await self.model_hub.call_llm_text(
-                    prompt=prompt, role="decision", umo=umo
+                msg = await _hub_call_text(
+                    self.model_hub, prompt, role="decision", umo=umo, soul=soul
                 )
             except Exception as exc:  # noqa: BLE001 - fall back instead of crashing
                 logger.warning(f"[OnlyYou] private unread catch-up LLM failed: {exc}")
@@ -925,7 +1310,7 @@ class OnlyYouPlugin(Star):
                 text = self._fallback_private_catchup(sender_name, len(batch))
             text = text[:120]
             try:
-                audio_path = await self._maybe_synthesize_proactive(text)
+                audio_path = await self._maybe_synthesize_proactive(text, soul)
                 sent = await self.platform_bridge.send_proactive_message(
                     umo=umo,
                     text=text,
@@ -955,94 +1340,305 @@ class OnlyYouPlugin(Star):
     # ==========================================================================
     # Background Loops: 24h dynamic timeline dispatch + Forgetting GC
     # ==========================================================================
-    async def _heartbeat_loop(self) -> None:
-        """Every 15 minutes: lazily settle BUSY_TASK blocks, then dispatch by action type.
+    async def _souls_for_heartbeat(self) -> list[Any]:
+        """Souls driven by the 15-minute heartbeat (bound platforms + default Soul)."""
+        try:
+            souls = await self.soul_manager.list_souls()
+        except Exception as exc:  # noqa: BLE001 - never break the heartbeat
+            logger.warning(f"[OnlyYou] heartbeat list_souls failed: {exc}")
+            return []
+        if not souls:
+            return []
+        try:
+            bindings = await self.soul_manager.get_platform_bindings()
+        except Exception:
+            bindings = {}
+        if not bindings:
+            # Backward compatible: no bot instance bound yet -> single default Soul.
+            default_id = ""
+            try:
+                default_id = str(await self.soul_manager.get_default_soul_id() or "")
+            except Exception:
+                default_id = ""
+            for soul in souls:
+                if soul.soul_id == default_id:
+                    return [soul]
+            return [souls[0]]
+        selected = [
+            soul
+            for soul in souls
+            if list(getattr(soul, "bound_platforms", None) or [])
+        ]
+        default_id = ""
+        try:
+            default_id = str(await self.soul_manager.get_default_soul_id() or "")
+        except Exception:
+            default_id = ""
+        if default_id:
+            for soul in souls:
+                if soul.soul_id == default_id and soul not in selected:
+                    selected.append(soul)
+        return selected or [souls[0]]
 
-        - ``SLEEP`` / ``BUSY_TASK`` -> do nothing (the progress bar advances by itself);
-        - ``SURF`` -> real surfing pipeline + optional proactive video share to ★L3;
-        - ``IDLE_ROAM`` -> group lurking (``GROUP_LURK``) or memory musing (``MEMORY_MUSE``).
+    async def _dispatch_heartbeat_for_soul(
+        self, soul: Any, bindings: Optional[dict[str, str]] = None, sole_soul: bool = False
+    ) -> None:
+        """Run one Soul's 15-minute dispatch on its own timeline / model config."""
+        bindings = dict(bindings or {})
+        default_id = ""
+        try:
+            default_id = str(await self.soul_manager.get_default_soul_id() or "")
+        except Exception:
+            default_id = ""
+        bound = set(getattr(soul, "bound_platforms", None) or [])
+        if sole_soul:
+            allowed_platforms: Any = None
+            blocked_platforms: Any = None
+        elif bound:
+            allowed_platforms = bound
+            blocked_platforms = None
+        elif default_id and soul.soul_id == default_id:
+            # Default Soul is the fallback for bot instances nobody bound.
+            allowed_platforms = None
+            blocked_platforms = set(bindings.keys())
+        else:
+            allowed_platforms = set()
+            blocked_platforms = None
+
+        run, current_slot, _ = await self.deck_engine.get_current_and_next_slot(
+            soul_id=soul.soul_id,
+            custom_cards=soul.state_event_cards,
+            custom_encounters=soul.encounter_talk_cards,
+            chronotype=soul.chronotype,
+        )
+
+        # 1) Lazily settle every BUSY_TASK block that already reached 100%.
+        await self._settle_finished_busy_blocks(soul, run)
+
+        # 2) Dispatch on the current block's action type (state fallback).
+        action = ActionType.coerce(getattr(current_slot, "action_type", None), None)
+        if action is None:
+            if current_slot.state == BotState.RESTING:
+                action = ActionType.SLEEP
+            elif current_slot.state == BotState.BUSY:
+                action = ActionType.BUSY_TASK
+            else:
+                action = ActionType.SURF
+
+        if action in (ActionType.SLEEP, ActionType.BUSY_TASK):
+            return
+
+        # Any IDLE block: first catch up private chats blocked while resting/busy.
+        await self._catch_up_private_unread(
+            soul,
+            run,
+            current_slot,
+            allowed_platforms=allowed_platforms,
+            blocked_platforms=blocked_platforms,
+        )
+
+        if action == ActionType.SURF:
+            if not self._surfing_enabled(soul):
+                # v2.8: cyber-surfing switched off -> degrade to idle roaming.
+                logger.info(
+                    f"[OnlyYou] SURF disabled for soul={soul.soul_id}; "
+                    "degrading to IDLE_ROAM."
+                )
+                await self._run_idle_roam_action(
+                    soul,
+                    run,
+                    current_slot,
+                    allowed_platforms=allowed_platforms,
+                    blocked_platforms=blocked_platforms,
+                )
+                return
+            review = await self.surfing_pipeline.surf_once(
+                soul=soul, current_state=BotState.IDLE
+            )
+            await self._maybe_share_surfed_video(soul, run, current_slot, review)
+            return
+
+        if action == ActionType.IDLE_ROAM:
+            await self._run_idle_roam_action(
+                soul,
+                run,
+                current_slot,
+                allowed_platforms=allowed_platforms,
+                blocked_platforms=blocked_platforms,
+            )
+
+    async def _maybe_share_surfed_video(
+        self, soul: Any, run: Any, current_slot: Any, review: Any
+    ) -> bool:
+        """Share one surfed video to the latest ★L3 only when all v2.8 gates pass.
+
+        Gates: not a degraded vision fallback + video never shared before +
+        ``score >= surf_share_min_score`` + surf-share cooldown + IDLE_ROAM cooldown.
+        """
+        try:
+            if review is None:
+                return False
+            video = getattr(review, "video", None)
+            video_id = str(getattr(video, "video_id", "") or "").strip()
+            if not video:
+                return False
+            if bool(getattr(review, "is_fallback", False)):
+                logger.info("[OnlyYou] SURF share skipped: vision fallback result")
+                return False
+            if not video_id:
+                return False
+            soul_id = str(getattr(soul, "soul_id", "") or "")
+
+            shared_map = getattr(self, "_shared_video_ids", None)
+            if not isinstance(shared_map, dict):
+                shared_map = {}
+                try:
+                    self._shared_video_ids = shared_map
+                except Exception:
+                    pass
+            shared_ids = shared_map.setdefault(soul_id, set())
+            if video_id in shared_ids:
+                logger.info("[OnlyYou] SURF share skipped: video already shared")
+                return False
+
+            surf_cfg = {}
+            try:
+                surf_cfg = dict(self.config.get("surfing_config") or {})
+            except Exception:
+                surf_cfg = {}
+            try:
+                min_score = int(surf_cfg.get("surf_share_min_score", 80) or 80)
+            except (TypeError, ValueError):
+                min_score = 80
+            try:
+                score = int(getattr(review, "score", 0) or 0)
+            except (TypeError, ValueError):
+                score = 0
+            if score < min_score:
+                logger.info(
+                    f"[OnlyYou] SURF share skipped: score {score} < min {min_score}"
+                )
+                return False
+
+            now = time.time()
+            try:
+                cooldown_minutes = int(
+                    surf_cfg.get("surf_share_cooldown_minutes", 90) or 90
+                )
+            except (TypeError, ValueError):
+                cooldown_minutes = 90
+            last_share_map = getattr(self, "_last_surf_share_ts", None)
+            if not isinstance(last_share_map, dict):
+                last_share_map = {}
+                try:
+                    self._last_surf_share_ts = last_share_map
+                except Exception:
+                    pass
+            last_share = float(last_share_map.get(soul_id, 0.0) or 0.0)
+            if cooldown_minutes > 0 and (now - last_share) < cooldown_minutes * 60:
+                logger.info(
+                    "[OnlyYou] SURF share skipped: surf-share cooldown "
+                    f"({cooldown_minutes}min)"
+                )
+                return False
+
+            idle_cooldown = self._idle_roam_cooldown_seconds()
+            try:
+                last_roam = float(
+                    (getattr(self, "_last_idle_roam_ts", None) or {}).get(soul_id, 0.0)
+                    or 0.0
+                )
+            except Exception:
+                last_roam = 0.0
+            if idle_cooldown > 0 and (now - last_roam) < idle_cooldown:
+                logger.info(
+                    "[OnlyYou] SURF share skipped: IDLE_ROAM cooldown "
+                    f"({idle_cooldown // 60}min)"
+                )
+                return False
+
+            target_umo = self._latest_l3_umo()
+            if not target_umo:
+                logger.info("[OnlyYou] SURF share skipped: no ★L3 private session")
+                return False
+
+            video_text = (
+                f"《{getattr(video, 'title', '')}》"
+                f"({getattr(video, 'share_url', '')}) - {getattr(review, 'commentary', '')}"
+            )
+            prompt = PROACTIVE_CHAT_PROMPT.format(
+                soul_name=soul.name,
+                soul_archetype=soul.archetype,
+                speaking_style=soul.speaking_style,
+                soul_summary=self._render_soul_summary(soul),
+                current_slot_title=str(getattr(current_slot, "title", "") or "刷视频"),
+                video_text=video_text,
+            )
+            msg = await _hub_call_text(
+                self.model_hub, prompt, role="decision", umo=target_umo, soul=soul
+            )
+            if not msg:
+                return False
+            audio_path = await self._maybe_synthesize_proactive(msg, soul)
+            sent = await self.platform_bridge.send_proactive_message(
+                umo=target_umo,
+                text=msg,
+                session_buffer=self.session_buffer,
+                soul_name=soul.name,
+                audio_path=audio_path,
+            )
+            if sent:
+                shared_ids.add(video_id)
+                last_share_map[soul_id] = now
+                logger.info(
+                    f"[OnlyYou] SURF share sent to {target_umo} "
+                    f"(video={video_id}, score={score})"
+                )
+            return bool(sent)
+        except Exception as exc:  # noqa: BLE001 - never break the heartbeat
+            logger.warning(f"[OnlyYou] _maybe_share_surfed_video failed: {exc}")
+            return False
+
+    async def _heartbeat_loop(self) -> None:
+        """Every 15 minutes: per-Soul busy settlement + action dispatch.
+
+        v2.8 drives **every Soul that owns bot instances** (plus the default Soul as
+        the fallback for unbound platforms), each with its own timeline, model config
+        and platform-scoped unread backlog.  Also runs the restart-safe daily GC.
         """
         while True:
             try:
                 await asyncio.sleep(900)
                 await self._ensure_initialized()
-                soul = await self.soul_manager.resolve_soul(allow_llm_seed=False)
-                run, current_slot, _ = await self.deck_engine.get_current_and_next_slot(
-                    soul_id=soul.soul_id,
-                    custom_cards=soul.state_event_cards,
-                    custom_encounters=soul.encounter_talk_cards,
-                    chronotype=soul.chronotype,
-                )
-
-                # 1) Lazily settle every BUSY_TASK block that already reached 100%.
-                await self._settle_finished_busy_blocks(soul, run)
-
-                # 2) Dispatch on the current block's action type (state fallback).
-                action = ActionType.coerce(
-                    getattr(current_slot, "action_type", None), None
-                )
-                if action is None:
-                    if current_slot.state == BotState.RESTING:
-                        action = ActionType.SLEEP
-                    elif current_slot.state == BotState.BUSY:
-                        action = ActionType.BUSY_TASK
-                    else:
-                        action = ActionType.SURF
-
-                if action in (ActionType.SLEEP, ActionType.BUSY_TASK):
-                    continue
-
-                # Any IDLE block (SURF or IDLE_ROAM): first catch up private chats
-                # whose messages were blocked while the bot was resting/busy.
-                await self._catch_up_private_unread(soul, run, current_slot)
-
-                if action == ActionType.SURF:
-                    # Real Bilibili/Douyin surfing + proactive share to the latest ★L3.
-                    review = await self.surfing_pipeline.surf_once(
-                        soul=soul, current_state=BotState.IDLE
-                    )
-                    target_umo = self._latest_l3_umo()
-                    if review and target_umo:
-                        video_text = (
-                            f"《{review.video.title}》({review.video.share_url})"
-                            f" - {review.commentary}"
+                await self._maybe_run_scheduled_gc()
+                souls = await self._souls_for_heartbeat()
+                try:
+                    bindings = await self.soul_manager.get_platform_bindings()
+                except Exception:
+                    bindings = {}
+                sole_soul = len(souls) <= 1 and not bindings
+                for soul in souls:
+                    try:
+                        await self._dispatch_heartbeat_for_soul(
+                            soul, bindings=bindings, sole_soul=sole_soul
                         )
-                        prompt = PROACTIVE_CHAT_PROMPT.format(
-                            soul_name=soul.name,
-                            soul_archetype=soul.archetype,
-                            speaking_style=soul.speaking_style,
-                            soul_summary=self._render_soul_summary(soul),
-                            current_slot_title=current_slot.title,
-                            video_text=video_text,
+                    except Exception as exc:  # noqa: BLE001 - one Soul must not stop others
+                        logger.warning(
+                            f"[OnlyYou] Heartbeat dispatch failed for soul="
+                            f"{getattr(soul, 'soul_id', '?')}: {exc}"
                         )
-                        msg = await self.model_hub.call_llm_text(
-                            prompt=prompt, role="decision", umo=target_umo
-                        )
-                        if msg:
-                            audio_path = await self._maybe_synthesize_proactive(msg)
-                            await self.platform_bridge.send_proactive_message(
-                                umo=target_umo,
-                                text=msg,
-                                session_buffer=self.session_buffer,
-                                soul_name=soul.name,
-                                audio_path=audio_path,
-                            )
-                    continue
-
-                if action == ActionType.IDLE_ROAM:
-                    await self._run_idle_roam_action(soul, run, current_slot)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.warning(f"[OnlyYou] Heartbeat loop error: {e}")
 
     async def _daily_gc_loop(self) -> None:
-        """Run Forgetting GC every 24 hours."""
+        """Fallback daily GC ticker (the persisted date keeps it idempotent)."""
         while True:
             try:
                 await asyncio.sleep(86400)
                 await self._ensure_initialized()
-                await self.memory_manager.run_forgetting_gc()
+                await self._maybe_run_scheduled_gc()
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1070,10 +1666,12 @@ class OnlyYouPlugin(Star):
             logger.debug(f"[OnlyYou] render_card_summary failed: {exc}")
             return ""
 
-    async def _maybe_synthesize_proactive(self, text: str) -> Optional[str]:
-        """Synthesize a proactive message when plugin TTS is enabled (best effort)."""
+    async def _maybe_synthesize_proactive(
+        self, text: str, soul: Any = None
+    ) -> Optional[str]:
+        """Synthesize a proactive message with the Soul's TTS config (best effort)."""
         try:
-            tts_cfg = self.model_hub.get_tts_config()
+            tts_cfg = _hub_tts_config(self.model_hub, soul)
             if (tts_cfg.get("mode") or "off") == "off" or not text:
                 return None
             try:
@@ -1082,7 +1680,7 @@ class OnlyYouPlugin(Star):
                 probability = 1.0
             if random.random() > probability:
                 return None
-            return await self.model_hub.synthesize(text)
+            return await _hub_synthesize(self.model_hub, text, soul)
         except Exception as exc:
             logger.debug(f"[OnlyYou] proactive TTS skipped: {exc}")
             return None
@@ -1160,6 +1758,20 @@ class OnlyYouPlugin(Star):
         if not is_private and umo and umo != "default_umo":
             # Remember active groups for IDLE_ROAM(GROUP_LURK) proactive actions.
             self._known_group_umos.add(umo)
+            # v2.8: maintain the persisted group card / last-active profile.
+            touch_group = getattr(self.user_relation, "touch_group", None)
+            if callable(touch_group):
+                try:
+                    group_id, group_name = _extract_group_meta(event, umo)
+                    await touch_group(
+                        umo=umo,
+                        group_id=group_id,
+                        platform_id=PlatformBridge.extract_platform_id(umo),
+                        display_name=group_name,
+                        bound_soul_id=str(getattr(soul, "soul_id", "") or ""),
+                    )
+                except Exception as exc:  # noqa: BLE001 - never block message handling
+                    logger.debug(f"[OnlyYou] touch_group failed: {exc}")
         recent_burst = self.session_buffer.get_recent_l2_l3_burst_count(umo=umo)
 
         # 2. Check if high-impact message mutates the current/next slot state
@@ -1210,7 +1822,9 @@ class OnlyYouPlugin(Star):
         # Let AstrBot's native pipeline (`_select_provider`) use our main model.
         if should_reply:
             try:
-                main_provider_id = await self.model_hub.get_main_provider_id()
+                # per-Soul model: get_main_provider_id(soul_id=...) via the
+                # TypeError-safe helper (legacy hubs without soul_id still work)
+                main_provider_id = await _hub_main_provider_id(self.model_hub, soul)
                 if main_provider_id:
                     event.set_extra("selected_provider", main_provider_id)
             except Exception as e:
@@ -1311,7 +1925,14 @@ class OnlyYouPlugin(Star):
         again (unless ``dual_output`` is enabled by the user).
         """
         try:
-            tts_cfg = self.model_hub.get_tts_config()
+            umo = getattr(event, "unified_msg_origin", "") or "default_umo"
+            try:
+                soul = await self.soul_manager.resolve_soul(
+                    umo=umo, allow_llm_seed=False
+                )
+            except Exception:
+                soul = None
+            tts_cfg = _hub_tts_config(self.model_hub, soul)
             if (tts_cfg.get("mode") or "off") == "off":
                 return
             try:
@@ -1346,7 +1967,7 @@ class OnlyYouPlugin(Star):
             if not text:
                 return
 
-            audio_path = await self.model_hub.synthesize(text)
+            audio_path = await _hub_synthesize(self.model_hub, text, soul)
             if not audio_path:
                 return
 
@@ -1727,6 +2348,12 @@ class OnlyYouPlugin(Star):
             return
 
         if sub == "surf":
+            if not self._surfing_enabled(soul):
+                yield event.plain_result(
+                    "📴 赛博冲浪总开关已关闭：当前角色不再主动刷视频，"
+                    "SURF 时段会自动降级为空闲闲逛。请先在 Pages「冲浪」页开启总开关。"
+                )
+                return
             cur_slot = await self.deck_engine.get_current_slot(
                 soul_id=soul.soul_id,
                 custom_cards=soul.state_event_cards,

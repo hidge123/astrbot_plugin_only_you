@@ -3,7 +3,7 @@
  *
  * 仅当 URL 带 `?mock=1`（或 `location.protocol === "file:"` 且页面没有真实 bridge）时生效：
  * 安装 `window.AstrBotPluginPage`（兼容 `window.AstrBotPluginView`），覆盖
- * **全部后端路由（17 条旧路由 + 10 条新路由，见 .team/NEW_TIMELINE_CONTRACT.md §6）**，
+ * **全部后端路由（v2.8 契约 31 条，见 .team/V28_IMPLEMENTATION_CONTRACT.md §6）**，
  * 返回与真实后端一致的信封结构 `{status, message, data}`，并带 300ms 模拟延迟。
  *
  * 数据形状为「24h 动态积木时间轴 × 四类行动卡」新契约：
@@ -16,6 +16,12 @@
  *  users 带 `attitude` 专属态度；action_types / 时间块带固定档位 `armor` / `armor_tier`
  *  （25/40/65/80，前端不再手动设置）；角色卡 schema 为 10 分区 / 36 字段，头像支持
  *  `data:image/...` Data URL；记忆页为分层分组列表（memories/list 返回结构不变）。
+ *
+ * v2.8 同步（契约 §6.2）：Soul 独立配置（每个 soul 带 model_config / bound_platforms / settings）；
+ *  机器人接口绑定 sessions/platforms + sessions/bind_platform / unbind_platform / clear_memory；
+ *  users/list 返回 `groups` 群聊档案，users/update 支持 update_group / clear_group_memory / delete_group；
+ *  memories/list 返回 `tier1_limit`；surfing/list_and_trigger 返回 surfing_enabled / soul_id 并支持
+ *  POST `action="toggle_surfing"`。关系页（T3）与会话 / 模型 / 记忆 / 冲浪页（T4）共用这些形状。
  *
  * 用途：无 AstrBot 后端时直接双击打开 `index.html?mock=1` 即可渲染所有页面 / 截图验收。
  * 数据是可变的：force_state / reroll / cards 增删改 / 默认角色 / UMO 绑定等操作都会更新内存状态。
@@ -557,8 +563,37 @@
     var cardMan = buildCardXiaoman();
     return {
       souls: [
-        { soul_id: "default_soul", card: cardJiu },
-        { soul_id: "soul_xiaoman", card: cardMan }
+        {
+          soul_id: "default_soul",
+          card: cardJiu,
+          /* v2.8：Soul 独立配置；model_config 缺省时首次访问懒拷贝 db.modelConfig */
+          bound_platforms: ["qq"],
+          settings: { surfing_enabled: true },
+          updated_at: nowSeconds()
+        },
+        {
+          soul_id: "soul_xiaoman",
+          card: cardMan,
+          /* v2.8：两个角色各自独立的模型配置（演示 per-soul models/config） */
+          bound_platforms: ["telegram"],
+          settings: { surfing_enabled: true },
+          model_config: {
+            main: { source_id: "ailiyun", model: "qwen-max" },
+            decision: { inherit: true, inherit_from: "main", source_id: "", model: "" },
+            vision: { inherit: true, inherit_from: "main", source_id: "", model: "" },
+            tts: {
+              mode: "off",
+              source_id: "",
+              model: "",
+              voice: "",
+              provider_id: "",
+              probability: 1.0,
+              scope: "private",
+              dual_output: false
+            }
+          },
+          updated_at: nowSeconds()
+        }
       ],
       defaultSoulId: "default_soul",
       decks: {
@@ -580,6 +615,79 @@
         "qq:GroupMessage:55667788": 0
       },
       defaultUmoTarget: "qq:GroupMessage:88481234",
+      /* v2.8：已知机器人接口目录（种子数据；手动绑定新 platform_id 时会自动补条目） */
+      platformCatalog: [
+        {
+          platform_id: "qq",
+          platform_type: "aiocqhttp",
+          name: "QQ（aiocqhttp）",
+          enabled: true,
+          running: true,
+          source: "runtime"
+        },
+        {
+          platform_id: "telegram",
+          platform_type: "telegram",
+          name: "Telegram Bot",
+          enabled: true,
+          running: true,
+          source: "runtime"
+        },
+        {
+          platform_id: "discord",
+          platform_type: "discord",
+          name: "Discord Bot",
+          enabled: false,
+          running: false,
+          source: "config"
+        }
+      ],
+      /* 内存会话最近活跃时间（epoch 秒）：sessions 概览 / 绑定解绑 / 清空内存共用 */
+      sessionActivity: {
+        "qq:GroupMessage:88481234": nowSeconds() - 1200,
+        "qq:FriendMessage:core_tester": nowSeconds() - 300,
+        "qq:GroupMessage:55667788": nowSeconds() - 86400,
+        "telegram:GroupMessage:-100123456789": nowSeconds() - 7200
+      },
+      /* v2.8：群聊档案（users/list data.groups[]；契约 §6.2 GroupItem） */
+      groups: [
+        {
+          umo: "qq:GroupMessage:88481234",
+          group_id: "88481234",
+          platform_id: "qq",
+          display_name: "狐狸窝·摸鱼小分队",
+          notes: "酒狐的主场群，晚上最热闹，群友喜欢发猫猫视频。",
+          bound_soul_id: "default_soul",
+          bound_soul_name: "酒狐",
+          window_count: 14,
+          unread_count: 3,
+          last_active_at: nowSeconds() - 1200
+        },
+        {
+          umo: "telegram:GroupMessage:-100123456789",
+          group_id: "-100123456789",
+          platform_id: "telegram",
+          display_name: "周末开黑群",
+          notes: "小满的群，周五晚上固定开黑。",
+          bound_soul_id: "soul_xiaoman",
+          bound_soul_name: "小满",
+          window_count: 3,
+          unread_count: 0,
+          last_active_at: nowSeconds() - 7200
+        },
+        {
+          umo: "qq:GroupMessage:55667788",
+          group_id: "55667788",
+          platform_id: "qq",
+          display_name: "潜水观察群",
+          notes: "只窥屏不冒泡的小群。",
+          bound_soul_id: "default_soul",
+          bound_soul_name: "酒狐",
+          window_count: 0,
+          unread_count: 0,
+          last_active_at: nowSeconds() - 86400 * 3
+        }
+      ],
       users: [
         { global_uid: "core_tester", display_name: "阿泽", nickname: "阿泽", attitude: "把 Ta 当成最信任的损友，嘴上嫌弃但每次都秒回帮他兜底，愿意分享最真实的心情。", tier: 3, tier_label: "★L3核心用户", interaction_count: 328, affinity: 92.5, platform_ids: ["qq:123456789", "telegram:987654321"] },
         { global_uid: "admin_luna", display_name: "Luna", nickname: "月姐", attitude: "当作靠谱的前辈，偶尔撒个娇求助，正经事上很听她的。", tier: 3, tier_label: "★L3核心用户", interaction_count: 194, affinity: 88.0, platform_ids: ["qq:222333444"] },
@@ -597,13 +705,20 @@
         { id: 105, soul_id: "default_soul", user_id: "core_tester", user_tier: 3, memory_tier: 3, content: "阿泽最喜欢的饮料是冰美式，不加糖。", keywords: "咖啡,冰美式,喜好", importance: 8, vitality: 90, access_count: 6, created_at: nowSeconds() - 86400 * 30, last_accessed_at: nowSeconds() - 86400 * 3 },
         { id: 106, soul_id: "default_soul", user_id: "l1_passerby", user_tier: 1, memory_tier: 1, content: "有群友问过 Bot 用的是哪个模型。", keywords: "模型,提问", importance: 3, vitality: 35, access_count: 1, created_at: nowSeconds() - 3600 * 6, last_accessed_at: nowSeconds() - 3600 * 6 },
         { id: 107, soul_id: "default_soul", user_id: "l2_mikan", user_tier: 2, memory_tier: 2, content: "蜜柑在南京读研，喜欢逛博物馆。", keywords: "南京,博物馆,兴趣", importance: 6, vitality: 55, access_count: 2, created_at: nowSeconds() - 86400 * 5, last_accessed_at: nowSeconds() - 86400 * 2 },
-        { id: 108, soul_id: "default_soul", user_id: "", user_tier: 0, memory_tier: 1, content: "今天刷到一个特别离谱的猫猫视频素材，可以用来吐槽。", keywords: "冲浪,素材,猫猫", importance: 4, vitality: 28, access_count: 1, created_at: nowSeconds() - 3600 * 2, last_accessed_at: nowSeconds() - 3600 * 2 }
+        { id: 108, soul_id: "default_soul", user_id: "", user_tier: 0, memory_tier: 1, content: "今天刷到一个特别离谱的猫猫视频素材，可以用来吐槽。", keywords: "冲浪,素材,猫猫", importance: 4, vitality: 28, access_count: 1, created_at: nowSeconds() - 3600 * 2, last_accessed_at: nowSeconds() - 3600 * 2 },
+        /* v2.8：第二个角色（小满）的分级记忆，切换角色后记忆页仍非空 */
+        { id: 109, soul_id: "soul_xiaoman", user_id: "l2_tester", user_tier: 2, memory_tier: 3, content: "老王答应周五带大家开黑，说好不许鸽。", keywords: "开黑,周五,约定", importance: 9, vitality: 100, access_count: 4, created_at: nowSeconds() - 86400 * 25, last_accessed_at: nowSeconds() - 3600 * 5 },
+        { id: 110, soul_id: "soul_xiaoman", user_id: "l2_mikan", user_tier: 2, memory_tier: 2, content: "蜜柑最近在准备博物馆的志愿讲解，有点紧张。", keywords: "蜜柑,博物馆,志愿", importance: 6, vitality: 66, access_count: 2, created_at: nowSeconds() - 86400 * 3, last_accessed_at: nowSeconds() - 86400 },
+        { id: 111, soul_id: "soul_xiaoman", user_id: "", user_tier: 0, memory_tier: 1, content: "今天在图书馆背单词时看到一个超好笑的告示牌。", keywords: "校园,图书馆,趣事", importance: 3, vitality: 30, access_count: 0, created_at: nowSeconds() - 3600 * 9, last_accessed_at: nowSeconds() - 3600 * 9 }
       ],
       videos: [
         { id: 1, soul_id: "default_soul", video_id: "BV1xx411c7AB", platform: "bilibili", title: "当猫猫第一次见到雪：这是什么，舔一口", author: "猫猫观察日记", cover_url: "", share_url: "https://www.bilibili.com/video/BV1xx411c7AB", tags: ["猫猫", "搞笑", "冬日"], hot_comments: ["猫：这雪怎么没味道", "笑死，我家猫也这样"], visual_notes: "白茫茫雪地里，一只橘猫蹲在门口反复伸爪试探；镜头给到猫脸特写时表情非常认真。", score: 93, commentary: "救命这猫也太憨了 hhh，一本正经尝雪的样子好像我第一次喝冰美式。", worth_sharing: true, watched_at: nowSeconds() - 1800 },
         { id: 2, soul_id: "default_soul", video_id: "BV1yy411c7CD", platform: "bilibili", title: "打工人下班后的 10 分钟晚餐：一人食番茄牛腩面", author: "深夜食堂研究所", cover_url: "", share_url: "https://www.bilibili.com/video/BV1yy411c7CD", tags: ["美食", "一人食", "解压"], hot_comments: ["看饿了", "这锅看着好香"], visual_notes: "暖黄色灯光下的厨房，番茄在锅里咕嘟冒泡，最后撒葱花。", score: 86, commentary: "看完立刻去煮了泡面，差距怎么这么大啊……不过汤底看起来真的绝。", worth_sharing: true, watched_at: nowSeconds() - 4200 },
         { id: 3, soul_id: "default_soul", video_id: "dy7418529630000", platform: "douyin", title: "用雪堆了一只巨大狐狸（失败版）", author: "手工区泥石流", cover_url: "", share_url: "https://www.douyin.com/video/7418529630000", tags: ["手工", "搞笑", "翻车"], hot_comments: ["这狐狸看着有点抽象", "但是很努力了"], visual_notes: "雪堆到一半塌了，作者本人蹲在旁边笑到站不起来。", score: 78, commentary: "这个翻车现场的狐狸…怎么有点像我们打工人上班时的精神状态。", worth_sharing: false, watched_at: nowSeconds() - 86400 },
-        { id: 4, soul_id: "default_soul", video_id: "BV1zz411c7EF", platform: "bilibili", title: "独立游戏像素风新作 30 分钟实况：太治愈了", author: "像素游戏挖掘机", cover_url: "", share_url: "https://www.bilibili.com/video/BV1zz411c7EF", tags: ["游戏", "像素风", "治愈"], hot_comments: ["已加入愿望单", "BGM 好好听"], visual_notes: "像素小人撑着伞走过雨夜小镇，路灯一盏盏亮起。", score: 91, commentary: "画风好戳我！这种慢慢走路的游戏就该配一杯热牛奶在深夜玩。", worth_sharing: true, watched_at: nowSeconds() - 86400 * 2 }
+        { id: 4, soul_id: "default_soul", video_id: "BV1zz411c7EF", platform: "bilibili", title: "独立游戏像素风新作 30 分钟实况：太治愈了", author: "像素游戏挖掘机", cover_url: "", share_url: "https://www.bilibili.com/video/BV1zz411c7EF", tags: ["游戏", "像素风", "治愈"], hot_comments: ["已加入愿望单", "BGM 好好听"], visual_notes: "像素小人撑着伞走过雨夜小镇，路灯一盏盏亮起。", score: 91, commentary: "画风好戳我！这种慢慢走路的游戏就该配一杯热牛奶在深夜玩。", worth_sharing: true, watched_at: nowSeconds() - 86400 * 2 },
+        /* v2.8：第二个角色（小满）的冲浪记录，切换角色后冲浪页仍非空 */
+        { id: 5, soul_id: "soul_xiaoman", video_id: "BV1xx411c7XY", platform: "bilibili", title: "大学生早起晨跑 vlog：六点半的操场有多安静", author: "晨光记录员", cover_url: "", share_url: "https://www.bilibili.com/video/BV1xx411c7XY", tags: ["校园", "晨跑", "治愈"], hot_comments: ["被治愈到了", "我也要早起"], visual_notes: "清晨蓝色调的操场，薄雾里有人慢跑，跑道上只有零星的脚步声。", score: 89, commentary: "哇，这个光线好舒服！明天早上我也想去操场转一圈，顺便背单词。", worth_sharing: true, watched_at: nowSeconds() - 5400 },
+        { id: 6, soul_id: "soul_xiaoman", video_id: "dy9638527410000", platform: "douyin", title: "图书馆占座终极攻略（不被管理员发现的版本）", author: "校园生存指南", cover_url: "", share_url: "https://www.douyin.com/video/9638527410000", tags: ["校园", "搞笑", "攻略"], hot_comments: ["这也太真实了", "我们图书馆不让占座"], visual_notes: "镜头以第一视角溜进图书馆，快速扫过一排排座位，配上紧张的音效。", score: 82, commentary: "哈哈哈这拍得跟谍战片一样！不过占座确实不好啦，我都是早起去的。", worth_sharing: false, watched_at: nowSeconds() - 86400 }
       ],
       nativePersonas: [
         { persona_name: "温柔知性姐姐", prompt: "你是一位温柔知性的姐姐，说话轻柔而有分寸，习惯用共情的方式回应别人……" },
@@ -665,6 +780,65 @@
     return soul;
   }
 
+  /* v2.8：Soul 独立配置字段兜底（model_config / bound_platforms / settings / updated_at）。
+     model_config 缺省时懒拷贝全局 db.modelConfig，保证旧 mock 数据与 init_summary 兼容。 */
+  function ensureSoulV28Fields(soul) {
+    if (!soul) return soul;
+    if (!soul.model_config || typeof soul.model_config !== "object") {
+      soul.model_config = clone(db.modelConfig || {});
+    }
+    if (!Array.isArray(soul.bound_platforms)) soul.bound_platforms = [];
+    soul.bound_platforms = soul.bound_platforms.filter(function (item) {
+      return typeof item === "string" && item.trim();
+    });
+    if (!soul.settings || typeof soul.settings !== "object") soul.settings = {};
+    if (typeof soul.settings.surfing_enabled !== "boolean") soul.settings.surfing_enabled = true;
+    if (typeof soul.updated_at !== "number") soul.updated_at = nowSeconds();
+    return soul;
+  }
+
+  /** 当前默认角色对象（sessions / models 的 soul_id 缺省目标，契约 §6.2）。 */
+  function defaultSoul() {
+    return findSoul(db.defaultSoulId) || activeSoul();
+  }
+
+  function soulNameOf(soul) {
+    if (!soul) return "";
+    syncLegacyFields(soul);
+    return soul.name || soul.soul_id || "";
+  }
+
+  /** {platform_id: soul_id} 绑定映射（init_summary.data.platform_bindings）。 */
+  function platformBindingsMap() {
+    var map = {};
+    db.souls.forEach(function (soul) {
+      ensureSoulV28Fields(soul);
+      soul.bound_platforms.forEach(function (platformId) {
+        map[platformId] = soul.soul_id;
+      });
+    });
+    return map;
+  }
+
+  function soulOwningPlatform(platformId) {
+    var wanted = String(platformId || "");
+    if (!wanted) return null;
+    for (var i = 0; i < db.souls.length; i++) {
+      var soul = db.souls[i];
+      ensureSoulV28Fields(soul);
+      if (soul.bound_platforms.indexOf(wanted) >= 0) return soul;
+    }
+    return null;
+  }
+
+  function catalogEntry(platformId) {
+    var wanted = String(platformId || "");
+    for (var i = 0; i < db.platformCatalog.length; i++) {
+      if (db.platformCatalog[i].platform_id === wanted) return db.platformCatalog[i];
+    }
+    return null;
+  }
+
   function soulChronotype(soul) {
     var card = soul && soul.card;
     var value = card && card.rhythm && card.rhythm.chronotype;
@@ -680,6 +854,7 @@
 
   function toSoulDict(soul) {
     syncLegacyFields(soul);
+    ensureSoulV28Fields(soul);
     var deck = deckOf(soul.soul_id);
     return clone({
       soul_id: soul.soul_id,
@@ -692,6 +867,11 @@
       state_event_cards: deck.customCards,
       /* 奇遇卡已从系统移除：仅保留空数组兼容旧字段 */
       encounter_talk_cards: [],
+      /* v2.8：Soul 独立配置文件字段（契约 §1.1 / §6.2） */
+      model_config: soul.model_config,
+      bound_platforms: soul.bound_platforms,
+      settings: soul.settings,
+      updated_at: soul.updated_at,
       card: soul.card
     });
   }
@@ -1054,8 +1234,246 @@
       });
   }
 
-  function buildModelStatus() {
-    var cfg = normalizeModelConfig(db.modelConfig || {});
+  /* ================================================================== *
+   * 4.1 v2.8 机器人接口绑定 / 会话内存（契约 §6.2 sessions/*）
+   * ================================================================== */
+  function simpleSoulList() {
+    return db.souls.map(function (soul) {
+      ensureSoulV28Fields(soul);
+      syncLegacyFields(soul);
+      return {
+        soul_id: soul.soul_id,
+        name: soul.name || soul.soul_id,
+        bound_platforms: soul.bound_platforms.slice()
+      };
+    });
+  }
+
+  function sessionKindOf(umo) {
+    return String(umo || "").indexOf("GroupMessage") >= 0 ? "group" : "private";
+  }
+
+  function platformOfUmo(umo) {
+    return String(umo || "").split(":")[0] || "";
+  }
+
+  function sessionLastActiveOf(umo) {
+    var value = db.sessionActivity[umo];
+    return typeof value === "number" ? value : 0;
+  }
+
+  function knownSessionUmos() {
+    var map = {};
+    Object.keys(db.windows).forEach(function (umo) {
+      map[umo] = true;
+    });
+    Object.keys(db.sessionActivity).forEach(function (umo) {
+      map[umo] = true;
+    });
+    return Object.keys(map);
+  }
+
+  /** 当前 Soul 管辖的会话概览（契约 §6.2 sessions[]）。未绑定接口时展示全部已知会话。 */
+  function sessionsForSoul(soulId) {
+    var soul = findSoul(String(soulId || "")) || defaultSoul();
+    ensureSoulV28Fields(soul);
+    var bound = soul.bound_platforms || [];
+    return knownSessionUmos()
+      .map(function (umo) {
+        var kind = sessionKindOf(umo);
+        return {
+          umo: umo,
+          kind: kind,
+          platform_id: platformOfUmo(umo),
+          bound_soul_id: soul.soul_id,
+          window_messages: Number(db.windows[umo] || 0),
+          is_l3_private: kind === "private" && umo.indexOf("core_tester") >= 0,
+          last_active_at: sessionLastActiveOf(umo)
+        };
+      })
+      .filter(function (session) {
+        return !bound.length || bound.indexOf(session.platform_id) >= 0;
+      })
+      .sort(function (a, b) {
+        return b.last_active_at - a.last_active_at;
+      });
+  }
+
+  /** 机器人接口列表（契约 §6.2 platforms[]）：目录条目 + Soul 绑定关系 + 活跃会话数。 */
+  function buildPlatformList() {
+    var catalog = db.platformCatalog.map(function (entry) {
+      return clone(entry);
+    });
+    /* 手动绑定了目录外的 platform_id 时自动补条目，保证页面能看到 */
+    db.souls.forEach(function (soul) {
+      ensureSoulV28Fields(soul);
+      soul.bound_platforms.forEach(function (platformId) {
+        var exists = catalog.some(function (item) {
+          return item.platform_id === platformId;
+        });
+        if (!exists) {
+          catalog.push({
+            platform_id: platformId,
+            platform_type: platformId,
+            name: platformId,
+            enabled: true,
+            running: false,
+            source: "config"
+          });
+        }
+      });
+    });
+    var umos = knownSessionUmos();
+    return catalog.map(function (entry) {
+      var owner = soulOwningPlatform(entry.platform_id);
+      var sessionCount = umos.filter(function (umo) {
+        return platformOfUmo(umo) === entry.platform_id;
+      }).length;
+      return {
+        platform_id: entry.platform_id,
+        platform_type: entry.platform_type || entry.platform_id,
+        name: entry.name || entry.platform_id,
+        enabled: entry.enabled !== false,
+        running: !!entry.running,
+        source: entry.source || "config",
+        bound_soul_id: owner ? owner.soul_id : "",
+        bound_soul_name: owner ? soulNameOf(owner) : "",
+        session_count: sessionCount
+      };
+    });
+  }
+
+  /** GET sessions/platforms 的完整 data 形状（契约 §6.2 冻结）。 */
+  function buildSessionsPayload(soulId) {
+    var soul = findSoul(String(soulId || "")) || defaultSoul();
+    if (!soul) throw new Error("没有可用的角色");
+    ensureSoulV28Fields(soul);
+    return {
+      current_soul_id: soul.soul_id,
+      default_soul_id: db.defaultSoulId || "",
+      souls: simpleSoulList(),
+      platforms: buildPlatformList(),
+      sessions: sessionsForSoul(soul.soul_id)
+    };
+  }
+
+  function clearPlatformMemoryInternal(platformId) {
+    var wanted = String(platformId || "");
+    var cleared = { windows: 0, evicted: 0, unread: 0, messages: 0 };
+    Object.keys(db.windows).forEach(function (umo) {
+      if (platformOfUmo(umo) !== wanted) return;
+      cleared.windows += 1;
+      cleared.messages += Number(db.windows[umo] || 0);
+      delete db.windows[umo];
+    });
+    Object.keys(db.sessionActivity).forEach(function (umo) {
+      if (platformOfUmo(umo) === wanted) delete db.sessionActivity[umo];
+    });
+    db.groups.forEach(function (group) {
+      if (group.platform_id !== wanted) return;
+      cleared.unread += Number(group.unread_count || 0);
+      group.window_count = 0;
+      group.unread_count = 0;
+    });
+    return cleared;
+  }
+
+  /** POST sessions/bind_platform：接口与 Soul 一对多、一个平台同一时刻只属于一个 Soul。 */
+  function bindPlatform(body) {
+    var soulId = String(body.soul_id || "");
+    var platformId = String(body.platform_id || "").trim();
+    if (!platformId) throw new Error("机器人接口 ID 不能为空");
+    if (platformId.indexOf(":") >= 0) throw new Error("机器人接口 ID 不能包含冒号");
+    if (platformId.length > 64) throw new Error("机器人接口 ID 长度不能超过 64");
+    var soul = findSoul(soulId);
+    if (!soul) throw new Error("角色不存在：" + soulId);
+    ensureSoulV28Fields(soul);
+    var owner = soulOwningPlatform(platformId);
+    if (owner && owner.soul_id !== soul.soul_id) {
+      var ownerName = soulNameOf(owner);
+      throw new Error(
+        "该机器人接口已被角色『" + ownerName + "』绑定，请先在角色 " + ownerName + " 下解绑"
+      );
+    }
+    db.souls.forEach(function (item) {
+      ensureSoulV28Fields(item);
+      item.bound_platforms = item.bound_platforms.filter(function (itemPlatform) {
+        return itemPlatform !== platformId;
+      });
+    });
+    soul.bound_platforms.push(platformId);
+    soul.updated_at = nowSeconds();
+    if (!catalogEntry(platformId)) {
+      db.platformCatalog.push({
+        platform_id: platformId,
+        platform_type: platformId,
+        name: platformId,
+        enabled: true,
+        running: false,
+        source: "config"
+      });
+    }
+    return {
+      soul_id: soul.soul_id,
+      platform_id: platformId,
+      souls: simpleSoulList(),
+      platforms: buildPlatformList()
+    };
+  }
+
+  /** POST sessions/unbind_platform：解绑并清空该平台的内存滑窗 / 未读（不删长期记忆）。 */
+  function unbindPlatform(body) {
+    var platformId = String(body.platform_id || "").trim();
+    if (!platformId) throw new Error("机器人接口 ID 不能为空");
+    var owner = soulOwningPlatform(platformId);
+    var previousSoulId = owner ? owner.soul_id : "";
+    db.souls.forEach(function (soul) {
+      ensureSoulV28Fields(soul);
+      soul.bound_platforms = soul.bound_platforms.filter(function (item) {
+        return item !== platformId;
+      });
+    });
+    var cleared = clearPlatformMemoryInternal(platformId);
+    return {
+      platform_id: platformId,
+      previous_soul_id: previousSoulId,
+      cleared: cleared,
+      souls: simpleSoulList(),
+      platforms: buildPlatformList()
+    };
+  }
+
+  /** POST sessions/clear_memory：清空单个 UMO 会话或整个平台的会话内存。 */
+  function clearSessionMemory(body) {
+    var soul = findSoul(String(body.soul_id || "")) || defaultSoul();
+    var umo = String(body.umo || "").trim();
+    var platformId = String(body.platform_id || "").trim();
+    var cleared = { windows: 0, evicted: 0, unread: 0, messages: 0 };
+    if (umo) {
+      cleared.windows = db.windows[umo] != null ? 1 : 0;
+      cleared.messages = Number(db.windows[umo] || 0);
+      delete db.windows[umo];
+      delete db.sessionActivity[umo];
+      db.groups.forEach(function (group) {
+        if (group.umo !== umo) return;
+        cleared.unread += Number(group.unread_count || 0);
+        group.window_count = 0;
+        group.unread_count = 0;
+      });
+    } else if (platformId) {
+      cleared = clearPlatformMemoryInternal(platformId);
+    } else {
+      throw new Error("请提供 umo 或 platform_id");
+    }
+    return {
+      cleared: cleared,
+      sessions: soul ? sessionsForSoul(soul.soul_id) : []
+    };
+  }
+
+  /** v2.8：status 支持按 Soul 计算（models/config?soul_id= 返回该角色状态；缺省用全局配置）。 */
+  function buildModelStatus(cfgOverride) {
+    var cfg = normalizeModelConfig(cfgOverride || db.modelConfig || {});
     var status = {};
     ["main", "decision", "vision"].forEach(function (role) {
       var entry = cfg[role] || {};
@@ -1187,7 +1605,9 @@
       active_schedule: soul ? buildSchedulePayload(soul.soul_id) : null,
       model_status: status,
       action_types: clone(ACTION_TYPE_DEFINITIONS),
-      default_soul_id: db.defaultSoulId || ""
+      default_soul_id: db.defaultSoulId || "",
+      /* v2.8：机器人接口 → 角色绑定映射（契约 §6.2 init_summary） */
+      platform_bindings: platformBindingsMap()
     };
   }
 
@@ -1511,12 +1931,39 @@
         else delete db.umoBindings[umo];
       }
     }
+    /* v2.8：souls/save 透传保存 model_config / bound_platforms / settings（契约 §6.2） */
+    ensureSoulV28Fields(soul);
+    if (body.model_config && typeof body.model_config === "object") {
+      soul.model_config = normalizeModelConfig(body.model_config);
+    }
+    if (Array.isArray(body.bound_platforms)) {
+      soul.bound_platforms = body.bound_platforms
+        .map(function (item) {
+          return String(item == null ? "" : item).trim();
+        })
+        .filter(function (item, index, arr) {
+          return item && item.indexOf(":") < 0 && arr.indexOf(item) === index;
+        });
+      /* 一个平台同一时刻只属于一个 Soul：从其他角色上摘掉 */
+      var claimed = soul.bound_platforms.slice();
+      db.souls.forEach(function (item) {
+        if (item === soul) return;
+        ensureSoulV28Fields(item);
+        item.bound_platforms = item.bound_platforms.filter(function (platformId) {
+          return claimed.indexOf(platformId) < 0;
+        });
+      });
+    }
+    if (body.settings && typeof body.settings === "object") {
+      soul.settings = deepMerge(soul.settings || {}, body.settings);
+    }
     syncLegacyFields(soul);
     return {
       soul: toSoulDict(soul),
       souls: listSoulDicts(),
       umo_bindings: clone(db.umoBindings),
-      known_umos: knownUmos()
+      known_umos: knownUmos(),
+      platform_bindings: platformBindingsMap()
     };
   }
 
@@ -1555,6 +2002,7 @@
     }
     deckOf(targetId);
     db.schedules[targetId] = buildRun(targetId, true);
+    ensureSoulV28Fields(soul);
     syncLegacyFields(soul);
     return {
       soul: toSoulDict(soul),
@@ -1587,6 +2035,13 @@
     db.videos.forEach(function (video) {
       if (video.soul_id === oldId) video.soul_id = newId;
     });
+    /* v2.8：群聊档案的管辖角色同步改名 */
+    db.groups.forEach(function (group) {
+      if (group.bound_soul_id === oldId) {
+        group.bound_soul_id = newId;
+        group.bound_soul_name = soulNameOf(soul);
+      }
+    });
     if (db.defaultSoulId === oldId) db.defaultSoulId = newId;
     syncLegacyFields(soul);
     return {
@@ -1604,6 +2059,13 @@
     delete db.schedules[soulId];
     Object.keys(db.umoBindings).forEach(function (umo) {
       if (db.umoBindings[umo] === soulId) delete db.umoBindings[umo];
+    });
+    /* v2.8：被删除角色曾管辖的群聊档案解除绑定（群档案本身保留） */
+    db.groups.forEach(function (group) {
+      if (group.bound_soul_id === soulId) {
+        group.bound_soul_id = "";
+        group.bound_soul_name = "";
+      }
     });
     if (db.defaultSoulId === soulId) db.defaultSoulId = db.souls[0] ? db.souls[0].soul_id : "";
     if (!db.souls.length) {
@@ -1681,6 +2143,15 @@
   /* ================================================================== *
    * 8. 用户 / 记忆 / 冲浪
    * ================================================================== */
+  function userCounts() {
+    return {
+      l3_count: db.users.filter(function (u) { return u.tier === 3; }).length,
+      l2_count: db.users.filter(function (u) { return u.tier === 2; }).length,
+      l1_count: db.users.filter(function (u) { return u.tier === 1; }).length,
+      total: db.users.length
+    };
+  }
+
   function listUsers(tier) {
     var filterTier = tier != null && tier !== "" ? Number(tier) : null;
     var users = db.users.filter(function (user) {
@@ -1688,17 +2159,75 @@
     });
     return {
       users: clone(users),
-      counts: {
-        l3_count: db.users.filter(function (u) { return u.tier === 3; }).length,
-        l2_count: db.users.filter(function (u) { return u.tier === 2; }).length,
-        l1_count: db.users.filter(function (u) { return u.tier === 1; }).length,
-        total: db.users.length
-      }
+      counts: userCounts(),
+      /* v2.8：群聊档案列表（契约 §6.2 GroupItem） */
+      groups: clone(db.groups)
     };
+  }
+
+  /* ---------------- v2.8 群聊档案（users/update 新 action） ---------------- */
+  function findGroupRecord(umo) {
+    var wanted = String(umo || "");
+    for (var i = 0; i < db.groups.length; i++) {
+      if (db.groups[i].umo === wanted) return db.groups[i];
+    }
+    return null;
+  }
+
+  function groupMutationResult(extra) {
+    var data = { groups: clone(db.groups), counts: userCounts() };
+    if (extra) Object.keys(extra).forEach(function (key) { data[key] = extra[key]; });
+    return data;
+  }
+
+  function updateGroupRecord(body) {
+    var umo = String(body.umo || "");
+    var group = findGroupRecord(umo);
+    if (!group) throw new Error("群聊档案不存在：" + umo);
+    if (body.display_name != null) {
+      var displayName = String(body.display_name).trim();
+      if (displayName) group.display_name = displayName;
+    }
+    if (body.notes != null) group.notes = String(body.notes).trim();
+    group.last_active_at = group.last_active_at || nowSeconds();
+    return groupMutationResult({ group: clone(group) });
+  }
+
+  function clearGroupMemoryRecord(body) {
+    var umo = String(body.umo || "");
+    var group = findGroupRecord(umo);
+    if (!group) throw new Error("群聊档案不存在：" + umo);
+    var cleared = {
+      windows: group.window_count > 0 ? 1 : 0,
+      evicted: 0,
+      unread: Number(group.unread_count || 0),
+      messages: Number(group.window_count || 0)
+    };
+    group.window_count = 0;
+    group.unread_count = 0;
+    delete db.windows[umo];
+    delete db.sessionActivity[umo];
+    return groupMutationResult({ cleared: cleared });
+  }
+
+  function deleteGroupRecord(body) {
+    var umo = String(body.umo || "");
+    var group = findGroupRecord(umo);
+    if (!group) throw new Error("群聊档案不存在：" + umo);
+    db.groups = db.groups.filter(function (item) {
+      return item.umo !== umo;
+    });
+    delete db.windows[umo];
+    delete db.sessionActivity[umo];
+    return groupMutationResult({ deleted_umo: umo });
   }
 
   function updateUser(body) {
     var action = String(body.action || "update").toLowerCase();
+    /* v2.8：群聊档案维护 action（契约 §6.2 users/update） */
+    if (action === "update_group") return updateGroupRecord(body);
+    if (action === "clear_group_memory") return clearGroupMemoryRecord(body);
+    if (action === "delete_group") return deleteGroupRecord(body);
     if (action === "merge") {
       var primary = null;
       var secondary = null;
@@ -1789,7 +2318,12 @@
       if (keyword && (memory.content + " " + memory.keywords).toLowerCase().indexOf(keyword) < 0) return false;
       return true;
     });
-    return { memories: clone(memories), stats: memoryStats() };
+    return {
+      memories: clone(memories),
+      stats: memoryStats(),
+      /* v2.8：T1 上限提示（契约 §5.6 / §6.2） */
+      tier1_limit: 30
+    };
   }
 
   function mutateMemory(body) {
@@ -1892,9 +2426,14 @@
   }
 
   function surfingGet(payload) {
+    var soul = findSoul(String(payload.soul_id || "")) || defaultSoul() || activeSoul();
+    ensureSoulV28Fields(soul);
     return {
-      videos: videosForSoul(payload.soul_id || ""),
-      known_umos: knownUmos()
+      videos: videosForSoul(soul ? soul.soul_id : payload.soul_id || ""),
+      known_umos: knownUmos(),
+      /* v2.8：冲浪总开关 + 当前角色（契约 §5.2 / §6.2） */
+      soul_id: soul ? soul.soul_id : "",
+      surfing_enabled: soul && soul.settings ? soul.settings.surfing_enabled !== false : true
     };
   }
 
@@ -1902,6 +2441,17 @@
     var action = String(body.action || "surf").toLowerCase();
     var soul = findSoul(String(body.soul_id || "")) || activeSoul();
     if (!soul) throw new Error("没有可用角色");
+    ensureSoulV28Fields(soul);
+    if (action === "toggle_surfing") {
+      soul.settings.surfing_enabled =
+        body.enabled === undefined ? !soul.settings.surfing_enabled : !!body.enabled;
+      soul.updated_at = nowSeconds();
+      return {
+        soul_id: soul.soul_id,
+        surfing_enabled: soul.settings.surfing_enabled,
+        soul: toSoulDict(soul)
+      };
+    }
     if (action === "delete") {
       var videoId = String(body.video_id || "");
       db.videos = db.videos.filter(function (video) {
@@ -1917,6 +2467,10 @@
         target_umo: targetUmo,
         share_text: "分享一条刚刷到的视频～\n《" + (db.videos[0] ? db.videos[0].title : "视频") + "》"
       };
+    }
+    /* 手动冲浪：总开关关闭时与后端一致返回错误（页面 toast err.message） */
+    if (soul.settings.surfing_enabled === false) {
+      throw new Error("赛博冲浪总开关已关闭，请先在冲浪页开启");
     }
     var template = db.videos[db.videos.length % Math.max(1, db.videos.length)] || {};
     var newVideo = {
@@ -2030,20 +2584,39 @@
         var sourceId = String(payload.source_id || "");
         return { source_id: sourceId, models: clone(db.modelLists[sourceId] || []) };
       }
-      case "models/config":
+      case "models/config": {
+        /* v2.8：models/config 支持 ?soul_id= / body.soul_id（契约 §6.2，per-soul 独立配置） */
+        var configSoul = findSoul(String(payload.soul_id || "")) || defaultSoul();
+        if (!configSoul) throw new Error("没有可用的角色");
+        ensureSoulV28Fields(configSoul);
         if (method === "POST") {
           var incoming = payload.model_config && typeof payload.model_config === "object" ? payload.model_config : payload;
           /* v2.6：保存时归一化 inherit / inherit_from，返回完整 canonical 配置 */
-          db.modelConfig = normalizeModelConfig(incoming);
-          return { model_config: clone(db.modelConfig), status: buildModelStatus() };
+          configSoul.model_config = normalizeModelConfig(incoming);
+          configSoul.updated_at = nowSeconds();
+          return {
+            soul_id: configSoul.soul_id,
+            model_config: clone(configSoul.model_config),
+            status: buildModelStatus(configSoul.model_config)
+          };
         }
-        return { model_config: clone(normalizeModelConfig(db.modelConfig || {})), status: buildModelStatus() };
+        return {
+          soul_id: configSoul.soul_id,
+          model_config: clone(normalizeModelConfig(configSoul.model_config || {})),
+          status: buildModelStatus(configSoul.model_config)
+        };
+      }
       case "models/test": {
         var role = String(payload.role || "main");
+        var testSoul = findSoul(String(payload.soul_id || "")) || defaultSoul();
+        if (testSoul) ensureSoulV28Fields(testSoul);
+        var testCfg = normalizeModelConfig(testSoul ? testSoul.model_config : db.modelConfig);
+        var testPair = resolveModelPair(testCfg, role);
         if (role === "tts") {
           return {
             status: "ok",
             role: "tts",
+            soul_id: testSoul ? testSoul.soul_id : "",
             latency_ms: 420,
             audio_path: "/tmp/onlyyou_mock_tts.mp3",
             audio_base64: mockSilentWavBase64(400)
@@ -2052,10 +2625,15 @@
         return {
           status: "ok",
           role: role,
-          provider_id: "deepseek/deepseek-chat",
-          model: "deepseek-chat",
+          soul_id: testSoul ? testSoul.soul_id : "",
+          provider_id: testPair ? "onlyyou::" + role + "::" + testPair.source_id + "::" + testPair.model : "",
+          model: testPair ? testPair.model : "",
           latency_ms: 640 + Math.round(Math.random() * 240),
-          reply: "pong～这里是 " + role + " 角色的 Mock 连通性测试回复。"
+          reply:
+            "pong～这里是 " +
+            (testSoul ? "角色 " + testSoul.soul_id + " 的 " : "") +
+            role +
+            " 角色的 Mock 连通性测试回复。"
         };
       }
       case "sessions/default_soul": {
@@ -2065,9 +2643,19 @@
         return {
           default_soul_id: db.defaultSoulId,
           souls: listSoulDicts(),
-          umo_bindings: clone(db.umoBindings)
+          umo_bindings: clone(db.umoBindings),
+          platform_bindings: platformBindingsMap()
         };
       }
+      /* ---- v2.8 机器人接口绑定 / 会话内存（契约 §6.2） ---- */
+      case "sessions/platforms":
+        return buildSessionsPayload(String(payload.soul_id || ""));
+      case "sessions/bind_platform":
+        return bindPlatform(payload);
+      case "sessions/unbind_platform":
+        return unbindPlatform(payload);
+      case "sessions/clear_memory":
+        return clearSessionMemory(payload);
       default:
         throw new Error("Mock 未覆盖的接口：" + method + " " + endpoint);
     }
@@ -2140,6 +2728,6 @@
   window.__OY_MOCK__ = true;
   window.OY_MOCK_DB = db;
   console.info(
-    "[OnlyYou] Mock bridge 已安装：覆盖 27 条 API（17 旧 + 10 新），模拟延迟 " + MOCK_DELAY + "ms。"
+    "[OnlyYou] Mock bridge 已安装：覆盖 31 条 API（v2.8 契约 §6），模拟延迟 " + MOCK_DELAY + "ms。"
   );
 })();

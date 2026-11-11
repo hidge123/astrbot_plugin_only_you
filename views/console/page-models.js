@@ -1,12 +1,15 @@
 /**
  * OnlyYou Plugin Pages — 模型页 (`views/console/page-models.js`)
  *
- * 数据源：
+ * 数据源（v2.8 按角色独立配置）：
  *   GET  `models/sources` → { sources: [...], tts_providers: [...] }
  *   GET  `models/list?source_id=` → { source_id, models: [...] }
- *   GET  `models/config`  → { model_config, status }
- *   POST `models/config`  → { model_config, status }（保存后热重建实例）
- *   POST `models/test`    → { status: "ok"|"error", role, latency_ms, reply | audio_base64 | error }
+ *   GET  `models/config?soul_id=`  → { soul_id, model_config, status }
+ *   POST `models/config` { soul_id, model_config } → { soul_id, model_config, status }（保存后热重建该角色实例）
+ *   POST `models/test` { role, soul_id? } → { status: "ok"|"error", role, latency_ms, reply | audio_base64 | error }
+ *
+ * v2.8：模型配置挂在 Soul 上（每个角色一套四角色模型）。页面顶部展示当前角色，
+ * 加载 / 自动保存都带 `soul_id`；切换角色后 app.js 会重渲染本页并重新拉取该角色的配置。
  *
  * 页面结构：4 张角色卡片 —— 对话（必填）/ 决策·读空气 / 视频解析 / 语音 TTS。
  * 聊天卡：模型来源模式下拉（独立配置 / 继承自主对话模型 / 继承自轻量决策模型）+「独立配置」时
@@ -76,6 +79,7 @@
     destroyed: false,
     sources: [],
     ttsProviders: [],
+    soulId: "",
     cfg: null,
     savedCfg: null,
     status: {},
@@ -130,6 +134,29 @@
 
   function hasOwn(obj, key) {
     return Object.prototype.hasOwnProperty.call(obj, key);
+  }
+
+  /** 当前管理角色（app.state 是唯一真源；切换角色后页面会重渲染） */
+  function currentSoulId() {
+    return String((S.app && S.app.state && S.app.state.currentSoulId) || "");
+  }
+
+  function currentSoulLabel() {
+    var app = S.app;
+    var sid = currentSoulId();
+    var soul = app && app.state && app.state.currentSoul;
+    if (soul && String(soul.soul_id || "") === sid && (soul.name || soul.soul_id)) {
+      return String(soul.name || soul.soul_id);
+    }
+    return sid || "未选择角色";
+  }
+
+  /** 保存请求体：按角色保存，缺 soul_id 时由后端回退默认角色 */
+  function configBody(modelConfig) {
+    var body = { model_config: modelConfig };
+    var sid = S.soulId || currentSoulId();
+    if (sid) body.soul_id = sid;
+    return body;
   }
 
   function inheritOptions(role) {
@@ -708,6 +735,24 @@
     return info.configured === false || info.mode === "unconfigured" || !info.label;
   }
 
+  function soulBannerHtml() {
+    var sid = currentSoulId();
+    if (!sid) return "";
+    return (
+      '<div class="card" data-role="soul-banner"><div class="card-body tight">' +
+      '<div class="row wrap" style="gap:8px">' +
+      '<span class="tag tag-primary">当前角色</span>' +
+      '<strong class="text-sm">' +
+      esc(currentSoulLabel()) +
+      "</strong>" +
+      '<span class="mono text-xs muted">' +
+      esc(sid) +
+      "</span>" +
+      '<span class="text-xs text-2" style="flex:1;min-width:200px">模型配置按角色独立保存；在顶栏切换角色后会自动加载该角色自己的四角色模型配置。</span>' +
+      "</div></div></div>"
+    );
+  }
+
   function bannerHtml() {
     if (!mainUnconfigured()) return "";
     return (
@@ -725,11 +770,14 @@
       '<div class="page-head"><h1 class="page-title">' +
       icon("models", 18) +
       "模型" +
-      '<span class="card-sub">插件自治四角色模型 · 修改即时生效</span></h1>' +
+      '<span class="card-sub">当前角色：' +
+      esc(currentSoulLabel()) +
+      " · 四角色模型按角色独立配置 · 修改即时生效</span></h1>" +
       '<div class="page-actions">' +
       '<button class="btn btn-ghost btn-sm" type="button" data-action="reload">' +
       icon("refresh", 14) +
       "重新读取</button></div></div>" +
+      soulBannerHtml() +
       bannerHtml() +
       '<div class="model-grid">' +
       CHAT_ROLES.map(chatCardHtml).join("") +
@@ -802,7 +850,8 @@
     var payloadJson = JSON.stringify(normalizeConfig(payload));
     S.busy = true;
     try {
-      var data = await app.apiPost("models/config", { model_config: payload });
+      var data = await app.apiPost("models/config", configBody(payload));
+      if (S.destroyed || !S.app) return;
       var saved =
         data && data.model_config && typeof data.model_config === "object"
           ? normalizeConfig(data.model_config)
@@ -812,6 +861,7 @@
       S.savedCfg = clone(saved);
       /* 保存期间用户若继续编辑，保留其新改动继续下一轮自动保存 */
       if (JSON.stringify(S.cfg) === payloadJson) S.cfg = saved;
+      if (data && data.soul_id) S.soulId = String(data.soul_id);
       S.status =
         data && data.status && typeof data.status === "object" ? data.status : S.status;
       if (app.applyModelStatus) app.applyModelStatus(S.status);
@@ -862,11 +912,17 @@
    * 数据加载
    * ------------------------------------------------------------------ */
   async function loadData(app) {
-    var results = await Promise.all([app.apiGet("models/sources"), app.apiGet("models/config")]);
+    var sid = currentSoulId();
+    var params = sid ? { soul_id: sid } : {};
+    var results = await Promise.all([
+      app.apiGet("models/sources"),
+      app.apiGet("models/config", params)
+    ]);
     var sourcesData = results[0] || {};
     var configData = results[1] || {};
     S.sources = Array.isArray(sourcesData.sources) ? sourcesData.sources : [];
     S.ttsProviders = Array.isArray(sourcesData.tts_providers) ? sourcesData.tts_providers : [];
+    S.soulId = configData.soul_id != null && configData.soul_id !== "" ? String(configData.soul_id) : sid;
     S.cfg = normalizeConfig(configData.model_config);
     S.savedCfg = clone(S.cfg);
     S.status = configData.status && typeof configData.status === "object" ? configData.status : {};
@@ -971,8 +1027,11 @@
       wrap.innerHTML =
         '<div class="model-test-result"><span class="spinner" style="width:12px;height:12px;display:inline-block;vertical-align:middle"></span> 测试中…</div>';
     }
+    var body = { role: role };
+    var sid = S.soulId || currentSoulId();
+    if (sid) body.soul_id = sid;
     try {
-      var data = await app.apiPost("models/test", { role: role });
+      var data = await app.apiPost("models/test", body);
       renderTestResult(role, data || { status: "error", error: "接口返回为空" });
     } catch (err) {
       renderTestResult(role, { status: "error", error: err.message || String(err) });
@@ -992,10 +1051,12 @@
     var saveBtn = S.container ? S.container.querySelector('[data-action="save-config"]') : null;
     if (saveBtn) saveBtn.classList.add("is-loading");
     try {
-      var data = await app.apiPost("models/config", { model_config: S.cfg });
+      var data = await app.apiPost("models/config", configBody(S.cfg));
+      if (S.destroyed || !S.app) return;
       if (data && data.model_config && typeof data.model_config === "object") {
         S.cfg = normalizeConfig(data.model_config);
       }
+      if (data && data.soul_id) S.soulId = String(data.soul_id);
       S.savedCfg = clone(S.cfg);
       S.autoSaveFailed = false;
       S.status = data && data.status && typeof data.status === "object" ? data.status : S.status;
@@ -1133,6 +1194,7 @@
     S.destroyed = false;
     S.sources = [];
     S.ttsProviders = [];
+    S.soulId = String((app && app.state && app.state.currentSoulId) || "");
     S.cfg = null;
     S.savedCfg = null;
     S.status = {};
@@ -1143,10 +1205,11 @@
     S.autoSaveFailed = false;
 
     container.innerHTML =
-      '<div class="loading"><span class="spinner"></span><span>加载模型配置…</span></div>';
+      '<div class="loading"><span class="spinner"></span><span>加载当前角色的模型配置…</span></div>';
     bindEvents(container, app);
     try {
       await loadData(app);
+      if (S.destroyed) return;
       paint();
     } catch (err) {
       console.error("[OnlyYou] 模型页渲染失败：", err);
@@ -1181,6 +1244,7 @@
     S.container = null;
     S.sources = [];
     S.ttsProviders = [];
+    S.soulId = "";
     S.cfg = null;
     S.savedCfg = null;
     S.status = {};

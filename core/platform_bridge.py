@@ -35,10 +35,179 @@ class PlatformBridge:
     1. 协同控制群聊/私聊唤醒与拦截（适配 AstrBot v4 ProcessStage & should_call_llm）
     2. 后台主动发消息时复用平台 segmented_reply 配置与打字延迟
     3. 感知平台 streaming_response 开关
+    4. 枚举 AstrBot 机器人接口（platform_id），供 Soul 绑定与路由
     """
 
     def __init__(self, context: Any):
         self.context = context
+
+    # ==================================================================
+    # Bot platform instances (v2.8: Soul -> platform_id binding)
+    # ==================================================================
+    @staticmethod
+    def extract_platform_id(umo: Any) -> str:
+        """``"<platform_id>:<msg_type>:<session_id>"`` -> first segment (``""`` safe)."""
+        if not umo:
+            return ""
+        text = str(umo).strip()
+        if not text:
+            return ""
+        return text.split(":", 1)[0].strip()
+
+    @staticmethod
+    def _meta_attr(meta: Any, key: str) -> str:
+        try:
+            value = getattr(meta, key, "")
+            if value is None and isinstance(meta, dict):
+                value = meta.get(key)
+            return str(value or "").strip()
+        except Exception:
+            return ""
+
+    def _runtime_instances(self) -> list[dict[str, Any]]:
+        """AstrBot currently loaded bot instances (``platform_manager.get_insts()``)."""
+        items: list[dict[str, Any]] = []
+        try:
+            pm = getattr(self.context, "platform_manager", None) if self.context is not None else None
+        except Exception as exc:  # noqa: BLE001 - broken contexts must not crash discovery
+            logger.debug(f"[OnlyYou] platform_manager unavailable: {exc}")
+            pm = None
+        if pm is None:
+            return items
+        getter = getattr(pm, "get_insts", None)
+        insts: Any = []
+        try:
+            if callable(getter):
+                insts = getter()
+            else:
+                insts = getattr(pm, "platform_insts", None) or getattr(pm, "insts", None) or []
+        except Exception:
+            insts = []
+        try:
+            for inst in list(insts or []):
+                meta = None
+                try:
+                    meta_getter = getattr(inst, "meta", None)
+                    if callable(meta_getter):
+                        meta = meta_getter()
+                except Exception:
+                    meta = None
+                platform_id = self._meta_attr(meta, "id") or str(
+                    getattr(inst, "platform_id", "") or ""
+                ).strip()
+                if not platform_id:
+                    continue
+                name = self._meta_attr(meta, "name") or platform_id
+                type_name = self._meta_attr(meta, "type") or str(
+                    getattr(inst, "platform", "") or ""
+                ).strip()
+                items.append(
+                    {
+                        "platform_id": platform_id,
+                        "platform_type": type_name or platform_id,
+                        "name": name,
+                        "enabled": True,
+                        "running": True,
+                        "source": "runtime",
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001 - discovery must never crash callers
+            logger.debug(f"[OnlyYou] runtime platform discovery failed: {exc}")
+        return items
+
+    def _config_instances(self) -> list[dict[str, Any]]:
+        """AstrBot configured bot instances (``context.get_config()["platform"]``)."""
+        items: list[dict[str, Any]] = []
+        if self.context is None:
+            return items
+        try:
+            ab_conf = self.context.get_config() or {}
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[OnlyYou] platform config discovery failed: {exc}")
+            return items
+        try:
+            for entry in ab_conf.get("platform", []) or []:
+                if not isinstance(entry, dict):
+                    continue
+                platform_id = str(entry.get("id") or "").strip()
+                if not platform_id:
+                    continue
+                enable = entry.get("enable", True)
+                items.append(
+                    {
+                        "platform_id": platform_id,
+                        "platform_type": str(entry.get("type") or platform_id).strip(),
+                        "name": str(entry.get("name") or platform_id).strip(),
+                        "enabled": True if enable is None else bool(enable),
+                        "running": False,
+                        "source": "config",
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[OnlyYou] platform config parse failed: {exc}")
+        return items
+
+    @staticmethod
+    def _observed_instances(observed_umos: Optional[list[str]]) -> list[dict[str, Any]]:
+        """Fallback entries inferred from historical UMOs (``platform:type:session``)."""
+        items: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for umo in list(observed_umos or []):
+            platform_id = PlatformBridge.extract_platform_id(umo)
+            if not platform_id or platform_id in seen:
+                continue
+            seen.add(platform_id)
+            items.append(
+                {
+                    "platform_id": platform_id,
+                    "platform_type": platform_id,
+                    "name": platform_id,
+                    "enabled": True,
+                    "running": False,
+                    "source": "observed",
+                }
+            )
+        return items
+
+    def list_platform_instances(
+        self, observed_umos: Optional[list[str]] = None
+    ) -> list[dict[str, Any]]:
+        """Enumerate AstrBot bot instances for the Soul binding UI (v2.8).
+
+        Sources merged by ``platform_id`` (first wins for descriptive fields, flags
+        are OR-ed): runtime ``platform_manager.get_insts()`` -> configured
+        ``platform`` entries -> historical UMO observations.  Never raises.
+        """
+        merged: dict[str, dict[str, Any]] = {}
+
+        def _merge(items: list[dict[str, Any]]) -> None:
+            for item in items:
+                pid = str(item.get("platform_id") or "").strip()
+                if not pid:
+                    continue
+                current = merged.get(pid)
+                if current is None:
+                    merged[pid] = dict(item)
+                    continue
+                # Running/enabled are sticky; keep the most informative name/type.
+                current["enabled"] = bool(current.get("enabled")) or bool(
+                    item.get("enabled")
+                )
+                current["running"] = bool(current.get("running")) or bool(
+                    item.get("running")
+                )
+                for key in ("platform_type", "name"):
+                    if not str(current.get(key) or "").strip() and str(
+                        item.get(key) or ""
+                    ).strip():
+                        current[key] = item[key]
+
+        _merge(self._runtime_instances())
+        _merge(self._config_instances())
+        _merge(self._observed_instances(observed_umos))
+        result = list(merged.values())
+        result.sort(key=lambda item: (not bool(item.get("running")), str(item.get("platform_id"))))
+        return result
 
     @staticmethod
     def apply_reply_decision(event: Any, should_reply: bool) -> None:

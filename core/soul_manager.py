@@ -20,7 +20,10 @@ Key concepts after the 2026 refactor:
   **decision** model (encounter cards are no longer generated).
 """
 
+import hashlib
 import json
+import os
+import re
 import time
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -31,6 +34,7 @@ from .character_card import (
     migrate_legacy,
     normalize_card,
 )
+from .model_hub import DEFAULT_MODEL_CONFIG, normalize_model_config
 from .roguelite_deck import StateEventCard
 from .state_machine import ActionType
 from ..prompts.templates import (
@@ -55,6 +59,15 @@ _CARD_SECTION_BY_ID: dict[str, dict[str, Any]] = {s["id"]: s for s in CARD_SCHEM
 
 DEFAULT_SOUL_ID = "default_soul"
 _SETTING_DEFAULT_SOUL_ID = "default_soul_id"
+_SETTING_LEGACY_UMO_MIGRATED = "legacy_umo_bindings_migrated"
+
+#: Default per-Soul plugin settings (v2.8).  ``surfing_enabled`` is the per-Soul
+#: override of the global cyber-surfing switch.
+DEFAULT_SOUL_SETTINGS: dict[str, Any] = {"surfing_enabled": True}
+
+#: Characters that are illegal in a cross-platform file name (plus control chars).
+_UNSAFE_FILENAME_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+_MAX_PLATFORM_ID_LEN = 64
 
 _TAGS_SPLIT_CHARS = ",，、/;；|\n\r"
 
@@ -150,6 +163,68 @@ def _clean_list(value: Any) -> list[str]:
     return result
 
 
+def _normalize_soul_settings(value: Any) -> dict[str, Any]:
+    """Normalize ``SoulProfile.settings`` (known keys coerced, unknown keys kept)."""
+    settings: dict[str, Any] = dict(DEFAULT_SOUL_SETTINGS)
+    if isinstance(value, dict):
+        for key, item in value.items():
+            text_key = _clean_text(key)
+            if text_key:
+                settings[text_key] = item
+    surfing = settings.get("surfing_enabled", True)
+    if isinstance(surfing, str):
+        settings["surfing_enabled"] = surfing.strip().lower() not in (
+            "0",
+            "false",
+            "off",
+            "no",
+        )
+    else:
+        settings["surfing_enabled"] = bool(surfing)
+    return settings
+
+
+def _normalize_bound_platforms(value: Any) -> list[str]:
+    """Normalize a Soul's bound bot-instance ids (no UMO / no colon)."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items: list[Any] = [value]
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        items = []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        text = _clean_text(item)
+        if not text or ":" in text or len(text) > _MAX_PLATFORM_ID_LEN:
+            continue
+        if text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
+
+
+def _coerce_timestamp(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _soul_filename(soul_id: str) -> str:
+    """Map a Soul ID onto a safe ``<name>.json`` file name (collision resistant)."""
+    sid = _clean_text(soul_id) or DEFAULT_SOUL_ID
+    safe = _UNSAFE_FILENAME_RE.sub("_", sid).strip(" .") or "soul"
+    if safe != sid:
+        digest = hashlib.sha1(sid.encode("utf-8")).hexdigest()[:8]
+        safe = f"{safe[:40]}__{digest}"
+    return f"{safe}.json"
+
+
 def _is_empty_value(value: Any) -> bool:
     if value is None:
         return True
@@ -198,9 +273,19 @@ class SoulProfile:
         card: Optional[dict[str, Any]] = None,
         state_event_cards: Optional[list[Any]] = None,
         encounter_talk_cards: Optional[list[Any]] = None,
+        model_config: Optional[dict[str, Any]] = None,
+        bound_platforms: Optional[list[str]] = None,
+        settings: Optional[dict[str, Any]] = None,
+        updated_at: Optional[int] = None,
         **legacy: Any,
     ) -> None:
         self.soul_id: str = _clean_text(soul_id) or DEFAULT_SOUL_ID
+        # v2.8: each Soul aggregates its own model config / bot bindings / settings
+        # (persisted as an independent ``souls/<soul_id>.json`` file).
+        self.model_config: dict[str, Any] = normalize_model_config(model_config)
+        self.bound_platforms: list[str] = _normalize_bound_platforms(bound_platforms)
+        self.settings: dict[str, Any] = _normalize_soul_settings(settings)
+        self.updated_at: int = _coerce_timestamp(updated_at)
         base: dict[str, Any] = normalize_card(card) if isinstance(card, dict) else empty_card()
 
         # Legacy keyword arguments (name=..., archetype=..., ...) are folded into
@@ -282,6 +367,22 @@ class SoulProfile:
         return raw if raw in _VALID_CHRONOTYPES else "normal"
 
     @property
+    def surfing_enabled(self) -> bool:
+        """Per-Soul cyber-surfing switch (``settings.surfing_enabled``, default True)."""
+        return bool(self.settings.get("surfing_enabled", True))
+
+    @surfing_enabled.setter
+    def surfing_enabled(self, value: Any) -> None:
+        self.settings = _normalize_soul_settings(
+            {**dict(self.settings or {}), "surfing_enabled": value}
+        )
+
+    @property
+    def tts_config(self) -> dict[str, Any]:
+        """This Soul's normalized TTS config section (copy)."""
+        return dict((self.model_config or {}).get("tts") or DEFAULT_MODEL_CONFIG["tts"])
+
+    @property
     def native_persona_prompt(self) -> str:
         return _clean_text((self.card.get("extra") or {}).get("native_persona_prompt"))
 
@@ -293,7 +394,11 @@ class SoulProfile:
     # ---- Serialization ----
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize, emitting **both** the new ``card`` and the legacy flat fields."""
+        """Serialize, emitting **both** the new ``card`` and the legacy flat fields.
+
+        v2.8 adds the per-Soul ``model_config`` / ``bound_platforms`` / ``settings``
+        / ``updated_at`` keys; the ``souls/<soul_id>.json`` file is this exact dict.
+        """
         return {
             "soul_id": self.soul_id,
             "card": normalize_card(self.card),
@@ -304,6 +409,10 @@ class SoulProfile:
             "surfing_preferences": list(self.surfing_preferences),
             "state_event_cards": [card.to_dict() for card in self.state_event_cards],
             "encounter_talk_cards": list(self.encounter_talk_cards),
+            "model_config": normalize_model_config(self.model_config),
+            "bound_platforms": _normalize_bound_platforms(self.bound_platforms),
+            "settings": _normalize_soul_settings(self.settings),
+            "updated_at": _coerce_timestamp(self.updated_at),
         }
 
     @classmethod
@@ -345,6 +454,10 @@ class SoulProfile:
                 for text in (_clean_text(x) for x in (data.get("encounter_talk_cards") or []))
                 if text
             ],
+            model_config=data.get("model_config"),
+            bound_platforms=data.get("bound_platforms"),
+            settings=data.get("settings"),
+            updated_at=data.get("updated_at"),
         )
 
 
@@ -360,6 +473,102 @@ class SoulManager:
         self._bindings_loaded: bool = False
         self._default_soul_id_cache: Optional[str] = None
         self._native_prompts_cache: Optional[list[str]] = None
+        # v2.8: ``souls/<safe>.json`` is the single source of truth; SQLite ``souls``
+        # stays as an index for cascade updates / legacy migration.
+        self.souls_dir: str = self._derive_souls_dir()
+        self._platform_bindings_cache: Optional[dict[str, str]] = None
+
+    # ==================================================================
+    # v2.8: independent per-Soul JSON files
+    # ==================================================================
+    def _derive_souls_dir(self) -> str:
+        """``<data dir>/souls`` derived from the SQLite path (never the cwd)."""
+        db_path = str(getattr(self.db, "db_path", "") or "").strip()
+        if db_path:
+            return os.path.join(os.path.dirname(os.path.abspath(db_path)), "souls")
+        return os.path.join(os.getcwd(), "data", "plugin_data", "astrbot_plugin_only_you", "souls")
+
+    def _ensure_souls_dir(self) -> bool:
+        try:
+            os.makedirs(self.souls_dir, exist_ok=True)
+            return True
+        except Exception as exc:  # noqa: BLE001 - degrade to SQLite-only mode
+            logger.warning(f"[OnlyYou] create souls dir failed: {exc}")
+            return False
+
+    def soul_file_path(self, soul_id: str) -> str:
+        """Absolute path of a Soul's JSON file."""
+        return os.path.join(self.souls_dir, _soul_filename(soul_id))
+
+    def _write_soul_file(self, profile: SoulProfile) -> bool:
+        path = self.soul_file_path(profile.soul_id)
+        if not self._ensure_souls_dir():
+            return False
+        try:
+            payload = json.dumps(profile.to_dict(), ensure_ascii=False, indent=2)
+            tmp_path = f"{path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+            os.replace(tmp_path, path)
+            return True
+        except Exception as exc:  # noqa: BLE001 - never lose an in-memory save
+            logger.warning(f"[OnlyYou] write soul file failed ({profile.soul_id}): {exc}")
+            return False
+
+    def _read_soul_file(self, path: str) -> Optional[SoulProfile]:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if not isinstance(data, dict):
+                return None
+            profile = SoulProfile.from_dict(data)
+            profile.updated_at = _coerce_timestamp(data.get("updated_at"))
+            return profile
+        except Exception as exc:  # noqa: BLE001 - skip a corrupt file, keep the rest
+            logger.warning(f"[OnlyYou] read soul file failed ({os.path.basename(path)}): {exc}")
+            return None
+
+    def _invalidate_platform_cache(self) -> None:
+        self._platform_bindings_cache = None
+
+    async def _upsert_soul_index(self, profile: SoulProfile, persona_hash: str = "file") -> None:
+        """Keep the SQLite ``souls`` index in sync with the JSON file."""
+        await self.db.execute(
+            """
+            INSERT INTO souls (soul_id, persona_hash, profile_json, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(soul_id) DO UPDATE SET
+                persona_hash = excluded.persona_hash,
+                profile_json = excluded.profile_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                profile.soul_id,
+                persona_hash or "file",
+                json.dumps(profile.to_dict(), ensure_ascii=False),
+                _coerce_timestamp(profile.updated_at) or int(time.time()),
+            ),
+        )
+
+    def get_cached_soul(self, soul_id: str) -> Optional[SoulProfile]:
+        """Return a Soul from the in-memory cache only (sync; used by ModelHub)."""
+        sid = _clean_text(soul_id)
+        if not sid:
+            return None
+        item = self._cache.get(sid)
+        return item[1] if item else None
+
+    def peek_default_soul(self) -> Optional[SoulProfile]:
+        """Return the default Soul from cache synchronously (newest as fallback)."""
+        sid = _clean_text(self._default_soul_id_cache)
+        if sid:
+            soul = self.get_cached_soul(sid)
+            if soul is not None:
+                return soul
+        souls = [profile for (_hash, profile) in self._cache.values() if profile is not None]
+        if not souls:
+            return None
+        return max(souls, key=lambda item: _coerce_timestamp(getattr(item, "updated_at", 0)))
 
     # ==================================================================
     # UMO routing bindings
@@ -528,39 +737,130 @@ class SoulManager:
     # CRUD
     # ==================================================================
     async def list_souls(self) -> list[SoulProfile]:
-        """Return all stored SoulProfiles in SQLite (ensuring at least 1 default soul exists)."""
-        rows = await self.db.fetchall(
-            "SELECT soul_id, persona_hash, profile_json FROM souls ORDER BY updated_at DESC"
-        )
-        souls: list[SoulProfile] = []
-        for r in rows:
-            try:
-                profile = SoulProfile.from_dict(json.loads(r["profile_json"]))
-                self._cache[profile.soul_id] = (str(r.get("persona_hash") or ""), profile)
-                souls.append(profile)
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"[OnlyYou] Failed to load soul row: {e}")
+        """Return all stored SoulProfiles, with ``souls/*.json`` as the source of truth.
+
+        Files are read first; SQLite-only rows (pre-v2.8 databases) are migrated to
+        JSON files on the fly. When no Soul exists at all, the built-in default Soul
+        is created (offline, no LLM).
+        """
+        souls: dict[str, SoulProfile] = {}
+        self._ensure_souls_dir()
+
+        file_names: list[str] = []
+        try:
+            file_names = sorted(
+                name for name in os.listdir(self.souls_dir) if name.endswith(".json")
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[OnlyYou] list soul files failed: {exc}")
+            file_names = []
+
+        for name in file_names:
+            path = os.path.join(self.souls_dir, name)
+            profile = self._read_soul_file(path)
+            if profile is None:
                 continue
+            souls[profile.soul_id] = profile
+            cached_hash = self._cache.get(profile.soul_id, ("file",))[0]
+            self._cache[profile.soul_id] = (cached_hash, profile)
+
+        db_rows: dict[str, dict[str, Any]] = {}
+        try:
+            rows = await self.db.fetchall(
+                "SELECT soul_id, persona_hash, profile_json, updated_at FROM souls"
+            )
+            for row in rows:
+                sid = _clean_text(row.get("soul_id"))
+                if sid:
+                    db_rows[sid] = row
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[OnlyYou] list souls from SQLite failed: {exc}")
+
+        # JSON file wins unless the SQLite index is strictly newer; SQLite-only rows
+        # (legacy v2.7 data) are migrated to independent JSON files.
+        for sid, row in db_rows.items():
+            try:
+                raw = json.loads(row.get("profile_json") or "{}")
+                db_profile = SoulProfile.from_dict(raw if isinstance(raw, dict) else {})
+                db_profile.soul_id = sid
+                db_profile.updated_at = _coerce_timestamp(row.get("updated_at"))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[OnlyYou] Failed to load soul row {sid}: {exc}")
+                continue
+
+            file_profile = souls.get(sid)
+            if file_profile is None:
+                souls[sid] = db_profile
+                self._cache[sid] = (str(row.get("persona_hash") or "file"), db_profile)
+                self._write_soul_file(db_profile)
+            elif _coerce_timestamp(row.get("updated_at")) > _coerce_timestamp(
+                file_profile.updated_at
+            ):
+                souls[sid] = db_profile
+                self._cache[sid] = (str(row.get("persona_hash") or "file"), db_profile)
+                self._write_soul_file(db_profile)
+            elif _coerce_timestamp(file_profile.updated_at) > _coerce_timestamp(
+                row.get("updated_at")
+            ):
+                try:
+                    await self._upsert_soul_index(
+                        file_profile, persona_hash=str(row.get("persona_hash") or "file")
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(f"[OnlyYou] sync soul index failed: {exc}")
+
+        orphan_ids = [
+            sid
+            for sid in souls
+            if sid not in db_rows and not os.path.exists(self.soul_file_path(sid))
+        ]
+        for sid in orphan_ids:
+            souls.pop(sid, None)
 
         if not souls:
             default_soul = await self.resolve_soul(allow_llm_seed=False)
-            souls.append(default_soul)
-        return souls
+            souls[default_soul.soul_id] = default_soul
+
+        result = sorted(
+            souls.values(),
+            key=lambda item: (
+                -_coerce_timestamp(getattr(item, "updated_at", 0)),
+                str(item.soul_id),
+            ),
+        )
+        self._invalidate_platform_cache()
+        return result
 
     async def get_soul_by_id(self, soul_id: str) -> Optional[SoulProfile]:
-        """Fetch a specific SoulProfile by `soul_id` from cache or SQLite."""
-        sid = (soul_id or "").strip()
+        """Fetch a specific SoulProfile by `soul_id` (cache -> JSON file -> SQLite)."""
+        sid = _clean_text(soul_id)
         if not sid:
             return None
-        if sid in self._cache:
-            return self._cache[sid][1]
+        cached = self.get_cached_soul(sid)
+        if cached is not None:
+            return cached
+
+        path = self.soul_file_path(sid)
+        if os.path.exists(path):
+            profile = self._read_soul_file(path)
+            if profile is not None:
+                profile.soul_id = profile.soul_id or sid
+                self._cache[sid] = (self._cache.get(sid, ("file",))[0], profile)
+                return profile
+
         row = await self.db.fetchone(
-            "SELECT persona_hash, profile_json FROM souls WHERE soul_id = ?", (sid,)
+            "SELECT persona_hash, profile_json, updated_at FROM souls WHERE soul_id = ?",
+            (sid,),
         )
         if row and row.get("profile_json"):
             try:
-                profile = SoulProfile.from_dict(json.loads(row["profile_json"]))
-                self._cache[sid] = (str(row.get("persona_hash") or ""), profile)
+                raw = json.loads(row["profile_json"])
+                profile = SoulProfile.from_dict(raw if isinstance(raw, dict) else {})
+                profile.soul_id = sid
+                profile.updated_at = _coerce_timestamp(row.get("updated_at"))
+                self._cache[sid] = (str(row.get("persona_hash") or "file"), profile)
+                # Legacy SQLite-only row -> migrate to an independent JSON file.
+                self._write_soul_file(profile)
                 return profile
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"[OnlyYou] Failed to parse soul {sid}: {e}")
@@ -568,40 +868,29 @@ class SoulManager:
         return None
 
     async def save_soul(self, profile: SoulProfile, persona_hash: Optional[str] = None) -> SoulProfile:
-        """Persist a SoulProfile to SQLite and update the in-memory cache."""
+        """Persist a SoulProfile to its own JSON file **and** the SQLite index."""
         if profile is None:
             raise ValueError("SoulProfile 不能为空")
         profile.card = normalize_card(profile.card)
-        if not (profile.soul_id or "").strip():
+        profile.model_config = normalize_model_config(profile.model_config)
+        profile.bound_platforms = _normalize_bound_platforms(profile.bound_platforms)
+        profile.settings = _normalize_soul_settings(profile.settings)
+        if not (_clean_text(profile.soul_id)):
             profile.soul_id = DEFAULT_SOUL_ID
-        p_hash = persona_hash or "webui_custom"
+        old_cached = self._cache.get(profile.soul_id, ("", None))[0]
+        p_hash = _clean_text(persona_hash) or _clean_text(old_cached) or "webui_custom"
+        profile.updated_at = int(time.time())
         self._cache[profile.soul_id] = (p_hash, profile)
-        await self.db.execute(
-            """
-            INSERT INTO souls (soul_id, persona_hash, profile_json, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(soul_id) DO UPDATE SET
-                persona_hash = excluded.persona_hash,
-                profile_json = excluded.profile_json,
-                updated_at = excluded.updated_at
-            """,
-            (
-                profile.soul_id,
-                p_hash,
-                json.dumps(profile.to_dict(), ensure_ascii=False),
-                int(time.time()),
-            ),
-        )
+        self._invalidate_platform_cache()
+        self._write_soul_file(profile)
+        await self._upsert_soul_index(profile, persona_hash=p_hash)
         return profile
 
     async def rename_soul(self, old_soul_id: str, new_soul_id: str) -> SoulProfile:
         """
         Rename `old_soul_id` -> `new_soul_id` and cascade update across:
-        - `souls`
-        - `daily_schedules`
-        - `memories`
-        - `umo_soul_bindings`
-        - `surfing_history`
+        - `souls` (JSON file renamed) / `daily_schedules` / `memories`
+        - `umo_soul_bindings` / `surfing_history` / plugin default soul
         """
         old_id = (old_soul_id or "").strip()
         new_id = (new_soul_id or "").strip()
@@ -621,6 +910,7 @@ class SoulManager:
         if profile is None:
             raise ValueError(f"未找到原角色 '{old_id}'")
 
+        old_path = self.soul_file_path(old_id)
         profile.soul_id = new_id
         await self.save_soul(profile)
 
@@ -656,6 +946,12 @@ class SoulManager:
         )
 
         self._cache.pop(old_id, None)
+        self._invalidate_platform_cache()
+        try:
+            if os.path.exists(old_path):
+                os.remove(old_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[OnlyYou] remove old soul file failed: {exc}")
         for k, v in list(self._umo_bindings.items()):
             if v == old_id:
                 self._umo_bindings[k] = new_id
@@ -664,11 +960,18 @@ class SoulManager:
         return profile
 
     async def delete_soul(self, soul_id: str) -> None:
-        """Delete a SoulProfile and its associated schedules, memories, and bindings."""
+        """Delete a SoulProfile (JSON file + its schedules, memories, and bindings)."""
         sid = (soul_id or "").strip()
         if not sid:
             return
         self._cache.pop(sid, None)
+        self._invalidate_platform_cache()
+        try:
+            path = self.soul_file_path(sid)
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[OnlyYou] delete soul file failed: {exc}")
         for k, v in list(self._umo_bindings.items()):
             if v == sid:
                 self._umo_bindings.pop(k, None)
@@ -679,6 +982,123 @@ class SoulManager:
         await self.db.execute("DELETE FROM surfing_history WHERE soul_id = ?", (sid,))
         if await self.get_default_soul_id() == sid:
             await self.set_default_soul_id("")
+
+    # ==================================================================
+    # v2.8: platform (bot instance) binding -- one-to-many Soul -> platforms,
+    # strictly mutually exclusive platform -> Soul.
+    # ==================================================================
+    async def get_platform_bindings(self) -> dict[str, str]:
+        """Return ``{platform_id: soul_id}`` (newest Soul wins on legacy conflicts)."""
+        if self._platform_bindings_cache is not None:
+            return dict(self._platform_bindings_cache)
+        mapping: dict[str, str] = {}
+        souls = await self.list_souls()
+        for soul in sorted(
+            souls,
+            key=lambda item: -_coerce_timestamp(getattr(item, "updated_at", 0)),
+        ):
+            for platform_id in _normalize_bound_platforms(soul.bound_platforms):
+                # Strict mutual exclusion: the most recently updated Soul wins.
+                mapping.setdefault(platform_id, soul.soul_id)
+        self._platform_bindings_cache = mapping
+        return dict(mapping)
+
+    async def get_bound_platforms(self, soul_id: str) -> list[str]:
+        soul = await self.get_soul_by_id(soul_id)
+        return list(soul.bound_platforms) if soul is not None else []
+
+    async def bind_platform(self, soul_id: str, platform_id: str) -> SoulProfile:
+        """Bind one bot instance to a Soul (rejects platforms owned by another Soul)."""
+        soul = await self.get_soul_by_id(soul_id)
+        if soul is None:
+            raise ValueError(f"未找到角色 {soul_id}")
+        pid = _clean_text(platform_id)
+        if not pid:
+            raise ValueError("机器人接口 ID (platform_id) 不能为空")
+        if ":" in pid:
+            raise ValueError("platform_id 必须是不含冒号的机器人接口 ID（如 aiocqhttp）")
+        if len(pid) > _MAX_PLATFORM_ID_LEN:
+            raise ValueError("platform_id 过长")
+        bindings = await self.get_platform_bindings()
+        owner = bindings.get(pid, "")
+        if owner and owner != soul.soul_id:
+            owner_soul = await self.get_soul_by_id(owner)
+            owner_name = (
+                _clean_text(getattr(owner_soul, "name", "")) or owner_soul.soul_id
+                if owner_soul is not None
+                else owner
+            )
+            raise ValueError(
+                f"该机器人接口已被角色『{owner_name}』绑定，请先在角色 {owner_name} 下解绑"
+            )
+        if pid not in soul.bound_platforms:
+            soul.bound_platforms = list(soul.bound_platforms) + [pid]
+            await self.save_soul(soul)
+        return soul
+
+    async def unbind_platform(self, platform_id: str) -> str:
+        """Unbind a bot instance from whichever Soul owns it; returns that Soul id."""
+        pid = _clean_text(platform_id)
+        if not pid:
+            return ""
+        bindings = await self.get_platform_bindings()
+        owner = bindings.get(pid, "")
+        if not owner:
+            return ""
+        soul = await self.get_soul_by_id(owner)
+        if soul is not None and pid in soul.bound_platforms:
+            soul.bound_platforms = [item for item in soul.bound_platforms if item != pid]
+            await self.save_soul(soul)
+        return owner
+
+    async def set_soul_setting(self, soul_id: str, key: str, value: Any) -> SoulProfile:
+        """Update one key of a Soul's ``settings`` dict and persist the JSON file."""
+        soul = await self.get_soul_by_id(soul_id)
+        if soul is None:
+            raise ValueError(f"未找到角色 {soul_id}")
+        text_key = _clean_text(key)
+        if not text_key:
+            raise ValueError("setting key 不能为空")
+        settings = dict(soul.settings or {})
+        settings[text_key] = value
+        soul.settings = _normalize_soul_settings(settings)
+        await self.save_soul(soul)
+        return soul
+
+    async def migrate_legacy_umo_bindings(self) -> int:
+        """One-shot migration: legacy UMO bindings -> platform (bot instance) bindings."""
+        try:
+            migrated = bool(
+                await self.db.get_setting(_SETTING_LEGACY_UMO_MIGRATED, False)
+            )
+        except Exception:
+            migrated = False
+        if migrated:
+            return 0
+        await self._ensure_bindings_loaded()
+        bindings = await self.get_platform_bindings()
+        count = 0
+        for umo, soul_id in list(self._umo_bindings.items()):
+            platform_id = _clean_text(umo).split(":", 1)[0].strip() if ":" in _clean_text(umo) else ""
+            if not platform_id or platform_id in bindings:
+                continue
+            soul = await self.get_soul_by_id(soul_id)
+            if soul is None or platform_id in soul.bound_platforms:
+                continue
+            try:
+                soul.bound_platforms = list(soul.bound_platforms) + [platform_id]
+                await self.save_soul(soul)
+                bindings[platform_id] = soul.soul_id
+                count += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[OnlyYou] migrate legacy umo binding failed: {exc}")
+        try:
+            await self.db.set_setting(_SETTING_LEGACY_UMO_MIGRATED, True)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[OnlyYou] persist legacy umo migration flag failed: {exc}")
+        if count:
+            logger.info(f"[OnlyYou] Migrated {count} legacy UMO bindings to platform bindings.")
+        return count
 
     # ==================================================================
     # Default / fallback cards
@@ -1041,8 +1461,9 @@ class SoulManager:
     ) -> SoulProfile:
         """Resolve the SoulProfile for a session.
 
-        Routing (CONTRACTS.md §3.2):
-        ``UMO 绑定 -> plugin_settings.default_soul_id -> 最近更新的角色 -> 创建默认角色``.
+        v2.8 routing:
+        ``机器人接口绑定 (umo 第一段 == platform_id) -> 旧 UMO 绑定兼容 ->
+        plugin_settings.default_soul_id -> 最近更新的角色 -> 创建默认角色``.
 
         ``allow_llm_seed`` is accepted for backward compatibility and ignored — the
         chat path never seeds cards with the LLM anymore (creation is offline/free).
@@ -1051,6 +1472,15 @@ class SoulManager:
         await self._ensure_bindings_loaded()
 
         clean_umo = _clean_text(umo)
+        platform_id = clean_umo.split(":", 1)[0].strip() if ":" in clean_umo else ""
+        if platform_id:
+            bindings = await self.get_platform_bindings()
+            bound_soul_id = bindings.get(platform_id, "")
+            if bound_soul_id:
+                soul = await self.get_soul_by_id(bound_soul_id)
+                if soul is not None:
+                    return soul
+
         if clean_umo and clean_umo in self._umo_bindings:
             soul = await self.get_soul_by_id(self._umo_bindings[clean_umo])
             if soul is not None:

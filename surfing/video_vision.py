@@ -15,6 +15,7 @@ class VideoReviewResult:
     score: int  # 0 ~ 100 (>=88 triggers bounded schedule mutation "刷片上头")
     commentary: str  # First-person reaction/commentary
     visual_notes: str = ""  # Multimodal visual scene summary notes
+    is_fallback: bool = False  # True when the vision LLM failed / output was malformed
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -29,6 +30,7 @@ class VideoReviewResult:
             "score": self.score,
             "commentary": self.commentary,
             "visual_notes": self.visual_notes,
+            "is_fallback": bool(self.is_fallback),
         }
 
 
@@ -73,13 +75,16 @@ class VideoVisionProcessor:
         )
 
         image_urls = [video.cover_url] if video.cover_url.startswith("http") else None
-        res: Any = await self.model_hub.call_llm_json(
-            prompt=prompt,
-            role="vision",
-            umo=umo,
-            image_urls=image_urls,
-            default=None,
-        )
+        try:
+            res: Any = await self.model_hub.call_llm_json(
+                prompt=prompt,
+                role="vision",
+                umo=umo,
+                image_urls=image_urls,
+                default=None,
+            )
+        except Exception:  # noqa: BLE001 - vision failure must degrade, not crash surfing
+            res = None
 
         default_notes = (
             f"画面主题围绕《{video.title[:18]}》，热评“{video.hot_comments[0][:20]}”精准踩中笑点"
@@ -88,17 +93,27 @@ class VideoVisionProcessor:
         )
 
         if isinstance(res, dict) and "commentary" in res:
-            score = max(0, min(100, int(res.get("score") or 78)))
             commentary = str(res.get("commentary") or "").strip()
+            try:
+                score = max(0, min(100, int(res.get("score") or 78)))
+            except (TypeError, ValueError):
+                score = None
             v_notes = str(res.get("visual_notes") or default_notes).strip()
-            if commentary:
+            if score is not None and commentary:
                 return VideoReviewResult(
-                    video=video, score=score, commentary=commentary, visual_notes=v_notes
+                    video=video,
+                    score=score,
+                    commentary=commentary,
+                    visual_notes=v_notes,
+                    is_fallback=False,
                 )
 
+        # v2.8 §5.1: vision failed / output unparseable -> score 60 + is_fallback=True
+        # so ``_maybe_share_surfed_video`` never shares an unverified video.
         return VideoReviewResult(
             video=video,
-            score=80,
+            score=60,
             commentary=f"刚刷到《{video.title}》，评论区笑死我了hhh",
             visual_notes=default_notes,
+            is_fallback=True,
         )

@@ -90,6 +90,10 @@ class ProviderFactory:
         self._owned_instances: List[Any] = []
         self._owned_ids: set = set()
         self._main_instance: Any = None
+        # v2.8: every plugin-built main instance may be exposed to AstrBot's native
+        # pipeline under its own id (``onlyyou::main::{soul_id}``). Map id(instance)
+        # -> registered provider id so a terminated/reloaded instance can be rebuilt.
+        self._registered_main_ids: Dict[int, str] = {}
 
     # ------------------------------------------------------------------
     # Low level helpers
@@ -642,19 +646,27 @@ class ProviderFactory:
         if cached is not None:
             if self._is_loaded_instance(cached):
                 # AstrBot's ``ProviderManager.reload()`` terminates every inst_map key
-                # that is not part of the user config — including our ``onlyyou::main``.
-                # Detect that case so the next message rebuilds a healthy instance.
+                # that is not part of the user config — including our
+                # ``onlyyou::main*`` registrations. Detect that case so the next
+                # message rebuilds a healthy instance.
+                registered_id = None
+                try:
+                    registered_id = self._registered_main_ids.get(id(cached))
+                except Exception:
+                    registered_id = None
                 if (
                     id(cached) in self._owned_ids
-                    and cached is self._main_instance
-                    and self.MAIN_PROVIDER_ID not in self._inst_map()
+                    and registered_id
+                    and registered_id not in self._inst_map()
                 ):
                     self._owned_ids.discard(id(cached))
                     try:
                         self._owned_instances.remove(cached)
                     except ValueError:
                         pass
-                    self._main_instance = None
+                    self._registered_main_ids.pop(id(cached), None)
+                    if cached is self._main_instance:
+                        self._main_instance = None
                     self._chat_cache.pop(cache_key, None)
                 else:
                     return cached
@@ -674,40 +686,64 @@ class ProviderFactory:
         self._chat_cache[cache_key] = instance
         return instance
 
-    def register_main(self, instance: Any) -> str:
-        """Expose a plugin-built main provider to AstrBot's native pipeline."""
+    def register_main(self, instance: Any, provider_id: Optional[str] = None) -> str:
+        """Expose a plugin-built main provider to AstrBot's native pipeline.
+
+        ``provider_id`` defaults to the legacy ``onlyyou::main``; v2.8 passes a
+        per-Soul id (``onlyyou::main::{soul_id}``) so multiple Souls can use
+        different main models at the same time.
+        """
         if instance is None:
             return ""
+        pid = _clean(provider_id) or self.MAIN_PROVIDER_ID
+        if not pid.startswith(PLUGIN_ID_PREFIX):
+            pid = f"{self.MAIN_PROVIDER_ID}::{pid}"
         try:
             inst_map = self._inst_map()
             if not isinstance(inst_map, dict):
                 logger.warning("[OnlyYou] provider_manager.inst_map unavailable")
                 return ""
-            inst_map[self.MAIN_PROVIDER_ID] = instance
+            inst_map[pid] = instance
             self._main_instance = instance
+            self._registered_main_ids[id(instance)] = pid
             meta = self._safe_meta(instance)
             logger.info(
                 "[OnlyYou] Registered plugin-built main provider as %s "
                 "(type=%s, model=%s)",
-                self.MAIN_PROVIDER_ID,
+                pid,
                 meta.get("type") or "?",
                 meta.get("model") or getattr(instance, "model_name", "") or "?",
             )
-            return self.MAIN_PROVIDER_ID
+            return pid
         except Exception as exc:
             logger.warning(f"[OnlyYou] register_main failed: {exc}")
             return ""
 
-    def unregister_main(self) -> None:
-        """Remove the ``onlyyou::main`` mapping (instance itself is kept for caching)."""
+    def unregister_main(self, provider_id: Optional[str] = None) -> None:
+        """Remove plugin main registrations (instances themselves stay cached).
+
+        Without ``provider_id`` every registered ``onlyyou::main*`` id is removed.
+        """
         try:
             inst_map = self._inst_map()
             if isinstance(inst_map, dict):
-                inst_map.pop(self.MAIN_PROVIDER_ID, None)
+                if provider_id:
+                    inst_map.pop(_clean(provider_id), None)
+                else:
+                    for pid in list(inst_map.keys()):
+                        if _clean(pid).startswith(self.MAIN_PROVIDER_ID):
+                            inst_map.pop(pid, None)
         except Exception as exc:
             logger.warning(f"[OnlyYou] unregister_main failed: {exc}")
         finally:
-            self._main_instance = None
+            if provider_id:
+                pid_clean = _clean(provider_id)
+                for key, value in list(self._registered_main_ids.items()):
+                    if value == pid_clean:
+                        self._registered_main_ids.pop(key, None)
+            else:
+                self._registered_main_ids.clear()
+                self._main_instance = None
 
     # ------------------------------------------------------------------
     # TTS provider construction / reuse
@@ -867,4 +903,5 @@ class ProviderFactory:
         self._owned_ids.clear()
         self._chat_cache.clear()
         self._tts_cache.clear()
+        self._registered_main_ids.clear()
         self._main_instance = None

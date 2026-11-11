@@ -1,12 +1,16 @@
 /**
  * OnlyYou Plugin Pages — 冲浪页 (`views/console/page-surfing.js`)
  *
- * 数据源：
- *   GET  `surfing/list_and_trigger`              → { videos: [...], known_umos: [...] }
- *   POST `surfing/list_and_trigger` { action }   → surf / share / delete
+ * 数据源（v2.8）：
+ *   GET  `surfing/list_and_trigger?soul_id=`    → { videos: [...], known_umos: [...], surfing_enabled: bool, soul_id }
+ *   POST `surfing/list_and_trigger` { action }   → surf / share / delete / toggle_surfing
+ *          toggle_surfing body {soul_id, enabled} → {soul_id, surfing_enabled, soul}
  *
- * 页面结构：视频卡片墙（封面、标题、UP 主、评分徽章、吐槽、平台标签）；
- * 卡片悬浮菜单：分享（可选目标 UMO）/ 删除；工具栏：平台筛选 + 忽略状态门禁 + 手动冲浪。
+ * 页面结构：顶部「赛博冲浪总开关」（按角色独立保存，乐观更新 + 失败回滚）→ 工具栏（平台筛选 /
+ * 忽略状态门禁 / 统计 / 手动冲浪）→ 视频卡片墙（封面、标题、UP 主、评分徽章、吐槽、平台标签）；
+ * 卡片悬浮菜单：分享（可选目标 UMO）/ 删除。
+ * 关闭总开关时顶部显示「已关闭：SURF 时段将自动降级为空闲闲逛，不再主动刷视频」，手动冲浪按钮保留，
+ * 后端拒绝时以 toast 展示错误。
  *
  * 注册：window.OY_PAGES.surfing = { id, title, icon, render(container, ctx), destroy() }
  */
@@ -21,6 +25,9 @@
     destroyed: false,
     videos: [],
     knownUmos: [],
+    /* v2.8：赛博冲浪总开关（Soul settings.surfing_enabled，来自 GET；默认 true） */
+    surfingEnabled: true,
+    toggleBusy: false,
     platform: "",
     ignoreGate: true,
     busy: false
@@ -167,6 +174,31 @@
     );
   }
 
+  /**
+   * v2.8：赛博冲浪总开关。
+   * 绑定 Soul 的 settings.surfing_enabled；关闭时 SURF 时段自动降级为空闲闲逛。
+   */
+  function masterSwitchHtml() {
+    var on = S.surfingEnabled !== false;
+    return (
+      '<div class="card" data-role="surf-master"><div class="card-body tight">' +
+      '<div class="switch-row">' +
+      '<div class="switch-row-text">' +
+      '<span class="switch-row-title">赛博冲浪总开关</span>' +
+      '<span class="switch-row-desc">按当前角色独立保存：开启后 SURF 时段会主动刷 B 站 / 抖音视频并看片吐槽；关闭后不再主动刷视频。</span>' +
+      "</div>" +
+      '<label class="switch" data-tip="赛博冲浪总开关（按当前角色独立保存）">' +
+      '<input type="checkbox" data-role="surfing-enabled"' +
+      (on ? " checked" : "") +
+      ' /><span class="switch-track"></span></label>' +
+      "</div>" +
+      (on
+        ? ""
+        : '<div class="text-xs muted mt-8" data-role="surfing-off-hint">已关闭：SURF 时段将自动降级为空闲闲逛，不再主动刷视频</div>') +
+      "</div></div>"
+    );
+  }
+
   function videoCardHtml(video) {
     var cover = String(video.cover_url || "").trim();
     var shareUrl = String(video.share_url || "").trim();
@@ -275,7 +307,7 @@
   }
 
   function pageHtml() {
-    return pageHeadHtml() + toolbarHtml() + gridHtml();
+    return pageHeadHtml() + masterSwitchHtml() + toolbarHtml() + gridHtml();
   }
 
   function paint() {
@@ -294,6 +326,8 @@
     if (!data || typeof data !== "object") throw new Error("GET surfing/list_and_trigger 返回为空");
     S.videos = Array.isArray(data.videos) ? data.videos : [];
     S.knownUmos = Array.isArray(data.known_umos) ? data.known_umos : [];
+    /* v2.8：总开关按当前角色返回；旧后端缺字段时保持当前值（默认开启） */
+    if (data.surfing_enabled != null) S.surfingEnabled = !!data.surfing_enabled;
   }
 
   async function reload(showToast) {
@@ -307,6 +341,47 @@
       S.app.toast("刷新冲浪池失败：" + (err.message || err), true);
     } finally {
       S.busy = false;
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 操作：赛博冲浪总开关（乐观更新 + 失败回滚）
+   * ------------------------------------------------------------------ */
+  async function toggleSurfing(enabled) {
+    var app = S.app;
+    if (!app || S.destroyed) return;
+    if (S.toggleBusy) {
+      /* 请求进行中再次切换：以服务端中的状态为准重绘，避免并发覆盖 */
+      paint();
+      return;
+    }
+    var previous = S.surfingEnabled !== false;
+    var next = !!enabled;
+    if (next === previous) return;
+    /* 先乐观更新 UI（开关 + 关闭提示），失败时回滚 */
+    S.surfingEnabled = next;
+    paint();
+    S.toggleBusy = true;
+    try {
+      var data = await app.apiPost("surfing/list_and_trigger", {
+        action: "toggle_surfing",
+        soul_id: soulId(),
+        enabled: next
+      });
+      if (S.destroyed) return;
+      if (data && typeof data.surfing_enabled === "boolean") {
+        S.surfingEnabled = data.surfing_enabled;
+      }
+      paint();
+      app.toast(S.surfingEnabled ? "赛博冲浪已开启" : "赛博冲浪已关闭：SURF 时段将降级为空闲闲逛");
+    } catch (err) {
+      if (S.destroyed) return;
+      /* 回滚到切换前的状态 */
+      S.surfingEnabled = previous;
+      paint();
+      app.toast("切换赛博冲浪总开关失败：" + (err.message || err), true);
+    } finally {
+      S.toggleBusy = false;
     }
   }
 
@@ -485,8 +560,11 @@
     container.addEventListener("change", function (event) {
       var target = event.target;
       if (!target || !target.getAttribute) return;
-      if (target.getAttribute("data-role") === "ignore-gate") {
+      var role = target.getAttribute("data-role");
+      if (role === "ignore-gate") {
         S.ignoreGate = !!target.checked;
+      } else if (role === "surfing-enabled") {
+        toggleSurfing(!!target.checked);
       }
     });
   }
@@ -500,6 +578,8 @@
     S.destroyed = false;
     S.videos = [];
     S.knownUmos = [];
+    S.surfingEnabled = true;
+    S.toggleBusy = false;
     S.platform = "";
     S.ignoreGate = true;
     S.busy = false;
@@ -533,6 +613,8 @@
     S.container = null;
     S.videos = [];
     S.knownUmos = [];
+    S.surfingEnabled = true;
+    S.toggleBusy = false;
     S.busy = false;
   }
 
