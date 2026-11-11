@@ -1702,7 +1702,17 @@ class OnlyYouPlugin(Star):
 
         msg_str = (getattr(event, "message_str", "") or "").strip()
         if not msg_str:
-            return
+            # AstrBot folds ``At`` components out of ``message_str``: an "@bot" ping
+            # without extra text arrives with an empty string. It is still a direct
+            # wake-up and must NOT be dropped here (v2.8.1 fix), otherwise it never
+            # appears in the sliding window / group cards and the bot never replies.
+            if not bool(getattr(event, "is_at_or_wake_command", False)):
+                return
+            msg_str = "（对方只是@了你一下，没有附带文字）"
+            try:
+                event.message_str = msg_str
+            except Exception:
+                pass
 
         # Allow commands through without interference
         lower_msg = msg_str.lower()
@@ -1771,7 +1781,7 @@ class OnlyYouPlugin(Star):
                         bound_soul_id=str(getattr(soul, "soul_id", "") or ""),
                     )
                 except Exception as exc:  # noqa: BLE001 - never block message handling
-                    logger.debug(f"[OnlyYou] touch_group failed: {exc}")
+                    logger.warning(f"[OnlyYou] touch_group failed: {exc}")
         recent_burst = self.session_buffer.get_recent_l2_l3_burst_count(umo=umo)
 
         # 2. Check if high-impact message mutates the current/next slot state
@@ -1842,6 +1852,13 @@ class OnlyYouPlugin(Star):
         """
         await self._ensure_initialized()
         umo = getattr(event, "unified_msg_origin", "") or "default_umo"
+        # @-only pings may reach the native pipeline with an empty prompt; give the
+        # model a neutral description so the persona can still answer naturally.
+        try:
+            if not str(getattr(req, "prompt", "") or "").strip():
+                req.prompt = "（对方只是@了你一下，没有附带文字）"
+        except Exception:
+            pass
         soul = await self.soul_manager.resolve_soul(umo=umo, allow_llm_seed=False)
         user = await self.user_relation.resolve_user(event)
         run, current_slot, _ = await self.deck_engine.get_current_and_next_slot(

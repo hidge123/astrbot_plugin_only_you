@@ -172,7 +172,9 @@ class AtmosphereReader:
         umo = getattr(event, "unified_msg_origin", "") or "default_umo"
         msg_str = (getattr(event, "message_str", "") or "").strip()
         if not msg_str:
-            return False
+            # An @-only ping has no text (AstrBot folds At out of message_str); a
+            # direct mention must still be answered instead of returning False.
+            return bool(is_direct_mention)
 
         # In BUSY state, only reply in group chat if directly mentioned or L3 Core User calls
         if current_slot.state == BotState.BUSY:

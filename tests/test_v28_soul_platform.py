@@ -41,6 +41,11 @@ from _helpers import (  # noqa: E402
 )
 
 mods = load_plugin_modules()
+
+import OnlyYou.core.atmosphere_reader as _atmosphere_reader  # noqa: E402
+
+mods.atmosphere_reader = _atmosphere_reader  # not preloaded by load_plugin_modules()
+
 SoulProfile = mods.soul_manager.SoulProfile
 SoulManager = mods.soul_manager.SoulManager
 DEFAULT_SOUL_ID = mods.soul_manager.DEFAULT_SOUL_ID
@@ -799,3 +804,182 @@ class _RecordingBridge:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ==========================================================================
+# v2.8.1 hotfix regression: "@bot only" group pings have an empty message_str
+# (AstrBot folds At components out of it) and used to be dropped by
+# ``on_any_message`` / ``AtmosphereReader.evaluate_should_reply``.
+# ==========================================================================
+class _AtOnlyGroupEvent:
+    """Minimal AstrBot group event mirroring an "@bot" ping with no extra text."""
+
+    def __init__(
+        self,
+        message_str="",
+        umo="qq bot:GroupMessage:1039802291",
+        at_bot=True,
+        sender_id="2975066889",
+        sender_name="hidge-1",
+    ):
+        self.message_str = message_str
+        self.unified_msg_origin = umo
+        self.is_at_or_wake_command = bool(at_bot)
+        self.is_wake = bool(at_bot)
+        self.call_llm = False
+        self.message_obj = SimpleNamespace(message=[])
+        self._sender_id = sender_id
+        self._sender_name = sender_name
+
+    def get_sender_id(self):
+        return self._sender_id
+
+    def get_sender_name(self):
+        return self._sender_name
+
+    def get_group_id(self):
+        return "1039802291"
+
+    def get_self_id(self):
+        return "3297648235"
+
+    def is_admin(self):
+        return True
+
+    def is_private_chat(self):
+        return False
+
+    def should_call_llm(self, value):
+        self.call_llm = bool(value)
+
+    def set_extra(self, key, value):
+        self._extra = getattr(self, "_extra", {})
+        self._extra[key] = value
+
+
+class _StubHubWithProviderId(SimpleNamespace):
+    async def get_main_provider_id(self, soul_id=None):
+        return ""
+
+    async def call_llm_json(
+        self, prompt="", role="decision", umo=None, system_prompt="", image_urls=None, default=None
+    ):
+        return {"decision": "REPLY", "confidence": 0.9}
+
+
+class _StubSoulManager:
+    def __init__(self, soul):
+        self._soul = soul
+
+    async def resolve_soul(self, umo=None, allow_llm_seed=True):
+        return self._soul
+
+
+class _StubScheduleMutator:
+    async def on_message_input(self, **kwargs):
+        return False
+
+
+class _StubDeckEngine:
+    def __init__(self, slot):
+        self._slot = slot
+
+    async def get_current_slot(self, **kwargs):
+        return self._slot
+
+
+class TestAtOnlyGroupMessage(DatabaseAsyncTestCase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        from test_regressions import bind_plugin_methods
+
+        self._bind_plugin_methods = bind_plugin_methods
+        self.config = make_plugin_config()
+        self.soul = make_soul("酒狐", card=card_with(identity={"name": "酒狐"}))
+        self.soul.bound_platforms = ["qq bot"]
+        self.slot = mods.roguelite_deck.SlotInstance(
+            slot_key="block_4",
+            start_hour=18.0,
+            end_hour=21.0,
+            card_id="evt_idle",
+            title="瘫着刷B站水群",
+            state=mods.state_machine.BotState.IDLE,
+            action_type=mods.state_machine.ActionType.IDLE_ROAM,
+            armor=25,
+        )
+        self.session_buffer = mods.context_budget.SessionBuffer(self.config)
+        self.platform_bridge = mods.platform_bridge.PlatformBridge(FakeContext())
+        self.user_relation = mods.user_relation.UserRelationManager(
+            self.db, self.platform_bridge, self.config
+        )
+        self.atmosphere = mods.atmosphere_reader.AtmosphereReader(
+            session_buffer=self.session_buffer,
+            model_hub=_StubHubWithProviderId(),
+            plugin_config=self.config,
+        )
+        self.fake = SimpleNamespace(
+            config=self.config,
+            session_buffer=self.session_buffer,
+            platform_bridge=self.platform_bridge,
+            soul_manager=_StubSoulManager(self.soul),
+            user_relation=self.user_relation,
+            atmosphere_reader=self.atmosphere,
+            schedule_mutator=_StubScheduleMutator(),
+            deck_engine=_StubDeckEngine(self.slot),
+            model_hub=_StubHubWithProviderId(),
+            _last_message_tier={},
+            _known_l3_umos={},
+            _known_group_umos=set(),
+            _ensure_initialized=self._noop_ensure_initialized,
+            _on_window_overflow=None,
+        )
+        self.fake = self._bind_plugin_methods(self.fake)
+
+    async def _noop_ensure_initialized(self):
+        return None
+
+    async def test_at_only_group_ping_is_recorded_and_replied(self):
+        event = _AtOnlyGroupEvent(message_str="", at_bot=True)
+        await self.fake.on_any_message(event)
+        umo = "qq bot:GroupMessage:1039802291"
+        window = self.session_buffer._windows.get(umo) or []
+        assert window, "the @-only ping must be recorded in the sliding window"
+        assert "@" in window[0].content
+        # direct mention in IDLE -> the native pipeline is allowed to answer
+        assert event.is_at_or_wake_command is True
+        assert event.call_llm is False
+        # group card / relations data is persisted (v2.8 group profiles)
+        group = await self.user_relation.get_group(umo)
+        assert group is not None
+        assert group.group_id == "1039802291"
+        assert group.platform_id == "qq bot"
+        assert group.bound_soul_id == "酒狐"
+
+    async def test_empty_non_mention_message_is_still_ignored(self):
+        event = _AtOnlyGroupEvent(message_str="", at_bot=False)
+        await self.fake.on_any_message(event)
+        assert not self.session_buffer._windows.get(event.unified_msg_origin)
+        assert await self.user_relation.get_group(event.unified_msg_origin) is None
+
+    async def test_evaluate_should_reply_answers_at_only_mention(self):
+        event = _AtOnlyGroupEvent(message_str="")
+        assert (
+            await self.atmosphere.evaluate_should_reply(
+                event=event,
+                soul=self.soul,
+                user=make_user("2975066889", "hidge-1"),
+                current_slot=self.slot,
+                is_direct_mention=True,
+            )
+            is True
+        )
+        assert (
+            await self.atmosphere.evaluate_should_reply(
+                event=event,
+                soul=self.soul,
+                user=make_user("2975066889", "hidge-1"),
+                current_slot=self.slot,
+                is_direct_mention=False,
+            )
+            is False
+        )
