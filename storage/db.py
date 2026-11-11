@@ -66,10 +66,23 @@ class DatabaseManager:
                 soul_id TEXT PRIMARY KEY,
                 persona_hash TEXT NOT NULL,
                 profile_json TEXT NOT NULL,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0
             );
             """
         )
+        # Safe idempotent migration for pre-v2.8.1 databases without the monotonic
+        # `revision` column (the JSON file is the source of truth; the revision is
+        # used to resolve clock rollbacks / manual JSON edits without losing data).
+        try:
+            columns = await self.fetchall("PRAGMA table_info(souls);")
+            column_names = {str(row.get("name") or "") for row in columns or []}
+            if "revision" not in column_names:
+                await self.execute(
+                    "ALTER TABLE souls ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;"
+                )
+        except Exception:
+            pass
 
         # 3. Daily schedules table (persists DailyScheduleRun per soul_id + date_str)
         await self.execute(

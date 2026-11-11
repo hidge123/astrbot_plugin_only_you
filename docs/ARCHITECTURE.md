@@ -1,6 +1,16 @@
-# OnlyYou (只有你) —— 技术架构与 AstrBot 实现方案设计 (v2.6)
+# OnlyYou (只有你) —— 技术架构与 AstrBot 实现方案设计 (v2.8)
 
-> 本文档紧密结合 [AstrBot 插件开发指南 (`Star` 规范)](https://docs.astrbot.app/dev/star/plugin-new.html)，详细定义 `astrbot_plugin_only_you` 的核心工程设计，重点包含：**三态门禁（休息中 / 繁忙中 / 空闲中）× 四类可执行行动卡（`SLEEP` / `SURF` / `IDLE_ROAM` / `BUSY_TASK`）**、**基于作息曲线的 24h 动态弹性时间轴**、**基于外部输入的时间块切分 / 延展微调（含繁忙半途结算）**、参考并精简自 `livingmemory` 的 **分级记忆、定时自动遗忘清理 (`Forgetting GC`) 与简易上下文预算管理器 (`Context Budget Manager`)**，以及 v2.4 引入、v2.5 延续的 **详细角色卡（10 分区 × 36 字段）接管原生 Persona** 与 **插件自治四角色模型体系（`ProviderFactory` + `ModelHub` + `selected_provider`）**；v2.6 进一步带来 **ModelHub 可选继承（`inherit_from`）、按单用户自定义态度 + 关系等级提示词注入、四类行动绑定的四档固定护甲（25/40/65/80）、Pages 记忆面板分层结构化列表、以及支持 Data URL 的角色图片头像（绝不注入 Persona）**。
+> 本文档紧密结合 [AstrBot 插件开发指南 (`Star` 规范)](https://docs.astrbot.app/dev/star/plugin-new.html)，详细定义 `astrbot_plugin_only_you` 的核心工程设计，重点包含：**三态门禁（休息中 / 繁忙中 / 空闲中）× 四类可执行行动卡（`SLEEP` / `SURF` / `IDLE_ROAM` / `BUSY_TASK`）**、**基于作息曲线的 24h 动态弹性时间轴**、**基于外部输入的时间块切分 / 延展微调（含繁忙半途结算）**、参考并精简自 `livingmemory` 的 **分级记忆、定时自动遗忘清理 (`Forgetting GC`) 与简易上下文预算管理器 (`Context Budget Manager`)**，以及 v2.4 引入、v2.5 延续的 **详细角色卡（10 分区 × 36 字段）接管原生 Persona** 与 **插件自治四角色模型体系（`ProviderFactory` + `ModelHub` + `selected_provider`）**；v2.6 带来 **ModelHub 可选继承（`inherit_from`）、按单用户自定义态度 + 关系等级提示词注入、四类行动绑定的四档固定护甲（25/40/65/80）、Pages 记忆面板分层结构化列表、以及支持 Data URL 的角色图片头像（绝不注入 Persona）**。**v2.8 的核心变化是「一个角色一份 JSON 文件」的持久化层：`<db 目录>/souls/<安全文件名>.json` 成为唯一真源（SQLite `souls` 仅作索引），配合 `revision` + 内容哈希的双写冲突裁决、原子写与索引自愈；同一层新增机器人接口（`platform_id`）绑定路由、按 Soul 读写的四角色模型、`runtime_state_v1` 运行态持久化（主动消息去重 / 冷却 / ★L3 目标跨重启）、SURF 分享五条件门禁、MEMORY_MUSE 三层分桶与繁忙成果单次消费、T1 记忆去重 / 上限 / 实时清理，以及 Web API 从 27 条扩展到 31 条。**
+
+**文档版本历史（append-only，滚动更新）**
+
+| 文档版本 | 适用产品版本 | 主要变化 |
+| :--- | :--- | :--- |
+| v2.8（当前） | 插件 v2.8 | Soul 独立 JSON 唯一真源（revision/内容哈希冲突裁决、原子写、索引自愈、写失败显式告警）；机器人接口绑定与 `resolve_soul` 五级路由；ModelHub 按 Soul 读写与 `onlyyou::main::<soul_id>`；`runtime_state_v1` 运行态持久化；SURF 分享五条件门禁 + 冲浪总开关；MEMORY_MUSE 三层分桶 + 繁忙成果单次消费；T1 去重 / 上限 / 跨重启 GC；Web API 31 条；关系页与会话页改版 |
+| v2.7 | 插件 v2.7 | 模型页 0.7s 防抖即时生效、顶栏 tooltip、页面未保存修改守卫、★L3 管理员级入口 |
+| v2.6 | 插件 v2.6 | ModelHub 可选继承、单用户专属态度注入、四档固定护甲（25/40/65/80）、记忆页分层列表、Data URL 头像 |
+| v2.5 | 插件 v2.5 | 24h 动态弹性时间轴、四类行动卡、繁忙完成结果、未读消息队列、移除奇遇卡 |
+| v2.4 | 插件 v2.4 | 详细角色卡（10 分区）接管 Persona、插件自治四角色模型、Pages 控制台 |
 
 ---
 
@@ -64,52 +74,53 @@ flowchart TB
 ```text
 astrbot_plugin_only_you/
 ├── metadata.yaml                # 插件元数据声明 (name: astrbot_plugin_only_you)
-├── _conf_schema.json            # AstrBot WebUI 配置 Schema（仅运行参数；模型配置迁至 plugin_settings，见 §5.1）
+├── _conf_schema.json            # AstrBot WebUI 配置 Schema（仅运行参数；模型配置按 Soul 存 JSON，见 §5.1/§六）
 ├── requirements.txt             # 依赖库 (httpx, aiosqlite, pillow, imageio-ffmpeg)
-├── main.py                      # 插件入口类 OnlyYouPlugin(Star)：三态门禁 + selected_provider + on_decorating_result TTS + 生命周期
+├── main.py                      # 插件入口类 OnlyYouPlugin(Star)：三态门禁 + selected_provider + on_decorating_result TTS + 心跳按 Soul 分发 + SURF 分享门禁 + 运行态持久化 + 生命周期
 ├── core/
 │   ├── state_machine.py         # 🚦 三态枚举 (RESTING/BUSY/IDLE) + 四类行动卡枚举 ActionType（含固定护甲 fixed_armor / armor_tier）门禁控制器
 │   ├── roguelite_deck.py        # 🎲 24h 动态积木时间轴引擎（角色专属四类卡池 / 作息曲线 / 弹性块拼接 / 繁忙完成结果字段）
 │   ├── schedule_mutator.py      # 🔄 输入驱动的受限微调器（BUSY_TASK 半点切分半途结算 / SLEEP 唤醒窗 / IDLE 加钟 + 三重门禁）
 │   ├── character_card.py        # 🎭 详细角色卡单一数据源：CARD_SCHEMA(10 分区/36 字段)、normalize/migrate（含 avatar Data URL 归一化）、Persona Prompt 渲染（头像不注入）
-│   ├── soul_manager.py          # 角色卡(Soul)管理：SoulProfile.card、会话路由、AI 造卡(generate_card)、原生 Persona 导入
-│   ├── user_relation.py         # 三级用户关系管理 (L1普通 / L2重要熟人 / ★L3核心用户) + 单用户专属态度 attitude + 跨平台映射
-│   ├── memory_manager.py        # 🧠 精简版分级记忆引擎 (Tier1瞬时/Tier2近期/Tier3核心 + 定时遗忘GC)
-│   ├── context_budget.py        # 🛡️ 上下文/记忆预算管理器 + _takeover_persona 三分支 + USER_RELATION_CONTEXT_PROMPT 关系上下文注入
-│   ├── provider_factory.py      # 🔧 唯一触碰 AstrBot Provider 内部结构的封装（复用/自建实例、inst_map、TTS、dispose）
-│   ├── model_hub.py             # 🔌 插件自治四角色模型网关 (main/decision/vision/tts，可选继承 inherit_from，配置存 plugin_settings.model_config)
-│   ├── platform_bridge.py       # 🤝 AstrBot 平台配置协同桥 (原生分段回复 segmented_reply、流式、语音主动消息)
-│   ├── web_api.py               # 🖥️ 27 条 Plugin Pages Web API 路由 (17 条兼容旧版 + 10 条新增)
+│   ├── soul_manager.py          # 🗂️ Soul 持久化与路由：souls/*.json 唯一真源 + revision/内容哈希冲突裁决 + 原子写/自愈 + 机器人接口绑定 + 五级 resolve_soul + AI 造卡 / 原生 Persona 导入
+│   ├── user_relation.py         # 三级用户关系管理 (L1普通 / L2重要熟人 / ★L3核心用户) + 单用户专属态度 attitude + 跨平台映射 + 群聊档案 GroupProfile
+│   ├── memory_manager.py        # 🧠 精简版分级记忆引擎 (Tier1瞬时/Tier2近期/Tier3核心 + T1 去重/上限/实时清理 + MEMORY_MUSE 三层分桶 + 定时遗忘GC)
+│   ├── context_budget.py        # 🛡️ 上下文/记忆预算管理器 + _takeover_persona 三分支 + USER_RELATION_CONTEXT_PROMPT 关系上下文注入 + SessionBuffer 平台内存清理
+│   ├── provider_factory.py      # 🔧 唯一触碰 AstrBot Provider 内部结构的封装（复用/自建实例、inst_map 自定义 id、TTS、dispose）
+│   ├── model_hub.py             # 🔌 插件自治四角色模型网关 (main/decision/vision/tts，可选继承；v2.8 按 Soul 读写，写 Soul JSON 的 model_config)
+│   ├── platform_bridge.py       # 🤝 AstrBot 平台配置协同桥 (extract_platform_id / list_platform_instances / 原生分段回复 / 流式 / 语音主动消息)
+│   ├── runtime_state.py         # 💾 v2.8 运行态持久化：runtime_state_v1 快照（分享去重 / muse 轮转 / 冷却 / ★L3 目标）跨重启恢复
+│   ├── web_api.py               # 🖥️ 31 条 Plugin Pages Web API 路由（v2.7 的 27 条 + v2.8 新增 sessions/* 4 条）
 │   └── atmosphere_reader.py     # 群聊主战场：防抖等待窗口、多人对话“解线团”、五维读空气器
 ├── views/                       # 🎨 AstrBot 插件自定义页面 (Plugin Pages / Views，兼容 pages/)
-│   └── console/                 # 灰白+青绿极简控制台（48px 顶栏 + 216px 侧栏，8 个页面）
+│   └── console/                 # 灰白+青绿极简控制台（48px 顶栏 + 216px 侧栏，8 个页面；v2.8 关系页/会话页改版）
 │       ├── index.html           # 外壳：顶栏、侧栏导航、main#view、toast/modal/drawer 容器
-│       ├── style.css            # 设计令牌 + 组件样式（浅/深色）
-│       ├── app.js               # bridge 封装、轻量状态、hash 路由、通用 UI（无构建 classic script）
+│       ├── style.css            # 设计令牌 + 组件样式（浅/深色；v2.8 追加 relations/sessions 等区段）
+│       ├── app.js               # bridge 封装、轻量状态、hash 路由、通用 UI、页面 isDirty 守卫、宽幅 modal（无构建 classic script）
 │       ├── icons.js             # ≥20 个内联 SVG 线性图标（替代 emoji）
 │       ├── charts.js            # 纯 SVG 环形表 / 24h 弹性动态时间轴（浮点时间 / 行动徽章 / 进度 tooltip）/ 环形图 / 条形图
 │       ├── page-overview.js     # 概览：状态环形表 + 24h 弹性轴 + 行动徽章/繁忙进度条/今日繁忙成果(Tier1) + 基调/配额/关系/记忆/模型小卡
 │       ├── page-schedule.js     # 日程：24h 弹性时间轴 + 四类行动卡网格/筛选/编辑器（已无奇遇卡） + 重抽/强制切换
 │       ├── page-character.js    # 角色卡：10 分区动态表单 + AI 整卡生成/分区补全 + Prompt 预览 + 图片头像上传（Canvas 裁剪压缩）
-│       ├── page-relations.js    # 关系：★L3 / ◆L2 / L1 三列看板 + L1/L2 拖拽改级 + 合并账号 + 专属态度 attitude（★L3 管理员级无好感度/不自动晋升，「⋯」菜单显式设置）
-│       ├── page-memory.js       # 记忆：v2.6 分层列表（层级概览条 + T3/T2/T1 分组折叠 + 结构化 memory-row）+ 搜索/提炼/GC
-│       ├── page-surfing.js      # 冲浪：视频卡片墙 + 分享/删除 + 手动触发冲浪
-│       ├── page-models.js       # 模型：四角色卡片 + 源/模型拉取 + 模型来源模式（独立配置/继承） + 测试 + TTS 试听
-│       ├── page-sessions.js     # 会话：插件默认角色 + UMO 绑定表
-│       └── mock.js              # ?mock=1 / file:// 打开时的本地 Mock bridge（离线预览与截图）
+│       ├── page-relations.js    # 关系与群聊（v2.8）：筛选 chips + 即时搜索 + ★L3→◆L2→L1 横向 relation-row + 居中宽幅详情弹窗 + 💬 群聊分区/详情弹窗（已移除 kanban / 拖拽 / ⋯ 菜单）
+│       ├── page-memory.js       # 记忆：v2.6 分层列表 + v2.8 T1「⏳ 剩余 Xh 清除」倒计时与「上限 N 条」
+│       ├── page-surfing.js      # 冲浪：视频卡片墙 + 分享/删除 + 手动触发冲浪 + v2.8 顶部「赛博冲浪总开关」（乐观更新 + 失败回滚）
+│       ├── page-models.js       # 模型：按当前角色读写四角色配置（models/config?soul_id=）+ 源/模型拉取 + 模型来源模式 + 测试 + TTS 试听
+│       ├── page-sessions.js     # 机器人接口（v2.8）：接口绑定/解绑（解绑清理平台内存）+ 手动预配 platform_id + 默认兜底角色 + 活跃会话内存概览（已移除旧 UMO 绑定表）
+│       └── mock.js              # ?mock=1 / file:// 打开时的本地 Mock bridge（v2.8 同步 sessions/platforms、groups、tier1_limit、toggle_surfing 等形状）
 ├── surfing/
-│   ├── pipeline.py              # 📱 赛博冲浪主控流水线（仅在 IDLE 空闲状态下运行）
-│   ├── video_vision.py          # 多模态视频预处理器（统一 role="vision" 评分，短视频流直传 / FFmpeg 3x3 抽帧）
+│   ├── pipeline.py              # 📱 赛博冲浪主控流水线（仅在 IDLE 空闲状态下运行；is_enabled(soul) 总开关、候选耗尽返回 None）
+│   ├── video_vision.py          # 多模态视频预处理器（统一 role="vision" 评分，短视频流直传 / FFmpeg 3x3 抽帧；v2.8 is_fallback 标记）
 │   └── adapters/
 │       ├── base.py              # 抽象平台接口 BaseVideoAdapter & VideoItem 模型
 │       ├── bilibili.py          # B站适配器（推荐流/热门/UP主动态、热评抓取、CC字幕/流解析）
 │       └── douyin.py            # 抖音适配器（热点榜/推荐流、无水印直链解析、热评抓取）
 ├── storage/
-│   └── db.py                    # 基于 aiosqlite 的持久化层（新增 plugin_settings KV 表 + get_setting/set_setting）
+│   └── db.py                    # 基于 aiosqlite 的持久化层（plugin_settings KV 表 + souls 索引 revision 列幂等迁移）
 ├── prompts/
 │   └── templates.py             # 集中管理角色卡生成/分区补全、卡池、受限微调、读空气、看片、记忆提炼等 Prompt
-├── tests/                       # 离线 unittest 测试套件（provider_factory/model_hub/character_card/persona_takeover/web_api/regressions）
-└── docs/                        # 产品与架构文档 (PRD.md / ARCHITECTURE.md / PROMPTS_AND_FLOWS.md / WEBUI_DESIGN.md)
+├── tests/                       # 离线 unittest 测试套件（v2.5~v2.8 全量回归：时间轴/记忆/模型/Web API/Soul 双写一致性/运行态持久化）
+└── docs/                        # 产品与架构文档 (PRD.md / ARCHITECTURE.md / PROMPTS_AND_FLOWS.md / WEBUI_DESIGN.md / UPGRADE.md)
 ```
 
 ---
@@ -304,7 +315,7 @@ async def on_any_message(self, event: AstrMessageEvent):
 > **未读消息定义**：只统计**被三态门禁拦截**的消息（`RESTING` 全部 / `BUSY` 的 `L1`）；被放行后读空气判 `IGNORE` 的消息是“已读但不想回”，不算未读。未读队列由 `SessionBuffer._unread` 独立维护（不依赖 15 条滑窗驱逐、按群聊/私聊分类、TTL/容量/冷却可配）。
 
 #### 2. 四类行动卡 (`SLEEP` / `BUSY_TASK` / `SURF` / `IDLE_ROAM`) 的后台心跳调度
-后台异步心跳循环按当前时间块 `current_block.action_type` 驱动真实行为：
+后台异步心跳循环（每 15 分钟）按当前时间块 `current_block.action_type` 驱动真实行为。**v2.8 起心跳按 Soul 驱动**（`_souls_for_heartbeat()`：有机器人接口绑定的 Soul + 默认兜底 Soul 各自独立跑时间轴 / 模型配置 / 未读范围，详见 §6.3），先执行 `_maybe_run_scheduled_gc()` 再做逐 Soul 分发：
 1. **当刚跨过一个 `BUSY_TASK` 时间块（进度到达 `100%` 且 `busy_settled == False`）**：
    - 自动结算该繁忙块：调用决策模型（或轻量模板回退）生成**一句话完成结果**（如 *“忙活两小时终于把回春丹炼出来了，成色还不错”*），赋值给 `block.completion_result`，并直接调用 `memory_manager.add_memory(memory_tier=1, ...)` 写入 **Tier 1 短时记忆库**，标记 `busy_settled = True`。
 2. **当当前块为 `① SLEEP` (`BotState.RESTING`)**：
@@ -314,10 +325,11 @@ async def on_any_message(self, event: AstrMessageEvent):
 4. **任意 `IDLE` 块（`SURF` / `IDLE_ROAM`）在驱动自身行为前，先执行【私聊未读补回】**：
    - `_catch_up_private_unread()` 取私聊未读队列，按会话逐条喂给 `UNREAD_PRIVATE_CATCHUP_PROMPT`，生成一句“刚睡醒/刚忙完才看到”的自然补回消息并经 `PlatformBridge.send_proactive_message()` 发送；每个私聊会话受 `unread_private_cooldown_minutes` 冷却限制，单次心跳最多补回 2 个会话，发送成功即 ack 该批未读（失败保留重试）。
 5. **当当前块为 `② SURF` (`BotState.IDLE`)**：
-   - **触发真实刷视频 (`CyberSurfingPipeline`)**：结合角色卡 `surfing_prefs` 拉取 B站/抖音推荐流与热评，由 `vision` 模型看片打分，写入看片记忆，并可主动分享给 ★L3 核心用户或活跃群聊。
+   - **总开关优先**：若该 Soul 的 `settings.surfing_enabled == False`（缺失时回退全局 `_conf_schema.json → surfing_config.surfing_enabled`），本次 `SURF` 自动**降级为 `IDLE_ROAM` 分支**，不刷视频；
+   - **触发真实刷视频 (`CyberSurfingPipeline`)**：结合角色卡 `surfing_prefs` 拉取 B站/抖音推荐流与热评，由 `vision` 模型看片打分，写入看片记忆；随后由 `_maybe_share_surfed_video()` 做**五条件分享门禁**（非 fallback 结果 / 本 Soul 未分享过该视频 / 分数 ≥ `surf_share_min_score` / 冲浪分享冷却 / IDLE_ROAM 冷却 / 存在 ★L3 私聊目标），**发送成功才记录 video_id 与时间戳**（失败保留重试机会），详见 §6.8。
 6. **当当前块为 `③ IDLE_ROAM` (`BotState.IDLE`)**：
    - **分支 A —— 翻群记录吃瓜 (`GROUP_LURK`，先决策后回复)**：从【群聊未读队列】按「未读条数 × 新鲜度」排序选一个群 → 先用 `ATMOSPHERE_EVAL_PROMPT` 对“未读批次 + 最近窗口”跑一次决策模型（`REPLY` / `IGNORE`）；只有 `REPLY` 才用 `IDLE_ROAM_PROACTIVE_PROMPT` 生成冒泡/私聊 ★L3 吐槽并发送；`IGNORE` 则静默消费该批未读（不重复评估）。消费即从队列移除，并受 `unread_group_cooldown_minutes` 每群冷却限制；
-   - **分支 B —— 发呆记忆联想 (`MEMORY_MUSE`)**：当无群聊未读、或群聊决策为 `IGNORE` 时，从 `MemoryManager` 抽取 1~2 条记忆（优先含今日刚结算完的 `BUSY_TASK` 完成结果短时记忆或历史记忆），生成一段第一人称“发呆突然想起某事”的开场白。
+   - **分支 B —— 发呆记忆联想 (`MEMORY_MUSE`，v2.8 三层分桶)**：当无群聊未读、或群聊决策为 `IGNORE` 时，**先消费今日已结算、且本 Soul 尚未主动聊过的 `BUSY_TASK` 完成结果**（`_mused_busy_keys[soul_id]`，同一成果最多聊 1 次）；全部聊过后再用 `MemoryManager.sample_muse_memories(soul_id, exclude_ids=...)` 对 **T1/T2/T3 三个分桶独立抽样**（各桶旧访问优先，按重要度 / 层级加权抽 ≤2 条）。**发送成功才** `touch_memories_for_muse()`（仅刷新 `last_accessed_at`，不加 `access_count`、不改 vitality / tier）并写入 `_mused_memory_ids`（环形上限 30）；两者皆空则安全跳过。
 
 ---
 
@@ -388,11 +400,19 @@ CREATE TABLE IF NOT EXISTS memories (
 3. **Tier 3 (`CORE = 3`，核心长效记忆)**：
    - 重要度 `>= 8`（如 ★L3核心用户 / ◆L2重要用户 的核心偏好、身份设定、重要约定），或由 Tier 2 记忆累计被召回 `access_count >= 4` 次后自动晋升而来。
 
+> **Tier 1 的 v2.8 写入约束**（`MemoryManager.add_memory()` / `cleanup_tier1()`）：
+> 1. **去重**：同一 `soul_id` + `memory_tier=1` 且 **content 完全相同** 的记忆已存在时，只刷新其 `last_accessed_at` 并返回原 id，**不新增行**（避免同一繁忙成果被重复结算 / 用户反复手动写入导致 T1 膨胀）；
+> 2. **上限**：插入后该 Soul 的 T1 数量超过 `memory_and_context_config.max_tier1_memories`（默认 30）时，按 `created_at ASC, id ASC` 淘汰最旧（FIFO）；T2 / T3 行为不变；
+> 3. **实时清理**：`cleanup_tier1()` 删除 `> 48h` 的 T1 并逐 Soul 裁剪超上限部分，返回 `{deleted_expired, deleted_overflow}`；由 `main._maybe_run_scheduled_gc()` 在**启动与每次心跳**调用（详见 §4.2）；
+> 4. **对记忆注入的影响**：T1 参与 `ContextBudgetManager` 的混合打分（关键词 / 新鲜度 / 重要度）与 MEMORY_MUSE 抽样，因此去重 + 上限 + 48h 清理共同保证「瞬时记忆不会挤掉 T2/T3 的注入预算」；T3 始终优先、T2 次之。
+
 ---
 
 ### 4.2 🗑️ 定时遗忘与自动清理程序 (`run_forgetting_gc`)
 
 后台定时任务每 24 小时（每天凌晨）执行一次物理清理，确保数据库绝不无限膨胀：
+
+> **v2.8 跨重启幂等**：`main._maybe_run_scheduled_gc()` 在 `initialize()` 与**每次心跳**都会调用，先用 `memory_manager.cleanup_tier1()` 做实时 T1 清理（48h 过期 + 每 Soul 超上限），再检查 `plugin_settings["last_forgetting_gc_date"]`：等于今天则只做实时清理，否则执行 `run_forgetting_gc()` 成功后才写入当天日期。因此插件重启 / 热重载不会重复跑每日 GC，也不会漏跑。
 
 ```python
 import math
@@ -533,11 +553,20 @@ CREATE TABLE IF NOT EXISTS plugin_settings (
 
 | key | value 类型 | 说明 |
 | :--- | :--- | :--- |
-| `model_config` | dict | 四角色模型配置（结构见 §5.1），由 Pages「模型」页读写 |
-| `default_soul_id` | str | 插件默认角色（「会话」页可改；UMO 未绑定时使用） |
-| `legacy_model_migrated` | bool | 旧版模型配置（`model_hub_config`）是否已尝试迁移，只尝试一次；这是唯一保留旧字段名的迁移说明 |
+| `default_soul_id` | str | 插件默认角色（「机器人接口」页的默认兜底角色，未绑定机器人接口的会话由它接管） |
+| `runtime_state_v1` | dict | **v2.8** 运行态快照：`shared_video_ids / last_surf_share_ts / mused_busy_keys / mused_memory_ids / last_idle_roam_ts / last_group_lurk_ts / last_private_catchup_ts / known_l3_umos`（结构 / 上限 / 恢复点见 §6.5） |
+| `group_profiles` | list[dict] | **v2.8** 群聊档案 `GroupProfile`（`umo / group_id / platform_id / display_name / notes / bound_soul_id / last_active_at`），由消息到达时 `touch_group` 采集、关系页维护 |
+| `last_forgetting_gc_date` | str | **v2.8** 最近一次成功执行每日遗忘 GC 的日期（`YYYY-MM-DD`），保证跨重启幂等 |
+| `legacy_umo_bindings_migrated` | bool | **v2.8** 旧 UMO 绑定 → 机器人接口绑定的一次性迁移标记；**只有全部迁移成功才写 True**，失败保留未写状态下次启动重试 |
+| `model_config_migrated_to_souls` | bool | **v2.8** 旧全局 `model_config` → 各 Soul JSON 的一次性迁移标记；同样只在全部成功（或无需迁移）后写 True |
+| `model_config` | dict | **v2.7 兼容保留**：旧全局四角色模型配置；`ModelHub` 未 attach `SoulManager` 时仍走这里（历史单测依赖）；v2.8 attach 后实际读写各 Soul JSON 的 `model_config` |
+| `legacy_model_migrated` | bool | 旧版模型配置（`model_hub_config`）是否已尝试迁移，只尝试一次（v2.4 遗留） |
 
-首次启动时 `ModelHub.load()` 会读取旧插件配置中的 `*_llm_provider_id`，经 `ProviderFactory.find_source_model_by_provider_id()` 反查出 `(source_id, model)` 迁移到 `model_config`。无论成功与否都会写入 `legacy_model_migrated = true`，之后不再重试；旧配置值从此不再生效，需在「模型」页重新确认。
+> 旧版单会话 UMO 绑定仍存 SQLite `umo_soul_bindings` 表，v2.8 仅作兼容读取（`get_umo_bindings` / `set_umo_binding`），主导路由已改为机器人接口绑定（见 §6.3）。
+
+首次启动时 `ModelHub.load()` 会读取旧插件配置中的 `*_llm_provider_id`，经 `ProviderFactory.find_source_model_by_provider_id()` 反查出 `(source_id, model)` 迁移到全局 `model_config`。无论成功与否都会写入 `legacy_model_migrated = true`，之后不再重试；旧配置值从此不再生效，需在「模型」页重新确认。
+
+> **v2.8 迁移 flag 的写入时机**：`legacy_umo_bindings_migrated` 与 `model_config_migrated_to_souls` 都**不是**「尝试即写」——只有本轮全部迁移成功（或本就不需要迁移）才落 True；任何一条失败都保持未写，下次启动自动重试（迁移本身幂等：已迁移的绑定 / 已有有效模型配置的 Soul 会被跳过），日志会出现 `migration incomplete ... next startup retries` 警告。
 
 ---
 
@@ -568,7 +597,7 @@ req.system_prompt = new_sp if n else card_block + sp
 1. **单一数据源 `CARD_SCHEMA`**（`core/character_card.py`）：10 个分区 / 36 个字段（v2.6 删除 `social.attitude_l3/l2/l1`，仅保留 `group_role`），同时供后端渲染 Prompt 与前端 `GET card/schema` 动态生成表单。
 2. **`SoulProfile.card`**：角色卡数据唯一来源；旧的 `name / archetype / speaking_style / surfing_preferences / native_persona_prompt` 退化为读写 `card` 的兼容 `@property`，旧档案经 `migrate_legacy()` 自动迁移。
 3. **渲染预算与优先级**（`render_persona_prompt(card, max_chars=2000)`）：只渲染非空字段、按分区输出 Markdown；优先保留 `identity / speech / personality / social`，超预算时按 `examples > background > appearance > extra > rhythm > interests` 顺序丢弃低优先级分区，最后硬截断保证 `len(result) <= max_chars`；`native_persona_prompt` 只作导入来源记录，**不参与**渲染。
-4. **会话路由 `resolve_soul(umo)`**：`UMO 绑定 → plugin_settings.default_soul_id → 最近更新的角色 → 创建默认角色`；不再读取平台 `default_personality`、不做 `persona_hash` 匹配，聊天路径上也不再用 LLM 播种卡池。
+4. **会话路由 `resolve_soul(umo)`（v2.8 五级优先级）**：① UMO 第一段 == `platform_id` 的**机器人接口绑定** → ② 旧 `umo_soul_bindings` 精确绑定（兼容旧数据）→ ③ `plugin_settings["default_soul_id"]` → ④ 最近更新的角色 → ⑤ 自动创建默认角色。**废除单会话 UMO 绑定主导路由**；不再读取平台 `default_personality`、不做 `persona_hash` 匹配，聊天路径上也不再用 LLM 播种卡池（详见 §6.3 / §6.4）。
 5. **AI 造卡**：`generate_card(seed_text, base_card, section)` 用**主模型**生成整卡或单个分区草稿（不落库）；`import_native_persona(..., avatar="")` 把原生人设原文写入 `card["extra"]["native_persona_prompt"]`，可选 AI 整卡生成；四类专属行动卡池由**决策模型**生成（奇遇卡已移除）。
 6. **头像视觉元数据（v2.6）**：`identity.avatar` 经 `_coerce_avatar()` 归一化为「Emoji/短字符 ≤32 字 / `data:image/(png|jpeg|jpg|webp|gif);base64,...` ≤120000 字符 / 图片 URL ≤500 字符」三选一，非法形态归空；`_render_section()` 显式跳过 `identity.avatar`，因此图片 Base64 **绝不进入 System Prompt / Persona 预算**，仅由 Pages 前端 `app.renderAvatarInner()` 渲染。
 7. **关系态度提示词（v2.6）**：系统提示词新增 `USER_RELATION_CONTEXT_PROMPT`（见 `prompts/templates.py`），由 `ContextBudgetManager` 按当前用户与群聊窗口动态填充 `{display_name} / {global_uid} / {tier_label} / {intimacy} / {nickname_text} / {attitude_text} / {notes_text} / {window_peers_block}`；角色卡不再保存千篇一律的等级态度。
@@ -591,7 +620,7 @@ req.system_prompt = new_sp if n else card_block + sp
 | `vision`（视频解析） | 赛博冲浪看片的多模态评分；始终使用 `role="vision"`，不再降级到决策模型 | **可选继承（v2.6）**：`inherit_from=""` / `"main"` / `"decision"`（`vision → decision → main` 递归最多 2 跳，带防环） |
 | `tts`（语音） | 插件自建语音合成 | **不继承**；`mode="off"` 即关闭 |
 
-模型配置存放在 `plugin_settings["model_config"]`（SQLite KV，见 §4.4），结构：
+模型配置存放在**每个 Soul 的独立 JSON 文件** `souls/<安全文件名>.json` 的 `model_config` 字段（v2.8 唯一真源，见 §6.1 / §6.6）；`plugin_settings["model_config"]` 仅作为 **v2.7 旧全局配置**兼容保留（`ModelHub` 未 attach `SoulManager` 时使用，历史单测依赖）。结构（单 Soul 视角，四角色归一化同 v2.6）：
 
 ```json
 {
@@ -602,6 +631,8 @@ req.system_prompt = new_sp if n else card_block + sp
           "provider_id": "", "probability": 1.0, "scope": "private|l3|all", "dual_output": false}
 }
 ```
+
+> **v2.8 按 Soul 读写**：`main.py` 构造 `SoulManager` 后调用 `model_hub.attach_soul_manager(self.soul_manager)`。attach 后 `get_config / save_config / resolve_role / get_provider / get_main_provider_id / get_tts_config / synthesize / get_status / test_role / call_llm_*` 全部支持可选 `soul_id`（缺省 = 默认角色；同步方法 `get_tts_config` 走 Soul 内存缓存，异步方法传 `umo` 时先按 `resolve_soul` 路由出 Soul）。`save_config(...)` 把归一化后的四角色配置写回**该 Soul 的 JSON 文件**并热重建实例。**未 attach 时完全保持 v2.7 全局 `plugin_settings["model_config"]` 行为**。
 
 > **v2.6 归一化不变量**：`decision` / `vision` 恒为 `{"inherit": bool, "inherit_from": str, "source_id": str, "model": str}` 四键结构，且 `inherit === bool(inherit_from)`。归一化顺序：显式 `inherit_from` → 显式 `inherit` → 旧配置缺省继承 `main`；非法 `inherit_from` 按「有 inherit=True 则 main，否则空」兜底。`main` / `tts` 恒补 `inherit=False, inherit_from=""`。
 
@@ -616,7 +647,8 @@ req.system_prompt = new_sp if n else card_block + sp
 - `ModelHub.ROLES = ("main", "decision", "vision", "tts")`；`role="small" / "aux"` 统一归一为 `decision`。
 - `resolve_role(role)` 返回 `{source_id, model}`（TTS 返回 `{mode, ...}`）；`main` 未配置返回 `None`。v2.6 起 `decision` / `vision` 按 `inherit_from` 递归解析：**关闭继承且源/模型未填时返回 `None`（该角色停用），绝不回退 `main`**；超过 2 跳 / 防环 / 未知父角色同样返回 `None`，调用方按无模型优雅降级。
 - `call_llm_text()` 直接调用实例的 `inst.text_chat(prompt=..., system_prompt=..., image_urls=...)`，不再经过 `context.llm_generate`；`call_llm_json()` 复用 `extract_json()` 容错解析。
-- `save_model_config()` 归一化并写入 `plugin_settings.model_config` 后，会立即 `unregister_main()`，下一次使用按新配置热重建实例。
+- `save_config()`（v2.6 旧名 `save_model_config()` 保留为别名）归一化后写入对应 Soul 的 `model_config` 并 `save_soul()`；随后**只注销该 Soul 的**主模型注册 id（`onlyyou::main::<soul_id>`），下一次使用按新配置热重建实例。未 attach `SoulManager` 时仍写全局 `plugin_settings.model_config` 并 `unregister_main()`。
+- `load()` 先读旧全局 `plugin_settings["model_config"]`；attach 后执行一次性迁移 `_migrate_config_to_souls_once()`：把旧全局配置复制进**主模型为空**的已有 Soul（不删除旧全局键），`model_config_migrated_to_souls` flag **只在全部 Soul 迁移成功后才写 True**，失败保留未写状态、下次启动重试（日志 `Migration incomplete ... next startup retries`）。
 - **彻底删除**旧回退链：不再读 `context.get_config()` / `get_current_chat_provider_id()` / `default_image_caption_provider_id`；Embedding / Rerank 槽位删除。
 
 #### 2. `ProviderFactory`：唯一触碰 AstrBot Provider 内部结构的模块
@@ -628,10 +660,10 @@ class ProviderFactory:
     def list_tts_providers(self) -> list[dict]        # AstrBot 已启用 TTS 实例 + 已配置未启用条目
     async def find_source_model_by_provider_id(pid)   # 旧配置迁移：provider id -> (source_id, model)
     async def get_chat_provider(source_id, model)     # 先复用 inst_map 同源同模型且启用的实例，否则自建
-    def register_main(inst) -> str                    # inst_map["onlyyou::main"] = inst；不 append 到 provider_insts
-    def unregister_main() -> None
+    def register_main(inst, provider_id=None) -> str  # 注册 inst_map[<provider_id>]；缺省 onlyyou::main，v2.8 传 onlyyou::main::<soul_id>；不 append 到 provider_insts
+    def unregister_main(provider_id=None) -> None     # 指定 id 只注销该 id；缺省注销全部 onlyyou::main*
     async def get_tts_provider(tts_cfg)               # mode=source 自建 openai_tts_api；mode=provider 取现有实例
-    async def dispose() -> None                       # 清理 onlyyou::main 并 terminate 全部自建实例
+    async def dispose() -> None                       # 清理全部 onlyyou::main* 并 terminate 全部自建实例
 ```
 
 自建实例的关键细节（已核对 AstrBot 4.29.3 源码）：
@@ -639,7 +671,7 @@ class ProviderFactory:
 1. **合并配置**：`{**source, **entry}`（provider 条目优先）；`entry` 形如 `{"id": "onlyyou::chat::<source>::<model>", "provider_source_id": ..., "model": ..., "enable": true, ...}`；`$ENV` / `${ENV}` 形式的 key 会从 `os.environ` 解析后写入配置。
 2. **实例化**：`provider_manager.dynamic_import_provider(type)` → `provider_cls_map[type].cls_type(cfg, provider_manager.provider_settings)` → 若实例有 `initialize` 则 `await inst.initialize()`。
 3. **实例复用与缓存**：先在 `inst_map` 中寻找 `provider_config.provider_source_id == source_id`、模型名匹配且未禁用的现有实例；找不到才自建。自建实例按 `(source_id, model)` 缓存。
-4. **不污染平台模型列表**：插件自建实例**不会**被 append 到 `provider_insts`，只按需写入 `inst_map["onlyyou::main"]`；卸载 / 换模型时由 `dispose()` 统一移除并 terminate。
+4. **不污染平台模型列表**：插件自建实例**不会**被 append 到 `provider_insts`，只按需写入 `inst_map["onlyyou::main"]`（v2.7 兼容路径）或 `inst_map["onlyyou::main::<soul_id>"]`（v2.8 按 Soul）；`save_config` 只注销该 Soul 的注册 id，卸载 / 换模型时由 `dispose()` 统一移除并 terminate。
 5. **防御式容错**：所有内部属性访问都是 `getattr` + `try/except`，失败只打 warning 并返回 `None` / `[]`，绝不炸掉插件生命周期。
 
 #### 3. `selected_provider`：让原生管线使用插件选出的主模型
@@ -647,21 +679,22 @@ class ProviderFactory:
 ```python
 # main.py —— 三态门禁决定放行之后、apply_reply_decision 之前
 if should_reply:
-    main_provider_id = await self.model_hub.get_main_provider_id()
+    main_provider_id = await self.model_hub.get_main_provider_id(soul_id=soul.soul_id)
     if main_provider_id:
         event.set_extra("selected_provider", main_provider_id)
 self.platform_bridge.apply_reply_decision(event, should_reply=should_reply)
 ```
 
-AstrBot 的 `astr_main_agent._select_provider()` 会先读 `event.get_extra("selected_provider")`，再通过 `context.get_provider_by_id()`（即查 `provider_manager.inst_map`）解析实例。`ModelHub.get_main_provider_id()` 的三种返回值：
+AstrBot 的 `astr_main_agent._select_provider()` 会先读 `event.get_extra("selected_provider")`，再通过 `context.get_provider_by_id()`（即查 `provider_manager.inst_map`）解析实例。`ModelHub.get_main_provider_id(soul_id=...)` 的四种返回值：
 
 | 返回值 | 含义 |
 | :--- | :--- |
 | `""` | 主模型未配置 / 实例创建失败 → 回退 AstrBot 平台默认模型（「模型」页红字提示） |
 | 已有 AstrBot provider id | 复用了 AstrBot 已加载且启用的同源同模型实例 |
-| `"onlyyou::main"` | 插件自建实例已注册进 `inst_map`（不会出现在平台模型列表） |
+| `"onlyyou::main"` | 插件自建实例已注册进 `inst_map`（**未 attach SoulManager 的 v2.7 兼容路径** / 全局配置） |
+| `"onlyyou::main::<soul_id>"` | **v2.8** 该 Soul 的插件自建实例已注册进 `inst_map`（同一时刻多个 Soul 可各用各的主模型，不会出现在平台模型列表） |
 
-其余模型角色（decision / vision / tts）只用于插件内部 `inst.text_chat()` / `get_audio()` 调用，不进入原生回复管线；`main` 的 Persona 段则由角色卡接管（见 §4.5）。
+其余模型角色（decision / vision / tts）只用于插件内部 `inst.text_chat()` / `get_audio()` 调用，不进入原生回复管线；`main` 的 Persona 段则由角色卡接管（见 §4.5）。`ProviderFactory.register_main(instance, provider_id=None)` / `unregister_main(provider_id=None)` 支持自定义 id；`dispose()` 注销全部 `onlyyou::main*` 注册并 terminate 自建实例。
 
 #### 4. 插件自治 TTS（`on_decorating_result` 钩子，先于原生 TTS）
 
@@ -690,26 +723,376 @@ AstrBot 的 `astr_main_agent._select_provider()` 会先读 `event.get_extra("sel
 
 ---
 
-## 六、 配置体系架构：`_conf_schema.json` + `plugin_settings` + 全功能 `Pages` 可视化控制台
+## 六、 v2.8 Soul 独立配置持久化层、机器人接口绑定与运行态持久化
+
+> **一句话总览**：v2.8 把「角色卡（Soul）」从 SQLite `souls.profile_json` 的一行 JSON 升级为 **磁盘上每个角色一份独立 JSON 文件**（`souls/<安全文件名>.json`，唯一真源）；SQLite 只保留索引，用于级联更新、旧库迁移与「最近更新」路由兜底。围绕这一层，v2.8 同时引入：机器人接口（`platform_id`）绑定与五级路由、按 Soul 读写的四角色模型、`runtime_state_v1` 运行态持久化、SURF 分享五条件门禁、MEMORY_MUSE 三层分桶、T1 去重 / 上限 / 实时清理，以及 31 条 Web API。
+
+### 6.1 🗃️ Soul 独立 JSON 文件（唯一真源）
+
+#### 1. 路径推导与文件名
+
+```python
+# core/soul_manager.py
+self.souls_dir = os.path.join(os.path.dirname(os.path.abspath(self.db.db_path)), "souls")
+# 生产环境（AstrBot Docker）：
+#   /AstrBot/data/plugin_data/astrbot_plugin_only_you/souls/<安全文件名>.json
+```
+
+- **禁止写死路径**：`souls_dir` 一律由 `db.db_path` 推导；只有 `db.db_path` 为空（离线 / 无 DB）时才回退到 `<cwd>/data/plugin_data/astrbot_plugin_only_you/souls`。单元测试把 DB 放在临时目录，Soul 文件也随之落在临时目录。
+- 文件名规则（`_soul_filename()`）：非法字符 `\ / : * ? " < > |` 与控制字符替换为 `_`，去掉首尾空格与 `.`；若发生替换，追加 `__<sha1(soul_id) 前 8 位>` 防撞（替换后主体截断 40 字符）。`default_soul` / `酒狐` 这类正常 ID 就是 `<soul_id>.json`。
+- 「一个角色可绑定多个机器人接口，一个机器人接口同一时刻只属于一个角色」——绑定关系保存在 **Soul JSON 的 `bound_platforms`** 中，而不是 `plugin_settings`。
+
+#### 2. 文件 schema 与目录树
+
+```json
+{
+  "soul_id": "酒狐",
+  "revision": 7,
+  "card": { "identity": {}, "appearance": {}, "...": "10 分区 × 36 字段" },
+  "state_event_cards": [ { "card_id": "evt_busy_1", "title": "...", "state": "BUSY",
+                            "action_type": "BUSY_TASK", "min_hours": 1.5, "max_hours": 3.0 } ],
+  "model_config": {
+    "main":     { "source_id": "deepseek", "model": "deepseek-flash" },
+    "decision": { "inherit": true, "inherit_from": "main", "source_id": "", "model": "" },
+    "vision":   { "inherit": true, "inherit_from": "main", "source_id": "", "model": "" },
+    "tts": { "mode": "off", "source_id": "", "model": "", "voice": "",
+             "provider_id": "", "probability": 1.0, "scope": "private", "dual_output": false }
+  },
+  "bound_platforms": ["aiocqhttp"],
+  "settings": { "surfing_enabled": true },
+  "updated_at": 1762840000
+}
+```
+
+```text
+<AstrBot data dir>/plugin_data/astrbot_plugin_only_you/
+├── only_you.db                 # SQLite：memories / users / surfing_history / plugin_settings / souls 索引 ...
+└── souls/                      # v2.8 唯一真源（每个角色一份 JSON）
+    ├── 酒狐.json
+    ├── 星野.json
+    └── weird_id__1a2b3c4d.json # soul_id 含非法字符时的安全文件名 + sha1 前 8 位
+```
+
+- `SoulProfile.to_dict()` 输出上述全部键，并**同时保留旧扁平字段**（`name / archetype / speaking_style / native_persona_prompt / surfing_preferences / encounter_talk_cards`）以兼容 v2.7 及更早档案；`from_dict()` 对缺失的 `revision / model_config / bound_platforms / settings / updated_at` 全部补默认值。
+- `settings` 至少含 `surfing_enabled: bool`（默认 True），未知键原样保留（前向兼容）；`SoulProfile.surfing_enabled` 是只读 property（`bool(settings.get("surfing_enabled", True))`）。
+- `bound_platforms` 去重去空、不含 `:`、长度 ≤64；`revision` 从 0 起、每次成功保存 +1。
+
+#### 3. 原子写
+
+`_write_soul_file()` 的写入协议（防止断电 / 并发产生半截 JSON）：
+
+1. 建立/确认 `souls/` 目录（失败 → 记 `last_file_write_error` 并降级 SQLite-only）；
+2. `json.dumps(profile.to_dict(), ensure_ascii=False, indent=2)`（UTF-8）；
+3. 写唯一临时文件 `"{path}.{pid}.{uuid4[:8]}.tmp"` → `flush()` → `os.fsync()`；
+4. `os.replace(tmp, path)` 原子替换；随后 **best-effort fsync 目录**（有的平台不支持，忽略 `OSError`）；
+5. 任一步失败 → 清理临时文件、**重试 1 次**；两次都失败 → `logger.error` 并记录 `SoulManager.last_file_write_error`（下一次成功写入时清空）。
+
+#### 4. SQLite `souls` 表仅作索引
+
+```sql
+CREATE TABLE IF NOT EXISTS souls (
+    soul_id TEXT PRIMARY KEY,
+    persona_hash TEXT NOT NULL,
+    profile_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 0   -- v2.8 新增
+);
+```
+
+- `db.initialize()` 用 `PRAGMA table_info(souls)` 检测列，旧库自动幂等执行 `ALTER TABLE souls ADD COLUMN revision INTEGER NOT NULL DEFAULT 0`（失败静默，读取路径另有「无 revision 列」兜底查询）。
+- 索引由 `_upsert_soul_index()` 用 `INSERT ... ON CONFLICT(soul_id) DO UPDATE` 同步；索引写失败不影响 JSON 已保存，下一次读取会以文件为准重建索引。
+- 旧库（仅 SQLite 行、无 JSON）在 `list_souls()` / `get_soul_by_id()` 时**自动落盘 JSON**（日志 `Migrated legacy SQLite soul '...' to ...json`），并把 `revision == 0` 升级为 1。
+
+---
+
+### 6.2 🔁 双写一致性：`revision` 单调 + 内容哈希冲突裁决 + 索引自愈
+
+> **目标**：JSON 文件为唯一真源，任何时钟回拨 / 手工改文件 / 写文件失败都不能让旧数据覆盖新数据，也不能静默降级。
+
+#### 1. `save_soul()` 的单调性保证
+
+```python
+previous_revision = max(file.revision, index.revision, cached.revision, incoming.revision)
+profile.revision   = previous_revision + 1
+previous_updated   = max(file.updated_at, index.updated_at, cached.updated_at)
+now = int(time.time())
+if previous_updated and now < previous_updated and soul not in warned:
+    logger.warning("System clock moved backwards ... keeping updated_at monotonic")  # 每个 Soul 只告警一次
+profile.updated_at = max(now, previous_updated + 1)
+```
+
+1. **先写 JSON（原子写），再 upsert 索引**；索引写失败只 warning（文件已是权威，下次读取重建索引）。
+2. 若 JSON 写失败：仍写入 SQLite 索引（数据不丢），同时记录 `last_file_write_error`，并由 `souls/save` Web API 显式告警（见 §6.2.3）。
+3. **保存时检测磁盘分叉**：若磁盘已有文件且其 revision 高于本次传入的 revision，log warning「检测到磁盘内容可能被外部修改，本次保存将以更高 revision 覆盖」，不阻塞保存。
+
+#### 2. 读取时的冲突裁决（`_resolve_soul_conflict()` 统一 helper）
+
+`list_souls()` 与 `get_soul_by_id()` 共用同一裁决逻辑，返回 `(winner, reason)`：
+
+| 磁盘状态 | 分支 / 裁决（reason） | 动作 |
+| :--- | :--- | :--- |
+| 只有 JSON 文件 | 文件为准（`file-only` 分支，在 helper 之外处理） | 补建 SQLite 索引（用于级联更新 / 最近更新路由） |
+| 只有索引（旧库） | 索引为准（`index-only` 分支，在 helper 之外处理） | 落盘 JSON（`revision == 0` 先升为 1） |
+| 两者都有，`index.revision > file.revision` | **索引胜**（`index-newer`） | 说明上次 JSON 写失败或被回滚 → **回写 JSON 自愈** + warning |
+| 两者都有，`file.revision > index.revision` | **文件胜**（`file-newer`） | 重建 SQLite 索引 |
+| revision 相同，内容哈希相同 | 文件胜（`synced`） | 无动作（已同步） |
+| revision 相同，内容哈希不同 | **文件胜**（`file-edited`） | 视为手工编辑 → 保留 JSON 并重建索引 + warning |
+
+- **内容哈希**：`_soul_content_hash()` 对 `to_dict()` **剔除 `updated_at` / `revision`** 后的 canonical JSON（`sort_keys=True`、紧凑分隔符）取 `sha256`；因此只有「真实内容」不同才算手工编辑，时间戳抖动不会误判。
+- `revision == 0` 的历史数据同样适用：首次读取自动视作 revision 0，迁移落盘后为 1。
+- **损坏 JSON**：`_read_soul_file()` 捕获异常 → warning 后回退索引（不崩溃）；下次成功写入即自愈。
+
+#### 3. 写失败显式告警与恢复
+
+- `SoulManager.last_file_write_error: str`（`""` 表示健康）是唯一的降级信号；`_write_soul_file()` 成功时清空。
+- `POST souls/save` 的 `data` 增加：
+
+```json
+"storage": { "file_written": true, "degraded": false, "error": "" }
+```
+
+  写失败时 `file_written=false` / `degraded=true`，`message` 追加中文告警：
+  `⚠️ Soul JSON 写入失败，已降级写入 SQLite 索引，读取/重启时会自动重试落盘：<error>`。
+- **`souls/` 不可写（权限 / 磁盘满 / 只读挂载）的降级与恢复**：插件继续以 SQLite 索引提供服务（保存只写索引、`last_file_write_error` 持续有值、日志 ERROR）；恢复目录权限后，下一次 `list_souls()` / `get_soul_by_id()` 发现 `index.revision > file.revision`（或文件缺失）即自动回填 JSON，删除/重命名等操作也会在可写后自愈。
+- **手工编辑建议**：停止插件 / 热重载后修改 `souls/*.json`，改完在 Pages 刷新一次即可（`list_souls()` 会以文件为准重建索引）；若在运行中修改，保存时可能以更高 revision 覆盖并在日志中提示。
+
+---
+
+### 6.3 🤖 机器人接口（`platform_id`）绑定与 `resolve_soul` 五级路由
+
+#### 1. 绑定 API（`core/soul_manager.py`）
+
+```python
+async def get_platform_bindings() -> dict[str, str]      # {platform_id: soul_id}
+async def get_bound_platforms(soul_id) -> list[str]      # 一个 Soul 可绑多个接口
+async def bind_platform(soul_id, platform_id) -> SoulProfile
+async def unbind_platform(platform_id) -> str            # 返回原绑定 soul_id（无则 ""）
+async def set_soul_setting(soul_id, key, value) -> SoulProfile
+async def migrate_legacy_umo_bindings() -> int           # 旧 UMO 绑定一次性迁移
+```
+
+- **互斥**：同一 `platform_id` 同一时刻只属于一个 Soul；冲突抛 `ValueError("该机器人接口已被角色『{name}』绑定，请先在角色 {name} 下解绑")`（Web API 原样放进 `message`）。
+- **校验**：`platform_id` 非空、不含 `:`、长度 ≤64；`platform_id` 取 UMO 第一段（`aiocqhttp:GroupMessage:123` → `aiocqhttp`）。
+- `get_umo_bindings()` / `set_umo_binding()` 仅保留 API 兼容，**「机器人接口」页不再使用**。
+
+#### 2. `resolve_soul` 路由优先级（v2.8 废除单会话 UMO 绑定主导路由）
+
+| 优先级 | 条件 | 结果 |
+| :--- | :--- | :--- |
+| ① | `umo` 第一段 `platform_id` 命中 **Soul JSON 的 `bound_platforms`** | 该 Soul |
+| ② | 旧 `umo_soul_bindings` 精确绑定（兼容旧数据，非首选） | 绑定的 Soul |
+| ③ | `plugin_settings["default_soul_id"]` 存在且有效 | 默认角色 |
+| ④ | 以上皆无 | 最近更新的角色（`updated_at DESC`） |
+| ⑤ | 一个角色都没有 | 自动创建内置默认角色并设为默认 |
+
+#### 3. 机器人接口探测（`core/platform_bridge.py`）
+
+```python
+@staticmethod
+def extract_platform_id(umo: str) -> str      # "aiocqhttp:GroupMessage:123" -> "aiocqhttp"；空/None -> ""
+
+def list_platform_instances(self, observed_umos=None) -> list[dict]
+# 每项：{platform_id, platform_type, name, enabled, running, source: "runtime"|"config"|"observed"}
+```
+
+- 来源①：`context.platform_manager.get_insts()`（运行时实例，`running=True`）；② `context.get_config().get("platform", [])`（配置条目，含 `enable`）；③ `observed_umos`（历史 UMO 第一段推断）。按 `platform_id` 去重合并，任何异常静默降级（绝不抛）。
+- `sessions/platforms` 的 `platforms[]` 即由该方法结果 + Soul 绑定关系 + 活跃会话数组装；一个已手动预绑定、但 AstrBot 尚未上报的 `platform_id` 也会以 `source="observed"` 出现在列表里（保证刚绑定就能看到）。
+
+#### 4. 会话内存清理（解绑 / 清空时）
+
+```python
+async def clear_platform_memory_state(platform_id: str) -> dict[str, int]
+# {"windows", "evicted", "unread", "messages", "groups", "l3", "caches"}
+```
+
+- 先 `SessionBuffer.clear_platform_memory(platform_id)` 清该平台所有 UMO 的**内存滑窗 / evicted 缓冲 / 未读队列**；
+- 再清 `_known_group_umos` / `_known_l3_umos` / `_last_group_lurk_ts` / `_last_private_catchup_ts` 中该平台的项；
+- **持久化数据（memories / users / surfing_history / group_profiles）一律不删**（语义表见 §6.9）。
+
+---
+
+### 6.4 💓 心跳按 Soul 驱动与平台作用域
+
+- 每 15 分钟 `_heartbeat_loop()`：`_maybe_run_scheduled_gc()` → `_souls_for_heartbeat()` → 逐 Soul `_dispatch_heartbeat_for_soul()`；单个 Soul 失败只 warning，不影响其他 Soul。
+- **参与心跳的 Soul**：有 `bound_platforms` 的 Soul + `default_soul_id` 兜底 Soul；**没有任何绑定**时退化为单个默认 Soul（保持 v2.7 行为）。
+- **会话归属作用域**：绑定 Soul 只处理 `umo` 第一段 ∈ 其 `bound_platforms` 的未读 / 群聊 / ★L3 目标；默认兜底 Soul 处理**第一段未被任何 Soul 绑定**的会话；仅一个 Soul 且无绑定时处理全部。
+- 每个 Soul 使用**自己的**时间轴（`deck_engine.get_current_and_next_slot(..., chronotype=soul.chronotype)`）、模型配置（`soul.model_config`）与冲浪开关（`soul.surfing_enabled`）。
+- 归属过滤通过带默认值的关键字参数实现（`allowed_platforms=None` 不过滤），历史单测直接两/三参数调用仍可用。
+
+---
+
+### 6.5 💾 运行态持久化（`runtime_state_v1`）
+
+> 解决的问题：以下状态原先只在内存，插件重载 / 重启后会导致 **重复分享同一视频、重复主动聊同一条繁忙成果、冷却时间重置、★L3 私聊目标丢失**。v2.8 把它们快照进 `plugin_settings["runtime_state_v1"]`。
+
+```json
+{
+  "version": 1,
+  "shared_video_ids": {"<soul_id>": ["<video_id>", "..."]},
+  "last_surf_share_ts": {"<soul_id>": 0.0},
+  "mused_busy_keys": {"<soul_id>": ["<slot_key>", "..."]},
+  "mused_memory_ids": {"<soul_id>": [1, 2, 3]},
+  "last_idle_roam_ts": {"<soul_id>": 0.0},
+  "last_group_lurk_ts": {"<umo>": 0.0},
+  "last_private_catchup_ts": {"<umo>": 0.0},
+  "known_l3_umos": {"<global_uid>": "<umo>"}
+}
+```
+
+| 快照键 | 上限 / 裁剪 | 恢复点（`main.py` 属性） |
+| :--- | :--- | :--- |
+| `shared_video_ids` | 每 Soul 200（FIFO 保留最新） | `_shared_video_ids: dict[str, set[str]]` |
+| `mused_busy_keys` | 每 Soul 100（FIFO） | `_mused_busy_keys: dict[str, set[str]]` |
+| `mused_memory_ids` | 每 Soul 30（环形，与原逻辑一致） | `_mused_memory_ids: dict[str, list[int]]` |
+| `known_l3_umos` | 100 条（MRU，淘汰最旧） | `_known_l3_umos: dict[str, str]` |
+| `last_surf_share_ts` / `last_idle_roam_ts` / `last_group_lurk_ts` / `last_private_catchup_ts` | 只保留最近 7 天且 `str→float` 合法项；未来时间戳夹到 `now`（防时钟偏移永久锁死冷却） | 对应 `dict[str, float]` |
+
+- **实现**：`core/runtime_state.py::RuntimeStateStore(db)`；`normalize_snapshot()` 防御式（非 dict / 类型错 / 脏值回退默认、未知键丢弃、布尔不当 int），`load()` / `save()` 永不向业务抛出（DB 不可用时 load 返回默认快照、save 返回 `False`）。
+- **写入时机**（全部防御式 `getattr` 调用，DB 异常静默）：SURF 分享成功、IDLE_ROAM 发送成功（含 muse / lurk 冷却）、冷却锁更新但未发送（IGNORE 消费 / 发送失败）、私聊未读补回冷却更新、★L3 私聊目标更新、`clear_platform_memory_state` 清理后；`terminate()` 在 `db.close()` 之前 best-effort 落盘；`initialize()` 在 `_ensure_initialized()` 之后恢复。
+- **边界（产品既定语义）**：**未读 backlog 本身不持久化**——重启后未读队列会清空（不会补回旧未读），但**主动消息去重 / 冷却 / ★L3 目标不会丢**。因此「重启后重复分享」是 bug，「重启后未读清空」是正常行为。
+
+---
+
+### 6.6 🔌 ModelHub 按 Soul 读写与 `inst_map` 命名
+
+- **接线**：`main.py` 构造 `SoulManager` 后 `self.model_hub.attach_soul_manager(self.soul_manager)`；未 attach 时保持 v2.7 全局行为（历史单测依赖）。
+- **读写**：`get_config / save_config / resolve_role / get_provider / get_main_provider_id / get_tts_config / synthesize / get_status / test_role / call_llm_*` 全部支持可选 `soul_id`（缺省 = 默认角色；传 `umo` 时先路由出 Soul）；同步接口用 Soul 内存缓存，异步接口按需 `get_soul_by_id()`。
+- **持久化位置**：`model_config` 写在**该 Soul 的 JSON 文件**（经 `save_soul()` 走 revision / 原子写 / 索引同步，与角色卡同一套一致性保证）；`plugin_settings["model_config"]` 仅作 v2.7 旧全局兼容。
+- **主模型实例命名**：自建实例注册为 `provider_manager.inst_map["onlyyou::main::<soul_id>"]`；v2.7 的 `"onlyyou::main"` 保留（未 attach / 全局路径）。`save_config` 只注销该 Soul 的注册 id；`dispose()` 注销全部 `onlyyou::main*`。
+- **迁移**：`load()` 一次性把旧全局配置迁入「主模型为空」的 Soul（flag `model_config_migrated_to_souls`，只在全部成功 / 无需迁移后写 True；不删旧全局键）。
+- 状态接口形状与 v2.7 一致（每个角色带 `configured / inherited / inherit / inherit_from / source_id / model / provider_id / mode / label / ok`）；`get_status(soul_id)` 按该 Soul 的配置计算。`models/config` 的 `data` 顶层新增 `soul_id` 字段，便于前端确认保存到哪个角色。
+
+---
+
+### 6.7 🌐 Web API：31 条路由
+
+路由前缀 `/astrbot_plugin_only_you`，由 `context.register_web_api` 注册（日志 `[OnlyYou] Registered 31 Web API routes for Plugin Pages.`），统一信封 `{status, message, data}`。v2.7 为 27 条，v2.8 **新增 4 条** `sessions/*`。
+
+| # | 路由（前缀后） | 方法 | v2.8 要点 |
+| :--- | :--- | :--- | :--- |
+| 1 | `init_summary` | GET | 新增 `platform_bindings: {platform_id: soul_id}`；`souls[]` 每项 `to_dict()` 自带 `model_config / bound_platforms / settings / revision / updated_at` |
+| 2 | `souls/detail` | GET | 新增 `platform_bindings` |
+| 3 | `souls/import_persona` | POST | 不变（avatar / AI 扩写兼容） |
+| 4 | `souls/save` | POST | body 透传 `model_config / bound_platforms / settings`；`data.storage` 告警降级 |
+| 5 | `souls/rename` | POST | 重命名 JSON 文件 + 级联 SQLite（默认角色 / UMO 绑定 / 记忆 / 日程 / 冲浪历史）；`bound_platforms` 随 Soul 文件自动携带 |
+| 6 | `souls/delete` | POST | 删 JSON + 级联 SQLite |
+| 7 | `schedule/reroll` | POST | 不变 |
+| 8 | `schedule/force_state` | POST | 不变（`action_type` 优先，`armor` 入参忽略） |
+| 9 | `cards/list` | GET | 不变 |
+| 10 | `cards/save` | POST | 不变 |
+| 11 | `cards/delete` | POST | 不变 |
+| 12 | `cards/ai_generate` | POST | 不变 |
+| 13 | `users/list` | GET | **新增 `groups: [GroupItem]`**（群聊档案） |
+| 14 | `users/update` | POST | **新增 action**：`update_group / clear_group_memory / delete_group`（body `{umo, display_name?, notes?}`） |
+| 15 | `memories/list` | GET | **新增 `tier1_limit`**（默认 30） |
+| 16 | `memories/mutate` | POST | 不变 |
+| 17 | `surfing/list_and_trigger` | GET/POST | GET 新增 `surfing_enabled / soul_id`；POST 新增 `action="toggle_surfing"`（`{soul_id, enabled}`） |
+| 18 | `dashboard/overview` | GET | 不变（进入前惰性结算繁忙块） |
+| 19 | `card/schema` | GET | 不变 |
+| 20 | `card/save` | POST | 不变 |
+| 21 | `card/ai_generate` | POST | 不变 |
+| 22 | `card/preview_prompt` | POST | 不变 |
+| 23 | `models/sources` | GET | 不变 |
+| 24 | `models/list` | GET | 不变 |
+| 25 | `models/config` | GET/POST | **支持 `?soul_id=` / body `{soul_id, model_config}`**；data 增加 `soul_id` |
+| 26 | `models/test` | POST | body 可选 `soul_id` |
+| 27 | `sessions/default_soul` | POST | 保留；设置为**默认兜底角色** |
+| 28 | `sessions/platforms` | GET | **新增**：机器人接口 / 绑定关系 / 当前角色管辖会话内存概览 |
+| 29 | `sessions/bind_platform` | POST | **新增**：`{soul_id, platform_id}` 绑定（平台互斥） |
+| 30 | `sessions/unbind_platform` | POST | **新增**：`{platform_id}` 解绑并清理该平台内存 |
+| 31 | `sessions/clear_memory` | POST | **新增**：`{umo?}` / `{platform_id?}` 清单会话 / 整平台内存 |
+
+> 完整入参 / 出参 / envelope 契约见 [`docs/WEBUI_DESIGN.md`](WEBUI_DESIGN.md) §五。
+
+---
+
+### 6.8 📱 v2.8 主动消息与记忆：SURF 分享五条件门禁、冲浪总开关、MEMORY_MUSE
+
+#### 1. SURF 分享五条件门禁（`main._maybe_share_surfed_video()`）
+
+必须**同时满足**才分享，且**发送成功才**记录 video_id 与时间戳（失败保留重试机会）：
+
+| # | 条件 | 数据来源 |
+| :--- | :--- | :--- |
+| ① | `review` 非空且 `not review.is_fallback`（视觉模型失败 / 解析失败兜底时 `score=60, is_fallback=True`，不分享） | `VideoReviewResult.is_fallback` |
+| ② | 该 `video_id` 未被**本 Soul** 分享过 | `_shared_video_ids[soul_id]`（持久化） |
+| ③ | `review.score >= surf_share_min_score`（默认 80） | `_conf_schema.json → surfing_config` |
+| ④ | 距上次冲浪分享 ≥ `surf_share_cooldown_minutes`（默认 90） | `_last_surf_share_ts[soul_id]`（持久化） |
+| ⑤ | 距上次 IDLE_ROAM 搭话 ≥ `idle_roam_cooldown_minutes`（默认 45） | `_last_idle_roam_ts[soul_id]`（持久化） |
+
+此外必须存在 ★L3 私聊目标（`_latest_l3_umo()`）；分享文本用 `PROACTIVE_CHAT_PROMPT` 生成，`PlatformBridge.send_proactive_message()` 发送并写入会话滑窗。
+
+#### 2. 冲浪总开关
+
+- 生效值：**Soul `settings.surfing_enabled` 优先**，缺失回退全局 `_conf_schema.json → surfing_config.surfing_enabled`（默认 True）；
+- `CyberSurfingPipeline.is_enabled(soul)` 判开关；关闭时 `surf_once()` 返回 `None`，心跳 `SURF` 时段**自动降级为 `IDLE_ROAM` 分支**；`/onlyyou surf` 直接回复「赛博冲浪总开关已关闭…请先到 Pages 冲浪页开启」；
+- `surf_once()` 候选全部已在 `_watched_ids` 时直接返回 `None`（不再回退 `candidates[0]`）。
+
+#### 3. MEMORY_MUSE 三层分桶 + 繁忙成果单次消费
+
+```python
+# core/memory_manager.py
+async def sample_muse_memories(soul_id, exclude_ids=None, per_bucket_limit=15, pick=2) -> list[MemoryItem]
+# 对 T1/T2/T3 各自独立查询：ORDER BY COALESCE(last_accessed_at,0) ASC, id ASC LIMIT ?
+# 过滤 exclude_ids 后按「重要度 × 层级权重(T1=1.0/T2=1.5/T3=2.0)」加权抽 ≤ pick 条
+async def touch_memories_for_muse(memory_ids) -> None
+# 仅 UPDATE last_accessed_at = now；不加 access_count、不改 vitality、不改 tier
+```
+
+`main._run_idle_roam_action()` 的 MEMORY_MUSE 分支：
+
+1. 先取 `run.settled_busy_results()` 中 `completion_result` 非空、且 `(soul_id, slot_key)` 不在 `_mused_busy_keys[soul_id]` 的成果（最多 2 条）作素材；**发送成功才**写入 `_mused_busy_keys`（同一繁忙成果最多主动聊 1 次，跨重启由 `runtime_state_v1` 保持）；
+2. 无未用繁忙成果 → `sample_muse_memories(..., exclude_ids=_mused_memory_ids[soul_id])`；**发送成功才** `touch_memories_for_muse(ids)` 并写入 `_mused_memory_ids`（环形上限 30）；
+3. 两者皆空 → 安全跳过（不产生空消息）；所有新增属性均 `getattr` 防御。
+
+#### 4. T1 记忆的去重 / 上限 / 实时清理
+
+- `add_memory()`：同 Soul + 同 content 的 T1 已存在 → 只刷新 `last_accessed_at` 返回原 id；插入后超过 `max_tier1_memories`（默认 30）按 `created_at ASC, id ASC` 淘汰最旧；T2/T3 不变。
+- `cleanup_tier1()`：删除 `> 48h` T1 + 每 Soul 超上限 T1，返回 `{deleted_expired, deleted_overflow}`；由 `main._maybe_run_scheduled_gc()` 在启动 / 每次心跳调用，并用 `plugin_settings["last_forgetting_gc_date"]` 保证每日 `run_forgetting_gc()` 跨重启只跑一次（见 §4.2）。
+- 对注入的影响：T1 仍参与记忆混合打分与 muse 抽样，但去重 / 上限 / 48h 清理确保瞬时记忆不会挤占 T2/T3 的注入预算（T3 优先、T2 次之）。
+
+---
+
+### 6.9 🧹 解绑 / 清空「清理 vs 保留」语义表
+
+| 操作 | 清什么（内存态） | 保留什么（持久化） | 重启后果 |
+| :--- | :--- | :--- | :--- |
+| **解绑机器人接口**（`sessions/unbind_platform`） | 该平台所有 UMO 的滑窗 / evicted / **未读**；`_known_group_umos` / `_known_l3_umos` 中该平台项；`_last_group_lurk_ts` / `_last_private_catchup_ts` 该平台项；同步清理 `runtime_state_v1` 中对应项 | SQLite `memories` / `users` / `surfing_history` / `plugin_settings["group_profiles"]`；Soul JSON 只改 `bound_platforms` | 该平台会话按 `resolve_soul` 重新路由（通常落到默认兜底角色）；未读不会复活 |
+| **清空单会话内存**（`sessions/clear_memory {umo}`） | 该 UMO 的滑窗 / evicted / 未读 | 记忆 / 用户档案 / 群档案 | 未读清空；冷却时间戳保留（不复活旧未读） |
+| **清空整个平台内存**（`sessions/clear_memory {platform_id}`） | 同「解绑」的内存部分 | 同上（不改绑定） | 同上 |
+| **清空群内存**（`users/update action="clear_group_memory"`） | 该群 UMO 的滑窗 / evicted / 未读 | 群档案（`group_profiles`）保留，仅内存清 | 未读清空 |
+| **移除群聊记录**（`users/update action="delete_group"`） | 该群档案 | **删除** `group_profiles` 中该群条目 | 该群下次消息到达会重新采集（新档案） |
+| **删除角色**（`souls/delete`） | JSON 文件 + SQLite `souls` 索引 + 级联关联表 | 独立于角色的 memories 等按级联规则处理 | — |
+
+> **统一文案口径**：解绑 / 清空只影响「内存会话状态」，**不删记忆、不删用户档案、不删群档案**；「移除群聊记录」是唯一会删群档案的入口。未读 backlog 本就不持久化，因此重启后清空属正常行为。
+>
+> **生产升级步骤**（备份 `only_you.db` → 部署 / 热重载 → 日志校验 `Registered 31 Web API routes` / `Plugin initialized successfully` / 迁移日志 / 无 Traceback → 数据校验 → 失败回滚 → 幂等重试与降级）见 [`docs/UPGRADE.md`](UPGRADE.md)。
+
+---
+
+## 七、 配置体系架构：`_conf_schema.json` + `plugin_settings` + 全功能 `Pages` 可视化控制台
 
 > **设计原则**：本插件采用 **三层配置架构**，动态数据与静态阈值彻底分离：
 > 1. **`views/console/`（AstrBot Plugin Pages 可视化控制台）**：承担所有动态交互管理——角色卡、行动卡片池、今日三态日程、用户关系、分级记忆、冲浪视频池，以及 **插件自治的四角色模型配置**（详见 [`docs/WEBUI_DESIGN.md`](WEBUI_DESIGN.md)）。
 > 2. **`_conf_schema.json`（全局运行参数）**：只保留 Roguelite / 关系 / 读空气 / 冲浪 / 记忆与上下文的算法阈值和 API 基础设置；**不再包含任何模型绑定**（模型配置见 §5.1 与 §4.4）。
 > 3. **SQLite `plugin_settings` 表（插件自治设置，见 §4.4）**：存放 `model_config`、`default_soul_id`、`legacy_model_migrated` 等插件自治数据。**不放进 `AstrBotConfig`**，避免 AstrBot 的 schema 完整性检查把未声明的键删掉导致配置丢失。
 
-### 6.1 三层配置归属对照
+### 7.1 三层配置归属对照
 
 | 配置数据 | 存放位置 | 读写入口 |
 | :--- | :--- | :--- |
-| 四角色模型选择（main / decision / vision / tts） | `plugin_settings["model_config"]` | Pages「模型」页（`models/config`） |
-| 插件默认角色 | `plugin_settings["default_soul_id"]` | Pages「会话」页（`sessions/default_soul`） |
-| 角色卡 10 分区 / 四类行动卡池 | SQLite `souls` 表 `profile_json` | Pages「角色卡」「日程」页 |
+| 角色卡 10 分区 / 四类行动卡池 / **四角色模型配置 / 机器人接口绑定 / Soul 级 settings** | **`souls/<安全文件名>.json`（唯一真源，见 §6.1）**；SQLite `souls` 仅索引 | Pages「角色卡」「日程」「模型」「机器人接口」页 |
+| 插件默认兜底角色 | `plugin_settings["default_soul_id"]` | Pages「机器人接口」页（`sessions/default_soul`） |
+| 旧全局四角色模型配置（v2.7 兼容） | `plugin_settings["model_config"]` | 仅 `ModelHub` 未 attach `SoulManager` 时使用 |
+| 运行态快照（去重 / 冷却 / ★L3 目标） | `plugin_settings["runtime_state_v1"]` | 插件内部（`core/runtime_state.py`） |
+| 群聊档案 | `plugin_settings["group_profiles"]` | Pages「关系与群聊」页 / 消息采集 |
+| 一次性迁移 flag / 上次 GC 日期 | `plugin_settings["legacy_umo_bindings_migrated"]`、`model_config_migrated_to_souls`、`last_forgetting_gc_date` | 插件内部 |
 | 用户关系 / 分级记忆 / 冲浪历史 | SQLite `users` / `memories` / `surfing_history` | Pages「关系」「记忆」「冲浪」页 |
 | 三态门禁、读空气、冲浪、记忆与上下文阈值 | `_conf_schema.json` | AstrBot 插件配置面板 |
 
-### 6.2 最终 `_conf_schema.json`
+### 7.2 最终 `_conf_schema.json`
 
-以下为 v2.5 最终 schema 全文（不含任何模型绑定，保持 JSON 合法；已移除 `daily_encounter_count`，新增 `idle_roam_cooldown_minutes` 与 6 个未读消息相关配置）：
+以下为 v2.8 最终 schema 全文（不含任何模型绑定，保持 JSON 合法；v2.5 移除 `daily_encounter_count`、新增 `idle_roam_cooldown_minutes` 与 6 个未读消息配置，v2.8 新增 `surfing_enabled / surf_share_min_score / surf_share_cooldown_minutes / max_tier1_memories`）：
 
 ```json
 {
@@ -846,6 +1229,21 @@ AstrBot 的 `astr_main_agent._select_provider()` 会先读 `event.get_extra("sel
         "description": "优先直发无水印视频文件",
         "type": "bool",
         "default": true
+      },
+      "surfing_enabled": {
+        "description": "赛博冲浪总开关（全局默认值；每个角色可在 Pages 冲浪页单独覆盖）",
+        "type": "bool",
+        "default": true
+      },
+      "surf_share_min_score": {
+        "description": "冲浪视频主动分享的最低 vision 评分（达到后才会分享给 ★L3）",
+        "type": "int",
+        "default": 80
+      },
+      "surf_share_cooldown_minutes": {
+        "description": "两次冲浪视频主动分享之间的冷却时间（分钟）",
+        "type": "int",
+        "default": 90
       }
     }
   },
@@ -878,6 +1276,11 @@ AstrBot 的 `astr_main_agent._select_provider()` 会先读 `event.get_extra("sel
         "description": "单次对话插入记忆的最大总字数预算（汉字数，防止费用过高）",
         "type": "int",
         "default": 400
+      },
+      "max_tier1_memories": {
+        "description": "每个角色最多保留的 Tier 1 瞬时记忆条数（超出按创建时间淘汰最旧；同时用于 Pages 记忆页「上限 N 条」提示）",
+        "type": "int",
+        "default": 30
       }
     }
   }
@@ -886,21 +1289,27 @@ AstrBot 的 `astr_main_agent._select_provider()` 会先读 `event.get_extra("sel
 
 ---
 
-## 七、 测试与验证体系
+## 八、 测试与验证体系
 
-离线 `tests/` 测试套件（stdlib `unittest`，零网络依赖，不要求安装 AstrBot / pytest；v2.6 基线 **310 tests** 全绿），覆盖：
+离线 `tests/` 测试套件（stdlib `unittest`，零网络依赖，不要求安装 AstrBot / pytest）。**测试数量随迭代增长，不在此写死**；以 `python3 -m unittest discover -s tests` 全绿为准（v2.8 全量回归全绿），覆盖：
 
 | 测试文件 | 覆盖范围 |
 | :--- | :--- |
-| `tests/test_provider_factory.py` | fake `provider_manager`：复用已启用实例、自建实例、按 `(source, model)` 缓存、`register_main` / `dispose` 清理 `inst_map` |
-| `tests/test_model_hub.py` | 旧配置一次性迁移（归一化后的 `inherit/inherit_from` 形状）、`decision` / `vision` 继承解析、`tts` 未配置时关闭、`get_main_provider_id` 三分支、全程不调用 `context.get_config` / `get_current_chat_provider_id` |
-| `tests/test_character_card.py` | 旧档案迁移、扁平属性兼容、v2.6 10 分区 / 36 字段、旧 `social.attitude_*` 丢弃、`render_persona_prompt` 跳过空字段/头像并遵守预算 |
+| `tests/test_provider_factory.py` | fake `provider_manager`：复用已启用实例、自建实例、按 `(source, model)` 缓存、`register_main`（含自定义 `onlyyou::main::<soul_id>` id）/ `dispose` 清理 `inst_map` |
+| `tests/test_model_hub.py` | 旧配置一次性迁移（归一化后的 `inherit/inherit_from` 形状）、`decision` / `vision` 继承解析、`tts` 未配置时关闭、`get_main_provider_id` 分支、全程不调用 `context.get_config` / `get_current_chat_provider_id`；**未 attach SoulManager 时保持 v2.7 全局配置行为** |
+| `tests/test_character_card.py` | 旧档案迁移、扁平属性兼容、10 分区 / 36 字段、旧 `social.attitude_*` 丢弃、`render_persona_prompt` 跳过空字段/头像并遵守预算 |
 | `tests/test_persona_takeover.py` | 精确替换 / 正则兜底 / 前置三分支 |
-| `tests/test_web_api.py` | 用 `set_mock_request` 调用 27 条路由并校验 `{status, message, data}` 信封；dashboard/cards/force_state/ai_generate 按 v2.5+ 新 payload 断言（`action_type/progress_pct/chronotype/busy_results/action_types/armor/armor_tier`） |
+| `tests/test_web_api.py` | 用 `set_mock_request` 调用**全部 31 条**路由并校验 `{status, message, data}` 信封；dashboard/cards/force_state/ai_generate 按 v2.5+ 新 payload 断言（`action_type/progress_pct/chronotype/busy_results/action_types/armor/armor_tier`） |
 | `tests/test_v26_models_armor.py` | v2.6 四档固定护甲（25/40/65/80）、`armor_tier`、排轴与微调产物、`force_state` / `cards_save` / `ai_generate` 忽略手填 armor、ModelHub 可选继承逐条链路与关闭即停用 |
 | `tests/test_v26_attitude.py` | v2.6 角色卡删除 `attitude_*` 且旧卡键丢弃、`users.attitude` 幂等迁移与持久化、`USER_RELATION_CONTEXT_PROMPT` 注入与 window peers、头像归一化（Data URL/URL/emoji/超长/非法）与 Persona 不含 Base64 |
 | `tests/test_v26_api.py` | v2.6 Web API 端到端：默认卡无 `attitude_l3`、`users/update` 的 attitude 截断/清空回读、`souls/import_persona` 与 `card/save` 的 avatar 落库、`models/config` 的 `inherit/inherit_from` 归一化、固定护甲 payload |
 | `tests/test_regressions.py` | 24h 动态时间轴不变量 / 7~11 块 / 0.5h 网格、chronotype 权重差异、旧卡与旧日程迁移、进度与时间格式化、BUSY_TASK 结算写 Tier1 且不重复、IDLE_ROAM 双分支与冷却、mutator 切分/加钟/唤醒、三态门禁矩阵、Forgetting GC、上下文预算 |
+| `tests/test_v28_soul_platform.py` | v2.8 Soul JSON 唯一真源、revision 冲突裁决、平台绑定互斥、五级路由、迁移 flag 重试、`onlyyou::main::<soul_id>` 注册 |
+| `tests/test_v28_memory_surf.py` | v2.8 MEMORY_MUSE 三层分桶 / touch 语义、T1 去重 / 上限 / `cleanup_tier1`、冲浪总开关、`is_fallback` 分享门禁、候选耗尽返回 `None` |
+| `tests/test_v28_web_api.py` | v2.8 新增 4 条 `sessions/*` 路由与扩展参数（`groups` / `tier1_limit` / `soul_id` / `toggle_surfing` / `storage`）、统一信封 |
+| `tests/test_v28_integration.py` | v2.8 跨模块集成：Soul JSON 落盘 / 索引自愈、心跳按 Soul、解绑清理、旧 UMO 迁移 + 模型配置迁移的幂等 |
+| `tests/test_v28_consistency.py` | 双写加固：revision 单调（模拟时钟回拨）、手工改文件胜出、索引 revision 更高时回写自愈、写文件失败仍落索引 + `last_file_write_error`、损坏 JSON 回退、旧库无 revision 列自动迁移、原子写不残留临时文件 |
+| `tests/test_v28_runtime_state.py` | 运行态持久化：快照 round-trip、上限 / 7 天裁剪 / 脏数据容错、重启不重复分享视频 / 不重复 muse 繁忙成果、冷却恢复、解绑后持久层同步、DB 异常不抛 |
 | `tests/test_js_syntax.py` | `node --check views/console/*.js` 前端语法检查 + `index.html` 脚本清单检查（无 node 时自动 skip） |
 
 ```bash

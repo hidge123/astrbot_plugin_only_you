@@ -1,6 +1,15 @@
-# OnlyYou (只有你) —— 核心 Prompt 工程与交互时序设计 (v2.6)
+# OnlyYou (只有你) —— 核心 Prompt 工程与交互时序设计 (v2.8)
 
-> 本文档定义 `astrbot_plugin_only_you` v2.6 的核心提示词模板，围绕 **三种基础状态（休息中 `RESTING` / 繁忙中 `BUSY` / 空闲中 `IDLE`）× 四类可执行行动卡（`SLEEP` / `SURF` / `IDLE_ROAM` / `BUSY_TASK`）**、**24h 动态弹性时间轴与繁忙完成结果短时记忆**、**根据消息/视频输入的时间块切分 / 延展微调**、**详细角色卡（10 分区 × 36 字段）的 AI 生成 / 分区补全**、**角色卡接管 Persona 段与插件自治 TTS 的时序**，以及 v2.6 新增的 **用户关系等级重要度与专属态度注入（`USER_RELATION_CONTEXT_PROMPT`）** 构建。文中的“决策模型”对应 `ModelHub` 的 `decision` 角色（读空气 / 记忆提炼 / 日程微调 / 造卡 / 繁忙结果与 IDLE_ROAM 搭话）。
+> 本文档定义 `astrbot_plugin_only_you` v2.8 的核心提示词模板，围绕 **三种基础状态（休息中 `RESTING` / 繁忙中 `BUSY` / 空闲中 `IDLE`）× 四类可执行行动卡（`SLEEP` / `SURF` / `IDLE_ROAM` / `BUSY_TASK`）**、**24h 动态弹性时间轴与繁忙完成结果短时记忆**、**根据消息/视频输入的时间块切分 / 延展微调**、**详细角色卡（10 分区 × 36 字段）的 AI 生成 / 分区补全**、**角色卡接管 Persona 段与插件自治 TTS 的时序**、v2.6 的 **用户关系等级重要度与专属态度注入（`USER_RELATION_CONTEXT_PROMPT`）** 构建；v2.8 进一步补充 **按 Soul 的模型解析与机器人接口绑定路由对 LLM 请求的影响、SURF 分享五条件门禁与失败保留重试、IDLE_ROAM MEMORY_MUSE 三层分桶、主动消息去重/冷却跨重启（`runtime_state_v1`）、T1 去重/上限/清理对记忆注入的影响**（见 §七）。文中的“决策模型”对应 `ModelHub` 的 `decision` 角色（读空气 / 记忆提炼 / 日程微调 / 造卡 / 繁忙结果与 IDLE_ROAM 搭话）。
+
+**文档版本历史（append-only）**
+
+| 文档版本 | 适用产品版本 | 主要变化 |
+| :--- | :--- | :--- |
+| v2.8（当前） | 插件 v2.8 | 新增 §七：按 Soul 模型解析与平台绑定路由、SURF 分享五条件门禁、MEMORY_MUSE 三层分桶 + 繁忙成果单次消费、主动消息去重/冷却跨重启、T1 去重/上限/清理对注入的影响；§3.2 空闲卡语义更新 |
+| v2.7 | 插件 v2.7 | 模型页即时生效、页面 isDirty 守卫、★L3 管理员级（Prompt 不变） |
+| v2.6 | 插件 v2.6 | 用户关系等级与专属态度注入（`USER_RELATION_CONTEXT_PROMPT`）、可选模型继承、固定护甲 |
+| v2.5 | 插件 v2.5 | 四类行动卡、繁忙完成结果、IDLE_ROAM 主动搭话、未读补回 |
 
 ---
 
@@ -236,7 +245,7 @@ Persona 名称：{persona_name}
 }
 ```
 
-> 调用方：`main.OnlyYouPlugin._run_idle_roam_action()`。`GROUP_LURK` 模式素材为近期群聊滑窗 transcript；`MEMORY_MUSE` 模式素材为 1~2 条记忆（优先今日已结算的 `BUSY_TASK` 完成结果），受 `idle_roam_cooldown_minutes`（默认 45 分钟）冷却限制。
+> 调用方：`main.OnlyYouPlugin._run_idle_roam_action()`。`GROUP_LURK` 模式素材为近期群聊滑窗 transcript；`MEMORY_MUSE` 模式素材按 v2.8 优先级为：**① 今日已结算、且本 Soul 尚未主动聊过的 `BUSY_TASK` 完成结果（`_mused_busy_keys`，同一成果最多聊 1 次）→ ② `sample_muse_memories()` 对 T1/T2/T3 三层分桶抽样（排除 `_mused_memory_ids` 最近聊过的记忆，按重要度 × 层级加权抽 ≤2 条）**；两者皆空安全跳过。发送成功才记录消费（`_mused_busy_keys` / `touch_memories_for_muse` + `_mused_memory_ids`），失败不消费、保留下次重试。受 `idle_roam_cooldown_minutes`（默认 45 分钟）冷却限制；冷却与去重状态由 `runtime_state_v1` 跨重启恢复（见 §7.3 / §7.4）。
 
 
 #### 私聊未读消息主动补回 (`UNREAD_PRIVATE_CATCHUP_PROMPT`)
@@ -244,6 +253,8 @@ Persona 名称：{persona_name}
 
 #### 冲浪分享主动搭话 (`PROACTIVE_CHAT_PROMPT`)
 > 心跳处于 `SURF` 时间块且刷到视频时使用：占位符为 `{soul_name}` / `{soul_archetype}` / `{speaking_style}` / `{soul_summary}` / `{current_slot_title}` / `{video_text}`，生成一段第一人称分享 / 吐槽，随后经 `PlatformBridge.send_proactive_message()` 发给最近 ★L3 私聊（并同步写入会话滑窗）。
+
+> **v2.8 分享门禁（先过门禁再调用本 Prompt）**：`main._maybe_share_surfed_video()` 必须同时满足 ① `review` 非空且 `not review.is_fallback`（视觉兜底 `score=60` 不分享）② 该 `video_id` 未被本 Soul 分享过 ③ `review.score >= surf_share_min_score`（默认 80）④ 距上次冲浪分享 ≥ `surf_share_cooldown_minutes`（默认 90 分钟）⑤ 距上次 IDLE_ROAM 搭话 ≥ `idle_roam_cooldown_minutes`（默认 45 分钟），且存在 ★L3 私聊目标。**发送成功才记录 video_id / 时间戳**（失败保留重试机会）；冲浪总开关（Soul `settings.surfing_enabled`）关闭时 SURF 心跳直接降级为 IDLE_ROAM，不调用本 Prompt（详见 §7.2）。
 
 ### 3.3 角色卡接管 Persona 段（`_takeover_persona`，System Prompt 组装顺序）
 
@@ -434,4 +445,182 @@ sequenceDiagram
 - **失败降级**：合成失败或 TTS 未配置时静默保留原文字链，不阻塞回复。
 - **主动消息**：心跳/主动搭话由 `_maybe_synthesize_proactive()` 按同一 TTS 配置决定是否合成，`PlatformBridge.send_proactive_message(..., audio_path=...)` 在文字发送后追加一条 `Record` 语音。
 - **TTS 三种来源**：`off` 关闭 / `source` 提供商源 + OpenAI 兼容 TTS（自建 `openai_tts_api`，音色默认 `alloy`）/ `provider` 直接使用 AstrBot 现有 TTS 提供商。
+
+---
+
+## 七、 v2.8 时序与 Prompt 相关变更
+
+> 本章只描述 v2.8 **改变时序 / 改变 Prompt 输入素材**的部分；既有 Prompt 模板正文（§一~§六）如无特别说明保持不变。涉及字段与持久化结构的完整契约见 [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) §六。
+
+### 7.1 按 Soul 的模型解析与机器人接口绑定路由对 LLM 请求的影响
+
+> v2.8 之前：会话经「UMO 绑定 → 默认角色 → 最近更新角色」路由出 Soul，但模型配置是**插件全局**一份。v2.8 之后：模型配置随 Soul JSON 走，且机器人接口（`platform_id`）绑定成为首选路由——**同一个 AstrBot 机器人接口下的所有会话由同一个 Soul 接管；不同接口可以分别绑定不同角色，各用各的模型**。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant EVT as AstrBot 消息事件 (umo = "<platform_id>:...")
+    participant SM as SoulManager.resolve_soul
+    participant CARD as 角色卡 / Persona 注入
+    participant HUB as ModelHub(按 Soul)
+    participant PIPE as AstrBot 原生管线
+
+    EVT->>SM: resolve_soul(umo)
+    SM->>SM: ① umo 第一段命中 Soul.bound_platforms<br/>② 旧 umo_soul_bindings<br/>③ default_soul_id<br/>④ 最近更新的角色<br/>⑤ 自动创建默认角色
+    SM-->>CARD: SoulProfile（card / 时间轴 / model_config / settings）
+    CARD->>CARD: _takeover_persona(render_persona_prompt(soul.card))<br/>+ USER_RELATION_CONTEXT_PROMPT + 三态/记忆注入
+    EVT->>HUB: get_main_provider_id(soul_id=soul.soul_id)
+    HUB-->>PIPE: "onlyyou::main::<soul_id>" / 平台已有 provider id / ""
+    Note over PIPE: 用该 Soul 的主模型生成回复（分段/流式/工具调用保留）
+    HUB->>HUB: decision / vision / tts 调用一律透传 soul_id（缺省 = 默认角色）
+```
+
+对 Prompt 与请求的实际影响：
+
+| 环节 | v2.7 行为 | v2.8 行为 |
+| :--- | :--- | :--- |
+| 会话归属 | 单会话 UMO 绑定优先 | **机器人接口绑定优先**（一个接口整体归属一个角色）；旧 UMO 绑定仅二级兼容 |
+| 主模型 | 全局一份 `plugin_settings.model_config` | 该 Soul JSON 的 `model_config`；自建主模型注册为 `onlyyou::main::<soul_id>` |
+| Persona / 关系上下文 / 记忆 | 按 `soul_id` 注入 | 不变；但 `soul_id` 现在由接口绑定优先决定 |
+| decision / vision / tts | 全局配置 | 同一 Soul 的四角色配置；`call_llm_*` 传 `soul_id`（或 `umo` 路由），互不串配置 |
+| 心跳 | 单 Soul | 逐 Soul 独立跑（各自时间轴 / 模型 / 未读范围，见 ARCHITECTURE §6.4） |
+| 冲浪开关 | 全局 `surfing_config.surfing_enabled` | Soul `settings.surfing_enabled` 优先，缺失才回退全局 |
+
+> 工程注意：历史单测用 `SimpleNamespace` 直接绑定 `main.py` 方法、且 stub 不接受新关键字参数——调用 `model_hub.call_llm_json(..., soul_id=...)` 时必须 `TypeError` 回退旧签名；未 attach `SoulManager` 时 ModelHub 完全保持 v2.7 全局行为。
+
+---
+
+### 7.2 SURF 分享五条件门禁与失败保留重试
+
+> 目标：既不错过「真正值得分享的高分视频」，也绝不重复分享同一视频、不在视觉模型降级时把垃圾结果发出去。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant HB as 15min 心跳 (SURF 时段)
+    participant PIPE as CyberSurfingPipeline.surf_once
+    participant GATE as _maybe_share_surfed_video
+    participant LLM as 决策模型 (PROACTIVE_CHAT_PROMPT)
+    participant PB as PlatformBridge.send_proactive_message
+
+    HB->>HB: 该 Soul settings.surfing_enabled? 关闭 -> 降级 IDLE_ROAM（结束）
+    HB->>PIPE: surf_once(soul)
+    PIPE-->>HB: review（候选全看过 -> None，不分享）
+    HB->>GATE: review
+    GATE->>GATE: ① 非 is_fallback ② video_id 未分享过 ③ score >= min_score<br/>④ 冲浪分享冷却 ⑤ IDLE_ROAM 冷却 ⑥ 存在 ★L3 私聊目标
+    alt 任一条件不满足
+        GATE-->>HB: False（不记录任何状态 -> 下次心跳自然重试）
+    else 全部满足
+        GATE->>LLM: PROACTIVE_CHAT_PROMPT
+        LLM-->>GATE: 分享文本
+        GATE->>PB: 发送（可附 TTS 语音）
+        alt 发送成功
+            GATE->>GATE: record video_id + last_surf_share_ts（并持久化 runtime_state_v1）
+        else 发送失败
+            GATE->>GATE: 不记录 -> 保留重试机会（仅冷却可能已消耗）
+        end
+    end
+```
+
+| 条件 | 数据来源 | 失败时行为 |
+| :--- | :--- | :--- |
+| ① `not review.is_fallback` | `surfing/video_vision.py`（视觉失败兜底 `score=60, is_fallback=True`） | 直接跳过，且**永不分享**该兜底结果 |
+| ② `video_id` 未被本 Soul 分享过 | `_shared_video_ids[soul_id]`（跨重启由 `runtime_state_v1` 恢复） | 跳过（重启后也不会重复分享） |
+| ③ `score >= surf_share_min_score`（80） | `_conf_schema.json → surfing_config` | 跳过（普通视频只入库不分享） |
+| ④ 距上次分享 ≥ `surf_share_cooldown_minutes`（90） | `_last_surf_share_ts[soul_id]` | 跳过 |
+| ⑤ 距上次 IDLE_ROAM 搭话 ≥ `idle_roam_cooldown_minutes`（45） | `_last_idle_roam_ts[soul_id]`（与搭话共用冷却预算） | 跳过 |
+| ⑥ 存在 ★L3 私聊目标 | `_latest_l3_umo()` | 跳过（无处可发） |
+
+> 冲浪总开关：Soul `settings.surfing_enabled` 关闭 → `surf_once()` 返回 `None`、心跳 `SURF` 自动降级 `IDLE_ROAM`、`/onlyyou surf` 提示「赛博冲浪总开关已关闭…请先到 Pages 冲浪页开启」；`surf_once()` 在所有候选都在 `_watched_ids` 时直接返回 `None`（不回退第一个候选）。
+
+---
+
+### 7.3 IDLE_ROAM MEMORY_MUSE 三层分桶 + 繁忙成果单次消费
+
+> v2.7 的 MEMORY_MUSE 只是「抽 1~2 条记忆（优先繁忙成果）」，同一繁忙结果可能被反复主动聊起、旧记忆可能永远抽不到。v2.8 改为：**繁忙成果先单次消费，耗尽后 T1/T2/T3 三层各自独立查询 + 加权抽样，并用最近聊过的 id 做排除。**
+
+```mermaid
+flowchart TB
+    A["IDLE_ROAM 心跳（过 idle_roam_cooldown_minutes 冷却）"] --> B{GROUP_LURK 有未读群?}
+    B -->|有| B1["五维读空气决策 REPLY/IGNORE"] --> B2["REPLY: 生成冒泡/私聊；IGNORE: 静默 ack"]
+    B -->|无 / 已处理| C{"run.settled_busy_results() 有<br/>本 Soul 未用过的成果?"}
+    C -->|有| C1["取 ≤2 条完成结果作素材<br/>（_mused_busy_keys[soul_id] 排除已聊过）"]
+    C -->|无| D["sample_muse_memories(soul_id, exclude_ids=_mused_memory_ids[soul_id])<br/>T1/T2/T3 各查 15 条（last_accessed_at 旧优先）<br/>过滤 exclude 后按 重要度×层级权重 抽 ≤2 条"]
+    C1 --> E["IDLE_ROAM_PROACTIVE_PROMPT（{roam_mode}=MEMORY_MUSE）"]
+    D --> E
+    E --> F["解析 JSON: target=GROUP|PRIVATE_L3 / message"]
+    F --> G{"有目标且消息非空?"}
+    G -->|否| X["安全跳过（不发送、不消费）"]
+    G -->|是| H["PlatformBridge.send_proactive_message"]
+    H -->|失败| X2["不消费 -> 下次心跳可重试"]
+    H -->|成功| I["消费：busy 结果写入 _mused_busy_keys<br/>或 touch_memories_for_muse(ids) + 写入 _mused_memory_ids（环形 30）<br/>更新 _last_idle_roam_ts -> 持久化 runtime_state_v1"]
+```
+
+Prompt 素材形态（`IDLE_ROAM_PROACTIVE_PROMPT` 的 `{context_material}`）：
+
+| 素材来源 | 渲染形态 |
+| :--- | :--- |
+| 繁忙成果（优先） | 每行 `- 【今日繁忙成果】{completion_result}`（最多 2 条；`slot_key` 用于去重） |
+| 分层抽样记忆 | 每行 `- {memory.content}`（最多 2 条；来源层级不限，T3 权重更高） |
+
+**`touch` 语义（v2.8 冻结）**：`touch_memories_for_muse(ids)` **仅** `UPDATE memories SET last_accessed_at = now` —— 不加 `access_count`、不改 `vitality`、不改 `memory_tier`。原因是「主动聊起」不等于「用户提及导致强化」，若错误加 `access_count` 会让 T2 被主动聊几句就提前晋升 T3、并干扰 T1/T2/T3 分桶轮转。发送失败 / 决策为空时**不 touch**，保证同一素材下次还能被抽到。
+
+| 状态 | 不持久化会怎样 | v2.8 处理 |
+| :--- | :--- | :--- |
+| `_mused_busy_keys` | 重启后同一繁忙成果被反复主动聊 | `runtime_state_v1` 持久化（每 Soul 100 条 FIFO） |
+| `_mused_memory_ids` | 重启后立刻重复抽到刚聊过的记忆 | 持久化（每 Soul 30 环形） |
+| `_last_idle_roam_ts` | 重启后冷却清零、立刻主动搭话 | 持久化（7 天裁剪） |
+
+---
+
+### 7.4 主动消息去重 / 冷却跨重启（`runtime_state_v1`）
+
+> v2.8 之前这些状态全在内存，插件重载 / 重启会「重复分享同一视频」「重复主动聊同一繁忙成果」「冷却时间重置」「★L3 私聊目标丢失」。v2.8 把快照存进 `plugin_settings["runtime_state_v1"]`（`core/runtime_state.py`）。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant INIT as plugin.initialize()
+    participant STORE as RuntimeStateStore(plugin_settings)
+    participant MAIN as main.py 运行属性
+    participant BIZ as 业务变更点（分享/搭话/冷却/L3）
+    participant TERM as plugin.terminate()
+
+    INIT->>STORE: load()（防御式 normalize，失败回默认快照）
+    STORE-->>MAIN: 恢复 _shared_video_ids / _last_surf_share_ts /<br/>_mused_busy_keys / _mused_memory_ids / _last_idle_roam_ts /<br/>_last_group_lurk_ts / _last_private_catchup_ts / _known_l3_umos
+    BIZ->>BIZ: 发送成功 / 冷却更新 / L3 私聊到达 / 解绑清理
+    BIZ->>STORE: _persist_runtime_state()（best-effort，异常静默）
+    TERM->>STORE: 终止前最后落盘（在 db.close() 之前）
+```
+
+| 快照字段 | 上限 / 裁剪 | 恢复点 |
+| :--- | :--- | :--- |
+| `shared_video_ids` | 每 Soul 200（FIFO 最新保留） | `_shared_video_ids: dict[str, set[str]]` |
+| `mused_busy_keys` | 每 Soul 100 | `_mused_busy_keys: dict[str, set[str]]` |
+| `mused_memory_ids` | 每 Soul 30（环形） | `_mused_memory_ids: dict[str, list[int]]` |
+| `known_l3_umos` | 100（MRU） | `_known_l3_umos: dict[str, str]` |
+| `last_*_ts` 冷却时间戳 | 仅保留 7 天内合法项；未来值夹到 now | 对应 `dict[str, float]` |
+
+**边界（必须写清，避免把正常行为当 bug）**：
+
+1. **未读 backlog 本身不持久化**——重启后未读队列清空（不会补回旧未读），这是产品既定语义；
+2. 持久化的是「主动消息去重 / 冷却 / ★L3 目标」，因此重启后**不应**出现重复分享视频或重复聊同一条繁忙成果；
+3. `normalize` 对非 dict / 类型错 / 脏值一律回退默认、未知键丢弃；`save` 失败只 warning 返回 False，**绝不抛出影响业务**（DB 不可用时安全 no-op）。
+
+---
+
+### 7.5 T1 去重 / 上限 / 清理对记忆注入的影响
+
+> T1（瞬时记忆）是繁忙成果、冲浪视频、小事的主要落点，也是「聊天谈资」的主要来源。v2.8 对 T1 增加三道纪律，避免它无限膨胀、挤占 T2/T3 的注入预算。
+
+| 规则 | 实现 | 对 Prompt / 注入的影响 |
+| :--- | :--- | :--- |
+| **去重** | `add_memory()`：同 `soul_id` + `memory_tier=1` + 完全相同 `content` 已存在 → 只刷新 `last_accessed_at` 并返回原 id | 同一繁忙成果不会被重复结算成多条 T1；「今日繁忙成果」列表与注入去重后更干净 |
+| **上限** | 插入后该 Soul 的 T1 超过 `max_tier1_memories`（默认 30）→ 按 `created_at ASC, id ASC` 淘汰最旧 | T1 注入预算稳定；最新谈资优先保留 |
+| **48h 过期** | `cleanup_tier1()` 删除 `> 48h` T1（返回 `deleted_expired`） | 聊天中不会突然提起两天前的无关小事 |
+| **跨重启 GC** | `_maybe_run_scheduled_gc()`：启动 + 每次心跳先实时清理；`plugin_settings["last_forgetting_gc_date"] == 今天` 则只做实时清理，否则跑 `run_forgetting_gc()` 后写日期 | 每日 GC 跨重启只跑一次（不重复衰减 T2，也不会漏跑） |
+| **与注入打分的关系** | `ContextBudgetManager` 仍用 `0.40*关键词 + 0.35*新鲜度 + 0.25*重要度`，T1 可被注入；T3/T2 因重要度高自然排前 | 去重 + 上限 + 清理让 T1 只保留「最近、最相关」的谈资，T2/T3 的预算不被瞬时噪声挤占 |
+| **与 MEMORY_MUSE 的关系** | `sample_muse_memories()` 对 T1/T2/T3 各查 15 条，T3 权重 2.0 / T2 1.5 / T1 1.0 | 主动搭话既会聊今日小事（T1），也会轮到长期记忆（T3），不会永远只聊最近的事 |
+
+> Pages 记忆页对应展示：T1 行显示 `⏳ 剩余 Xh 清除`（`48 - (now-created_at)/3600`）与 `上限 N 条`（N 来自 `memories/list` 的 `tier1_limit`，默认 30）；T2 保持活力条；T3 显示永久保存。清理 / GC 动作与 v2.6 一致（`memories/mutate` 的 `gc` / `extract` / 增删改）。
 

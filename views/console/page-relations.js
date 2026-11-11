@@ -630,7 +630,7 @@
       "</div>" +
       '<div class="rel-toolbar-hint">' +
       "<span>★L3 管理员级不参与好感度计算与自动晋升；自动晋升只到 L2</span>" +
-      "<span>群聊滑窗 / 未读为内存态，清空不会删除长期记忆</span>" +
+      "<span>群聊滑窗 / 未读为内存态：清空只清内存滑窗 + 未读；保留 SQLite memories / users / surfing_history / 群档案（重启后未读队列会重置）</span>" +
       "</div></div></div>"
     );
   }
@@ -1240,7 +1240,7 @@
       esc(group.notes) +
       '" placeholder="例如：酒狐的主场群，晚上最热闹" /></label>' +
       "</div>" +
-      '<div class="rel-group-danger-hint">清空内存滑窗与未读只影响内存态上下文；移除群聊记录会删除该群档案（下次收到群消息会重新记录），长期记忆与用户档案不受影响。</div>';
+      '<div class="rel-group-danger-hint">清空该群内存：只清该群的内存滑窗 + 未读队列；保留 SQLite memories / users / surfing_history / 群档案（重启后未读队列会重置）。移除群聊记录：会删除该群档案（下次收到群消息会重新记录），长期记忆与用户档案仍保留。</div>';
     app.modal({
       title: "群聊详情 · " + group.display_name,
       wide: true,
@@ -1315,7 +1315,8 @@
         message:
           "确定清空群聊「" +
           name +
-          "」的内存滑窗与未读数吗？仅清空内存态上下文，不影响长期记忆与群聊档案。",
+          "」吗？清空：该群的内存滑窗 + 未读队列。" +
+          "保留：SQLite memories / users / surfing_history / 群档案；重启后未读队列本身会重置。",
         danger: true,
         confirmLabel: "清空内存",
         onConfirm: async function () {
@@ -1344,7 +1345,8 @@
         message:
           "确定移除群聊「" +
           name +
-          "」的档案吗？会同时清空该群的内存滑窗与未读；长期记忆和用户档案不受影响，下次收到群消息会重新记录。",
+          "」的档案吗？会删除该群档案并同时清空该群的内存滑窗 + 未读；" +
+          "保留 SQLite memories / users / surfing_history（长期记忆与用户档案不受影响）；下次收到群消息会重新记录，重启后未读队列本身会重置。",
         danger: true,
         confirmLabel: "移除记录",
         onConfirm: async function () {

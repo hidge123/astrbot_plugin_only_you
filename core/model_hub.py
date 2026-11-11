@@ -347,7 +347,13 @@ class ModelHub:
         return _clean(tts.get("mode")).lower() not in ("", "off")
 
     async def _migrate_config_to_souls_once(self) -> None:
-        """One-shot migration of the legacy global config into every existing Soul."""
+        """One-shot migration of the legacy global config into every existing Soul.
+
+        v2.8 hardening: ``model_config_migrated_to_souls`` is only persisted after
+        every Soul was migrated without error.  Partial failures keep the flag unset
+        so the next startup retries (idempotent: Souls that already carry a
+        meaningful config are skipped).
+        """
         if not self._soul_manager_ready() or self.db is None:
             return
         try:
@@ -363,6 +369,7 @@ class ModelHub:
             return
         souls = await lister()
         global_cfg = normalize_model_config(self._config)
+        failures = 0
         if self._config_is_meaningful(global_cfg):
             migrated = 0
             for soul in souls:
@@ -371,17 +378,37 @@ class ModelHub:
                 )
                 if self._config_is_meaningful(current):
                     continue
+                original_config = copy.deepcopy(
+                    getattr(soul, "model_config", None) or {}
+                )
                 try:
                     setattr(soul, "model_config", copy.deepcopy(global_cfg))
                     if callable(saver):
                         await saver(soul)
                         migrated += 1
                 except Exception as exc:  # noqa: BLE001
+                    # Revert the in-memory mutation + drop the cached copy so the
+                    # next startup retries instead of treating the Soul as migrated.
+                    try:
+                        setattr(soul, "model_config", original_config)
+                    except Exception:
+                        pass
+                    cache = getattr(self.soul_manager, "_cache", None)
+                    if isinstance(cache, dict):
+                        cache.pop(getattr(soul, "soul_id", ""), None)
+                    failures += 1
                     logger.warning(f"[OnlyYou] migrate soul model config failed: {exc}")
             if migrated:
                 logger.info(
                     f"[OnlyYou] Migrated legacy global model_config into {migrated} Soul(s)."
                 )
+        if failures:
+            logger.warning(
+                "[OnlyYou] per-soul model_config migration incomplete "
+                f"({failures} failure(s)); keeping the migration flag unset so the "
+                "next startup retries."
+            )
+            return
         try:
             await self.db.set_setting(self.SOUL_MIGRATION_FLAG_KEY, True)
         except Exception as exc:  # noqa: BLE001

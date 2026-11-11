@@ -25,6 +25,7 @@ import json
 import os
 import re
 import time
+import uuid
 from typing import TYPE_CHECKING, Any, Optional
 
 from .character_card import (
@@ -225,6 +226,31 @@ def _soul_filename(soul_id: str) -> str:
     return f"{safe}.json"
 
 
+def _coerce_revision(value: Any) -> int:
+    """Coerce a persisted Soul ``revision`` counter into a non-negative int."""
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _soul_content_hash(profile: "SoulProfile") -> str:
+    """Hash the *content* of a SoulProfile, ignoring volatile bookkeeping fields.
+
+    Used by the v2.8 dual-write conflict resolver: when the ``souls/*.json`` file
+    and the SQLite index share the same ``revision`` but disagree on content, a
+    differing hash means the JSON file was edited by hand (the single source of
+    truth) and must win instead of being overwritten by a stale index row.
+    """
+    payload = profile.to_dict()
+    payload.pop("updated_at", None)
+    payload.pop("revision", None)
+    raw = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def _is_empty_value(value: Any) -> bool:
     if value is None:
         return True
@@ -277,6 +303,7 @@ class SoulProfile:
         bound_platforms: Optional[list[str]] = None,
         settings: Optional[dict[str, Any]] = None,
         updated_at: Optional[int] = None,
+        revision: Optional[int] = None,
         **legacy: Any,
     ) -> None:
         self.soul_id: str = _clean_text(soul_id) or DEFAULT_SOUL_ID
@@ -286,6 +313,9 @@ class SoulProfile:
         self.bound_platforms: list[str] = _normalize_bound_platforms(bound_platforms)
         self.settings: dict[str, Any] = _normalize_soul_settings(settings)
         self.updated_at: int = _coerce_timestamp(updated_at)
+        # v2.8 hardening: monotonically increasing version counter that survives
+        # clock rollbacks; the JSON file and the SQLite index are reconciled by it.
+        self.revision: int = _coerce_revision(revision)
         base: dict[str, Any] = normalize_card(card) if isinstance(card, dict) else empty_card()
 
         # Legacy keyword arguments (name=..., archetype=..., ...) are folded into
@@ -413,6 +443,7 @@ class SoulProfile:
             "bound_platforms": _normalize_bound_platforms(self.bound_platforms),
             "settings": _normalize_soul_settings(self.settings),
             "updated_at": _coerce_timestamp(self.updated_at),
+            "revision": _coerce_revision(self.revision),
         }
 
     @classmethod
@@ -458,6 +489,7 @@ class SoulProfile:
             bound_platforms=data.get("bound_platforms"),
             settings=data.get("settings"),
             updated_at=data.get("updated_at"),
+            revision=data.get("revision"),
         )
 
 
@@ -477,6 +509,10 @@ class SoulManager:
         # stays as an index for cascade updates / legacy migration.
         self.souls_dir: str = self._derive_souls_dir()
         self._platform_bindings_cache: Optional[dict[str, str]] = None
+        # v2.8 hardening: last JSON-file write error ("" == healthy). Surfaced by the
+        # ``souls/save`` Web API so a SQLite-only degradation is never silent again.
+        self.last_file_write_error: str = ""
+        self._clock_rollback_warned: set[str] = set()
 
     # ==================================================================
     # v2.8: independent per-Soul JSON files
@@ -493,7 +529,8 @@ class SoulManager:
             os.makedirs(self.souls_dir, exist_ok=True)
             return True
         except Exception as exc:  # noqa: BLE001 - degrade to SQLite-only mode
-            logger.warning(f"[OnlyYou] create souls dir failed: {exc}")
+            self.last_file_write_error = f"无法创建 souls 目录 {self.souls_dir}: {exc}"
+            logger.error(f"[OnlyYou] create souls dir failed: {exc}")
             return False
 
     def soul_file_path(self, soul_id: str) -> str:
@@ -501,32 +538,170 @@ class SoulManager:
         return os.path.join(self.souls_dir, _soul_filename(soul_id))
 
     def _write_soul_file(self, profile: SoulProfile) -> bool:
+        """Atomically persist one Soul JSON file (unique tmp + fsync + ``os.replace``).
+
+        Returns ``True`` on success and records ``last_file_write_error`` otherwise,
+        so callers (``souls/save`` Web API) can surface a degraded persistence state
+        instead of silently falling back to SQLite-only.
+        """
         path = self.soul_file_path(profile.soul_id)
         if not self._ensure_souls_dir():
             return False
         try:
             payload = json.dumps(profile.to_dict(), ensure_ascii=False, indent=2)
-            tmp_path = f"{path}.tmp"
-            with open(tmp_path, "w", encoding="utf-8") as handle:
-                handle.write(payload)
-            os.replace(tmp_path, path)
-            return True
-        except Exception as exc:  # noqa: BLE001 - never lose an in-memory save
-            logger.warning(f"[OnlyYou] write soul file failed ({profile.soul_id}): {exc}")
+        except Exception as exc:  # noqa: BLE001 - non-serialisable payload
+            self.last_file_write_error = f"序列化 Soul JSON 失败: {exc}"
+            logger.error(
+                f"[OnlyYou] serialize soul file failed ({profile.soul_id}): {exc}"
+            )
             return False
+
+        last_error = ""
+        for _attempt in range(2):
+            tmp_path = (
+                f"{path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+            )
+            try:
+                with open(tmp_path, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp_path, path)
+                # Best-effort directory fsync (not supported on every platform).
+                try:
+                    dir_fd = os.open(self.souls_dir, os.O_RDONLY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except OSError:
+                    pass
+                self.last_file_write_error = ""
+                return True
+            except Exception as exc:  # noqa: BLE001 - retry once, then degrade loudly
+                last_error = str(exc)
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except OSError:
+                    pass
+                logger.warning(
+                    f"[OnlyYou] write soul file attempt failed ({profile.soul_id}): {exc}"
+                )
+        self.last_file_write_error = last_error or "未知错误"
+        logger.error(
+            "[OnlyYou] write soul file failed after retries "
+            f"({profile.soul_id}, path={path}): {last_error}; "
+            "falling back to the SQLite index (the next read will self-heal)."
+        )
+        return False
 
     def _read_soul_file(self, path: str) -> Optional[SoulProfile]:
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 data = json.load(handle)
             if not isinstance(data, dict):
+                logger.warning(
+                    f"[OnlyYou] soul file {os.path.basename(path)} is not a JSON object"
+                )
                 return None
             profile = SoulProfile.from_dict(data)
             profile.updated_at = _coerce_timestamp(data.get("updated_at"))
+            profile.revision = _coerce_revision(data.get("revision"))
             return profile
         except Exception as exc:  # noqa: BLE001 - skip a corrupt file, keep the rest
-            logger.warning(f"[OnlyYou] read soul file failed ({os.path.basename(path)}): {exc}")
+            logger.warning(
+                f"[OnlyYou] read soul file failed ({os.path.basename(path)}): {exc}"
+            )
             return None
+
+    @staticmethod
+    def _profile_from_index_row(soul_id: str, row: dict[str, Any]) -> Optional[SoulProfile]:
+        """Rebuild a SoulProfile from one SQLite index row (tolerant parse)."""
+        raw = row.get("profile_json") or "{}"
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            return None
+        profile = SoulProfile.from_dict(data if isinstance(data, dict) else {})
+        profile.soul_id = soul_id
+        profile.updated_at = _coerce_timestamp(row.get("updated_at"))
+        profile.revision = _coerce_revision(row.get("revision"))
+        return profile
+
+    async def _fetch_soul_index_row(self, soul_id: str) -> Optional[dict[str, Any]]:
+        try:
+            return await self.db.fetchone(
+                "SELECT persona_hash, profile_json, updated_at, revision "
+                "FROM souls WHERE soul_id = ?",
+                (soul_id,),
+            )
+        except Exception:
+            # A pre-migration database may not have the ``revision`` column yet.
+            try:
+                return await self.db.fetchone(
+                    "SELECT persona_hash, profile_json, updated_at "
+                    "FROM souls WHERE soul_id = ?",
+                    (soul_id,),
+                )
+            except Exception as exc:  # noqa: BLE001 - DB may be closed / uninitialized
+                logger.debug(f"[OnlyYou] read soul index failed ({soul_id}): {exc}")
+                return None
+
+    async def _fetch_all_soul_index_rows(self) -> list[dict[str, Any]]:
+        """Return every ``souls`` index row (tolerates a pre-migration schema)."""
+        try:
+            return await self.db.fetchall(
+                "SELECT soul_id, persona_hash, profile_json, updated_at, revision "
+                "FROM souls"
+            )
+        except Exception:
+            try:
+                return await self.db.fetchall(
+                    "SELECT soul_id, persona_hash, profile_json, updated_at FROM souls"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[OnlyYou] list souls from SQLite failed: {exc}")
+                return []
+
+    @staticmethod
+    def _resolve_soul_conflict(
+        file_profile: SoulProfile, db_profile: SoulProfile
+    ) -> tuple[SoulProfile, str]:
+        """Return ``(winner, reason)`` when the JSON file and the index disagree.
+
+        v2.8 hardening rules (clock-rollback safe, manual-edit friendly):
+
+        - ``revision`` is the primary key: the higher revision always wins, so a
+          wall-clock rollback can never resurrect an older copy;
+        - equal revision → compare a content hash (ignores ``updated_at/revision``):
+          identical = already synced (JSON wins as the source of truth), differing =
+          the JSON file was edited by hand → JSON wins and the index is rebuilt;
+        - a higher index revision only happens when the previous JSON write failed →
+          the index holds the newer content → index wins and the file is rewritten.
+        """
+        file_rev = _coerce_revision(getattr(file_profile, "revision", 0))
+        db_rev = _coerce_revision(getattr(db_profile, "revision", 0))
+        if db_rev > file_rev:
+            return db_profile, "index-newer"
+        if file_rev > db_rev:
+            return file_profile, "file-newer"
+        if _soul_content_hash(file_profile) != _soul_content_hash(db_profile):
+            return file_profile, "file-edited"
+        return file_profile, "synced"
+
+    async def _sync_soul_index_safe(
+        self, profile: SoulProfile, persona_hash: str = "file"
+    ) -> bool:
+        """Best-effort index upsert; never raises (JSON file remains the truth)."""
+        try:
+            await self._upsert_soul_index(profile, persona_hash=persona_hash)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"[OnlyYou] sync soul index failed ({profile.soul_id}): {exc}"
+            )
+            return False
 
     def _invalidate_platform_cache(self) -> None:
         self._platform_bindings_cache = None
@@ -535,18 +710,20 @@ class SoulManager:
         """Keep the SQLite ``souls`` index in sync with the JSON file."""
         await self.db.execute(
             """
-            INSERT INTO souls (soul_id, persona_hash, profile_json, updated_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO souls (soul_id, persona_hash, profile_json, updated_at, revision)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(soul_id) DO UPDATE SET
                 persona_hash = excluded.persona_hash,
                 profile_json = excluded.profile_json,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                revision = excluded.revision
             """,
             (
                 profile.soul_id,
                 persona_hash or "file",
                 json.dumps(profile.to_dict(), ensure_ascii=False),
                 _coerce_timestamp(profile.updated_at) or int(time.time()),
+                _coerce_revision(profile.revision),
             ),
         )
 
@@ -740,8 +917,11 @@ class SoulManager:
         """Return all stored SoulProfiles, with ``souls/*.json`` as the source of truth.
 
         Files are read first; SQLite-only rows (pre-v2.8 databases) are migrated to
-        JSON files on the fly. When no Soul exists at all, the built-in default Soul
-        is created (offline, no LLM).
+        JSON files on the fly. When the JSON file and the SQLite index disagree the
+        v2.8 conflict resolver decides (see :meth:`_resolve_soul_conflict`): the
+        higher ``revision`` wins, equal revisions keep the JSON file (manual edit)
+        and the index is rebuilt, and a newer index row self-heals the JSON file.
+        When no Soul exists at all, the built-in default Soul is created.
         """
         souls: dict[str, SoulProfile] = {}
         self._ensure_souls_dir()
@@ -765,49 +945,61 @@ class SoulManager:
             self._cache[profile.soul_id] = (cached_hash, profile)
 
         db_rows: dict[str, dict[str, Any]] = {}
-        try:
-            rows = await self.db.fetchall(
-                "SELECT soul_id, persona_hash, profile_json, updated_at FROM souls"
-            )
-            for row in rows:
-                sid = _clean_text(row.get("soul_id"))
-                if sid:
-                    db_rows[sid] = row
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"[OnlyYou] list souls from SQLite failed: {exc}")
+        for row in await self._fetch_all_soul_index_rows():
+            sid = _clean_text(row.get("soul_id"))
+            if sid:
+                db_rows[sid] = row
 
-        # JSON file wins unless the SQLite index is strictly newer; SQLite-only rows
-        # (legacy v2.7 data) are migrated to independent JSON files.
         for sid, row in db_rows.items():
-            try:
-                raw = json.loads(row.get("profile_json") or "{}")
-                db_profile = SoulProfile.from_dict(raw if isinstance(raw, dict) else {})
-                db_profile.soul_id = sid
-                db_profile.updated_at = _coerce_timestamp(row.get("updated_at"))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"[OnlyYou] Failed to load soul row {sid}: {exc}")
+            db_profile = self._profile_from_index_row(sid, row)
+            if db_profile is None:
+                logger.warning(f"[OnlyYou] Failed to load soul row {sid} (corrupt JSON)")
+                continue
+            persona_hash = str(row.get("persona_hash") or "file")
+            file_profile = souls.get(sid)
+
+            if file_profile is None:
+                # Legacy SQLite-only row (pre-v2.8) -> migrate to an independent file.
+                if _coerce_revision(db_profile.revision) == 0:
+                    db_profile.revision = 1
+                souls[sid] = db_profile
+                self._cache[sid] = (persona_hash, db_profile)
+                if self._write_soul_file(db_profile):
+                    logger.info(
+                        f"[OnlyYou] Migrated legacy SQLite soul '{sid}' to "
+                        f"{self.soul_file_path(sid)}"
+                    )
                 continue
 
-            file_profile = souls.get(sid)
-            if file_profile is None:
+            winner, reason = self._resolve_soul_conflict(file_profile, db_profile)
+            if winner is db_profile:
+                # The index is newer than the file (the previous JSON write failed,
+                # or a wall-clock rollback produced a newer index row) -> self-heal.
                 souls[sid] = db_profile
-                self._cache[sid] = (str(row.get("persona_hash") or "file"), db_profile)
-                self._write_soul_file(db_profile)
-            elif _coerce_timestamp(row.get("updated_at")) > _coerce_timestamp(
-                file_profile.updated_at
-            ):
-                souls[sid] = db_profile
-                self._cache[sid] = (str(row.get("persona_hash") or "file"), db_profile)
-                self._write_soul_file(db_profile)
-            elif _coerce_timestamp(file_profile.updated_at) > _coerce_timestamp(
-                row.get("updated_at")
-            ):
-                try:
-                    await self._upsert_soul_index(
-                        file_profile, persona_hash=str(row.get("persona_hash") or "file")
+                self._cache[sid] = (persona_hash, db_profile)
+                if self._write_soul_file(db_profile):
+                    logger.warning(
+                        f"[OnlyYou] Restored soul '{sid}' JSON file from the newer "
+                        f"SQLite index (revision {_coerce_revision(db_profile.revision)})"
                     )
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug(f"[OnlyYou] sync soul index failed: {exc}")
+                continue
+
+            souls[sid] = file_profile
+            self._cache[sid] = (persona_hash, file_profile)
+            if reason == "file-edited":
+                logger.warning(
+                    f"[OnlyYou] Soul '{sid}' JSON file differs from the SQLite index "
+                    "at the same revision; keeping the JSON file (manual edit) and "
+                    "rebuilding the index."
+                )
+            if reason in ("file-newer", "file-edited"):
+                await self._sync_soul_index_safe(file_profile, persona_hash=persona_hash)
+
+        # JSON-only souls (e.g. files copied into ``souls/``) -> rebuild the index.
+        for sid, profile in list(souls.items()):
+            if sid in db_rows or not os.path.exists(self.soul_file_path(sid)):
+                continue
+            await self._sync_soul_index_safe(profile)
 
         orphan_ids = [
             sid
@@ -832,7 +1024,7 @@ class SoulManager:
         return result
 
     async def get_soul_by_id(self, soul_id: str) -> Optional[SoulProfile]:
-        """Fetch a specific SoulProfile by `soul_id` (cache -> JSON file -> SQLite)."""
+        """Fetch a specific SoulProfile by ``soul_id`` (cache -> JSON file -> SQLite)."""
         sid = _clean_text(soul_id)
         if not sid:
             return None
@@ -840,35 +1032,69 @@ class SoulManager:
         if cached is not None:
             return cached
 
+        file_profile: Optional[SoulProfile] = None
         path = self.soul_file_path(sid)
         if os.path.exists(path):
-            profile = self._read_soul_file(path)
-            if profile is not None:
-                profile.soul_id = profile.soul_id or sid
-                self._cache[sid] = (self._cache.get(sid, ("file",))[0], profile)
-                return profile
+            file_profile = self._read_soul_file(path)
+            if file_profile is not None:
+                file_profile.soul_id = file_profile.soul_id or sid
 
-        row = await self.db.fetchone(
-            "SELECT persona_hash, profile_json, updated_at FROM souls WHERE soul_id = ?",
-            (sid,),
-        )
+        row = await self._fetch_soul_index_row(sid)
+        db_profile: Optional[SoulProfile] = None
         if row and row.get("profile_json"):
-            try:
-                raw = json.loads(row["profile_json"])
-                profile = SoulProfile.from_dict(raw if isinstance(raw, dict) else {})
-                profile.soul_id = sid
-                profile.updated_at = _coerce_timestamp(row.get("updated_at"))
-                self._cache[sid] = (str(row.get("persona_hash") or "file"), profile)
-                # Legacy SQLite-only row -> migrate to an independent JSON file.
-                self._write_soul_file(profile)
-                return profile
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"[OnlyYou] Failed to parse soul {sid}: {e}")
-                return None
+            db_profile = self._profile_from_index_row(sid, row)
+        persona_hash = str((row or {}).get("persona_hash") or "file")
+
+        if file_profile is not None and db_profile is not None:
+            winner, reason = self._resolve_soul_conflict(file_profile, db_profile)
+            self._cache[sid] = (persona_hash, winner)
+            if winner is db_profile:
+                if self._write_soul_file(db_profile):
+                    logger.warning(
+                        f"[OnlyYou] Restored soul '{sid}' JSON file from the newer "
+                        f"SQLite index (revision {_coerce_revision(db_profile.revision)})"
+                    )
+                return db_profile
+            if reason in ("file-newer", "file-edited"):
+                await self._sync_soul_index_safe(file_profile, persona_hash=persona_hash)
+                if reason == "file-edited":
+                    logger.warning(
+                        f"[OnlyYou] Soul '{sid}' JSON file differs from the SQLite "
+                        "index at the same revision; keeping the JSON file (manual "
+                        "edit) and rebuilding the index."
+                    )
+            return file_profile
+
+        if file_profile is not None:
+            self._cache[sid] = (self._cache.get(sid, ("file",))[0], file_profile)
+            # A JSON file without an index row still needs a row for cascade updates
+            # and the "newest Soul" fallback routing.
+            await self._sync_soul_index_safe(file_profile)
+            return file_profile
+
+        if db_profile is not None:
+            if _coerce_revision(db_profile.revision) == 0:
+                db_profile.revision = 1
+            self._cache[sid] = (persona_hash, db_profile)
+            # Legacy SQLite-only row -> migrate to an independent JSON file.
+            if self._write_soul_file(db_profile):
+                logger.info(
+                    f"[OnlyYou] Migrated legacy SQLite soul '{sid}' to "
+                    f"{self.soul_file_path(sid)}"
+                )
+            return db_profile
         return None
 
     async def save_soul(self, profile: SoulProfile, persona_hash: Optional[str] = None) -> SoulProfile:
-        """Persist a SoulProfile to its own JSON file **and** the SQLite index."""
+        """Persist a SoulProfile to its own JSON file **and** the SQLite index.
+
+        v2.8 hardening: ``revision`` increases monotonically on every save and
+        ``updated_at`` never moves backwards, so a wall-clock rollback can never
+        make an older copy win.  The JSON write is atomic and retried; when it
+        finally fails the SQLite index still receives the new revision (no data
+        loss), ``last_file_write_error`` is set for surfacing, and the next read
+        (index revision > file revision) rewrites the JSON file automatically.
+        """
         if profile is None:
             raise ValueError("SoulProfile 不能为空")
         profile.card = normalize_card(profile.card)
@@ -877,13 +1103,76 @@ class SoulManager:
         profile.settings = _normalize_soul_settings(profile.settings)
         if not (_clean_text(profile.soul_id)):
             profile.soul_id = DEFAULT_SOUL_ID
-        old_cached = self._cache.get(profile.soul_id, ("", None))[0]
+        sid = profile.soul_id
+        incoming_revision = _coerce_revision(profile.revision)
+
+        # ---- monotonic revision / updated_at (clock-rollback safe) ----
+        file_path = self.soul_file_path(sid)
+        file_profile = (
+            self._read_soul_file(file_path) if os.path.exists(file_path) else None
+        )
+        row = await self._fetch_soul_index_row(sid)
+        db_profile = (
+            self._profile_from_index_row(sid, row)
+            if row and row.get("profile_json")
+            else None
+        )
+        cached_profile = (self._cache.get(sid) or ("", None))[1]
+        previous_revision = max(
+            _coerce_revision(getattr(file_profile, "revision", 0)),
+            _coerce_revision(getattr(db_profile, "revision", 0)),
+            _coerce_revision(getattr(cached_profile, "revision", 0)),
+            incoming_revision,
+        )
+        previous_updated = max(
+            _coerce_timestamp(getattr(file_profile, "updated_at", 0)),
+            _coerce_timestamp(getattr(db_profile, "updated_at", 0)),
+            _coerce_timestamp(getattr(cached_profile, "updated_at", 0)),
+        )
+        now = int(time.time())
+        # A real clock rollback is a jump backwards; a 1s drift is just the
+        # same-second save clamp below (monotonic updated_at), not a rollback.
+        if (
+            previous_updated
+            and previous_updated - now > 5
+            and sid not in self._clock_rollback_warned
+        ):
+            self._clock_rollback_warned.add(sid)
+            logger.warning(
+                f"[OnlyYou] System clock moved backwards while saving soul '{sid}' "
+                f"(now={now}, last={previous_updated}); keeping updated_at monotonic."
+            )
+        if (
+            file_profile is not None
+            and incoming_revision < _coerce_revision(file_profile.revision)
+        ):
+            logger.warning(
+                f"[OnlyYou] save_soul('{sid}') received a stale copy "
+                f"(incoming revision {incoming_revision} < disk revision "
+                f"{_coerce_revision(file_profile.revision)}); the disk file may have "
+                "been edited externally. Saving with a newer revision will overwrite it."
+            )
+        profile.revision = previous_revision + 1
+        profile.updated_at = max(now, previous_updated + 1)
+
+        old_cached = (self._cache.get(sid) or ("",))[0]
         p_hash = _clean_text(persona_hash) or _clean_text(old_cached) or "webui_custom"
-        profile.updated_at = int(time.time())
-        self._cache[profile.soul_id] = (p_hash, profile)
+
+        file_written = self._write_soul_file(profile)
+        try:
+            await self._upsert_soul_index(profile, persona_hash=p_hash)
+        except Exception as exc:  # noqa: BLE001 - JSON file is authoritative
+            logger.warning(
+                f"[OnlyYou] upsert soul index failed for '{sid}' ({exc}); "
+                "the JSON file is kept and the index will be rebuilt on next read."
+            )
+        self._cache[sid] = (p_hash, profile)
         self._invalidate_platform_cache()
-        self._write_soul_file(profile)
-        await self._upsert_soul_index(profile, persona_hash=p_hash)
+        if not file_written and self.last_file_write_error:
+            logger.error(
+                f"[OnlyYou] Soul '{sid}' saved to the SQLite index only; "
+                f"JSON file degraded: {self.last_file_write_error}"
+            )
         return profile
 
     async def rename_soul(self, old_soul_id: str, new_soul_id: str) -> SoulProfile:
@@ -1066,7 +1355,13 @@ class SoulManager:
         return soul
 
     async def migrate_legacy_umo_bindings(self) -> int:
-        """One-shot migration: legacy UMO bindings -> platform (bot instance) bindings."""
+        """One-shot migration: legacy UMO bindings -> platform (bot instance) bindings.
+
+        v2.8 hardening: the ``legacy_umo_bindings_migrated`` flag is only persisted
+        when **every** binding was migrated successfully.  A failed save leaves the
+        flag unset so the next startup retries (the migration itself is idempotent:
+        already-bound platforms are skipped).
+        """
         try:
             migrated = bool(
                 await self.db.get_setting(_SETTING_LEGACY_UMO_MIGRATED, False)
@@ -1078,6 +1373,7 @@ class SoulManager:
         await self._ensure_bindings_loaded()
         bindings = await self.get_platform_bindings()
         count = 0
+        failed = 0
         for umo, soul_id in list(self._umo_bindings.items()):
             platform_id = _clean_text(umo).split(":", 1)[0].strip() if ":" in _clean_text(umo) else ""
             if not platform_id or platform_id in bindings:
@@ -1085,13 +1381,30 @@ class SoulManager:
             soul = await self.get_soul_by_id(soul_id)
             if soul is None or platform_id in soul.bound_platforms:
                 continue
+            original_platforms = list(soul.bound_platforms)
             try:
-                soul.bound_platforms = list(soul.bound_platforms) + [platform_id]
+                soul.bound_platforms = original_platforms + [platform_id]
                 await self.save_soul(soul)
                 bindings[platform_id] = soul.soul_id
                 count += 1
             except Exception as exc:  # noqa: BLE001
+                # Revert the in-memory mutation and drop the cached copy so the
+                # next startup retries from the on-disk state (no phantom binding).
+                soul.bound_platforms = original_platforms
+                self._cache.pop(soul.soul_id, None)
+                failed += 1
                 logger.warning(f"[OnlyYou] migrate legacy umo binding failed: {exc}")
+        if failed:
+            logger.warning(
+                "[OnlyYou] legacy UMO binding migration incomplete "
+                f"({failed} failure(s)); keeping the migration flag unset so the "
+                "next startup retries."
+            )
+            if count:
+                logger.info(
+                    f"[OnlyYou] Migrated {count} legacy UMO bindings to platform bindings."
+                )
+            return count
         try:
             await self.db.set_setting(_SETTING_LEGACY_UMO_MIGRATED, True)
         except Exception as exc:  # noqa: BLE001

@@ -10,6 +10,6 @@ help: |
   /onlyyou surf - 手动触发一次 B站/抖音赛博冲浪看片与分享测试
   /onlyyou unread [list|flush|clear] - 查看/立即补回/清空因休息或繁忙错过的未读消息
   /onlyyou help - 显示完整指令列表
-version: 0.1.0
+version: 2.8.0
 author: hidge123
 repo: https://github.com/hidge123/astrbot_plugin_only_you

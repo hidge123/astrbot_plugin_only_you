@@ -151,6 +151,11 @@ from .core.model_hub import ModelHub
 from .core.platform_bridge import PlatformBridge
 from .core.provider_factory import ProviderFactory
 from .core.roguelite_deck import RogueliteDeckEngine, SlotInstance
+from .core.runtime_state import (
+    MAX_KNOWN_L3_UMOS,
+    MAX_MUSED_MEMORY_IDS_PER_SOUL,
+    RuntimeStateStore,
+)
 from .core.schedule_mutator import BoundedScheduleMutator
 from .core.soul_manager import SoulManager
 from .core.state_machine import ActionType, BotState, StateController, UserTier
@@ -332,7 +337,7 @@ def _umo_in_platform_scope(
     "astrbot_plugin_only_you",
     "hidge123",
     "OnlyYou (只有你) —— 具备生命节律、三级记忆与赛博冲浪能力的高自治 AI 伴侣与数字网友插件",
-    "0.1.0",
+    "2.8.0",
     "https://github.com/hidge123/astrbot_plugin_only_you",
 )
 class OnlyYouPlugin(Star):
@@ -371,6 +376,10 @@ class OnlyYouPlugin(Star):
 
         # Initialize core components
         self.db = DatabaseManager(self.db_path)
+        # v2.8: restart-safe snapshot of the proactive-message runtime bookkeeping
+        # (shared video ids / cooldowns / MEMORY_MUSE rotation / ★L3 targets).
+        # ``RuntimeStateStore`` no-ops safely when the DB is unavailable.
+        self.runtime_state_store = RuntimeStateStore(self.db)
         self.provider_factory = ProviderFactory(self.context)
         self.model_hub = ModelHub(
             context=self.context,
@@ -468,6 +477,9 @@ class OnlyYouPlugin(Star):
     async def initialize(self) -> None:
         """AstrBot Star lifecycle initialization hook."""
         await self._ensure_initialized()
+        # v2.8: restore the proactive-message dedupe / cooldown / ★L3 bookkeeping
+        # right after the DB is available (defensive: defaults on any failure).
+        await self._load_runtime_state()
         # v2.8: migrate legacy per-UMO bindings into bot-instance (platform) bindings
         # and catch up a missed daily Forgetting GC after a restart.
         try:
@@ -493,8 +505,256 @@ class OnlyYouPlugin(Star):
             await self.model_hub.dispose()
         except Exception as e:
             logger.warning(f"[OnlyYou] model_hub dispose failed: {e}")
+        # v2.8: flush the runtime-state snapshot **before** closing the DB. The
+        # persister swallows its own errors, so shutdown is never blocked.
+        persister = getattr(self, "_persist_runtime_state", None)
+        if callable(persister):
+            try:
+                await persister()
+            except Exception as exc:  # noqa: BLE001 - never break shutdown
+                logger.debug(f"[OnlyYou] persist runtime state failed: {exc}")
         await self.db.close()
         logger.info("[OnlyYou] Plugin terminated cleanly.")
+
+    # ==========================================================================
+    # v2.8 runtime-state persistence: restart-safe proactive-message bookkeeping
+    # ==========================================================================
+    async def _load_runtime_state(self) -> None:
+        """Restore dedupe / cooldown / ★L3 runtime maps from ``plugin_settings``.
+
+        Only the proactive-message bookkeeping is restored — the **unread backlog
+        itself is intentionally in-memory** (a restart clears it, product contract).
+        Attribute names and container types stay exactly as in ``__init__``:
+        ``dict[str, set[str]]`` / ``dict[str, list[int]]`` / ``dict[str, float]`` /
+        ``dict[str, str]``.
+        """
+        store = getattr(self, "runtime_state_store", None)
+        if store is None:
+            return
+        try:
+            snapshot = await store.load()
+        except Exception as exc:  # noqa: BLE001 - store.load already swallows
+            logger.warning(f"[OnlyYou] load runtime state failed: {exc}")
+            return
+        if not isinstance(snapshot, dict):
+            return
+
+        def _dict_of_sets(attr: str, key: str) -> None:
+            mapping = getattr(self, attr, None)
+            if not isinstance(mapping, dict):
+                mapping = {}
+                try:
+                    setattr(self, attr, mapping)
+                except Exception:  # pragma: no cover - defensive
+                    return
+            raw = snapshot.get(key)
+            if not isinstance(raw, dict):
+                return
+            for map_key, values in raw.items():
+                if not isinstance(map_key, str) or not map_key:
+                    continue
+                if not isinstance(values, (list, tuple, set)):
+                    continue
+                cleaned = {
+                    str(item) for item in values if isinstance(item, str) and item
+                }
+                if not cleaned:
+                    continue
+                current = mapping.get(map_key)
+                if not isinstance(current, set):
+                    current = set(current) if isinstance(current, (list, tuple)) else set()
+                    mapping[map_key] = current
+                current.update(cleaned)
+
+        def _dict_of_float(attr: str, key: str) -> None:
+            mapping = getattr(self, attr, None)
+            if not isinstance(mapping, dict):
+                mapping = {}
+                try:
+                    setattr(self, attr, mapping)
+                except Exception:  # pragma: no cover - defensive
+                    return
+            raw = snapshot.get(key)
+            if not isinstance(raw, dict):
+                return
+            for map_key, value in raw.items():
+                if not isinstance(map_key, str) or not map_key:
+                    continue
+                try:
+                    timestamp = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if timestamp > 0:
+                    mapping[map_key] = timestamp
+
+        def _dict_of_memory_ids() -> None:
+            mapping = getattr(self, "_mused_memory_ids", None)
+            if not isinstance(mapping, dict):
+                mapping = {}
+                try:
+                    self._mused_memory_ids = mapping
+                except Exception:  # pragma: no cover - defensive
+                    return
+            raw = snapshot.get("mused_memory_ids")
+            if not isinstance(raw, dict):
+                return
+            for map_key, values in raw.items():
+                if not isinstance(map_key, str) or not map_key:
+                    continue
+                if not isinstance(values, (list, tuple)):
+                    continue
+                cleaned: list[int] = []
+                for value in values:
+                    if isinstance(value, bool):
+                        continue
+                    if isinstance(value, int):
+                        memory_id = value
+                    elif isinstance(value, float) and value.is_integer():
+                        memory_id = int(value)
+                    else:
+                        continue
+                    if memory_id > 0:
+                        cleaned.append(memory_id)
+                if cleaned:
+                    current = mapping.get(map_key)
+                    ring = list(current) if isinstance(current, list) else []
+                    mapping[map_key] = (
+                        ring + cleaned
+                    )[-MAX_MUSED_MEMORY_IDS_PER_SOUL:]
+
+        def _known_l3() -> None:
+            mapping = getattr(self, "_known_l3_umos", None)
+            if not isinstance(mapping, dict):
+                mapping = {}
+                try:
+                    self._known_l3_umos = mapping
+                except Exception:  # pragma: no cover - defensive
+                    return
+            raw = snapshot.get("known_l3_umos")
+            if not isinstance(raw, dict):
+                return
+            for uid, umo in raw.items():
+                if not isinstance(uid, str) or not uid:
+                    continue
+                if not isinstance(umo, str) or not umo:
+                    continue
+                # MRU: a restored target is the most recently seen insertion.
+                mapping.pop(uid, None)
+                mapping[uid] = umo
+            overflow = len(mapping) - MAX_KNOWN_L3_UMOS
+            if overflow > 0:
+                for stale_uid in list(mapping.keys())[:overflow]:
+                    mapping.pop(stale_uid, None)
+
+        try:
+            _dict_of_sets("_shared_video_ids", "shared_video_ids")
+            _dict_of_sets("_mused_busy_keys", "mused_busy_keys")
+            _dict_of_memory_ids()
+            for attr, key in (
+                ("_last_surf_share_ts", "last_surf_share_ts"),
+                ("_last_idle_roam_ts", "last_idle_roam_ts"),
+                ("_last_group_lurk_ts", "last_group_lurk_ts"),
+                ("_last_private_catchup_ts", "last_private_catchup_ts"),
+            ):
+                _dict_of_float(attr, key)
+            _known_l3()
+        except Exception as exc:  # noqa: BLE001 - a dirty snapshot must not block boot
+            logger.warning(f"[OnlyYou] restore runtime state failed: {exc}")
+
+    async def _persist_runtime_state(self) -> None:
+        """Snapshot the in-memory runtime bookkeeping into ``plugin_settings``.
+
+        Best-effort by contract: the store normalizes + swallows errors, and this
+        method also guards the snapshot assembly so call sites never need a try.
+        """
+
+        def _string_list_map(attr: str) -> dict[str, list[str]]:
+            raw = getattr(self, attr, None)
+            result: dict[str, list[str]] = {}
+            if not isinstance(raw, dict):
+                return result
+            for map_key, values in raw.items():
+                if not isinstance(map_key, str) or not map_key:
+                    continue
+                if not isinstance(values, (set, list, tuple)):
+                    continue
+                cleaned = [
+                    str(item) for item in values if isinstance(item, str) and item
+                ]
+                if cleaned:
+                    result[map_key] = cleaned
+            return result
+
+        def _memory_id_map() -> dict[str, list[int]]:
+            raw = getattr(self, "_mused_memory_ids", None)
+            result: dict[str, list[int]] = {}
+            if not isinstance(raw, dict):
+                return result
+            for map_key, values in raw.items():
+                if not isinstance(map_key, str) or not map_key:
+                    continue
+                if not isinstance(values, (list, tuple)):
+                    continue
+                cleaned: list[int] = []
+                for value in values:
+                    if isinstance(value, bool):
+                        continue
+                    try:
+                        memory_id = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if memory_id > 0:
+                        cleaned.append(memory_id)
+                if cleaned:
+                    result[map_key] = cleaned
+            return result
+
+        def _float_map(attr: str) -> dict[str, float]:
+            raw = getattr(self, attr, None)
+            result: dict[str, float] = {}
+            if not isinstance(raw, dict):
+                return result
+            for map_key, value in raw.items():
+                if not isinstance(map_key, str) or not map_key:
+                    continue
+                try:
+                    timestamp = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if timestamp > 0:
+                    result[map_key] = timestamp
+            return result
+
+        def _string_map(attr: str) -> dict[str, str]:
+            raw = getattr(self, attr, None)
+            result: dict[str, str] = {}
+            if not isinstance(raw, dict):
+                return result
+            for map_key, value in raw.items():
+                if not isinstance(map_key, str) or not map_key:
+                    continue
+                if isinstance(value, str) and value:
+                    result[map_key] = value
+            return result
+
+        store = getattr(self, "runtime_state_store", None)
+        if store is None:
+            return
+        try:
+            snapshot = {
+                "version": 1,
+                "shared_video_ids": _string_list_map("_shared_video_ids"),
+                "mused_busy_keys": _string_list_map("_mused_busy_keys"),
+                "mused_memory_ids": _memory_id_map(),
+                "last_surf_share_ts": _float_map("_last_surf_share_ts"),
+                "last_idle_roam_ts": _float_map("_last_idle_roam_ts"),
+                "last_group_lurk_ts": _float_map("_last_group_lurk_ts"),
+                "last_private_catchup_ts": _float_map("_last_private_catchup_ts"),
+                "known_l3_umos": _string_map("_known_l3_umos"),
+            }
+            await store.save(snapshot)
+        except Exception as exc:  # noqa: BLE001 - persistence is best-effort only
+            logger.debug(f"[OnlyYou] persist runtime state failed: {exc}")
 
     # ==========================================================================
     # 0. BUSY_TASK 每日随机完成结果结算 + IDLE_ROAM 空闲游荡主动行为 (Phase 3)
@@ -569,6 +829,14 @@ class OnlyYouPlugin(Star):
 
         if stats["windows"] or stats["unread"] or stats["groups"]:
             logger.info(f"[OnlyYou] Cleared platform memory of {clean}: {stats}")
+        # v2.8: keep the persisted snapshot in sync so the cleared ★L3 targets /
+        # cooldowns cannot resurrect after a restart (unbind semantics).
+        persister = getattr(self, "_persist_runtime_state", None)
+        if callable(persister):
+            try:
+                await persister()
+            except Exception as exc:  # noqa: BLE001 - never break the unbind flow
+                logger.debug(f"[OnlyYou] persist runtime state failed: {exc}")
         return stats
 
     async def _maybe_run_scheduled_gc(self) -> dict[str, int]:
@@ -1076,6 +1344,16 @@ class OnlyYouPlugin(Star):
                                 "[OnlyYou] IDLE_ROAM(GROUP_LURK) proactive message sent "
                                 f"to {target_umo} (consumed {len(batch)} unread)"
                             )
+                            persister = getattr(
+                                self, "_persist_runtime_state", None
+                            )
+                            if callable(persister):
+                                try:
+                                    await persister()
+                                except Exception as exc:  # noqa: BLE001 - best-effort
+                                    logger.debug(
+                                        f"[OnlyYou] persist runtime state failed: {exc}"
+                                    )
                             return True
                     # Decision said REPLY but generation/send failed: keep the
                     # backlog for a later retry, but cool this group down.
@@ -1084,6 +1362,14 @@ class OnlyYouPlugin(Star):
                         "[OnlyYou] IDLE_ROAM(GROUP_LURK) decision=REPLY but send "
                         "failed; unread kept for retry"
                     )
+                    persister = getattr(self, "_persist_runtime_state", None)
+                    if callable(persister):
+                        try:
+                            await persister()
+                        except Exception as exc:  # noqa: BLE001 - best-effort
+                            logger.debug(
+                                f"[OnlyYou] persist runtime state failed: {exc}"
+                            )
                 else:
                     # Decision model judged IGNORE -> these messages are consumed
                     # silently (read but not worth replying), never re-evaluated.
@@ -1093,6 +1379,14 @@ class OnlyYouPlugin(Star):
                         "[OnlyYou] IDLE_ROAM(GROUP_LURK) decided IGNORE, consumed "
                         f"{len(batch)} unread from {umo}"
                     )
+                    persister = getattr(self, "_persist_runtime_state", None)
+                    if callable(persister):
+                        try:
+                            await persister()
+                        except Exception as exc:  # noqa: BLE001 - best-effort
+                            logger.debug(
+                                f"[OnlyYou] persist runtime state failed: {exc}"
+                            )
 
             # ---- 分支 B：发呆记忆联想 (MEMORY_MUSE) ----
             # v2.8: each settled BUSY_TASK result is mused at most once per Soul.
@@ -1210,6 +1504,14 @@ class OnlyYouPlugin(Star):
                         "[OnlyYou] IDLE_ROAM(MEMORY_MUSE) proactive message sent "
                         f"to {target_umo} (source={'BUSY_RESULT' if use_busy else 'MEMORY'})"
                     )
+                    persister = getattr(self, "_persist_runtime_state", None)
+                    if callable(persister):
+                        try:
+                            await persister()
+                        except Exception as exc:  # noqa: BLE001 - best-effort
+                            logger.debug(
+                                f"[OnlyYou] persist runtime state failed: {exc}"
+                            )
                     return True
             logger.info(
                 "[OnlyYou] IDLE_ROAM(MEMORY_MUSE) skipped: no target or empty message"
@@ -1280,6 +1582,12 @@ class OnlyYouPlugin(Star):
                 continue
             # cool down even if the send fails, so we never tight-loop a broken chat
             self._last_private_catchup_ts[umo] = now
+            persister = getattr(self, "_persist_runtime_state", None)
+            if callable(persister):
+                try:
+                    await persister()
+                except Exception as exc:  # noqa: BLE001 - best-effort
+                    logger.debug(f"[OnlyYou] persist runtime state failed: {exc}")
             last = batch[-1]
             sender_name = str(getattr(last, "sender_name", "") or "")
             try:
@@ -1594,6 +1902,14 @@ class OnlyYouPlugin(Star):
                     f"[OnlyYou] SURF share sent to {target_umo} "
                     f"(video={video_id}, score={score})"
                 )
+                # v2.8: persist only after a successful send so a failed share keeps
+                # its retry chance, while a restart can never re-share this video.
+                persister = getattr(self, "_persist_runtime_state", None)
+                if callable(persister):
+                    try:
+                        await persister()
+                    except Exception as exc:  # noqa: BLE001 - best-effort
+                        logger.debug(f"[OnlyYou] persist runtime state failed: {exc}")
             return bool(sent)
         except Exception as exc:  # noqa: BLE001 - never break the heartbeat
             logger.warning(f"[OnlyYou] _maybe_share_surfed_video failed: {exc}")
@@ -1756,6 +2072,14 @@ class OnlyYouPlugin(Star):
             # Refresh insertion order so `_latest_l3_umo()` really returns the MRU chat.
             self._known_l3_umos.pop(user.global_uid, None)
             self._known_l3_umos[user.global_uid] = umo
+            # v2.8: the ★L3 private target must survive a restart (one KV upsert per
+            # L3 private message is cheap and keeps PROACTIVE_CHAT/SHARE targets warm).
+            persister = getattr(self, "_persist_runtime_state", None)
+            if callable(persister):
+                try:
+                    await persister()
+                except Exception as exc:  # noqa: BLE001 - never block message handling
+                    logger.debug(f"[OnlyYou] persist runtime state failed: {exc}")
 
         # 1. Record into sliding window & extract reply topology
         _, is_direct_mention, buffered_message = self.atmosphere_reader.record_message(

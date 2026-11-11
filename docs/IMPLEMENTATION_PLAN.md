@@ -1,5 +1,8 @@
 # OnlyYou 24h 动态弹性时间轴 × 四类可执行行动卡 实现计划 (Implementation Plan)
 
+> **历史文档（v2.5 实现计划，归档）**：本文记录 v2.5 时间轴重构的当时计划与验收口径，文中「27 条 Web API」「固定 6 时段迁移」等均为历史表述；当前 v2.8 架构、31 条路由与升级步骤请以 [ARCHITECTURE.md](ARCHITECTURE.md)、[WEBUI_DESIGN.md](WEBUI_DESIGN.md)、[UPGRADE.md](UPGRADE.md) 为准。
+
+
 本计划指导将 **OnlyYou (`astrbot_plugin_only_you`)** 的日程引擎从「固定 6 时段 + 静态标题卡片 + 奇遇卡」重构为 **「角色专属四类行动卡池 (`SLEEP` / `SURF` / `IDLE_ROAM` / `BUSY_TASK`) × 基于作息曲线的 24h 动态积木时间轴 × 每日随机繁忙结果短时记忆」**。
 
 ---

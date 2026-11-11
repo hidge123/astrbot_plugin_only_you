@@ -199,7 +199,7 @@
       return (
         '<button class="btn btn-outline btn-sm" type="button" data-action="unbind-platform" data-platform-id="' +
         pid +
-        '" data-tip="解绑后清理该平台的内存会话滑窗与未读队列">' +
+        '" data-tip="解绑只清空该平台的内存滑窗 + 未读队列；保留 SQLite memories / users / surfing_history / 群档案（重启后未读队列会重置）">' +
         icon("link", 13) +
         "解绑（清理该平台内存滑窗）</button>"
       );
@@ -391,7 +391,7 @@
       '</td><td class="cell-actions">' +
       '<button class="btn btn-ghost btn-sm" type="button" data-action="clear-session" data-umo="' +
       esc(umo) +
-      '">清空</button></td></tr>'
+      '" data-tip="清空该会话的内存滑窗 + 未读队列；保留 SQLite memories / users / surfing_history / 群档案（重启后未读队列会重置）">清空</button></td></tr>'
     );
   }
 
@@ -437,7 +437,7 @@
           "</span></div>" +
           '<button class="btn btn-ghost btn-sm" type="button" data-action="clear-platform" data-platform-id="' +
           esc(platformId === "未标注平台" ? "" : platformId) +
-          '" data-tip="清空该平台下所有会话的内存滑窗与未读队列">' +
+          '" data-tip="清空该平台下所有会话的内存滑窗 + 未读队列；保留 SQLite memories / users / surfing_history / 群档案（重启后未读队列会重置）">' +
           icon("trash", 13) +
           "清空全部</button></div>" +
           '<div class="table-wrap mt-4"><table class="table"><thead><tr>' +
@@ -460,7 +460,7 @@
       '活跃会话内存<span class="badge-count">' +
       esc(list.length) +
       '</span><span class="card-sub">当前角色管辖的会话滑窗</span></div>' +
-      '<div class="card-actions"><span class="text-xs muted" data-tip="清空只影响内存会话滑窗与未读队列，持久化记忆 / 用户档案不受影响">仅清内存，不删记忆</span></div></div>' +
+      '<div class="card-actions"><span class="text-xs muted" data-tip="清空：该平台/会话的内存滑窗 + 未读队列；保留：SQLite memories / users / surfing_history / 群档案（重启后未读队列会重置）">仅清内存，不删记忆</span></div></div>' +
       '<div class="card-body tight">' +
       sessionGroupsHtml() +
       "</div></section>"
@@ -604,7 +604,9 @@
         message:
           "确定解绑「" +
           pid +
-          "」吗？解绑后会清理该平台的内存会话滑窗与未读队列（持久化记忆 / 用户档案不受影响），该平台的会话将改由默认角色兜底接管。",
+          "」吗？解绑后该平台的会话将改由默认角色兜底接管。" +
+          "清空：该平台所有 UMO 的内存滑窗 + 未读队列，以及该平台的 ★L3 私聊目标 / 主动消息冷却缓存。" +
+          "保留：SQLite memories / users / surfing_history / 群档案；重启后未读队列本身会重置。",
         danger: true,
         confirmLabel: "解绑并清理",
         onConfirm: async function () {
@@ -648,7 +650,8 @@
         message:
           "确定清空会话「" +
           umo +
-          "」的内存滑窗与未读队列吗？仅清理运行时内存，持久化记忆与用户档案不受影响。",
+          "」吗？清空：该会话的内存滑窗 + 未读队列。" +
+          "保留：SQLite memories / users / surfing_history / 群档案；重启后未读队列本身会重置。",
         danger: true,
         confirmLabel: "清空",
         onConfirm: async function () {
@@ -679,7 +682,8 @@
         message:
           "确定清空「" +
           pid +
-          "」平台下所有会话的内存滑窗与未读队列吗？仅清理运行时内存，持久化记忆与用户档案不受影响。",
+          "」平台下所有会话吗？清空：该平台的内存滑窗 + 未读队列，以及该平台的 ★L3 私聊目标 / 主动消息冷却缓存。" +
+          "保留：SQLite memories / users / surfing_history / 群档案；重启后未读队列本身会重置。",
         danger: true,
         confirmLabel: "清空全部",
         onConfirm: async function () {

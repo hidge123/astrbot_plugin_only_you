@@ -1743,14 +1743,31 @@ class OnlyYouWebAPI:
             to_dict = getattr(profile, "to_dict", None)
             profile_dict = to_dict() if callable(to_dict) else {}
             profile_name = str(getattr(profile, "name", "") or soul_id)
+            # v2.8 hardening: surface a degraded JSON write instead of silently
+            # reporting success when only the SQLite index could be updated.
+            write_error = str(
+                getattr(manager, "last_file_write_error", "") or ""
+            ).strip()
+            storage = {
+                "file_written": not bool(write_error),
+                "degraded": bool(write_error),
+                "error": write_error,
+            }
+            message = f"已保存角色 {profile_name} ({soul_id})"
+            if write_error:
+                message += (
+                    "（⚠️ Soul JSON 写入失败，已降级写入 SQLite 索引，"
+                    f"读取/重启时会自动重试落盘：{write_error}）"
+                )
             return ok_response(
                 {
                     "soul": profile_dict,
                     "souls": [s.to_dict() for s in souls],
                     "umo_bindings": bindings,
                     "known_umos": self._collect_known_umos(bindings),
+                    "storage": storage,
                 },
-                message=f"已保存角色 {profile_name} ({soul_id})",
+                message=message,
             )
         except Exception as e:
             logger.warning(f"[OnlyYou] api_souls_save error: {e}")
@@ -3027,7 +3044,8 @@ class OnlyYouWebAPI:
                 payload,
                 message=(
                     f"已解绑机器人接口 {platform_id}"
-                    f"（清理 {cleared['messages']} 条内存消息）"
+                    f"（清理 {cleared['messages']} 条内存消息；仅清理内存滑窗/未读，"
+                    "数据库 memories / users / surfing_history 与群档案保留）"
                 ),
             )
         except Exception as e:
@@ -3054,7 +3072,8 @@ class OnlyYouWebAPI:
                 {"cleared": cleared, "sessions": await self._session_entries(soul)},
                 message=(
                     f"已清空{target}的内存滑窗与未读"
-                    f"（{cleared['messages']} 条消息）"
+                    f"（{cleared['messages']} 条消息；仅清理内存态，"
+                    "数据库 memories / users / surfing_history 与群档案保留）"
                 ),
             )
         except Exception as e:
