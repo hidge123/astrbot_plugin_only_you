@@ -456,10 +456,12 @@ class TestModelHubPerSoul(SoulStoreTestBase):
 
 class TestPlatformBridgeDiscovery(unittest.TestCase):
     class _Meta:
-        def __init__(self, pid, type_name="aiocqhttp", name=""):
+        """Mirror AstrBot ``PlatformMetadata``: name=adapter type, id=instance id."""
+
+        def __init__(self, pid, adapter_type="aiocqhttp", display_name=""):
             self.id = pid
-            self.type = type_name
-            self.name = name or pid
+            self.name = adapter_type
+            self.adapter_display_name = display_name or None
 
     class _Inst:
         def __init__(self, meta):
@@ -498,9 +500,14 @@ class TestPlatformBridgeDiscovery(unittest.TestCase):
         by_id = {item["platform_id"]: item for item in items}
         assert set(by_id) == {"aiocqhttp", "tg_bot", "disabled_bot", "lark"}
         assert by_id["aiocqhttp"]["running"] is True
+        assert by_id["aiocqhttp"]["platform_type"] == "aiocqhttp"
+        assert by_id["aiocqhttp"]["name"] == "aiocqhttp"  # fallback: platform id
         assert by_id["disabled_bot"]["enabled"] is False
         assert by_id["lark"]["source"] == "observed"
+        # AstrBot PlatformMetadata.name is the adapter type, adapter_display_name
+        # is the UI label (id "tg_bot" -> type telegram, display "TG 机器人").
         assert by_id["tg_bot"]["platform_type"] == "telegram"
+        assert by_id["tg_bot"]["name"] == "TG 机器人"
 
     def test_list_never_raises_with_broken_context(self):
         class Broken:

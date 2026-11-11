@@ -97,15 +97,20 @@ class PlatformBridge:
                 ).strip()
                 if not platform_id:
                     continue
-                name = self._meta_attr(meta, "name") or platform_id
-                type_name = self._meta_attr(meta, "type") or str(
-                    getattr(inst, "platform", "") or ""
-                ).strip()
+                # AstrBot's ``PlatformMetadata``: ``name`` is the platform/adapter
+                # type (aiocqhttp / telegram / webchat), ``id`` is the configured bot
+                # instance id and ``adapter_display_name`` the UI display name.
+                type_name = (
+                    self._meta_attr(meta, "name")
+                    or self._meta_attr(meta, "type")
+                    or str(getattr(inst, "platform", "") or "").strip()
+                )
+                display_name = self._meta_attr(meta, "adapter_display_name")
                 items.append(
                     {
                         "platform_id": platform_id,
                         "platform_type": type_name or platform_id,
-                        "name": name,
+                        "name": display_name,
                         "enabled": True,
                         "running": True,
                         "source": "runtime",
@@ -137,7 +142,7 @@ class PlatformBridge:
                     {
                         "platform_id": platform_id,
                         "platform_type": str(entry.get("type") or platform_id).strip(),
-                        "name": str(entry.get("name") or platform_id).strip(),
+                        "name": str(entry.get("name") or "").strip(),
                         "enabled": True if enable is None else bool(enable),
                         "running": False,
                         "source": "config",
@@ -206,6 +211,11 @@ class PlatformBridge:
         _merge(self._config_instances())
         _merge(self._observed_instances(observed_umos))
         result = list(merged.values())
+        for item in result:
+            if not str(item.get("name") or "").strip():
+                item["name"] = str(item.get("platform_id") or "").strip()
+            if not str(item.get("platform_type") or "").strip():
+                item["platform_type"] = item["name"]
         result.sort(key=lambda item: (not bool(item.get("running")), str(item.get("platform_id"))))
         return result
 
