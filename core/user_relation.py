@@ -36,7 +36,7 @@ _GROUP_NAME_MAX_CHARS = 120
 _GROUP_NOTES_MAX_CHARS = 500
 
 #: One-shot migration flag for legacy bare ``global_uid`` platform ids (v2.8.4).
-LEGACY_USER_IDENTITY_MIGRATED_KEY = "legacy_user_identity_migrated_v1"
+LEGACY_USER_IDENTITY_MIGRATED_KEY = "legacy_user_identity_migrated_v2"
 
 
 def split_platform_account(value: Any) -> Optional[tuple[str, str]]:
@@ -362,7 +362,10 @@ class UserRelationManager:
         raw_tier = int(row.get("tier", 1))
         tier = UserTier(raw_tier) if raw_tier in (1, 2, 3) else UserTier.L1_NORMAL
         global_uid = str(row.get("global_uid") or "").strip()
-        pids = _normalize_platform_ids(self._pids_from_row(row))
+        # Keep the raw (deduped) list here: legacy bare ids must stay visible in the
+        # console and detectable by the migration. ``save_user`` performs the final
+        # canonicalization (drops bare ids shadowed by a qualified account).
+        pids = _dedupe_keep_order(self._pids_from_row(row))
         if not pids:
             pids = [global_uid]
         return UserProfile(

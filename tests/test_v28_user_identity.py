@@ -298,6 +298,21 @@ class TestLegacyIdentityMigration(UserIdentityTestBase):
             mods.user_relation.LEGACY_USER_IDENTITY_MIGRATED_KEY, False
         ) is True
 
+    async def test_migration_cleans_shadowed_bare_entry(self):
+        await self.seed_user(
+            "2975066889", ["2975066889", "qq bot:2975066889"]
+        )
+        await self.db.execute(
+            "INSERT INTO umo_soul_bindings (umo, soul_id, updated_at) VALUES (?,?,?)",
+            ("qq bot:FriendMessage:2975066889", "soul_a", 1),
+        )
+        stats = await self.relation.migrate_legacy_user_identities()
+        assert stats["accounts_converted"] == 1
+        row = await self.fetch_user_row("2975066889")
+        assert json.loads(row["platform_ids_json"]) == [
+            "qq bot:2975066889"
+        ]
+
     async def test_migration_reads_runtime_state_known_l3_umos(self):
         await self.seed_user("555", ["555"])
         await self.db.set_setting(
@@ -408,7 +423,7 @@ class TestUserIdentityWebApi(DatabaseAsyncTestCase):
             }
         ]
 
-    async def test_users_list_drops_bare_id_shadowed_by_qualified_account(self):
+    async def test_users_list_shows_legacy_shadow_for_manual_cleanup(self):
         await self.seed_user(
             "2975066889", ["2975066889", "qq bot:2975066889"]
         )
@@ -418,9 +433,27 @@ class TestUserIdentityWebApi(DatabaseAsyncTestCase):
             for item in response["data"]["users"]
             if item["global_uid"] == "2975066889"
         )
-        # The bare duplicate is shadowed by the qualified account and hidden.
-        assert user["platform_ids"] == ["qq bot:2975066889"]
-        assert user["has_legacy_platform_ids"] is False
+        # The legacy entry is visible until the user saves the profile; then
+        # ``save_user`` drops the shadow duplicate automatically (next test).
+        assert user["platform_ids"] == [
+            "2975066889",
+            "qq bot:2975066889",
+        ]
+        assert user["has_legacy_platform_ids"] is True
+
+    async def test_saving_profile_drops_shadowed_bare_id(self):
+        await self.seed_user(
+            "2975066889", ["2975066889", "qq bot:2975066889"]
+        )
+        response = await self.call(
+            "POST",
+            self.api.api_users_update,
+            body={"global_uid": "2975066889", "nickname": "阿一"},
+        )
+        assert response["status"] == "ok"
+        assert response["data"]["user"]["platform_ids"] == [
+            "qq bot:2975066889"
+        ]
 
     async def test_users_update_removes_legacy_id(self):
         await self.seed_user(
