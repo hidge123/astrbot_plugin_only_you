@@ -417,3 +417,25 @@ v2.8.3 起，普通配置中的 `surfing_config.enable_bili_surfing` / `enable_d
 3. **作用范围**：只影响 SURF 心跳的自动抓取；手动冲浪仍可在工具栏「平台筛选」显式指定 B站 / 抖音，该显式选择会覆盖角色偏好；
 4. **至少一个源**：Pages 会拒绝保存空列表（避免后台冲浪彻底失效）；
 5. 无数据库迁移，热重载或重启即可生效。
+
+---
+
+## 16. v2.8.4 用户平台身份规范化（`platform_id:native_uid`）
+
+v2.8 起一个角色可绑定多个机器人接口，私聊会话可跨平台合并到同一个用户档案。但早期用户档案只存了裸 `global_uid`（如 QQ 号 `2975066889`），与 v2.8 约定的 `platform_id:native_uid`（如 `qq bot:2975066889`）格式不一致，会出现：
+
+- 关系页的平台标签把裸 ID 当成「平台」显示；
+- 详情弹窗里旧格式 ID 删除后又被后端强制加回（`update_user_details` 曾强制把 `global_uid` 插回 `platform_ids`）；
+- 跨平台同名数字 ID 可能落到同一档案 / 互相覆盖缓存，合并与删除语义混乱。
+
+**v2.8.4 修复（无表结构变更，热重载/重启即生效）**：
+
+1. **新用户**：平台账号直接以 `platform_id:native_uid` 写入 `users.platform_ids`（`global_uid` 也使用该规范值）；
+2. **旧用户自动修复**：
+   - 收到消息时按 UMO 第一段（平台）+ 发送者 ID 自动把裸 ID 升级为 `platform_id:native_uid`，并移除已被合格账号覆盖的裸条目；
+   - 启动时一次性迁移 `legacy_user_identity_migrated_v1`：只使用**持久化的私聊 UMO 证据**（`umo_soul_bindings` 与 `runtime_state_v1.known_l3_umos`）推断平台，证据唯一才改写；有歧义/无证据的保持原样，留给 Pages 手动补全；
+3. **Pages 关系页**：旧格式条目显示「⚠️ 旧格式」标签，可在详情弹窗补全为 `platform_id:uid`（输入框支持已知接口下拉）或直接删除；保存不会再被强制加回；
+4. **API**：`users/list` 每项新增 `platform_accounts`（`{account, platform_id, uid, legacy}`）、`legacy_platform_ids`、`has_legacy_platform_ids`；`users/update` 新增 `action="normalize_identity"`（body `{global_uid, platform_id?}`，按证据或显式平台补全旧 ID）；`platform_ids` 支持字符串数组或 `{platform_id, native_uid}` 对象数组，至少保留一个账号；
+5. **兼容**：`global_uid` 仍是档案主键（历史 `memories.user_id` 不需要迁移）；裸 ID 在找不到平台证据时保留，可在关系页手动处理。
+
+建议升级后：打开 Pages「关系与群聊」页检查带「旧格式」标签的用户；有明确的平台归属时点「补全平台」保存即可。该操作只改 `users.platform_ids_json`，不动记忆与群聊档案。

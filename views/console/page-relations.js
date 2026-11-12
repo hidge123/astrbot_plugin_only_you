@@ -195,15 +195,21 @@
     return Math.max(2, Math.min(100, n));
   }
 
-  /** 平台标签：从 platform_ids 里按平台聚合（qq:123 / qq:456 → `qq ×2`）。 */
+  /** 平台标签：从 platform_ids 里按平台聚合（qq:123 / qq:456 → `qq ×2`）。
+   *  v2.8.4：不含冒号的旧版裸 ID 不是平台账号，单独渲染为「旧格式」告警标签。 */
   function platformTagsHtml(platformIds, limit) {
     var ids = safeList(platformIds);
     if (!ids.length) return "";
     var order = [];
     var counter = {};
+    var legacy = 0;
     ids.forEach(function (item) {
       var text = String(item == null ? "" : item).trim();
       if (!text) return;
+      if (text.indexOf(":") < 0) {
+        legacy += 1;
+        return;
+      }
       var platform = text.split(":")[0] || "账号";
       if (!Object.prototype.hasOwnProperty.call(counter, platform)) {
         counter[platform] = 0;
@@ -211,7 +217,7 @@
       }
       counter[platform] += 1;
     });
-    if (!order.length) return "";
+    if (!order.length && !legacy) return "";
     var max = limit || 3;
     var html = order
       .slice(0, max)
@@ -229,7 +235,39 @@
     if (order.length > max) {
       html += '<span class="tag tag-muted rel-platform-more">+' + (order.length - max) + "</span>";
     }
+    if (legacy) {
+      html +=
+        '<span class="tag rel-platform-tag is-legacy" data-tip="旧版数据：只有 global_uid、缺少 platform_id 前缀。打开详情补全平台或删除该行。">' +
+        icon("alert", 11) +
+        " 旧格式 " +
+        legacy +
+        "</span>";
+    }
     return '<span class="rel-platform-tags">' + html + "</span>";
+  }
+
+  /** 已知机器人接口（来自角色绑定 / 历史会话 UMO），用于平台账号输入联想。 */
+  function knownPlatformIds(app) {
+    var order = [];
+    var seen = {};
+    function add(pid) {
+      var text = String(pid == null ? "" : pid).trim();
+      if (!text || seen[text]) return;
+      seen[text] = 1;
+      order.push(text);
+    }
+    var state = app && app.state ? app.state : {};
+    safeList(state.souls).forEach(function (soul) {
+      safeList(soul && soul.bound_platforms).forEach(add);
+    });
+    safeList(state.knownUmos).forEach(function (item) {
+      var umo = item && item.umo ? item.umo : item;
+      if (typeof umo === "string" && umo.indexOf(":") > 0) add(umo.split(":")[0]);
+    });
+    Object.keys(state.umoBindings || {}).forEach(function (umo) {
+      if (typeof umo === "string" && umo.indexOf(":") > 0) add(umo.split(":")[0]);
+    });
+    return order;
   }
 
   /* ------------------------------------------------------------------ *
@@ -757,6 +795,7 @@
    * 弹窗公共片段
    * ------------------------------------------------------------------ */
   function userIdentityHtml(user, tier) {
+    // v2.8.4: global_uid is an internal archive id, not a platform account.
     var meta = tierMeta(tier);
     var name = nameOf(user);
     var nickname = nicknameOf(user);
@@ -820,11 +859,21 @@
   }
 
   function platformRowHtml(value) {
+    var text = String(value == null ? "" : value).trim();
+    var isLegacy = !!text && text.indexOf(":") < 0;
     return (
-      '<div class="rel-platform-row" data-role="platform-row">' +
-      '<input class="input input-sm mono" type="text" data-role="platform-input" placeholder="platform:uid，例如 qq:123456789" value="' +
-      esc(value || "") +
+      '<div class="rel-platform-row' +
+      (isLegacy ? " is-legacy" : "") +
+      '" data-role="platform-row">' +
+      '<input class="input input-sm mono" type="text" list="rel-platform-options" data-role="platform-input" ' +
+      'placeholder="platform:uid，例如 qq bot:123456789" value="' +
+      esc(text) +
       '" />' +
+      (isLegacy
+        ? '<span class="rel-platform-legacy-tag" data-tip="旧版数据只有裸 ID：请在左侧补全为 platform:uid（如 qq bot:123456789），或直接移除该行。">' +
+          icon("alert", 12) +
+          " 旧格式</span>"
+        : "") +
       '<button class="icon-btn" type="button" data-action="remove-platform" data-tip="移除该平台账号" aria-label="移除该平台账号">' +
       icon("trash", 13) +
       "</button></div>"
@@ -988,7 +1037,14 @@
       icon("link", 13) +
       "合并其他用户账号到此档案</button>" +
       "</div>" +
-      '<div class="rel-platform-hint">格式 <code>platform:uid</code>（例如 <code>qq:123456789</code>），一行一个；同一平台的多个账号用逗号分隔。</div>' +
+      '<datalist id="rel-platform-options">' +
+      knownPlatformIds(app)
+        .map(function (pid) {
+          return '<option value="' + esc(pid + ":") + '"></option>';
+        })
+        .join("") +
+      "</datalist>" +
+      '<div class="rel-platform-hint">格式 <code>platform:uid</code>（例如 <code>qq bot:123456789</code>；可从下拉选择接口后补 UID）；一行一个，同一平台多个账号用逗号分隔。<b>旧格式</b>（只有裸 ID、无冒号）的行请补全平台后再保存，或直接删除该行。</div>' +
       "</div></div>" +
       "</div>";
     app.modal({

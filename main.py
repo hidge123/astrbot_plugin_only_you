@@ -492,6 +492,30 @@ class OnlyYouPlugin(Star):
             await self.soul_manager.migrate_legacy_umo_bindings()
         except Exception as exc:  # noqa: BLE001 - migration must never block startup
             logger.warning(f"[OnlyYou] legacy umo binding migration failed: {exc}")
+        # v2.8.4: upgrade legacy bare user ids (only ``global_uid``) into the
+        # canonical ``platform_id:native_uid`` account form, using persisted UMO
+        # evidence; ambiguous rows are left for the Pages「关系与群聊」manual repair.
+        identity_manager = getattr(self, "user_relation", None)
+        identity_migrator = (
+            getattr(identity_manager, "migrate_legacy_user_identities", None)
+            if identity_manager is not None
+            else None
+        )
+        try:
+            identity_stats = (
+                await identity_migrator() if callable(identity_migrator) else None
+            )
+            if isinstance(identity_stats, dict) and identity_stats.get(
+                "accounts_converted"
+            ):
+                logger.info(
+                    "[OnlyYou] Migrated %s legacy user platform id(s) into "
+                    "platform:uid form (%s user(s) updated).",
+                    identity_stats.get("accounts_converted"),
+                    identity_stats.get("users_updated"),
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[OnlyYou] legacy user identity migration failed: {exc}")
         try:
             await self._maybe_run_scheduled_gc()
         except Exception as exc:  # noqa: BLE001

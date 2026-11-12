@@ -2183,6 +2183,32 @@ class OnlyYouWebAPI:
             if action in ("update_group", "clear_group_memory", "delete_group"):
                 return await self._handle_group_action(action, body)
 
+            if action == "normalize_identity":
+                # v2.8.4: one-click repair of legacy bare platform ids (旧数据只有
+                # 裸 global_uid) into ``platform_id:native_uid`` form.
+                uid = str(body.get("global_uid") or "").strip()
+                platform_id = str(body.get("platform_id") or "").strip()
+                if not uid:
+                    return err_response("用户 ID (global_uid) 不能为空")
+                manager = getattr(self.plugin, "user_relation", None)
+                repair = getattr(manager, "normalize_user_identity", None)
+                if not callable(repair):
+                    return err_response("UserRelationManager 未实现 normalize_user_identity")
+                try:
+                    user = repair(uid, platform_id=platform_id)
+                    if inspect.isawaitable(user):
+                        user = await user
+                except ValueError as exc:
+                    return err_response(str(exc))
+                users = await self.plugin.user_relation.list_users()
+                return ok_response(
+                    {
+                        "user": user.to_dict() if user is not None else {},
+                        "users": [u.to_dict() for u in users],
+                    },
+                    message=f"已补全用户 {uid} 的平台账号标识",
+                )
+
             if action == "merge":
                 primary_uid = str(body.get("primary_uid") or "").strip()
                 secondary_uid = str(body.get("secondary_uid") or "").strip()
@@ -2218,9 +2244,25 @@ class OnlyYouWebAPI:
                 int(tier_val) if tier_val in (1, 2, 3, "1", "2", "3") else None
             )
             if isinstance(pids_val, str):
-                pids_list = [x.strip() for x in pids_val.split(",") if x.strip()]
+                # Tolerate comma / newline separated text from the console editor.
+                pids_list = [
+                    x.strip()
+                    for x in re.split(r"[,，\n\r]+", pids_val)
+                    if x and x.strip()
+                ]
             elif isinstance(pids_val, list):
-                pids_list = [str(x).strip() for x in pids_val if str(x).strip()]
+                # v2.8.4: entries may be strings (``platform:uid``) or objects
+                # (``{platform_id, native_uid}``); normalization happens in
+                # ``UserRelationManager.update_user_details``.
+                pids_list = []
+                for item in pids_val:
+                    if isinstance(item, dict):
+                        if item:
+                            pids_list.append(item)
+                        continue
+                    text = str(item or "").strip()
+                    if text:
+                        pids_list.append(text)
             else:
                 pids_list = None
 
@@ -2239,7 +2281,10 @@ class OnlyYouWebAPI:
                     None if attitude_raw is None else str(attitude_raw).strip()[:300]
                 )
 
-            updated = await self.plugin.user_relation.update_user_details(**update_kwargs)
+            try:
+                updated = await self.plugin.user_relation.update_user_details(**update_kwargs)
+            except ValueError as exc:
+                return err_response(str(exc))
             users = await self.plugin.user_relation.list_users()
             return ok_response(
                 {

@@ -5049,3 +5049,29 @@ html[data-theme="dark"] .rel-chip.is-active .rel-chip-count {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* ==================== v2.8.4 user platform identity ==================== */
+/* 旧版用户只有裸 global_uid：在关系页详情里以「旧格式」告警呈现，可补全或删除。 */
+.rel-platform-row.is-legacy {
+  border-color: var(--warning, #d97706);
+  background: color-mix(in srgb, var(--warning, #d97706) 7%, transparent);
+}
+.rel-platform-legacy-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: nowrap;
+  color: var(--warning, #d97706);
+  border: 1px solid color-mix(in srgb, var(--warning, #d97706) 45%, transparent);
+  background: color-mix(in srgb, var(--warning, #d97706) 10%, transparent);
+}
+.rel-platform-tag.is-legacy {
+  color: var(--warning, #d97706);
+  border-color: color-mix(in srgb, var(--warning, #d97706) 45%, transparent);
+  background: color-mix(in srgb, var(--warning, #d97706) 10%, transparent);
+}

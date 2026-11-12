@@ -35,6 +35,118 @@ GROUP_PERSIST_THROTTLE_SECONDS = 60.0
 _GROUP_NAME_MAX_CHARS = 120
 _GROUP_NOTES_MAX_CHARS = 500
 
+#: One-shot migration flag for legacy bare ``global_uid`` platform ids (v2.8.4).
+LEGACY_USER_IDENTITY_MIGRATED_KEY = "legacy_user_identity_migrated_v1"
+
+
+def split_platform_account(value: Any) -> Optional[tuple[str, str]]:
+    """Parse ``"platform_id:native_uid"`` -> ``(platform_id, native_uid)``.
+
+    Legacy rows only stored the bare ``global_uid`` (e.g. a QQ number) without a
+    platform prefix; those return ``None`` and are surfaced as legacy entries.
+    """
+    text = str(value or "").strip()
+    if not text or ":" not in text:
+        return None
+    platform_id, native_uid = text.split(":", 1)
+    platform_id = platform_id.strip()
+    native_uid = native_uid.strip()
+    if not platform_id or not native_uid or ":" in platform_id:
+        return None
+    return platform_id, native_uid
+
+
+def make_platform_account(platform_id: Any, native_uid: Any) -> str:
+    """Build the canonical ``platform_id:native_uid`` platform account string."""
+    pid = str(platform_id or "").strip()
+    uid = str(native_uid or "").strip()
+    if not pid or not uid or ":" in pid:
+        return ""
+    return f"{pid}:{uid}"
+
+
+def _platform_id_from_umo(umo: Any) -> str:
+    """``"<platform_id>:<msg_type>:<session>"`` -> platform id (``""`` safe)."""
+    text = str(umo or "").strip()
+    if not text or ":" not in text:
+        return ""
+    return text.split(":", 1)[0].strip()
+
+
+def _is_qualified_account(value: Any) -> bool:
+    return split_platform_account(value) is not None
+
+
+def _normalize_platform_ids(values: Any) -> list[str]:
+    """Normalize console/user payloads into canonical platform account strings.
+
+    Accepts ``["platform:uid", {"platform_id": ..., "native_uid": ...}, "platform:uid"]``
+    and legacy bare ids. Qualified accounts win over a bare id with the same native
+    uid (the bare legacy entry is dropped as a "shadow" duplicate).
+    """
+    if values is None:
+        return []
+    if isinstance(values, str):
+        items: list[Any] = [values]
+    elif isinstance(values, (list, tuple, set)):
+        items = list(values)
+    else:
+        items = []
+    accounts: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        candidates: list[str] = []
+        if isinstance(item, dict):
+            platform_id = item.get("platform_id") or item.get("platform") or ""
+            native_uid = (
+                item.get("native_uid")
+                or item.get("uid")
+                or item.get("user_id")
+                or item.get("global_uid")
+                or ""
+            )
+            if platform_id and native_uid:
+                candidates.append(make_platform_account(platform_id, native_uid))
+            account = str(item.get("account") or "").strip()
+            if account:
+                candidates.append(account)
+        else:
+            text = str(item or "").strip()
+            if text:
+                candidates.append(text)
+        for text in candidates:
+            if not text:
+                continue
+            parsed = split_platform_account(text)
+            canonical = f"{parsed[0]}:{parsed[1]}" if parsed else text
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            accounts.append(canonical)
+    # Drop legacy bare ids that are already represented by a qualified account of
+    # the same native uid (e.g. ["2975066889", "qq bot:2975066889"] -> the latter).
+    qualified_uids = {
+        parsed[1]
+        for parsed in (split_platform_account(account) for account in accounts)
+        if parsed is not None
+    }
+    return [
+        account
+        for account in accounts
+        if _is_qualified_account(account) or account not in qualified_uids
+    ]
+
+
+def _dedupe_keep_order(values: Any) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in list(values or []):
+        text = str(value or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
+
 
 @dataclass
 class UserProfile:
@@ -51,6 +163,32 @@ class UserProfile:
     attitude: str = ""
 
     def to_dict(self) -> dict[str, Any]:
+        accounts: list[dict[str, Any]] = []
+        legacy_ids: list[str] = []
+        for raw in list(self.platform_ids):
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            parsed = split_platform_account(text)
+            if parsed is None:
+                legacy_ids.append(text)
+                accounts.append(
+                    {
+                        "account": text,
+                        "platform_id": "",
+                        "uid": text,
+                        "legacy": True,
+                    }
+                )
+            else:
+                accounts.append(
+                    {
+                        "account": f"{parsed[0]}:{parsed[1]}",
+                        "platform_id": parsed[0],
+                        "uid": parsed[1],
+                        "legacy": False,
+                    }
+                )
         return {
             "global_uid": self.global_uid,
             "display_name": self.display_name,
@@ -61,6 +199,10 @@ class UserProfile:
             "interaction_count": self.interaction_count,
             "affinity": round(float(self.affinity), 1),
             "platform_ids": list(self.platform_ids),
+            # v2.8.4: parsed platform accounts + legacy (bare-id) diagnostics.
+            "platform_accounts": accounts,
+            "legacy_platform_ids": legacy_ids,
+            "has_legacy_platform_ids": bool(legacy_ids),
         }
 
 
@@ -157,7 +299,12 @@ class UserRelationManager:
         if not sid:
             return None
         platform_admins = set(self.platform_bridge.get_platform_admins(umo=umo))
-        if sid in platform_admins or is_event_admin:
+        account = make_platform_account(_platform_id_from_umo(umo), sid)
+        if (
+            sid in platform_admins
+            or (account and account in platform_admins)
+            or is_event_admin
+        ):
             return UserTier.L3_CORE
         return None
 
@@ -190,7 +337,128 @@ class UserRelationManager:
             umo=umo,
             is_event_admin=is_admin,
             bump_interaction=True,
+            platform_id=_platform_id_from_umo(umo),
         )
+
+    # ------------------------------------------------------------------
+    # v2.8.4: canonical platform-account identity helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _pids_from_row(row: dict[str, Any]) -> list[str]:
+        try:
+            pids = json.loads(row.get("platform_ids_json") or "[]")
+        except Exception:
+            pids = []
+        if not isinstance(pids, list):
+            return []
+        cleaned: list[str] = []
+        for item in pids:
+            text = str(item or "").strip()
+            if text and text not in cleaned:
+                cleaned.append(text)
+        return cleaned
+
+    def _profile_from_row(self, row: dict[str, Any]) -> UserProfile:
+        raw_tier = int(row.get("tier", 1))
+        tier = UserTier(raw_tier) if raw_tier in (1, 2, 3) else UserTier.L1_NORMAL
+        global_uid = str(row.get("global_uid") or "").strip()
+        pids = _normalize_platform_ids(self._pids_from_row(row))
+        if not pids:
+            pids = [global_uid]
+        return UserProfile(
+            global_uid=global_uid,
+            display_name=str(row.get("display_name") or global_uid),
+            tier=tier,
+            interaction_count=int(row.get("interaction_count", 0)),
+            affinity=float(row.get("affinity", 0.0)),
+            platform_ids=pids,
+            nickname=str(row.get("nickname") or ""),
+            attitude=str(row.get("attitude") or ""),
+        )
+
+    @staticmethod
+    def _heal_profile_identity(
+        profile: UserProfile, native_uid: str, account: str
+    ) -> bool:
+        """Upgrade a legacy bare platform id to ``platform:native_uid`` in place.
+
+        Called on every incoming message (the platform is known from the UMO), so
+        historical users are repaired lazily without a destructive big-bang rewrite.
+        """
+        if profile is None or not native_uid or not account:
+            return False
+        before = list(profile.platform_ids)
+        healed: list[str] = []
+        for value in before:
+            if split_platform_account(value) is None and str(value).strip() == native_uid:
+                healed.append(account)
+            else:
+                healed.append(value)
+        if account not in healed:
+            healed.append(account)
+        normalized = _normalize_platform_ids(healed)
+        if normalized and normalized != before:
+            profile.platform_ids = normalized
+            return True
+        return False
+
+    async def _lookup_profile_by_identity(
+        self, account: str, bare_uid: str
+    ) -> Optional[UserProfile]:
+        """Locate an existing profile by canonical account / legacy bare id."""
+        for key in (account, bare_uid):
+            if not key:
+                continue
+            cached = self._cache.get(key)
+            if cached is None:
+                continue
+            # Never trust an unrelated cache entry that only shares a bare id.
+            if key == bare_uid and (
+                cached.global_uid != bare_uid and bare_uid not in cached.platform_ids
+            ):
+                continue
+            return cached
+
+        for key in (account, bare_uid):
+            if not key:
+                continue
+            row = await self.db.fetchone(
+                "SELECT * FROM users WHERE global_uid = ?", (key,)
+            )
+            if row:
+                return self._profile_from_row(row)
+
+        if not account and not bare_uid:
+            return None
+        rows = await self.db.fetchall("SELECT * FROM users")
+        account_matches: list[dict[str, Any]] = []
+        bare_matches: list[dict[str, Any]] = []
+        for row in rows:
+            pids = self._pids_from_row(row)
+            if account and account in pids:
+                account_matches.append(row)
+            if bare_uid and bare_uid in pids:
+                bare_matches.append(row)
+        if account_matches:
+            return self._profile_from_row(account_matches[0])
+        if len(bare_matches) == 1:
+            # Unique legacy owner -> adopt it and upgrade its id to qualified form.
+            return self._profile_from_row(bare_matches[0])
+        if len(bare_matches) > 1:
+            exact = [
+                row
+                for row in bare_matches
+                if str(row.get("global_uid") or "").strip() == bare_uid
+            ]
+            if len(exact) == 1:
+                return self._profile_from_row(exact[0])
+            logger.warning(
+                "[OnlyYou] Ambiguous legacy user id '%s' (matches %d profiles); "
+                "creating a platform-qualified profile instead of auto-merging",
+                bare_uid,
+                len(bare_matches),
+            )
+        return None
 
     async def get_or_create_user(
         self,
@@ -199,63 +467,39 @@ class UserRelationManager:
         umo: Optional[str] = None,
         is_event_admin: bool = False,
         bump_interaction: bool = False,
+        platform_id: Optional[str] = None,
     ) -> UserProfile:
-        """Get or create a UserProfile by `user_id`, applying tier rules & auto-promotion."""
+        """Get or create a UserProfile by platform identity.
+
+        v2.8.4: the identity is the canonical ``platform_id:native_uid`` account
+        (e.g. ``qq bot:2975066889``) built from the event's UMO prefix + sender id.
+        Legacy profiles that only stored the bare sender id are healed lazily: the
+        bare id is upgraded to the qualified account on the next message instead of
+        being kept as an undeletable ghost entry.
+        """
         uid = str(user_id).strip() or "anonymous"
         name = (display_name or uid).strip()
+        pid = str(platform_id or "").strip() or _platform_id_from_umo(umo)
+        account = make_platform_account(pid, uid) if pid else ""
         cfg_tier = self._get_configured_tier(uid, umo=umo, is_event_admin=is_event_admin)
 
-        profile = self._cache.get(uid)
-        if profile is None:
-            row = await self.db.fetchone(
-                "SELECT * FROM users WHERE global_uid = ?", (uid,)
+        profile = await self._lookup_profile_by_identity(account, uid)
+        if profile is not None:
+            self._heal_profile_identity(profile, uid, account)
+        else:
+            new_uid = account or uid
+            profile = UserProfile(
+                global_uid=new_uid,
+                display_name=name,
+                tier=cfg_tier or UserTier.L1_NORMAL,
+                interaction_count=0,
+                affinity=0.0,
+                platform_ids=[new_uid],
+                nickname="",
+                attitude="",
             )
-            if not row:
-                # Check if `uid` was merged into another `global_uid` via `platform_ids_json`
-                all_rows = await self.db.fetchall("SELECT * FROM users")
-                for r in all_rows:
-                    try:
-                        pids = json.loads(r.get("platform_ids_json") or "[]")
-                    except Exception:
-                        pids = []
-                    if uid in pids:
-                        row = r
-                        uid = str(r["global_uid"])
-                        break
-            if row:
-                raw_tier = int(row.get("tier", 1))
-                tier = (
-                    UserTier(raw_tier)
-                    if raw_tier in (1, 2, 3)
-                    else UserTier.L1_NORMAL
-                )
-                try:
-                    pids = json.loads(row.get("platform_ids_json") or "[]")
-                except Exception:
-                    pids = [uid]
-                profile = UserProfile(
-                    global_uid=uid,
-                    display_name=str(row.get("display_name") or name),
-                    tier=tier,
-                    interaction_count=int(row.get("interaction_count", 0)),
-                    affinity=float(row.get("affinity", 0.0)),
-                    platform_ids=pids,
-                    nickname=str(row.get("nickname") or ""),
-                    attitude=str(row.get("attitude") or ""),
-                )
-            else:
-                profile = UserProfile(
-                    global_uid=uid,
-                    display_name=name,
-                    tier=cfg_tier or UserTier.L1_NORMAL,
-                    interaction_count=0,
-                    affinity=0.0,
-                    platform_ids=[uid],
-                    nickname="",
-                    attitude="",
-                )
 
-        if name and name != uid:
+        if name and name != profile.global_uid:
             profile.display_name = name
 
         # Config tier always upgrades if higher
@@ -280,6 +524,169 @@ class UserRelationManager:
         await self.save_user(profile)
         return profile
 
+    async def normalize_user_identity(
+        self, user_id: str, platform_id: str = ""
+    ) -> UserProfile:
+        """One-click repair of legacy bare platform ids (Pages「补全平台」).
+
+        ``platform_id`` is the platform to use when the legacy entry has no prefix.
+        """
+        target = str(user_id or "").strip()
+        if not target:
+            raise ValueError("用户 ID 不能为空")
+        pid_hint = str(platform_id or "").strip()
+        profile = await self._lookup_profile_by_identity(target, target)
+        if profile is None:
+            profile = await self.get_or_create_user(target)
+        repaired: list[str] = []
+        for value in list(profile.platform_ids):
+            parsed = split_platform_account(value)
+            if parsed is not None:
+                repaired.append(value)
+                continue
+            if not pid_hint:
+                repaired.append(value)
+                continue
+            account = make_platform_account(pid_hint, value)
+            repaired.append(account or value)
+        if not pid_hint:
+            # No explicit platform: infer from any single known platform evidence.
+            evidence = await self._collect_platform_evidence()
+            inferred: list[str] = []
+            for value in list(profile.platform_ids):
+                parsed = split_platform_account(value)
+                if parsed is not None:
+                    inferred.append(value)
+                    continue
+                candidates = evidence.get(value, set())
+                if len(candidates) == 1:
+                    account = make_platform_account(next(iter(candidates)), value)
+                    inferred.append(account or value)
+                else:
+                    inferred.append(value)
+            repaired = inferred
+        normalized = _normalize_platform_ids(repaired)
+        if normalized:
+            profile.platform_ids = normalized
+        await self.save_user(profile)
+        return profile
+
+    # ------------------------------------------------------------------
+    # v2.8.4: legacy bare platform id migration (evidence based, non-destructive)
+    # ------------------------------------------------------------------
+    async def _collect_platform_evidence(self) -> dict[str, set[str]]:
+        """Infer ``{native_uid: {platform_id}}`` from persisted UMO evidence.
+
+        Sources: legacy ``umo_soul_bindings`` rows and the persisted runtime-state
+        ``known_l3_umos`` UMOs — only **private-chat** UMOs whose session id is the
+        user's native id can prove a platform. Group UMOs are ignored (their session
+        id is a group id, never a user id).
+        """
+        evidence: dict[str, set[str]] = {}
+
+        def _add_umo(umo: Any) -> None:
+            text = str(umo or "").strip()
+            parts = text.split(":")
+            if len(parts) < 3:
+                return
+            platform_id = parts[0].strip()
+            msg_type = parts[1].strip().lower()
+            session_id = parts[2].strip()
+            if not platform_id or not session_id:
+                return
+            is_private = ("friend" in msg_type) or ("private" in msg_type)
+            if not is_private:
+                return
+            evidence.setdefault(session_id, set()).add(platform_id)
+
+        try:
+            rows = await self.db.fetchall(
+                "SELECT umo FROM umo_soul_bindings WHERE umo IS NOT NULL"
+            )
+            for row in rows:
+                _add_umo(row.get("umo"))
+        except Exception as exc:  # noqa: BLE001 - migration must not crash startup
+            logger.debug(f"[OnlyYou] read umo bindings for identity migration failed: {exc}")
+        try:
+            snapshot = await self.db.get_setting("runtime_state_v1", {}) or {}
+            known = (
+                snapshot.get("known_l3_umos")
+                if isinstance(snapshot, dict)
+                else None
+            )
+            if isinstance(known, dict):
+                for umo in known.values():
+                    _add_umo(umo)
+            elif isinstance(known, list):
+                for umo in known:
+                    _add_umo(umo)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[OnlyYou] read runtime_state for identity migration failed: {exc}")
+        return evidence
+
+    async def migrate_legacy_user_identities(self) -> dict[str, int]:
+        """Upgrade legacy bare ``platform_ids`` to ``platform_id:native_uid`` form.
+
+        Only entries with **unambiguous** evidence (exactly one private-chat
+        platform) are rewritten; ambiguous / unknown ones are kept for manual
+        completion in the Pages console (never guessed destructively).
+        Idempotent via ``plugin_settings["legacy_user_identity_migrated_v1"]``.
+        """
+        stats = {"users_updated": 0, "accounts_converted": 0, "ambiguous": 0}
+        try:
+            already = bool(
+                await self.db.get_setting(LEGACY_USER_IDENTITY_MIGRATED_KEY, False)
+            )
+        except Exception:
+            already = False
+        if already:
+            return stats
+
+        evidence = await self._collect_platform_evidence()
+        try:
+            rows = await self.db.fetchall("SELECT * FROM users")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[OnlyYou] identity migration read users failed: {exc}")
+            return stats
+
+        for row in rows:
+            profile = self._profile_from_row(row)
+            rewritten: list[str] = []
+            changed = False
+            for value in list(profile.platform_ids):
+                parsed = split_platform_account(value)
+                if parsed is not None:
+                    rewritten.append(value)
+                    continue
+                candidates = evidence.get(value, set())
+                if len(candidates) == 1:
+                    account = make_platform_account(next(iter(candidates)), value)
+                    if account:
+                        rewritten.append(account)
+                        stats["accounts_converted"] += 1
+                        changed = True
+                        continue
+                stats["ambiguous"] += 1
+                rewritten.append(value)
+            if not changed:
+                continue
+            normalized = _normalize_platform_ids(rewritten)
+            if not normalized:
+                continue
+            profile.platform_ids = normalized
+            await self.save_user(profile)
+            stats["users_updated"] += 1
+        try:
+            await self.db.set_setting(LEGACY_USER_IDENTITY_MIGRATED_KEY, True)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[OnlyYou] persist identity migration flag failed: {exc}")
+        if stats["accounts_converted"] or stats["ambiguous"]:
+            logger.info(
+                "[OnlyYou] Legacy user identity migration: %s",
+                stats,
+            )
+        return stats
+
     async def set_user_tier(self, user_id: str, new_tier: UserTier, display_name: str = "") -> UserProfile:
         """Manually set a user's relationship tier (e.g. via `/onlyyou tier`)."""
         profile = await self.get_or_create_user(user_id=user_id, display_name=display_name)
@@ -288,9 +695,34 @@ class UserRelationManager:
         return profile
 
     async def save_user(self, profile: UserProfile) -> None:
-        """Persist UserProfile to SQLite and memory cache."""
+        """Persist UserProfile to SQLite and memory cache.
+
+        v2.8.4: platform ids are normalized to ``platform:native_uid`` (bare legacy
+        ids shadowed by a qualified account are dropped) and the cache never lets a
+        shared bare id silently overwrite another profile (cross-platform collision).
+        """
+        normalized = _normalize_platform_ids(profile.platform_ids)
+        if normalized:
+            profile.platform_ids = normalized
+        elif profile.global_uid:
+            profile.platform_ids = [profile.global_uid]
         self._cache[profile.global_uid] = profile
         for pid in profile.platform_ids:
+            existing = self._cache.get(pid)
+            if (
+                existing is not None
+                and existing is not profile
+                and existing.global_uid != profile.global_uid
+                and not _is_qualified_account(pid)
+            ):
+                logger.warning(
+                    "[OnlyYou] legacy platform id '%s' already cached for user %s; "
+                    "skip cache overwrite for user %s",
+                    pid,
+                    existing.global_uid,
+                    profile.global_uid,
+                )
+                continue
             self._cache[pid] = profile
         await self.db.execute(
             """
@@ -335,22 +767,11 @@ class UserRelationManager:
 
         users: list[UserProfile] = []
         for r in rows:
-            raw_tier = int(r.get("tier", 1))
-            t = UserTier(raw_tier) if raw_tier in (1, 2, 3) else UserTier.L1_NORMAL
             try:
-                pids = json.loads(r.get("platform_ids_json") or "[]")
-            except Exception:
-                pids = [str(r["global_uid"])]
-            u = UserProfile(
-                global_uid=str(r["global_uid"]),
-                display_name=str(r.get("display_name") or r["global_uid"]),
-                tier=t,
-                interaction_count=int(r.get("interaction_count", 0)),
-                affinity=float(r.get("affinity", 0.0)),
-                platform_ids=pids,
-                nickname=str(r.get("nickname") or ""),
-                attitude=str(r.get("attitude") or ""),
-            )
+                u = self._profile_from_row(r)
+            except Exception as exc:  # noqa: BLE001 - one bad row must not break the list
+                logger.warning(f"[OnlyYou] Failed to parse user row: {exc}")
+                continue
             self._cache[u.global_uid] = u
             users.append(u)
         return users
@@ -381,9 +802,11 @@ class UserRelationManager:
         if affinity is not None:
             profile.affinity = max(0.0, min(100.0, float(affinity)))
         if platform_ids is not None:
-            cleaned = [str(p).strip() for p in platform_ids if str(p).strip()]
-            if profile.global_uid not in cleaned:
-                cleaned.insert(0, profile.global_uid)
+            cleaned = _normalize_platform_ids(platform_ids)
+            if not cleaned:
+                raise ValueError(
+                    "至少保留一个平台账号（格式 platform_id:native_uid，例如 qq bot:123456）"
+                )
             profile.platform_ids = cleaned
         await self.save_user(profile)
         return profile
@@ -403,10 +826,9 @@ class UserRelationManager:
         primary = await self.get_or_create_user(p_id)
         secondary = await self.get_or_create_user(s_id)
 
-        merged_pids = list(primary.platform_ids)
-        for pid in [s_id] + list(secondary.platform_ids):
-            if pid and pid not in merged_pids:
-                merged_pids.append(pid)
+        merged_pids = _normalize_platform_ids(
+            list(primary.platform_ids) + [s_id] + list(secondary.platform_ids)
+        )
 
         primary.platform_ids = merged_pids
         if secondary.tier.value > primary.tier.value:
@@ -432,6 +854,9 @@ class UserRelationManager:
         if not uid:
             return
         self._cache.pop(uid, None)
+        for key, value in list(self._cache.items()):
+            if value is not None and value.global_uid == uid:
+                self._cache.pop(key, None)
         await self.db.execute("DELETE FROM users WHERE global_uid = ?", (uid,))
 
     # ==================================================================
