@@ -477,6 +477,12 @@ class OnlyYouPlugin(Star):
     async def initialize(self) -> None:
         """AstrBot Star lifecycle initialization hook."""
         await self._ensure_initialized()
+        # v2.8.2: QQ「戳一戳」/ 撤回 / 群文件等 OneBot notice 会被 AstrBot 适配器
+        # 转成空文本伪消息事件；标记启动以便线上日志确认过滤器已生效。
+        logger.info(
+            "[OnlyYou] Ignoring QQ poke/notice pseudo-message events "
+            "(OneBot notice/request are not chat input)."
+        )
         # v2.8: restore the proactive-message dedupe / cooldown / ★L3 bookkeeping
         # right after the DB is available (defensive: defaults on any failure).
         await self._load_runtime_state()
@@ -2004,10 +2010,60 @@ class OnlyYouPlugin(Star):
     # ==========================================================================
     # 1. Three-State Message Gate (`priority=999`)
     # ==========================================================================
+    @staticmethod
+    def _is_non_chat_platform_event(event: Any) -> bool:
+        """Detect adapter-synthesized **non-chat** events (QQ 戳一戳 / notice / request).
+
+        AstrBot's aiocqhttp adapter converts *every* OneBot v11 ``notice`` event
+        （戳一戳 poke、撤回、群文件上传、好友添加、输入状态等）and ``request`` event
+        into an ``AstrBotMessage`` whose ``message_str`` is empty. Private chats are
+        wake-by-default, so without this guard those pseudo-messages reach the gate
+        and make the bot answer an empty prompt (the 戳一戳 auto-reply bug).
+
+        Detection is payload-based: prefer the raw OneBot ``post_type`` and fall back
+        to a message chain made only of ``Poke`` components, so genuine messages
+        (including @-only / image-only ones) are never dropped.
+        """
+        try:
+            message_obj = getattr(event, "message_obj", None)
+        except Exception:  # noqa: BLE001 - hostile / partial event objects
+            return False
+        if message_obj is None:
+            return False
+        try:
+            raw_message = getattr(message_obj, "raw_message", None)
+            post_type = ""
+            if isinstance(raw_message, dict) or hasattr(raw_message, "get"):
+                post_type = str(raw_message.get("post_type") or "").strip().lower()
+            elif raw_message is not None:
+                post_type = str(
+                    getattr(raw_message, "post_type", "") or ""
+                ).strip().lower()
+            if post_type and post_type != "message":
+                # notice / request / meta_event / message_sent -> not user chat input
+                return True
+
+            components = list(getattr(message_obj, "message", None) or [])
+            if not components:
+                return False
+            component_types: list[str] = []
+            for component in components:
+                component_type = getattr(component, "type", None)
+                if not component_type:
+                    component_type = type(component).__name__
+                component_types.append(str(component_type).strip().lower())
+            # A chain made only of poke/nudge components is a nudge, not a message.
+            return bool(component_types) and all(
+                item in ("poke", "nudge") for item in component_types
+            )
+        except Exception:  # noqa: BLE001 - detection must never break the gate
+            return False
+
     @filter.event_message_type(filter.EventMessageType.ALL, priority=999)
     async def on_any_message(self, event: AstrMessageEvent):
         """
         First-stage gate for every incoming group/private message:
+        0. Drop adapter-synthesized non-chat events (QQ 戳一戳 / notice / request)
         1. Pass through system/plugin commands (`/onlyyou`, `/oy`, `/...`)
         2. Silently record message into sliding window (`SessionBuffer`)
         3. Check input-driven bounded schedule mutation (`BoundedScheduleMutator`)
@@ -2015,6 +2071,21 @@ class OnlyYouPlugin(Star):
         5. Run group `AtmosphereReader` and coordinate with native pipeline via `PlatformBridge`
         """
         await self._ensure_initialized()
+
+        if self._is_non_chat_platform_event(event):
+            # QQ 戳一戳等 OneBot notice 不是聊天输入：不写滑窗/群档案、不走门禁、
+            # 不触发 LLM；同时明确关闭原生管线，避免私聊 notice 被当成空消息回复。
+            logger.debug(
+                "[OnlyYou] Ignored non-chat platform event (%s)",
+                getattr(
+                    getattr(event, "message_obj", None), "raw_message", None
+                ),
+            )
+            try:
+                self.platform_bridge.apply_reply_decision(event, False)
+            except Exception as exc:  # noqa: BLE001 - never break event handling
+                logger.debug(f"[OnlyYou] suppress non-chat event failed: {exc}")
+            return
 
         msg_str = (getattr(event, "message_str", "") or "").strip()
         if not msg_str:
@@ -2175,6 +2246,10 @@ class OnlyYouPlugin(Star):
         recall & score memories within hard char/count budget, and inject 3-state prompt.
         """
         await self._ensure_initialized()
+        # Defensive: non-chat events (QQ 戳一戳 / notice / request) must never get
+        # age-injected persona/context even if another stage somehow reaches the LLM.
+        if self._is_non_chat_platform_event(event):
+            return
         umo = getattr(event, "unified_msg_origin", "") or "default_umo"
         # @-only pings may reach the native pipeline with an empty prompt; give the
         # model a neutral description so the persona can still answer naturally.

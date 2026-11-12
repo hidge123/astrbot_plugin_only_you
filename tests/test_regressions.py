@@ -84,6 +84,7 @@ _PLUGIN_METHOD_NAMES = (
     "_fallback_private_catchup",
     "_maybe_synthesize_proactive",
     "_render_soul_summary",
+    "_is_non_chat_platform_event",
     "on_any_message",
 )
 
