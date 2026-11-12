@@ -1319,9 +1319,23 @@ class SoulManager:
         for k, v in list(self._umo_bindings.items()):
             if v == sid:
                 self._umo_bindings.pop(k, None)
+        # v2.9: purge the per-Soul relation cache held by UserRelationManager.
+        purge = getattr(self, "on_soul_deleted", None)
+        if callable(purge):
+            try:
+                purge(sid)
+            except Exception as exc:  # noqa: BLE001 - cache purge is best-effort
+                logger.warning(f"[OnlyYou] purge soul relation cache failed: {exc}")
         await self.db.execute("DELETE FROM souls WHERE soul_id = ?", (sid,))
         await self.db.execute("DELETE FROM daily_schedules WHERE soul_id = ?", (sid,))
         await self.db.execute("DELETE FROM memories WHERE soul_id = ?", (sid,))
+        # v2.9: relationship rows are per Soul -> cascade with the Soul.
+        try:
+            await self.db.execute(
+                "DELETE FROM user_relations WHERE soul_id = ?", (sid,)
+            )
+        except Exception as exc:  # noqa: BLE001 - older DBs may not have the table yet
+            logger.warning(f"[OnlyYou] delete user_relations failed: {exc}")
         await self.db.execute("DELETE FROM umo_soul_bindings WHERE soul_id = ?", (sid,))
         await self.db.execute("DELETE FROM surfing_history WHERE soul_id = ?", (sid,))
         if await self.get_default_soul_id() == sid:

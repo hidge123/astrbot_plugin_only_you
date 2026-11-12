@@ -132,6 +132,33 @@ class DatabaseManager:
         except Exception:
             pass
 
+        # 4b. v2.9: per-Soul relationship state (identity stays in `users`).
+        #     One row per (soul_id, global_uid); the legacy users relation columns
+        #     remain as a read/write fallback for pre-v2.9 callers.
+        await self.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_relations (
+                soul_id TEXT NOT NULL,
+                global_uid TEXT NOT NULL,
+                tier INTEGER NOT NULL DEFAULT 1,
+                interaction_count INTEGER NOT NULL DEFAULT 0,
+                affinity REAL NOT NULL DEFAULT 0.0,
+                nickname TEXT NOT NULL DEFAULT '',
+                attitude TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (soul_id, global_uid)
+            );
+            """
+        )
+        await self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_relations_soul "
+            "ON user_relations(soul_id);"
+        )
+        await self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_relations_uid "
+            "ON user_relations(global_uid);"
+        )
+
         # 5. UMO -> Soul ID explicit routing bindings table (for WebUI Console Module 1)
         await self.execute(
             """

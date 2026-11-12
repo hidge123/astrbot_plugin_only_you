@@ -439,3 +439,42 @@ v2.8 起一个角色可绑定多个机器人接口，私聊会话可跨平台合
 5. **兼容**：`global_uid` 仍是档案主键（历史 `memories.user_id` 不需要迁移）；裸 ID 在找不到平台证据时保留，可在关系页手动处理。
 
 建议升级后：打开 Pages「关系与群聊」页检查带「旧格式」标签的用户；有明确的平台归属时点「补全平台」保存即可。该操作只改 `users.platform_ids_json`，不动记忆与群聊档案。
+
+---
+
+## 17. v2.9 用户身份全局化 + 关系状态按角色隔离
+
+v2.9 起用户数据拆成两层：`users` 只保存**全局身份**（`global_uid / display_name / platform_ids`），新增 `user_relations` 保存**每个角色对该用户的关系状态**（`tier / affinity / interaction_count / nickname / attitude`）。
+
+### 17.1 升级后行为变化
+
+1. 关系页（Pages「关系与群聊」）只显示**当前角色**的关系档案；切换顶部「当前角色」会重新加载对应角色的用户与群聊。
+2. 同一用户在不同角色下可以有不同等级 / 好感 / 专属称呼 / 专属态度（互不影响）；`display_name` 与平台账号是全局身份，修改会影响所有角色。
+3. 合并用户时只能从**当前角色已存在的关系档案**中下拉选择，后端会再次校验；合并会按角色逐 Soul 合并关系行，并迁移 `memories.user_id`。
+4. 删除用户默认只移除**当前角色**的关系档案；只有该用户在所有角色都没有关系行时才删除全局身份。**记忆仍然不随用户档案删除**（记忆属于角色，按 `soul_id` 隔离；如需彻底清理请在记忆页按关联用户删除）。
+5. `users/list` / `users/update` 不传 `soul_id` 时仍返回/操作 legacy 全局视图（兼容旧脚本与旧页面）。
+
+### 17.2 升级步骤
+
+1. **备份**：`docker exec astrbot cp /AstrBot/data/plugin_data/astrbot_plugin_only_you/only_you.db /AstrBot/data/plugin_data/astrbot_plugin_only_you/only_you.db.bak_v28`（或整体备份 `plugin_data` 目录）。
+2. 部署新插件文件并热重载/重启容器。
+3. 确认日志出现：
+   - `[OnlyYou] Registered 31 Web API routes for Plugin Pages.`
+   - `[OnlyYou] Plugin initialized successfully.`
+   - `[OnlyYou] Migrated legacy user relationships into per-Soul user_relations: {'users_processed': N, 'relations_created': M, 'skipped': K}`（一次性；幂等 flag 写入后不会重复）
+   - 无 Traceback。
+4. 数据校验（容器内）：
+   ```bash
+   sqlite3 /AstrBot/data/plugin_data/astrbot_plugin_only_you/only_you.db \
+     "select soul_id, count(*) from user_relations group by soul_id;"
+   ```
+   预期每个角色一行计数；`users` 表身份数不变。
+5. Pages 逐角色打开关系页，确认用户/群聊按角色过滤、关系字段正确。
+
+### 17.3 迁移规则与回滚
+
+- 关系拆分：每个 `users` 行按 `platform_ids` 中平台归属的 Soul 生成 `user_relations` 行（复制 legacy 的 tier/affinity/interaction/nickname/attitude）；跨 Soul 的多平台用户在每个角色各一行。
+- 裸旧 ID：优先按持久化私聊 UMO 证据（`umo_soul_bindings` / `runtime_state_v1.known_l3_umos`）推断平台，再回退 `default_soul_id`（若未设置则回退运行时兜底角色，即最近更新的角色）。
+- 迁移失败/无 Soul 时不会写入 flag，下次启动自动重试；可重复执行不产生重复行。
+- `users` 旧关系列保留作回退，**请勿手工删除**；回滚到 v2.8 时旧列仍可读，但 v2.9 期间按角色修改的关系不会回写旧列。
+- 回滚步骤：恢复升级前的 `only_you.db` 备份 + 旧版插件文件，重启；`user_relations` 表可保留（旧版不读取）。

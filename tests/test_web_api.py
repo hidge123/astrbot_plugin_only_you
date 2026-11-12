@@ -268,9 +268,13 @@ class TestDashboardOverview(WebApiTestBase):
 
     async def test_dashboard_counts_reflect_data(self):
         soul = await self.first_soul()
-        await self.plugin.user_relation.get_or_create_user("u-l1", "普通群友")
+        # v2.9 §4.3: dashboard relation counters are scoped to the current Soul, so
+        # seed the relationships through the per-Soul relation API.
+        await self.plugin.user_relation.get_or_create_user(
+            "u-l1", "普通群友", soul_id=soul.soul_id
+        )
         await self.plugin.user_relation.set_user_tier(
-            "u-l3", mods.state_machine.UserTier.L3_CORE
+            "u-l3", mods.state_machine.UserTier.L3_CORE, soul_id=soul.soul_id
         )
         await self.plugin.memory_manager.add_memory(
             soul_id=soul.soul_id,
@@ -311,7 +315,11 @@ class TestDashboardOverview(WebApiTestBase):
                 1700000000,
             ),
         )
-        data = self.assert_ok(await self.call("GET", self.api.api_dashboard_overview))
+        data = self.assert_ok(
+            await self.call(
+                "GET", self.api.api_dashboard_overview, query={"soul_id": soul.soul_id}
+            )
+        )
         assert data["counts"]["relations"] == {"l1": 1, "l2": 0, "l3": 1, "total": 2}
         assert data["counts"]["memories"]["total"] == 2
         assert data["counts"]["memories"]["tier2"] == 1

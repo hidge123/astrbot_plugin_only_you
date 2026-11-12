@@ -1316,7 +1316,7 @@ class TestGateUnreadMarking(unittest.IsolatedAsyncioTestCase):
         async def resolve_soul(umo=None, allow_llm_seed=True):
             return soul
 
-        async def resolve_user(event):
+        async def resolve_user(event, soul_id=None):
             return user
 
         async def noop_mutator(**kwargs):

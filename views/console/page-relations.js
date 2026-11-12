@@ -4,18 +4,20 @@
  * v2.8 重设计（契约 §7.1 / §7.2）：废弃三列看板 / HTML5 拖拽 / 编辑抽屉 / 「⋯」小菜单，
  * 改为「筛选 chips + 即时搜索 + ★L3→◆L2→L1 横向列表行 + 居中宽幅详情弹窗 + 💬群聊卡片」。
  *
- * 数据源：
- *   GET  `users/list`   → {
- *     users: [UserProfile],
- *     counts: { l3_count, l2_count, l1_count, total },
- *     groups: [GroupItem]   // v2.8 新增（契约 §6.2）
- *   }
- *   POST `users/update` → 默认 action 更新用户（display_name / nickname / tier / affinity / attitude / platform_ids）；
- *                         action="merge" 合并其他账号；action="delete" 删除用户；
- *                         action="update_group" / "clear_group_memory" / "delete_group" 维护群聊档案。
+ * v2.9 按角色（Soul）作用域（契约 §5）：
+ *   - 身份全局、关系按角色：display_name / platform_ids 属全局身份，tier / affinity /
+ *     nickname / attitude 属「当前角色」的关系档案；页面头部显示当前角色名与作用域提示。
+ *   - 数据源：GET `users/list?soul_id=当前角色` → {
+ *       soul_id, users: [UserProfile + soul_id],
+ *       counts: { l3_count, l2_count, l1_count, total },
+ *       groups: [GroupItem]   // 由后端按当前角色过滤
+ *     }
+ *     POST `users/update`（update / merge / delete / 群档案 action）请求体统一带 soul_id。
+ *   - 合并用户：弹窗改为 `<select>` 下拉选择「当前角色关系列表中的其他用户」，
+ *     不再手输 secondary_uid；合并目标不在当前角色列表时展示后端错误 message。
  *
  * ★L3 = 管理员级：不参与好感度计算，也不会被好感度自动晋升（自动晋升只到 L2）。
- * 由 AstrBot admins_id / relationship_config.core_user_ids 自动确定，也可在详情弹窗里显式设为 L3。
+ * 由 AstrBot admins_id 自动确定，也可在详情弹窗里显式设为 L3。
  *
  * 注册：window.OY_PAGES.relations = { id, title, icon, render(container, ctx), destroy() }
  */
@@ -60,6 +62,7 @@
     app: null,
     container: null,
     destroyed: false,
+    soulId: "",
     users: [],
     groups: [],
     counts: { l3_count: 0, l2_count: 0, l1_count: 0, total: 0 },
@@ -142,6 +145,43 @@
       if (S.users[i] && String(S.users[i].global_uid) === wanted) return S.users[i];
     }
     return null;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * v2.9 当前角色作用域
+   * ------------------------------------------------------------------ */
+
+  /** 当前角色 soul_id：以 app.state.currentSoulId 为准，加载回显兜底。 */
+  function currentSoulId() {
+    var state = S.app && S.app.state ? S.app.state : {};
+    return String(state.currentSoulId || S.soulId || "");
+  }
+
+  /** 当前角色显示名（角色卡 identity.name 优先，回退 soul_id）。 */
+  function currentSoulName() {
+    var state = S.app && S.app.state ? S.app.state : {};
+    var soul = state.currentSoul;
+    var name = soul && (soul.name || soul.soul_id);
+    return String(name || state.currentSoulId || S.soulId || "");
+  }
+
+  /** users/update 的公共作用域字段：所有写操作都带当前角色 soul_id（契约 §5.1）。 */
+  function scopeBody(extra) {
+    var body = { soul_id: currentSoulId() };
+    if (extra) {
+      Object.keys(extra).forEach(function (key) {
+        body[key] = extra[key];
+      });
+    }
+    return body;
+  }
+
+  /** 全局身份字段提示标签（显示名 / 平台账号） */
+  function scopeTagHtml(kind) {
+    if (kind === "global") {
+      return '<span class="rel-scope-tag is-global" data-tip="全局身份：所有角色共用，修改后影响所有角色">全局身份</span>';
+    }
+    return '<span class="rel-scope-tag" data-tip="当前角色关系：只作用于当前角色，其他角色互不影响">当前角色</span>';
   }
 
   function normalizeGroup(raw) {
@@ -343,9 +383,12 @@
    * 空态
    * ------------------------------------------------------------------ */
   function emptyStateHtml() {
-    var title = "还没有任何关系或群聊档案";
+    var soulName = currentSoulName();
+    var title = soulName
+      ? "当前角色「" + soulName + "」还没有任何关系或群聊档案"
+      : "还没有任何关系或群聊档案";
     var text =
-      "在群聊 / 私聊里和 Bot 互动后，用户与群聊会自动出现在这里；也可以在「会话」页查看机器人接口绑定。";
+      "在群聊 / 私聊里和 Bot 互动后，用户与群聊会自动出现在这里；也可以在「会话」页查看机器人接口绑定。切换顶部角色可查看其他角色的关系档案。";
     var actions = "";
     if (S.keyword) {
       title = "没有找到匹配的关系或群聊";
@@ -637,6 +680,21 @@
 
   function pageHeadHtml() {
     var totalUsers = num(S.counts.total, S.users.length);
+    var soulName = currentSoulName();
+    var scopeBar = soulName
+      ? '<div class="rel-scope-bar">' +
+        '<span class="rel-scope-chip">' +
+        icon("user", 12) +
+        "<span>当前角色：<b>" +
+        esc(soulName) +
+        "</b></span></span>" +
+        '<span class="rel-scope-hint">' +
+        icon("info", 12) +
+        "<span>仅显示当前角色的关系档案</span></span>" +
+        "</div>"
+      : '<div class="rel-scope-bar"><span class="rel-scope-hint">' +
+        icon("info", 12) +
+        "<span>全局视图：未选择角色</span></span></div>";
     return (
       '<div class="page-head"><h1 class="page-title">' +
       icon("relations", 18) +
@@ -645,11 +703,13 @@
       esc(totalUsers) +
       " 位用户 · " +
       esc(S.groups.length) +
-      " 个群聊</span></h1></div>"
+      " 个群聊</span></h1></div>" +
+      scopeBar
     );
   }
 
   function toolbarHtml() {
+    var soulName = currentSoulName() || "当前角色";
     return (
       '<div class="card rel-toolbar"><div class="card-body tight">' +
       '<div class="rel-toolbar-row">' +
@@ -662,11 +722,16 @@
       esc(S.keyword) +
       '" />' +
       "</div>" +
-      '<button class="btn btn-outline btn-sm rel-refresh-btn" type="button" data-action="reload" data-tip="重新拉取用户与群聊档案">' +
+      '<button class="btn btn-outline btn-sm rel-refresh-btn" type="button" data-action="reload" data-tip="重新拉取当前角色的用户与群聊档案">' +
       icon("refresh", 13) +
       "刷新</button>" +
       "</div>" +
       '<div class="rel-toolbar-hint">' +
+      "<span>" +
+      icon("info", 12) +
+      " 关系按角色隔离：「" +
+      esc(soulName) +
+      "」的等级 / 好感度 / 专属称呼 / 专属态度只属于当前角色；显示名称 / 平台账号是全局身份，所有角色共用。</span>" +
       "<span>★L3 管理员级不参与好感度计算与自动晋升；自动晋升只到 L2</span>" +
       "<span>群聊滑窗 / 未读为内存态：清空只清内存滑窗 + 未读；保留 SQLite memories / users / surfing_history / 群档案（重启后未读队列会重置）</span>" +
       "</div></div></div>"
@@ -688,6 +753,7 @@
    * ------------------------------------------------------------------ */
   function applyUsersPayload(data) {
     if (!data || typeof data !== "object") return;
+    if (typeof data.soul_id === "string") S.soulId = data.soul_id;
     if (Array.isArray(data.users)) S.users = data.users;
     S.counts =
       data.counts && typeof data.counts === "object" ? data.counts : computeCounts(S.users);
@@ -697,12 +763,16 @@
 
   function applyGroupsPayload(data) {
     if (!data || typeof data !== "object") return;
+    if (typeof data.soul_id === "string" && !S.soulId) S.soulId = data.soul_id;
     if (Array.isArray(data.groups)) S.groups = normalizeGroups(data.groups);
     if (data.counts && typeof data.counts === "object") S.counts = data.counts;
   }
 
   async function loadData(app) {
-    var data = await app.apiGet("users/list");
+    /* v2.9：按当前角色作用域加载关系档案与群聊（契约 §5.1） */
+    var state = app && app.state ? app.state : {};
+    var soulId = String(state.currentSoulId || "");
+    var data = await app.apiGet("users/list", soulId ? { soul_id: soulId } : {});
     if (!data || typeof data !== "object") throw new Error("GET users/list 返回为空");
     applyUsersPayload(data);
   }
@@ -972,59 +1042,33 @@
       ? platformIds.map(platformRowHtml).join("")
       : platformRowHtml("");
     var affinityValue = String(num(user.affinity, 0));
+    var soulName = currentSoulName() || "当前角色";
+    var scopeNote =
+      '<div class="rel-scope-note">' +
+      icon("info", 13) +
+      "<span><b>全局身份</b>：显示名称与平台账号会影响所有角色；<b>当前角色关系</b>：等级、好感度、专属称呼、专属态度只属于当前角色「" +
+      esc(soulName) +
+      "」，切换到其他角色后互不影响。</span></div>";
     var body =
       userIdentityHtml(user, tier) +
+      scopeNote +
+      '<div class="rel-form-section" data-role="global-identity">' +
+      '<div class="rel-form-section-head">' +
+      icon("user", 13) +
+      "<span>全局身份</span>" +
+      scopeTagHtml("global") +
+      '<span class="rel-form-section-tip">所有角色共用同一份身份档案</span></div>' +
       '<div class="rel-form-grid">' +
-      '<label class="field"><span class="field-label">显示名称 <span class="req">*</span></span>' +
+      '<label class="field"><span class="field-label">显示名称 <span class="req">*</span> ' +
+      scopeTagHtml("global") +
+      "</span>" +
       '<input class="input" type="text" data-role="display-name" maxlength="64" value="' +
       esc(user.display_name || nameOf(user)) +
-      '" /></label>' +
-      '<label class="field"><span class="field-label">角色对 Ta 的专属称呼 <span class="mono muted">nickname</span></span>' +
-      '<input class="input" type="text" data-role="nickname" maxlength="64" value="' +
-      esc(nickname) +
-      '" /></label>' +
-      '<div class="field is-full"><span class="field-label">关系等级</span>' +
-      '<div class="rel-tier-options" data-role="tier-options">' +
-      TIER_ORDER.map(function (value) {
-        return tierOptionHtml(value, tier);
-      }).join("") +
-      "</div>" +
-      '<div class="rel-tier-warn" data-role="tier-warn"' +
-      (tier === 3 ? "" : " hidden") +
-      ">" +
-      icon("alert", 13) +
-      "<span>" +
-      esc(L3_WARNING) +
-      "</span></div></div>" +
-      '<div class="field is-full' +
-      (tier === 3 ? " is-disabled" : "") +
-      '" data-role="affinity-field"><span class="field-label">好感度</span>' +
-      '<input class="input" type="number" step="0.5" min="0" max="100" data-role="affinity" placeholder="' +
-      (tier === 3 ? "管理员级无需好感度" : "0 ~ 100") +
-      '" value="' +
-      esc(affinityValue) +
-      '"' +
-      (tier === 3 ? " disabled" : "") +
-      " />" +
-      '<div class="field-help" data-role="affinity-help">' +
-      (tier === 3
-        ? "管理员级无需好感度：★L3 不参与好感度计算与自动晋升。"
-        : "L1 / L2 可手动调整好感度（0 ~ 100）；留空按 0 处理。") +
-      "</div></div>" +
-      '<div class="field is-full"><span class="field-label">专属态度 <span class="mono muted">attitude</span></span>' +
-      '<textarea class="input textarea" rows="3" maxlength="' +
-      ATTITUDE_MAX +
-      '" data-role="attitude" placeholder="例如：把 Ta 当成最信任的损友，说话可以毒舌一点但关键时刻很护短">' +
-      esc(attitude) +
-      "</textarea>" +
-      '<div class="field-help">最多 ' +
-      ATTITUDE_MAX +
-      ' 字，会随关系上下文注入 System Prompt，让角色按这里的设定区别对待 Ta；留空则按人设自然相处。（<span class="rel-attitude-count" data-role="attitude-count">' +
-      esc(attitude.length) +
-      "</span>/" +
-      ATTITUDE_MAX +
-      " 字）</div></div>" +
-      '<div class="field is-full"><span class="field-label">平台账号</span>' +
+      '" />' +
+      '<div class="field-help">修改后所有角色看到的显示名称都会变化。</div></label>' +
+      '<div class="field is-full"><span class="field-label">平台账号 ' +
+      scopeTagHtml("global") +
+      "</span>" +
       '<div class="rel-platform-editor">' +
       '<div class="rel-platform-rows" data-role="platform-rows">' +
       rows +
@@ -1044,16 +1088,84 @@
         })
         .join("") +
       "</datalist>" +
-      '<div class="rel-platform-hint">格式 <code>platform:uid</code>（例如 <code>qq bot:123456789</code>；可从下拉选择接口后补 UID）；一行一个，同一平台多个账号用逗号分隔。<b>旧格式</b>（只有裸 ID、无冒号）的行请补全平台后再保存，或直接删除该行。</div>' +
+      '<div class="rel-platform-hint">格式 <code>platform:uid</code>（例如 <code>qq bot:123456789</code>；可从下拉选择接口后补 UID）；一行一个，同一平台多个账号用逗号分隔。<b>平台账号是全局身份</b>，修改后所有角色共用。' +
+      "<b>旧格式</b>（只有裸 ID、无冒号）的行请补全平台后再保存，或直接删除该行。</div>" +
+      "</div></div></div></div>" +
+      '<div class="rel-form-section" data-role="soul-relation">' +
+      '<div class="rel-form-section-head">' +
+      icon("heart", 13) +
+      "<span>当前角色关系 · " +
+      esc(soulName) +
+      "</span>" +
+      scopeTagHtml("soul") +
+      '<span class="rel-form-section-tip">只影响当前角色，按 Soul 隔离存储</span></div>' +
+      '<div class="rel-form-grid">' +
+      '<label class="field"><span class="field-label">角色对 Ta 的专属称呼 <span class="mono muted">nickname</span> ' +
+      scopeTagHtml("soul") +
+      "</span>" +
+      '<input class="input" type="text" data-role="nickname" maxlength="64" value="' +
+      esc(nickname) +
+      '" />' +
+      '<div class="field-help">仅「' +
+      esc(soulName) +
+      "」会这样称呼 Ta；留空使用显示名称。</div></label>" +
+      '<div class="field is-full"><span class="field-label">关系等级 ' +
+      scopeTagHtml("soul") +
+      "</span>" +
+      '<div class="rel-tier-options" data-role="tier-options">' +
+      TIER_ORDER.map(function (value) {
+        return tierOptionHtml(value, tier);
+      }).join("") +
+      "</div>" +
+      '<div class="rel-tier-warn" data-role="tier-warn"' +
+      (tier === 3 ? "" : " hidden") +
+      ">" +
+      icon("alert", 13) +
+      "<span>" +
+      esc(L3_WARNING) +
+      "</span></div></div>" +
+      '<div class="field is-full' +
+      (tier === 3 ? " is-disabled" : "") +
+      '" data-role="affinity-field"><span class="field-label">好感度 ' +
+      scopeTagHtml("soul") +
+      "</span>" +
+      '<input class="input" type="number" step="0.5" min="0" max="100" data-role="affinity" placeholder="' +
+      (tier === 3 ? "管理员级无需好感度" : "0 ~ 100") +
+      '" value="' +
+      esc(affinityValue) +
+      '"' +
+      (tier === 3 ? " disabled" : "") +
+      " />" +
+      '<div class="field-help" data-role="affinity-help">' +
+      (tier === 3
+        ? "管理员级无需好感度：★L3 不参与好感度计算与自动晋升。"
+        : "L1 / L2 可手动调整好感度（0 ~ 100）；留空按 0 处理。只会写入当前角色的关系档案。") +
       "</div></div>" +
-      "</div>";
+      '<div class="field is-full"><span class="field-label">专属态度 <span class="mono muted">attitude</span> ' +
+      scopeTagHtml("soul") +
+      "</span>" +
+      '<textarea class="input textarea" rows="3" maxlength="' +
+      ATTITUDE_MAX +
+      '" data-role="attitude" placeholder="例如：把 Ta 当成最信任的损友，说话可以毒舌一点但关键时刻很护短">' +
+      esc(attitude) +
+      "</textarea>" +
+      '<div class="field-help">最多 ' +
+      ATTITUDE_MAX +
+      ' 字，会随关系上下文注入 System Prompt，让角色按这里的设定区别对待 Ta；留空则按人设自然相处。仅当前角色「' +
+      esc(soulName) +
+      '」生效。（<span class="rel-attitude-count" data-role="attitude-count">' +
+      esc(attitude.length) +
+      "</span>/" +
+      ATTITUDE_MAX +
+      " 字）</div></div>" +
+      "</div></div>";
     app.modal({
-      title: "用户详情 · " + nameOf(user),
+      title: "用户详情 · " + nameOf(user) + (soulName ? "（" + soulName + "）" : ""),
       wide: true,
       body: body,
       actions: [
         {
-          label: "删除用户",
+          label: "移除当前角色的关系档案",
           danger: true,
           icon: "trash",
           onClick: function () {
@@ -1103,7 +1215,7 @@
         return false;
       }
     }
-    var payload = {
+    var payload = scopeBody({
       global_uid: uid,
       display_name: displayName,
       nickname: nicknameEl ? String(nicknameEl.value || "").trim() : "",
@@ -1112,7 +1224,7 @@
         ? String(attitudeEl.value || "").trim().slice(0, ATTITUDE_MAX)
         : "",
       platform_ids: platformIds
-    };
+    });
     /* ★L3 管理员级：不提交好感度，避免把无意义数值写回档案 */
     if (tier !== 3) {
       var affinity = affinityEl ? Number(affinityEl.value) : num(user.affinity, 0);
@@ -1122,7 +1234,10 @@
     var data = await app.apiPost("users/update", payload);
     applyUsersPayload(data);
     paint();
-    app.toast("已保存用户「" + displayName + "」");
+    var soulName = currentSoulName();
+    app.toast(
+      "已保存「" + displayName + "」" + (soulName ? "在角色「" + soulName + "」下" : "") + "的关系档案"
+    );
     return true;
   }
 
@@ -1131,22 +1246,30 @@
     var user = findUser(uid);
     if (!app) return;
     var name = user ? nameOf(user) : String(uid);
+    var soulName = currentSoulName() || "当前角色";
     app
       .confirm({
-        title: "删除用户",
+        title: "移除当前角色的关系档案",
         message:
-          "确定删除用户「" +
+          "确定移除当前角色「" +
+          soulName +
+          "」对用户「" +
           name +
           "」(" +
           uid +
-          ") 吗？该用户的关系等级、好感度与专属态度会被清除；记忆库与群聊档案不会被删除。",
+          ") 的关系档案吗？" +
+          "移除内容：当前角色下的等级、好感度、专属称呼、专属态度与互动记录；" +
+          "不受影响：其他角色对该用户的关系档案，以及各角色的记忆库（memories）与群聊档案。",
         danger: true,
-        confirmLabel: "删除",
+        confirmLabel: "移除当前角色档案",
         onConfirm: async function () {
-          var data = await app.apiPost("users/update", { action: "delete", global_uid: uid });
+          var data = await app.apiPost(
+            "users/update",
+            scopeBody({ action: "delete", global_uid: uid })
+          );
           applyUsersPayload(data);
           paint();
-          app.toast("已删除用户：" + name);
+          app.toast("已移除当前角色「" + soulName + "」对用户「" + name + "」的关系档案");
         }
       })
       .then(function () {
@@ -1155,49 +1278,93 @@
   }
 
   /* ------------------------------------------------------------------ *
-   * 合并其他账号
+   * 合并其他账号（v2.9：下拉选择当前角色列表中的其他用户）
    * ------------------------------------------------------------------ */
+
+  /** 取当前弹窗底部第 index 个操作按钮（0-based，与 actions 顺序一致）。 */
+  function modalActionButton(index) {
+    var root = document.getElementById("modal-root");
+    if (!root) return null;
+    var foot = root.querySelector(".modal-foot");
+    if (!foot) return null;
+    var buttons = foot.querySelectorAll("button[data-action-index]");
+    return buttons[index] || null;
+  }
+
+  /** 禁用 / 启用弹窗底部操作按钮（空候选时禁用「确认合并」）。 */
+  function setModalActionDisabled(index, disabled, tip) {
+    var btn = modalActionButton(index);
+    if (!btn) return;
+    btn.disabled = !!disabled;
+    if (disabled && tip) btn.setAttribute("data-tip", tip);
+    else btn.removeAttribute("data-tip");
+  }
+
   function openMergeModal(primaryUid) {
     var app = S.app;
     var user = findUser(primaryUid);
     if (!app || !user) return;
     var primaryName = nameOf(user);
-    var candidates = S.users
-      .filter(function (item) {
-        return item && String(item.global_uid) !== String(primaryUid);
-      })
-      .slice(0, 80);
-    var datalist = candidates.length
-      ? '<datalist id="rel-merge-candidates">' +
+    var soulName = currentSoulName() || "当前角色";
+    /* 候选 = 当前角色关系列表（S.users）中的其他用户，排除自己 */
+    var candidates = S.users.filter(function (item) {
+      return item && String(item.global_uid) !== String(primaryUid);
+    });
+    var selectHtml;
+    if (candidates.length) {
+      selectHtml =
+        '<select class="input rel-merge-select" data-role="merge-secondary" aria-label="选择要合并到主档案的用户">' +
+        '<option value="">— 请选择要合并到主档案的用户 —</option>' +
         candidates
           .map(function (item) {
+            var tier = Number(item.tier) || 1;
+            if (!TIER_META[tier]) tier = 1;
+            var label =
+              nameOf(item) + "（" + TIER_META[tier].short + "）· " + String(item.global_uid || "");
             return (
-              '<option value="' +
-              esc(item.global_uid) +
-              '">' +
-              esc(nameOf(item)) +
-              "</option>"
+              '<option value="' + esc(item.global_uid) + '">' + esc(label) + "</option>"
             );
           })
           .join("") +
-        "</datalist>"
-      : "";
+        "</select>" +
+        '<div class="field-help">选项来自当前角色「' +
+        esc(soulName) +
+        "」的关系列表，已排除该用户自己；合并目标必须是当前角色关系列表中的已有用户。</div>";
+    } else {
+      selectHtml =
+        '<select class="input rel-merge-select" data-role="merge-secondary" aria-label="暂无可合并用户" disabled>' +
+        '<option value="">— 当前角色暂无可合并的其他用户 —</option>' +
+        "</select>" +
+        '<div class="rel-merge-empty">' +
+        icon("info", 13) +
+        "<span>当前角色暂无其他用户可合并。合并目标必须是当前角色关系列表中的已有用户：可先在群聊 / 私聊里让 Bot 与该用户产生互动，或切换到对应角色后再合并。</span></div>";
+    }
     var body =
+      '<div class="rel-scope-note">' +
+      icon("info", 13) +
+      "<span>合并目标只能是当前角色「" +
+      esc(soulName) +
+      "」关系列表中的已有用户；合并后该账号的平台账号并入主档案，各角色的关系档案按等级取高、好感度取高、互动次数相加，被合并账号随后从列表移除。</span></div>" +
       '<div class="rel-merge-primary">' +
       '<span class="avatar rel-avatar" style="--tier-color:var(--tier-l3)">' +
       avatarInner(user.avatar, primaryName) +
       "</span>" +
       '<div class="rel-row-main"><strong>' +
       esc(primaryName) +
-      '</strong><span class="text-xs muted mono">' +
+      "</strong>" +
+      '<span class="text-xs muted mono">' +
       esc(user.global_uid || "") +
-      " · 主档案</span></div></div>" +
-      '<div class="field"><span class="field-label">被合并账号 global_uid <span class="req">*</span></span>' +
-      '<input class="input mono" type="text" data-role="merge-secondary" list="rel-merge-candidates" placeholder="输入另一个平台账号的 global_uid" />' +
-      datalist +
-      '<div class="field-help">被合并账号的平台 ID、互动次数会并入当前用户档案，之后该账号从列表移除；主档案的专属态度优先。</div></div>';
+      " · 主档案（保留显示名与平台账号）</span></div></div>" +
+      '<div class="rel-merge-arrow">' +
+      icon("arrow-right", 14) +
+      "<span>被合并用户</span></div>" +
+      '<div class="field"><span class="field-label">选择被合并的用户 <span class="req">*</span> ' +
+      scopeTagHtml("soul") +
+      "</span>" +
+      selectHtml +
+      "</div>";
     app.modal({
-      title: "合并其他用户账号",
+      title: "合并其他用户账号 · " + primaryName,
       body: body,
       actions: [
         { label: "取消" },
@@ -1206,28 +1373,51 @@
           primary: true,
           icon: "link",
           onClick: async function (modalApp, bodyEl) {
-            var input = bodyEl.querySelector('[data-role="merge-secondary"]');
-            var secondary = input ? String(input.value || "").trim() : "";
+            var select = bodyEl.querySelector('[data-role="merge-secondary"]');
+            var secondary = select ? String(select.value || "").trim() : "";
             if (!secondary) {
-              app.toast("请填写被合并账号的 global_uid", true);
+              app.toast(
+                candidates.length ? "请选择要合并的用户" : "当前角色暂无可合并的其他用户",
+                true
+              );
               return false;
             }
             if (secondary === String(primaryUid)) {
-              app.toast("不能把账号合并到它自己", true);
+              app.toast("不能把用户合并到它自己", true);
               return false;
             }
-            var data = await app.apiPost("users/update", {
-              action: "merge",
-              primary_uid: primaryUid,
-              secondary_uid: secondary
-            });
+            var secondaryUser = findUser(secondary);
+            var secondaryName = secondaryUser ? nameOf(secondaryUser) : secondary;
+            /* 后端校验失败时直接展示 message（例如「合并目标必须是当前角色关系列表中的已有用户」） */
+            var data = await app.apiPost(
+              "users/update",
+              scopeBody({
+                action: "merge",
+                primary_uid: primaryUid,
+                secondary_uid: secondary
+              })
+            );
             applyUsersPayload(data);
             paint();
-            app.toast("已将 " + secondary + " 合并到 " + primaryName);
+            app.toast(
+              "已将「" +
+                secondaryName +
+                "」合并到「" +
+                primaryName +
+                "」（当前角色：" +
+                soulName +
+                "）"
+            );
             return true;
           }
         }
-      ]
+      ],
+      onMount: function () {
+        /* 空候选：禁用「确认合并」按钮（契约 §5.2） */
+        if (!candidates.length) {
+          setModalActionDisabled(1, true, "当前角色暂无可合并的其他用户");
+        }
+      }
     });
   }
 
@@ -1342,12 +1532,15 @@
       app.toast("群显示名称不能为空", true);
       return false;
     }
-    var data = await app.apiPost("users/update", {
-      action: "update_group",
-      umo: umo,
-      display_name: displayName,
-      notes: notesEl ? String(notesEl.value || "").trim() : ""
-    });
+    var data = await app.apiPost(
+      "users/update",
+      scopeBody({
+        action: "update_group",
+        umo: umo,
+        display_name: displayName,
+        notes: notesEl ? String(notesEl.value || "").trim() : ""
+      })
+    );
     applyGroupsPayload(data);
     if (!data || !Array.isArray(data.groups)) {
       if (group) {
@@ -1376,10 +1569,13 @@
         danger: true,
         confirmLabel: "清空内存",
         onConfirm: async function () {
-          var data = await app.apiPost("users/update", {
-            action: "clear_group_memory",
-            umo: umo
-          });
+          var data = await app.apiPost(
+            "users/update",
+            scopeBody({
+              action: "clear_group_memory",
+              umo: umo
+            })
+          );
           applyGroupsPayload(data);
           paint();
           app.toast("已清空群聊「" + name + "」的内存滑窗与未读");
@@ -1406,10 +1602,13 @@
         danger: true,
         confirmLabel: "移除记录",
         onConfirm: async function () {
-          var data = await app.apiPost("users/update", {
-            action: "delete_group",
-            umo: umo
-          });
+          var data = await app.apiPost(
+            "users/update",
+            scopeBody({
+              action: "delete_group",
+              umo: umo
+            })
+          );
           applyGroupsPayload(data);
           paint();
           app.toast("已移除群聊记录：" + name);
@@ -1489,6 +1688,7 @@
     S.app = app;
     S.container = container;
     S.destroyed = false;
+    S.soulId = "";
     S.users = [];
     S.groups = [];
     S.counts = { l3_count: 0, l2_count: 0, l1_count: 0, total: 0 };
@@ -1513,6 +1713,7 @@
     S.destroyed = true;
     S.app = null;
     S.container = null;
+    S.soulId = "";
     S.users = [];
     S.groups = [];
     S.counts = { l3_count: 0, l2_count: 0, l1_count: 0, total: 0 };

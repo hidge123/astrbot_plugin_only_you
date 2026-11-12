@@ -162,6 +162,12 @@ AstrBot 默认的 `_conf_schema.json` 只适合静态、扁平的基础键值对
 ### 3.4 关系与群聊（`page-relations.js`，v2.8 重写）
 
 > **v2.8 重设计**：废弃 v2.6 的「三列看板 + HTML5 拖拽改级 + 编辑抽屉 + 「⋯」小菜单」，改为「筛选 chips + 即时搜索 + 分组横向列表 + 居中宽幅详情弹窗 + 💬 群聊分区」。数据源仍为 `users/list`（v2.8 新增 `groups`）与 `users/update`（v2.8 新增群档案 action）。
+>
+> **v2.9 变更（身份全局 · 关系按角色）**：
+> 1. 页面加载与所有写入都带当前角色 `soul_id`：`users/list?soul_id=`、`users/update` body `{soul_id, ...}`；切换顶部「当前角色」后自动重渲染并按新角色重新拉取。页头显示「当前角色：<角色名>」与「仅显示当前角色的关系档案」作用域条。
+> 2. **合并用户改为下拉选择**：不再手输 `secondary_uid`，合并弹窗用 `<select>` 列出**当前角色关系列表中的其他用户**（排除自己，label「显示名（等级标签）· global_uid」）；无候选时禁用并提示「当前角色暂无可合并的其他用户」。后端会校验两个账号都必须存在于当前角色关系列表，否则返回错误文案「合并目标必须是当前角色关系列表中的已有用户」。
+> 3. 详情弹窗拆成两个语义分区：**「全局身份（影响所有角色）」**= 显示名称 + 平台账号；**「当前角色关系 · <角色名>」**= 关系等级 / 好感度 / 专属称呼 / 专属态度。删除按钮改为「移除当前角色的关系档案」，二次确认注明其他角色关系与 memories/群档案不受影响（最后一个关系删除时才移除全局身份）。
+> 4. 群聊分区数据由 API 按当前角色的 `bound_soul_id` / 绑定平台过滤，群档案操作同样带 `soul_id`；不传 `soul_id` 时接口保持 v2.8 legacy 全量视图（记忆页等旧调用兼容）。
 
 1. **页头**：标题「关系与群聊」+ 副标题（关系条数与群聊数）；右侧「刷新」按钮。数据加载中显示 spinner「加载关系与群聊…」。
 2. **筛选 chips**：`[全部] [★L3 核心 (n)] [◆L2 重要 (n)] [L1 普通 (n)] [💬 群聊 (n)]`——点击切换列表内容；选「💬 群聊」时只显示群聊分区，选「全部」时用户区之后显示群聊分区。计数来自 `users/list` 的 `counts` 与 `groups.length`。
@@ -349,8 +355,8 @@ window.OY_PAGES["overview"] = {
 | 10 | `cards/save` | POST | `{ soul_id?, card_type:"action", scope:"soul"\|"global", card }`（card 含 `action_type/min_hours/max_hours`；v2.6 传 `armor` 会被固定档位覆盖；encounter 类型已移除并返回错误） | 同 `cards/list` 的卡片池结构 |
 | 11 | `cards/delete` | POST | `{ soul_id?, card_type:"action", scope, card_id }` | 同 `cards/list` 的卡片池结构 |
 | 12 | `cards/ai_generate` | POST | `{ soul_id?, auto_save? }` | 卡片池结构 + `{ generated_cards }`（决策模型生成 8~12 张四类专属行动卡；v2.6 Prompt 不再要求 armor，落库时按固定档位写入） |
-| 13 | `users/list` | GET | `?tier=1\|2\|3` | `{ users, counts, groups }`；`users` 每项含 `global_uid/display_name/nickname/attitude/tier/affinity/platform_ids` 等（v2.6 新增 `attitude`）；**v2.8 新增 `groups: [GroupItem]`（见 §5.4）** |
-| 14 | `users/update` | POST | `{ action:"update"\|"merge"\|"delete"\|"update_group"\|"clear_group_memory"\|"delete_group", ... }`（v2.8 群档案 action body `{umo, display_name?, notes?}`） | update：`{ user, users }`；merge：`{ merged_user, users }`；delete：`{ users }`；**v2.8 群档案 action：`{ groups, counts }`**；v2.6 `attitude` 去空白后截断 300 字持久化 |
+| 13 | `users/list` | GET | `?tier=1\|2\|3&soul_id=`（**v2.9 新增 `soul_id`**） | `{ soul_id, users, counts, groups }`；`users` 每项含 `global_uid/display_name/nickname/attitude/tier/affinity/platform_ids/platform_accounts` 等（v2.6 新增 `attitude`，v2.8.4 新增 `platform_accounts`）；**v2.8 新增 `groups: [GroupItem]`（见 §5.4）**；**v2.9 传 `soul_id` 时 users/counts/groups 均按该角色过滤，关系字段来自 `user_relations(soul_id, global_uid)`；不传保持 legacy 全量视图并回显 `soul_id=""`** |
+| 14 | `users/update` | POST | `{ action:"update"\|"merge"\|"delete"\|"normalize_identity"\|"update_group"\|"clear_group_memory"\|"delete_group", soul_id?, ... }`（v2.8 群档案 action body `{umo, display_name?, notes?}`；**v2.9 关系 action 建议带 `soul_id`**） | update：`{ user, users, soul_id? }`；merge：`{ merged_user, users, counts, soul_id? }`；delete：`{ users, counts, soul_id? }`；**v2.9 merge 要求 primary/secondary 均为当前角色关系列表中已有用户（否则 error「合并目标必须是当前角色关系列表中的已有用户」），并按 Soul 合并关系行与迁移 memories.user_id**；**v2.8 群档案 action：`{ groups, counts }`**；v2.6 `attitude` 去空白后截断 300 字持久化 |
 | 15 | `memories/list` | GET | `?soul_id&memory_tier=1\|2\|3&user_id&keyword` | `{ memories, stats, tier1_limit }`；`stats` 含 `tier3_count/tier2_count/tier1_count/total` 与上下文预算参数；**v2.8 新增 `tier1_limit`（默认 30，来自 `memory_and_context_config.max_tier1_memories`）** |
 | 16 | `memories/mutate` | POST | `{ action:"add"\|"edit"\|"delete"\|"pin_core"\|"extract"\|"gc", soul_id, id?, content?, keywords?, importance?, memory_tier?, vitality?, user_id?, umo? }` | 各 action 返回对应结果（`memories` / `memory` / `gc_stats` / `extracted_count` 等） |
 | 17 | `surfing/list_and_trigger` | GET / POST | GET：`?soul_id=`；POST：`{ action:"surf"\|"share"\|"delete"\|"toggle_surfing"\|"set_surfing_sources", soul_id?, enabled?, sources?, ... }` | GET：`{ videos, known_umos, surfing_enabled, surfing_sources, soul_id }`（v2.8 新增总开关，v2.8.3 新增后台视频源）；surf：`{ review, videos, schedule }`；share：`{ sent, target_umo, share_text }`；delete：`{ videos }`；**v2.8 `toggle_surfing`：`{ soul_id, surfing_enabled, soul }`；v2.8.3 `set_surfing_sources`：`{ soul_id, surfing_sources, soul }`** |

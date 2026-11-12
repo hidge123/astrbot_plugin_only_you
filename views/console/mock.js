@@ -23,6 +23,16 @@
  *  memories/list 返回 `tier1_limit`；surfing/list_and_trigger 返回 surfing_enabled /
  *  surfing_sources / soul_id，并支持 POST `action="toggle_surfing"` / `"set_surfing_sources"`。关系页（T3）与会话 / 模型 / 记忆 / 冲浪页（T4）共用这些形状。
  *
+ * v2.9 同步（契约 §1 / §5.5）：**身份全局 + 关系按角色（Soul）隔离**。
+ *  - `db.users` 只保存全局身份（global_uid / display_name / platform_ids，保留 legacy 关系列作无
+ *    soul_id 旧视图的回退）；`db.userRelations[soul_id][global_uid]` 保存该角色的
+ *    tier / interaction_count / affinity / nickname / attitude。
+ *  - `users/list?soul_id=` 返回该角色有关系的用户 + 按 Soul 过滤的 groups，回显 `soul_id`；
+ *    `users/update` 各 action 带 `soul_id`（identity 字段全局写、关系字段只写该角色）；
+ *    merge 校验 secondary 必须在当前角色关系列表，否则返回与后端一致的错误 message。
+ *  - 同一 global_uid 在不同角色下 tier / affinity / attitude 可不同（见 buildInitialDb 夹具）。
+ *  不传 `soul_id` 时保持 v2.8 legacy 全量视图（记忆页关联用户下拉等旧调用兼容）。
+ *
  * 用途：无 AstrBot 后端时直接双击打开 `index.html?mock=1` 即可渲染所有页面 / 截图验收。
  * 数据是可变的：force_state / reroll / cards 增删改 / 默认角色 / UMO 绑定等操作都会更新内存状态。
  *
@@ -688,6 +698,10 @@
           last_active_at: nowSeconds() - 86400 * 3
         }
       ],
+      /* v2.9：users 行 = 全局身份（global_uid / display_name / platform_ids）。
+       * 其中的 tier / nickname / attitude / affinity / interaction_count 是 legacy 回退列，
+       * 只在 users/list 不传 soul_id 的旧视图（记忆页关联用户下拉等）里使用；
+       * 页面关系档案一律读下方 db.userRelations[soul_id]。 */
       users: [
         { global_uid: "core_tester", display_name: "阿泽", nickname: "阿泽", attitude: "把 Ta 当成最信任的损友，嘴上嫌弃但每次都秒回帮他兜底，愿意分享最真实的心情。", tier: 3, tier_label: "★L3核心用户", interaction_count: 328, affinity: 92.5, platform_ids: ["qq:123456789", "telegram:987654321"] },
         { global_uid: "admin_luna", display_name: "Luna", nickname: "月姐", attitude: "当作靠谱的前辈，偶尔撒个娇求助，正经事上很听她的。", tier: 3, tier_label: "★L3核心用户", interaction_count: 194, affinity: 88.0, platform_ids: ["qq:222333444"] },
@@ -697,6 +711,31 @@
         { global_uid: "l1_bob", display_name: "Bob", nickname: "", attitude: "", tier: 1, tier_label: "L1普通群友", interaction_count: 4, affinity: 6.5, platform_ids: ["qq:666777888"] },
         { global_uid: "l1_anon", display_name: "匿名网友", nickname: "", attitude: "", tier: 1, tier_label: "L1普通群友", interaction_count: 1, affinity: 2.0, platform_ids: [] }
       ],
+      /* v2.9：按角色（Soul）隔离的关系行 —— 同一 global_uid 在不同角色下
+       * tier / affinity / interaction_count / nickname / attitude 可以不同：
+       *   · core_tester：酒狐（default_soul）★L3 + 高好感 + 专属态度；小满（soul_xiaoman）L1 + 低好感。
+       *   · l2_tester / l2_mikan：两个角色都有，但好感度 / 昵称 / 态度不同。
+       *   · admin_luna / l1_passerby / l1_anon 只在酒狐有关系；小满另有 l1_bob 的 L2 关系。
+       * 关系集合不同 → 切换角色后关系页用户列表与 group 列表随之变化（契约 §5.5）。 */
+      userRelations: {
+        default_soul: {
+          core_tester: { tier: 3, interaction_count: 328, affinity: 92.5, nickname: "阿泽", attitude: "把 Ta 当成最信任的损友，嘴上嫌弃但每次都秒回帮他兜底，愿意分享最真实的心情。" },
+          admin_luna: { tier: 3, interaction_count: 194, affinity: 88.0, nickname: "月姐", attitude: "当作靠谱的前辈，偶尔撒个娇求助，正经事上很听她的。" },
+          l2_tester: { tier: 2, interaction_count: 86, affinity: 64.0, nickname: "老王", attitude: "一起开黑互损的老熟人，说话可以没大没小。" },
+          l2_mikan: { tier: 2, interaction_count: 61, affinity: 57.5, nickname: "小橘子", attitude: "" },
+          l1_passerby: { tier: 1, interaction_count: 9, affinity: 12.0, nickname: "", attitude: "" },
+          l1_bob: { tier: 1, interaction_count: 4, affinity: 6.5, nickname: "", attitude: "" },
+          l1_anon: { tier: 1, interaction_count: 1, affinity: 2.0, nickname: "", attitude: "" }
+        },
+        soul_xiaoman: {
+          /* 同一 global_uid 在另一个角色下 tier / affinity / attitude 完全不同 */
+          core_tester: { tier: 1, interaction_count: 12, affinity: 24.5, nickname: "", attitude: "只是偶尔在群里说上两句话的网友，保持基本礼貌。" },
+          l2_tester: { tier: 2, interaction_count: 42, affinity: 71.5, nickname: "开黑老王", attitude: "周五固定开黑的老搭档，输了会互相甩锅但从不生气。" },
+          l2_mikan: { tier: 2, interaction_count: 96, affinity: 85.0, nickname: "橘子", attitude: "最信任的学姐，遇到选课和实习的问题都想先问问她。" },
+          l1_passerby: { tier: 1, interaction_count: 3, affinity: 5.0, nickname: "", attitude: "" },
+          l1_bob: { tier: 2, interaction_count: 37, affinity: 50.0, nickname: "鲍勃", attitude: "一起上选修课的同学，经常互相帮忙占座。" }
+        }
+      },
       memories: [
         { id: 101, soul_id: "default_soul", user_id: "core_tester", user_tier: 3, memory_tier: 3, content: "阿泽严重海鲜过敏，聚餐千万别点海鲜。", keywords: "海鲜过敏,饮食,健康", importance: 10, vitality: 100, access_count: 12, created_at: nowSeconds() - 86400 * 40, last_accessed_at: nowSeconds() - 3600 },
         { id: 102, soul_id: "default_soul", user_id: "core_tester", user_tier: 3, memory_tier: 3, content: "阿泽最近在准备考研，压力很大，喜欢晚上找人聊两句。", keywords: "考研,压力,作息", importance: 9, vitality: 96, access_count: 8, created_at: nowSeconds() - 86400 * 20, last_accessed_at: nowSeconds() - 7200 },
@@ -1186,16 +1225,15 @@
     return Math.max(0, cooldown - (nowSeconds() - run.last_mutation_ts));
   }
 
-  function relationsCounts() {
-    var l1 = 0;
-    var l2 = 0;
-    var l3 = 0;
-    db.users.forEach(function (user) {
-      if (user.tier === 3) l3 += 1;
-      else if (user.tier === 2) l2 += 1;
-      else l1 += 1;
-    });
-    return { l1: l1, l2: l2, l3: l3, total: db.users.length };
+  /* v2.9：dashboard/overview 关系计数按当前角色作用域统计（契约 §4.3）。 */
+  function relationsCounts(soulId) {
+    var counts = userCountsFor(soulId);
+    return {
+      l1: counts.l1_count,
+      l2: counts.l2_count,
+      l3: counts.l3_count,
+      total: counts.total
+    };
   }
 
   function memoryCounts() {
@@ -1547,7 +1585,7 @@
     var current = schedule.current_slot;
     var card = soul.card || {};
     var counts = {
-      relations: relationsCounts(),
+      relations: relationsCounts(soul.soul_id),
       memories: memoryCounts(),
       videos: db.videos.filter(function (video) {
         return video.soul_id === soul.soul_id;
@@ -2146,25 +2184,149 @@
   /* ================================================================== *
    * 8. 用户 / 记忆 / 冲浪
    * ================================================================== */
-  function userCounts() {
-    return {
-      l3_count: db.users.filter(function (u) { return u.tier === 3; }).length,
-      l2_count: db.users.filter(function (u) { return u.tier === 2; }).length,
-      l1_count: db.users.filter(function (u) { return u.tier === 1; }).length,
-      total: db.users.length
-    };
+  /* ------------------------------------------------------------------ *
+   * v2.9 身份全局 + 关系按角色（契约 §1.3 / §2.2 / §5.5）
+   *   db.users               = 全局身份行（global_uid / display_name / platform_ids + legacy 关系列）
+   *   db.userRelations[soul] = { global_uid: { tier, interaction_count, affinity, nickname, attitude } }
+   *   soul_id 为空 = legacy 全量视图（旧调用兼容，契约 §4.1）。
+   * ------------------------------------------------------------------ */
+
+  function userTierLabel(tier) {
+    return ({ 3: "★L3核心用户", 2: "◆L2重要熟人", 1: "L1普通群友" })[Number(tier) || 1] ||
+      "L1普通群友";
   }
 
-  function listUsers(tier) {
-    var filterTier = tier != null && tier !== "" ? Number(tier) : null;
-    var users = db.users.filter(function (user) {
-      return filterTier == null || user.tier === filterTier;
+  function findUserIdentity(uid) {
+    var wanted = String(uid == null ? "" : uid);
+    for (var i = 0; i < db.users.length; i++) {
+      if (db.users[i] && String(db.users[i].global_uid) === wanted) return db.users[i];
+    }
+    return null;
+  }
+
+  /** 某角色的关系行映射（懒建空对象）。 */
+  function relationsOfSoul(soulId) {
+    var key = String(soulId || "");
+    if (!key) return null;
+    if (!db.userRelations || typeof db.userRelations !== "object") db.userRelations = {};
+    if (!db.userRelations[key] || typeof db.userRelations[key] !== "object") {
+      db.userRelations[key] = {};
+    }
+    return db.userRelations[key];
+  }
+
+  function relationOf(soulId, uid) {
+    var map = relationsOfSoul(soulId);
+    return map ? map[String(uid)] || null : null;
+  }
+
+  /** 把全局身份 + 指定角色关系行合成 UserProfile 形状（含 soul_id）。 */
+  function composeScopedUser(identity, relation, soulId) {
+    if (!identity) return null;
+    var rel = relation && typeof relation === "object" ? relation : {};
+    var tier = clamp(rel.tier != null ? rel.tier : 1, 1, 3);
+    var affinity = Number(rel.affinity != null ? rel.affinity : 0);
+    if (!isFinite(affinity)) affinity = 0;
+    return clone({
+      global_uid: identity.global_uid,
+      display_name: identity.display_name,
+      nickname: String(rel.nickname || ""),
+      tier: tier,
+      tier_label: userTierLabel(tier),
+      interaction_count: Number(rel.interaction_count || 0),
+      affinity: Math.max(0, Math.min(100, affinity)),
+      attitude: String(rel.attitude || ""),
+      platform_ids: Array.isArray(identity.platform_ids) ? identity.platform_ids.slice() : [],
+      updated_at: rel.updated_at || identity.updated_at || 0,
+      soul_id: String(soulId || "")
     });
+  }
+
+  /** 指定角色的用户列表（tier DESC, affinity DESC, interaction_count DESC）；空 soul = legacy 视图。 */
+  function scopedUsers(soulId) {
+    var key = String(soulId || "");
+    var users;
+    if (!key) {
+      users = db.users.map(function (identity) {
+        var tier = clamp(identity.tier != null ? identity.tier : 1, 1, 3);
+        return clone({
+          global_uid: identity.global_uid,
+          display_name: identity.display_name,
+          nickname: String(identity.nickname || ""),
+          tier: tier,
+          tier_label: userTierLabel(tier),
+          interaction_count: Number(identity.interaction_count || 0),
+          affinity: Math.max(0, Math.min(100, Number(identity.affinity || 0))),
+          attitude: String(identity.attitude || ""),
+          platform_ids: Array.isArray(identity.platform_ids) ? identity.platform_ids.slice() : [],
+          updated_at: identity.updated_at || 0,
+          soul_id: ""
+        });
+      });
+    } else {
+      var map = relationsOfSoul(key);
+      users = db.users
+        .filter(function (identity) {
+          return !!(identity && map[String(identity.global_uid)]);
+        })
+        .map(function (identity) {
+          return composeScopedUser(identity, map[String(identity.global_uid)], key);
+        });
+    }
+    users.sort(function (a, b) {
+      if ((b.tier || 1) !== (a.tier || 1)) return (b.tier || 1) - (a.tier || 1);
+      if ((b.affinity || 0) !== (a.affinity || 0)) return (b.affinity || 0) - (a.affinity || 0);
+      return (b.interaction_count || 0) - (a.interaction_count || 0);
+    });
+    return users;
+  }
+
+  function userCountsFor(soulId) {
+    var users = scopedUsers(soulId);
+    var counts = { l3_count: 0, l2_count: 0, l1_count: 0, total: users.length };
+    users.forEach(function (user) {
+      var tier = Number(user.tier) || 1;
+      if (tier === 3) counts.l3_count += 1;
+      else if (tier === 2) counts.l2_count += 1;
+      else counts.l1_count += 1;
+    });
+    return counts;
+  }
+
+  /** 按 Soul 过滤群聊档案（契约 §4.4）：bound_soul_id 命中，或 group.platform_id ∈ soul.bound_platforms。 */
+  function groupsForSoul(soulId) {
+    var key = String(soulId || "");
+    if (!key) return clone(db.groups);
+    var soul = findSoul(key);
+    if (!soul) return [];
+    ensureSoulV28Fields(soul);
+    var boundPlatforms = soul.bound_platforms || [];
+    return clone(
+      db.groups.filter(function (group) {
+        if (String(group.bound_soul_id || "") === key) return true;
+        return !!group.platform_id && boundPlatforms.indexOf(group.platform_id) >= 0;
+      })
+    );
+  }
+
+  /** GET users/list（契约 §4.1）：users/counts/groups 均按 soul_id 过滤；回显 soul_id。 */
+  function listUsers(payload) {
+    payload = payload && typeof payload === "object" ? payload : {};
+    var soulId = String(payload.soul_id || "");
+    var filterTier =
+      payload.tier != null && payload.tier !== "" ? Number(payload.tier) : null;
+    var users = scopedUsers(soulId);
+    if (filterTier != null) {
+      users = users.filter(function (user) {
+        return user.tier === filterTier;
+      });
+    }
     return {
-      users: clone(users),
-      counts: userCounts(),
-      /* v2.8：群聊档案列表（契约 §6.2 GroupItem） */
-      groups: clone(db.groups)
+      soul_id: soulId,
+      users: users,
+      counts: userCountsFor(soulId),
+      /* v2.8：群聊档案列表（v2.9 按当前角色过滤，契约 §4.4） */
+      groups: groupsForSoul(soulId)
     };
   }
 
@@ -2177,9 +2339,14 @@
     return null;
   }
 
-  function groupMutationResult(extra) {
-    var data = { groups: clone(db.groups), counts: userCounts() };
-    if (extra) Object.keys(extra).forEach(function (key) { data[key] = extra[key]; });
+  function groupMutationResult(extra, soulId) {
+    var key = String(soulId || "");
+    var data = {
+      soul_id: key,
+      groups: groupsForSoul(key),
+      counts: userCountsFor(key)
+    };
+    if (extra) Object.keys(extra).forEach(function (key2) { data[key2] = extra[key2]; });
     return data;
   }
 
@@ -2193,7 +2360,7 @@
     }
     if (body.notes != null) group.notes = String(body.notes).trim();
     group.last_active_at = group.last_active_at || nowSeconds();
-    return groupMutationResult({ group: clone(group) });
+    return groupMutationResult({ group: clone(group) }, body.soul_id);
   }
 
   function clearGroupMemoryRecord(body) {
@@ -2210,7 +2377,7 @@
     group.unread_count = 0;
     delete db.windows[umo];
     delete db.sessionActivity[umo];
-    return groupMutationResult({ cleared: cleared });
+    return groupMutationResult({ cleared: cleared }, body.soul_id);
   }
 
   function deleteGroupRecord(body) {
@@ -2222,78 +2389,252 @@
     });
     delete db.windows[umo];
     delete db.sessionActivity[umo];
-    return groupMutationResult({ deleted_umo: umo });
+    return groupMutationResult({ deleted_umo: umo }, body.soul_id);
+  }
+
+  /* ---------------- v2.9 users/update：按角色作用域写身份 / 关系 ---------------- */
+
+  /** normalize_identity：身份全局操作（契约 §4.2），可选回显 soul_id。 */
+  function normalizeUserIdentity(body) {
+    var uid = String(body.global_uid || "").trim();
+    if (!uid) throw new Error("用户 ID (global_uid) 不能为空");
+    var identity = findUserIdentity(uid);
+    if (!identity) throw new Error("用户不存在：" + uid);
+    var platformId = String(body.platform_id || "").trim();
+    var soulId = String(body.soul_id || "");
+    if (platformId) {
+      var repaired = platformId + ":" + uid;
+      var pids = Array.isArray(identity.platform_ids) ? identity.platform_ids.slice() : [];
+      pids = pids.filter(function (pid) {
+        return String(pid).indexOf(":") >= 0;
+      });
+      if (pids.indexOf(repaired) < 0) pids.push(repaired);
+      identity.platform_ids = pids;
+    }
+    return {
+      soul_id: soulId,
+      user: soulId ? composeScopedUser(identity, relationOf(soulId, uid), soulId) : null,
+      users: scopedUsers(soulId),
+      counts: userCountsFor(soulId),
+      groups: groupsForSoul(soulId)
+    };
+  }
+
+  /** merge：身份合并全局生效，关系行逐 Soul 合并；soul_id 非空时校验双方都在该 Soul 列表（契约 §2.4 / §4.2）。 */
+  function mergeUsers(body, soulId) {
+    var primaryUid = String(body.primary_uid || "").trim();
+    var secondaryUid = String(body.secondary_uid || "").trim();
+    if (!primaryUid || !secondaryUid) throw new Error("待合并账号不能为空");
+    if (primaryUid === secondaryUid) throw new Error("不能把用户合并到它自己");
+    var primaryIdentity = findUserIdentity(primaryUid);
+    var secondaryIdentity = findUserIdentity(secondaryUid);
+    if (!primaryIdentity || !secondaryIdentity) throw new Error("待合并账号不存在");
+
+    if (soulId) {
+      var scopedIds = {};
+      scopedUsers(soulId).forEach(function (user) {
+        scopedIds[user.global_uid] = true;
+      });
+      /* 契约 §4.2：primary / secondary 均必须存在于该 Soul 的关系列表 */
+      if (!scopedIds[primaryUid] || !scopedIds[secondaryUid]) {
+        throw new Error("合并目标必须是当前角色关系列表中的已有用户");
+      }
+    }
+
+    /* 身份合并：platform_ids 并集、display_name 保留 primary（契约 §2.4） */
+    var mergedPlatformIds = Array.isArray(primaryIdentity.platform_ids)
+      ? primaryIdentity.platform_ids.slice()
+      : [];
+    var secondaryPlatformIds = Array.isArray(secondaryIdentity.platform_ids)
+      ? secondaryIdentity.platform_ids
+      : [];
+    secondaryPlatformIds.forEach(function (pid) {
+      if (mergedPlatformIds.indexOf(pid) < 0) mergedPlatformIds.push(pid);
+    });
+    primaryIdentity.platform_ids = mergedPlatformIds;
+    primaryIdentity.updated_at = nowSeconds();
+
+    /* legacy 列同步合并（无 soul_id 的旧视图回退列，契约 §1.1） */
+    primaryIdentity.interaction_count = Number(primaryIdentity.interaction_count || 0) +
+      Number(secondaryIdentity.interaction_count || 0);
+    primaryIdentity.affinity = Math.min(
+      100,
+      Math.max(Number(primaryIdentity.affinity || 0), Number(secondaryIdentity.affinity || 0))
+    );
+    primaryIdentity.tier = Math.max(
+      Number(primaryIdentity.tier || 1),
+      Number(secondaryIdentity.tier || 1)
+    );
+    primaryIdentity.tier_label = userTierLabel(primaryIdentity.tier);
+    if (!primaryIdentity.nickname) primaryIdentity.nickname = String(secondaryIdentity.nickname || "");
+    if (!primaryIdentity.attitude) primaryIdentity.attitude = String(secondaryIdentity.attitude || "");
+
+    /* 逐 Soul 合并关系行：interaction 相加、affinity 取 max(≤100)、tier 取 max、nickname/attitude 空则继承 */
+    Object.keys(db.userRelations || {}).forEach(function (key) {
+      var map = db.userRelations[key];
+      if (!map || typeof map !== "object") return;
+      var secondaryRel = map[secondaryUid];
+      if (!secondaryRel) return;
+      var primaryRel = map[primaryUid];
+      if (primaryRel) {
+        primaryRel.interaction_count = Number(primaryRel.interaction_count || 0) +
+          Number(secondaryRel.interaction_count || 0);
+        primaryRel.affinity = Math.min(
+          100,
+          Math.max(Number(primaryRel.affinity || 0), Number(secondaryRel.affinity || 0))
+        );
+        primaryRel.tier = Math.max(Number(primaryRel.tier || 1), Number(secondaryRel.tier || 1));
+        if (!primaryRel.nickname) primaryRel.nickname = String(secondaryRel.nickname || "");
+        if (!primaryRel.attitude) primaryRel.attitude = String(secondaryRel.attitude || "");
+        primaryRel.updated_at = nowSeconds();
+      } else {
+        map[primaryUid] = clone(secondaryRel);
+        map[primaryUid].updated_at = nowSeconds();
+      }
+      delete map[secondaryUid];
+    });
+
+    /* 记忆归属从 secondary 迁到 primary；删除 secondary 身份行 */
+    db.memories.forEach(function (memory) {
+      if (String(memory.user_id) === secondaryUid) memory.user_id = primaryUid;
+    });
+    db.users = db.users.filter(function (user) {
+      return String(user.global_uid) !== secondaryUid;
+    });
+
+    return {
+      soul_id: soulId,
+      merged_user: soulId
+        ? composeScopedUser(primaryIdentity, relationOf(soulId, primaryUid), soulId)
+        : null,
+      users: scopedUsers(soulId),
+      counts: userCountsFor(soulId),
+      groups: groupsForSoul(soulId)
+    };
+  }
+
+  /** delete：只删当前角色的关系行；该 uid 已无任何关系行时连同全局身份行删除（契约 §2.5）。 */
+  function deleteUserRecord(body, soulId) {
+    var uid = String(body.global_uid || "").trim();
+    if (!uid) throw new Error("用户账号 ID 不能为空");
+    if (soulId) {
+      var map = relationsOfSoul(soulId);
+      if (!map[uid]) throw new Error("该用户不在当前角色的关系列表中");
+      delete map[uid];
+      var hasAnyRelation = false;
+      Object.keys(db.userRelations || {}).forEach(function (key) {
+        var soulMap = db.userRelations[key];
+        if (soulMap && soulMap[uid]) hasAnyRelation = true;
+      });
+      if (!hasAnyRelation) {
+        db.users = db.users.filter(function (user) {
+          return String(user.global_uid) !== uid;
+        });
+      }
+    } else {
+      db.users = db.users.filter(function (user) {
+        return String(user.global_uid) !== uid;
+      });
+      Object.keys(db.userRelations || {}).forEach(function (key) {
+        if (db.userRelations[key]) delete db.userRelations[key][uid];
+      });
+    }
+    return {
+      soul_id: soulId,
+      users: scopedUsers(soulId),
+      counts: userCountsFor(soulId),
+      groups: groupsForSoul(soulId)
+    };
+  }
+
+  /** 默认 update：identity 字段全局写；tier/affinity/nickname/attitude 只写当前角色关系行。 */
+  function updateUserRecord(body, soulId) {
+    var uid = String(body.global_uid || "").trim();
+    if (!uid) throw new Error("用户账号 ID 不能为空");
+    var identity = findUserIdentity(uid);
+    if (!identity) {
+      identity = {
+        global_uid: uid,
+        display_name: String(body.display_name || uid),
+        /* legacy 回退列（无 soul_id 旧视图使用） */
+        nickname: "",
+        tier: 1,
+        interaction_count: 0,
+        affinity: 0,
+        attitude: "",
+        platform_ids: [],
+        updated_at: nowSeconds()
+      };
+      db.users.push(identity);
+    }
+    /* 全局身份字段 */
+    if (body.display_name != null) identity.display_name = String(body.display_name);
+    if (Array.isArray(body.platform_ids)) {
+      identity.platform_ids = body.platform_ids.slice();
+    } else if (typeof body.platform_ids === "string") {
+      identity.platform_ids = body.platform_ids
+        .split(",")
+        .map(function (item) { return item.trim(); })
+        .filter(Boolean);
+    }
+    identity.updated_at = nowSeconds();
+
+    var relation;
+    if (soulId) {
+      var map = relationsOfSoul(soulId);
+      if (!map[uid]) {
+        map[uid] = { tier: 1, interaction_count: 0, affinity: 0, nickname: "", attitude: "" };
+      }
+      relation = map[uid];
+    } else {
+      relation = identity;
+    }
+    if (body.nickname != null) relation.nickname = String(body.nickname);
+    if (body.tier != null && body.tier !== "") relation.tier = clamp(body.tier, 1, 3);
+    if (body.affinity != null && body.affinity !== "") {
+      relation.affinity = clamp(body.affinity, 0, 100);
+    }
+    /* v2.6：角色对 Ta 的专属态度，去首尾空白并截断到 300 字（与后端一致） */
+    if (body.attitude != null) {
+      relation.attitude = String(body.attitude).trim().slice(0, 300);
+    }
+    relation.updated_at = nowSeconds();
+
+    var resultUser = soulId
+      ? composeScopedUser(identity, relation, soulId)
+      : null;
+    if (!resultUser) {
+      var legacyUsers = scopedUsers("");
+      for (var i = 0; i < legacyUsers.length; i++) {
+        if (String(legacyUsers[i].global_uid) === uid) {
+          resultUser = legacyUsers[i];
+          break;
+        }
+      }
+    }
+    return {
+      soul_id: soulId,
+      user: resultUser,
+      users: scopedUsers(soulId),
+      counts: userCountsFor(soulId),
+      groups: groupsForSoul(soulId)
+    };
   }
 
   function updateUser(body) {
+    body = body && typeof body === "object" ? body : {};
     var action = String(body.action || "update").toLowerCase();
+    var soulId = String(body.soul_id || "");
+    if (soulId && !findSoul(soulId)) throw new Error("角色不存在：" + soulId);
     /* v2.8：群聊档案维护 action（契约 §6.2 users/update） */
     if (action === "update_group") return updateGroupRecord(body);
     if (action === "clear_group_memory") return clearGroupMemoryRecord(body);
     if (action === "delete_group") return deleteGroupRecord(body);
-    if (action === "merge") {
-      var primary = null;
-      var secondary = null;
-      db.users.forEach(function (user) {
-        if (user.global_uid === body.primary_uid) primary = user;
-        if (user.global_uid === body.secondary_uid) secondary = user;
-      });
-      if (!primary || !secondary) throw new Error("待合并账号不存在");
-      primary.platform_ids = (primary.platform_ids || []).concat(secondary.platform_ids || []);
-      primary.interaction_count += secondary.interaction_count;
-      /* v2.6：合并时主账号没有专属态度则继承被合并账号的 */
-      if (!primary.attitude && secondary.attitude) primary.attitude = secondary.attitude;
-      db.users = db.users.filter(function (user) {
-        return user.global_uid !== secondary.global_uid;
-      });
-      return {
-        merged_user: clone(primary),
-        users: clone(db.users)
-      };
-    }
-    if (action === "delete") {
-      db.users = db.users.filter(function (user) {
-        return user.global_uid !== body.global_uid;
-      });
-      return { users: clone(db.users) };
-    }
-    var target = null;
-    db.users.forEach(function (user) {
-      if (user.global_uid === body.global_uid) target = user;
-    });
-    if (!target) {
-      if (!body.global_uid) throw new Error("用户账号 ID 不能为空");
-      target = {
-        global_uid: String(body.global_uid),
-        display_name: String(body.display_name || body.global_uid),
-        nickname: "",
-        tier: 1,
-        tier_label: "L1普通群友",
-        interaction_count: 0,
-        affinity: 0,
-        platform_ids: [],
-        attitude: ""
-      };
-      db.users.push(target);
-    }
-    if (body.display_name != null) target.display_name = String(body.display_name);
-    if (body.nickname != null) target.nickname = String(body.nickname);
-    if (body.tier != null && body.tier !== "") {
-      target.tier = clamp(body.tier, 1, 3);
-      target.tier_label = { 3: "★L3核心用户", 2: "◆L2重要熟人", 1: "L1普通群友" }[target.tier];
-    }
-    if (body.affinity != null && body.affinity !== "") {
-      target.affinity = clamp(body.affinity, 0, 100);
-    }
-    /* v2.6：角色对 Ta 的专属态度，去首尾空白并截断到 300 字（与后端一致） */
-    if (body.attitude != null) {
-      target.attitude = String(body.attitude).trim().slice(0, 300);
-    }
-    if (Array.isArray(body.platform_ids)) target.platform_ids = body.platform_ids.slice();
-    if (typeof body.platform_ids === "string") {
-      target.platform_ids = body.platform_ids.split(",").map(function (x) { return x.trim(); }).filter(Boolean);
-    }
-    return { user: clone(target), users: clone(db.users) };
+    /* v2.9：身份全局操作 */
+    if (action === "normalize_identity") return normalizeUserIdentity(body);
+    if (action === "merge") return mergeUsers(body, soulId);
+    if (action === "delete") return deleteUserRecord(body, soulId);
+    return updateUserRecord(body, soulId);
   }
 
   function memoryStats() {
@@ -2558,7 +2899,7 @@
       case "cards/ai_generate":
         return aiGenerateCards(String(payload.soul_id || ""));
       case "users/list":
-        return listUsers(payload.tier);
+        return listUsers(payload);
       case "users/update":
         return updateUser(payload);
       case "memories/list":
@@ -2755,6 +3096,8 @@
   window.__OY_MOCK__ = true;
   window.OY_MOCK_DB = db;
   console.info(
-    "[OnlyYou] Mock bridge 已安装：覆盖 31 条 API（v2.8 契约 §6），模拟延迟 " + MOCK_DELAY + "ms。"
+    "[OnlyYou] Mock bridge 已安装：覆盖 31 条 API（v2.9 身份全局 + 关系按角色），模拟延迟 " +
+      MOCK_DELAY +
+      "ms。"
   );
 })();

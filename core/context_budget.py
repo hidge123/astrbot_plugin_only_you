@@ -627,7 +627,9 @@ class ContextBudgetManager:
             return "（今天还没忙完什么事）"
         return "\n   ".join(lines)
 
-    async def _render_window_peers_block(self, umo: str, user: UserProfile) -> str:
+    async def _render_window_peers_block(
+        self, umo: str, user: UserProfile, soul_id: str = ""
+    ) -> str:
         """Render the other configured active speakers of the current window.
 
         v2.6 (contract §2.3): only speakers of ``umo``'s sliding window that have a
@@ -644,7 +646,17 @@ class ContextBudgetManager:
         if not sender_ids:
             return ""
         current_uid = _clean_text(getattr(user, "global_uid", ""))
-        profiles = await self.user_relation.list_users()
+        # v2.9: peer nickname/attitude must come from the current Soul's relations.
+        # Transitional fallback: if this Soul has no relation rows yet (pre-migration
+        # / unit tests), fall back to the legacy global view instead of dropping peers.
+        profiles = []
+        if soul_id:
+            try:
+                profiles = await self.user_relation.list_users(soul_id=soul_id)
+            except Exception:  # noqa: BLE001 - never break the LLM hook
+                profiles = []
+        if not profiles:
+            profiles = await self.user_relation.list_users()
         by_uid: dict[str, Any] = {}
         for profile in profiles or []:
             uid = _clean_text(getattr(profile, "global_uid", ""))
@@ -683,7 +695,9 @@ class ContextBudgetManager:
             return ""
         return "\n\n[当前群聊其他活跃对话者档案]:\n" + "\n".join(lines)
 
-    async def _render_user_relation_context(self, umo: str, user: UserProfile) -> str:
+    async def _render_user_relation_context(
+        self, umo: str, user: UserProfile, soul_id: str = ""
+    ) -> str:
         """Render ``USER_RELATION_CONTEXT_PROMPT`` for the current speaker (v2.6).
 
         The block documents the three-tier importance law plus the current user's
@@ -708,7 +722,9 @@ class ContextBudgetManager:
         # ``relation_notes`` is not a DB column yet (v2.6 freeze): getattr fallback.
         notes_text = _clean_text(getattr(user, "relation_notes", "")) or "无"
         try:
-            window_peers_block = await self._render_window_peers_block(umo, user)
+            window_peers_block = await self._render_window_peers_block(
+                umo, user, soul_id=soul_id
+            )
         except Exception as e:  # noqa: BLE001 - peers are best-effort only
             logger.warning(f"[OnlyYou] window peers context failed: {e}")
             window_peers_block = ""
@@ -888,7 +904,9 @@ class ContextBudgetManager:
         # 整段 try/except 兜底，任何异常都静默降级为空 block，绝不阻塞 LLM 请求。
         # =====================================================================
         try:
-            relation_block = await self._render_user_relation_context(umo, user)
+            relation_block = await self._render_user_relation_context(
+                umo, user, soul_id=getattr(soul, "soul_id", "")
+            )
         except Exception as e:  # noqa: BLE001 - never break the LLM request hook
             logger.warning(f"[OnlyYou] user relation context injection failed: {e}")
             relation_block = ""

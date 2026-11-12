@@ -337,7 +337,7 @@ def _umo_in_platform_scope(
     "astrbot_plugin_only_you",
     "hidge123",
     "OnlyYou (只有你) —— 具备生命节律、三级记忆与赛博冲浪能力的高自治 AI 伴侣与数字网友插件",
-    "2.8.3",
+    "2.9.0",
     "https://github.com/hidge123/astrbot_plugin_only_you",
 )
 class OnlyYouPlugin(Star):
@@ -486,6 +486,15 @@ class OnlyYouPlugin(Star):
         # v2.8: restore the proactive-message dedupe / cooldown / ★L3 bookkeeping
         # right after the DB is available (defensive: defaults on any failure).
         await self._load_runtime_state()
+        # v2.9: Soul deletion cascades per-Soul relationship rows + their cache.
+        purge = getattr(
+            getattr(self, "user_relation", None), "purge_soul_cache", None
+        )
+        if callable(purge):
+            try:
+                self.soul_manager.on_soul_deleted = purge
+            except Exception:  # noqa: BLE001 - defensive: optional hook
+                pass
         # v2.8: migrate legacy per-UMO bindings into bot-instance (platform) bindings
         # and catch up a missed daily Forgetting GC after a restart.
         try:
@@ -516,6 +525,64 @@ class OnlyYouPlugin(Star):
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[OnlyYou] legacy user identity migration failed: {exc}")
+        # v2.9: split the legacy global relationship columns into per-Soul
+        # ``user_relations`` rows (identity stays in ``users``). Idempotent flag;
+        # failure leaves the flag unset so the next startup retries.
+        relation_migrator = (
+            getattr(identity_manager, "migrate_user_relations", None)
+            if identity_manager is not None
+            else None
+        )
+        try:
+            if callable(relation_migrator):
+                bindings = {}
+                soul_ids: list[str] = []
+                default_soul_id = ""
+                try:
+                    bindings = dict(
+                        await self.soul_manager.get_platform_bindings() or {}
+                    )
+                except Exception:  # noqa: BLE001
+                    bindings = {}
+                try:
+                    soul_ids = [
+                        str(getattr(soul, "soul_id", "") or "")
+                        for soul in (await self.soul_manager.list_souls() or [])
+                    ]
+                    soul_ids = [item for item in soul_ids if item]
+                except Exception:  # noqa: BLE001
+                    soul_ids = []
+                try:
+                    default_soul_id = str(
+                        await self.soul_manager.get_default_soul_id() or ""
+                    )
+                except Exception:  # noqa: BLE001
+                    default_soul_id = ""
+                if not default_soul_id:
+                    # Match runtime routing: ``resolve_soul`` falls back to the latest
+                    # Soul when no default_soul_id is configured, so attribute users
+                    # without platform evidence to that same Soul.
+                    try:
+                        fallback = await self.soul_manager.resolve_soul(umo="")
+                        default_soul_id = str(
+                            getattr(fallback, "soul_id", "") or ""
+                        )
+                    except Exception:  # noqa: BLE001
+                        default_soul_id = ""
+                relation_stats = await relation_migrator(
+                    bindings, default_soul_id, soul_ids
+                )
+                if isinstance(relation_stats, dict) and (
+                    relation_stats.get("relations_created")
+                    or relation_stats.get("skipped")
+                ):
+                    logger.info(
+                        "[OnlyYou] Migrated legacy user relationships into "
+                        "per-Soul user_relations: %s",
+                        relation_stats,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[OnlyYou] user_relations migration failed: {exc}")
         try:
             await self._maybe_run_scheduled_gc()
         except Exception as exc:  # noqa: BLE001
@@ -2160,7 +2227,8 @@ class OnlyYouPlugin(Star):
 
         umo = getattr(event, "unified_msg_origin", "") or "default_umo"
         soul = await self.soul_manager.resolve_soul(umo=umo)
-        user = await self.user_relation.resolve_user(event)
+        # v2.9: relationship state (tier/affinity/nickname/attitude) is per Soul.
+        user = await self.user_relation.resolve_user(event, soul_id=soul.soul_id)
         self._last_message_tier[umo] = user.tier
 
         if user.tier == UserTier.L3_CORE and self.atmosphere_reader.is_private_event(event):
@@ -2283,7 +2351,7 @@ class OnlyYouPlugin(Star):
         except Exception:
             pass
         soul = await self.soul_manager.resolve_soul(umo=umo, allow_llm_seed=False)
-        user = await self.user_relation.resolve_user(event)
+        user = await self.user_relation.resolve_user(event, soul_id=soul.soul_id)
         run, current_slot, _ = await self.deck_engine.get_current_and_next_slot(
             soul_id=soul.soul_id,
             custom_cards=soul.state_event_cards,
@@ -2533,7 +2601,7 @@ class OnlyYouPlugin(Star):
 
         sub = tokens[0].lower() if tokens else default_sub
         soul = await self.soul_manager.resolve_soul(umo=umo)
-        user = await self.user_relation.resolve_user(event)
+        user = await self.user_relation.resolve_user(event, soul_id=soul.soul_id)
 
         if sub == "status":
             run, cur_slot, next_slot = await self.deck_engine.get_current_and_next_slot(
@@ -2716,7 +2784,9 @@ class OnlyYouPlugin(Star):
             if len(tokens) >= 3 and tokens[2] in ("1", "2", "3"):
                 target_uid = tokens[1]
                 new_tier = UserTier(int(tokens[2]))
-                updated = await self.user_relation.set_user_tier(target_uid, new_tier)
+                updated = await self.user_relation.set_user_tier(
+                    target_uid, new_tier, soul_id=soul.soul_id
+                )
                 extra = ""
                 if new_tier == UserTier.L3_CORE:
                     extra = (

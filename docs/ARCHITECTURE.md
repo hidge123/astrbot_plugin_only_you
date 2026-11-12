@@ -1314,3 +1314,38 @@ python3 -m unittest discover -s tests -v
 python3 -m compileall -q core storage surfing prompts main.py
 node --check views/console/*.js
 ```
+
+---
+
+## 七、v2.9 —— 用户身份全局化 + 关系状态按角色（Soul）隔离
+
+v2.8 完成 Soul→机器人接口绑定后，`users` 表仍是「身份 + 关系」混合且没有 `soul_id`：`tier / affinity / interaction_count / nickname / attitude` 会被所有角色共享，平台换绑、跨平台账号合并、默认角色兜底、平台管理员 L3 全局化时出现跨角色污染。v2.9 把两者拆开：**身份全局、关系按角色**。
+
+### 7.1 数据模型
+
+| 表 | 作用域 | 字段 | 说明 |
+| :-- | :-- | :-- | :-- |
+| `users` | 全局 | `global_uid`(PK) / `display_name` / `platform_ids_json` / `updated_at` + 旧关系列 | 只作**身份表**：同一个人（可多平台账号、可合并）在所有角色间共享；旧关系列（`nickname/tier/interaction_count/affinity/attitude`）冻结为 pre-v2.9 回退读写路径，运行期失败回退用 |
+| `user_relations` | 按角色 | `(soul_id, global_uid)`(PK) / `tier` / `interaction_count` / `affinity` / `nickname` / `attitude` / `updated_at` | 一个角色对一个人的关系状态；同一 `global_uid` 在不同 `soul_id` 下完全独立（等级/好感/互动/专属称呼/专属态度互不影响） |
+
+- `UserProfile` 是两者的合并视图：`global_uid/display_name/platform_ids` 来自 `users`，关系字段来自「`soul_id` 对应的 `user_relations` 行」；`soul_id=""` 表示 legacy/未作用域调用（兼容旧测试与旧 API）。
+- 记忆仍按角色隔离（`memories.soul_id`），`memories.user_id` 指向全局身份 `global_uid`，因此「角色记得的事」不会跨角色，而「这个人是谁」跨角色一致。
+
+### 7.2 运行时
+
+1. `main.on_any_message` / `on_llm_request_hook` / `/onlyyou tier` 先 `resolve_soul(umo)`，再 `user_relation.resolve_user(event, soul_id=soul.soul_id)`。
+2. `get_or_create_user(..., soul_id)`：首次在该角色遇到此人时，从 legacy `users` 列复制一次关系种值写入 `user_relations`；此后 `bump_interaction`、L1→L2 自动晋升、平台管理员/event admin 的 L3 升级都只作用于当前角色关系行。
+3. `list_users(soul_id)`：`INNER JOIN user_relations`，只返回该角色有关系的人；`list_users()`（无 soul）保持旧 `users` 列列表。
+4. `ContextBudgetManager._render_user_relation_context/_render_window_peers_block` 使用当前角色的关系行（同一群聊窗口里他人的昵称/态度也按当前角色读取）。
+5. `delete_soul` 级联 `user_relations` 并把删除事件通知 `UserRelationManager.purge_soul_cache()`（避免内存缓存复活已删除角色的关系）。
+
+### 7.3 Web API / Pages
+
+- `users/list?soul_id=`、`users/update` body `soul_id`：users/counts/groups/关系写入全部按角色作用域；不传 `soul_id` 保持 v2.8 legacy 形状（兼容旧脚本与旧页面）。
+- 关系页按当前角色加载；合并用户改为从**当前角色关系列表**中下拉选择（后端再次校验，非法 uid 返回 error），避免跨角色误合并。
+- 编辑语义：`display_name` / `platform_ids` = 全局身份（影响所有角色）；`tier/affinity/nickname/attitude` = 当前角色关系。
+
+### 7.4 迁移与兼容
+
+- 启动时 `migrate_user_relations(platform_to_soul, default_soul_id, soul_ids)`：按每个 `users.platform_ids` 中平台归属的 Soul 拆分关系行；裸旧 ID 先按持久化私聊 UMO 证据推断平台，再回退默认/兜底角色；跨 Soul 的多平台用户各角色各一行；legacy 列保留不删。幂等 flag `plugin_settings["user_relations_migrated_v1"]`，失败/无 Soul 时不置位，下次启动重试。
+- 旧调用（无 `soul_id`）保持 `users` 列读写，测试基线（583 → v2.9 的 650+）全绿。

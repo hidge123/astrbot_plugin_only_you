@@ -6,6 +6,7 @@ persisted in ``plugin_settings["group_profiles"]``: it backs the console
 ``touch_group`` (contract §4.2 / §6.3).
 """
 
+import copy
 import json
 import time
 from dataclasses import dataclass, field
@@ -161,6 +162,9 @@ class UserProfile:
     nickname: str = ""
     # v2.6: the character's custom attitude / tone reserved for this exact user.
     attitude: str = ""
+    # v2.9: relationship scope. ``""`` = legacy/global callers; otherwise the relation
+    # fields (tier/affinity/interaction/nickname/attitude) belong to this Soul.
+    soul_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         accounts: list[dict[str, Any]] = []
@@ -203,6 +207,7 @@ class UserProfile:
             "platform_accounts": accounts,
             "legacy_platform_ids": legacy_ids,
             "has_legacy_platform_ids": bool(legacy_ids),
+            "soul_id": self.soul_id,
         }
 
 
@@ -277,6 +282,8 @@ class UserRelationManager:
         self.platform_bridge = platform_bridge
         self.plugin_config = plugin_config
         self._cache: dict[str, UserProfile] = {}
+        # ---- v2.9 per-Soul relationship rows: (soul_id, global_uid) -> row dict ----
+        self._relation_cache: dict[tuple[str, str], dict[str, Any]] = {}
         # ---- v2.8 group profiles (plugin_settings["group_profiles"]) ----
         self._groups_cache: Optional[dict[str, GroupProfile]] = None
         self._group_persist_ts: dict[str, float] = {}
@@ -308,8 +315,14 @@ class UserRelationManager:
             return UserTier.L3_CORE
         return None
 
-    async def resolve_user(self, event: Any) -> UserProfile:
-        """Resolve UserProfile from an incoming AstrMessageEvent and record interaction."""
+    async def resolve_user(
+        self, event: Any, soul_id: Optional[str] = None
+    ) -> UserProfile:
+        """Resolve UserProfile from an incoming AstrMessageEvent and record interaction.
+
+        v2.9: pass ``soul_id`` so tier/affinity/nickname/attitude are read & updated in
+        the per-Soul ``user_relations`` row (identity stays global).
+        """
         sender_id = ""
         sender_name = "群友"
         umo = getattr(event, "unified_msg_origin", None)
@@ -338,6 +351,7 @@ class UserRelationManager:
             is_event_admin=is_admin,
             bump_interaction=True,
             platform_id=_platform_id_from_umo(umo),
+            soul_id=soul_id,
         )
 
     # ------------------------------------------------------------------
@@ -420,7 +434,8 @@ class UserRelationManager:
                 cached.global_uid != bare_uid and bare_uid not in cached.platform_ids
             ):
                 continue
-            return cached
+            # v2.9: return a clone so per-Soul overlays never mutate cached identity.
+            return self._clone_identity(cached)
 
         for key in (account, bare_uid):
             if not key:
@@ -463,6 +478,168 @@ class UserRelationManager:
             )
         return None
 
+    # ------------------------------------------------------------------
+    # v2.9: per-Soul relationship rows (identity stays in ``users``)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _soul_key(soul_id: Any) -> str:
+        return str(soul_id or "").strip()
+
+    @staticmethod
+    def _clone_identity(profile: UserProfile) -> UserProfile:
+        """Copy an identity+legacy profile so per-Soul overlays never mutate caches."""
+        return UserProfile(
+            global_uid=profile.global_uid,
+            display_name=profile.display_name,
+            tier=profile.tier,
+            interaction_count=profile.interaction_count,
+            affinity=profile.affinity,
+            platform_ids=list(profile.platform_ids),
+            nickname=profile.nickname,
+            attitude=profile.attitude,
+            soul_id="",
+        )
+
+    @staticmethod
+    def _relation_fields(row: Optional[dict[str, Any]]) -> dict[str, Any]:
+        if not row:
+            return {}
+        raw_tier = int(row.get("tier", 1))
+        return {
+            "tier": UserTier(raw_tier) if raw_tier in (1, 2, 3) else UserTier.L1_NORMAL,
+            "interaction_count": int(row.get("interaction_count", 0)),
+            "affinity": float(row.get("affinity", 0.0)),
+            "nickname": str(row.get("nickname") or ""),
+            "attitude": str(row.get("attitude") or ""),
+        }
+
+    def _apply_relation(
+        self, profile: UserProfile, soul_id: str, row: Optional[dict[str, Any]]
+    ) -> UserProfile:
+        profile.soul_id = soul_id
+        for key, value in self._relation_fields(row).items():
+            setattr(profile, key, value)
+        return profile
+
+    def purge_soul_cache(self, soul_id: str) -> None:
+        """Drop cached relation rows for a deleted Soul (called by SoulManager)."""
+        soul = self._soul_key(soul_id)
+        if not soul:
+            return
+        for key in [item for item in self._relation_cache if item[0] == soul]:
+            self._relation_cache.pop(key, None)
+
+    async def _load_relation(
+        self, soul_id: str, global_uid: str
+    ) -> Optional[dict[str, Any]]:
+        """Read one ``(soul_id, global_uid)`` relation row (cache first)."""
+        soul = self._soul_key(soul_id)
+        uid = str(global_uid or "").strip()
+        if not soul or not uid:
+            return None
+        cache_key = (soul, uid)
+        cached = self._relation_cache.get(cache_key)
+        if cached is not None:
+            return copy.deepcopy(cached)
+        row = await self.db.fetchone(
+            "SELECT * FROM user_relations WHERE soul_id = ? AND global_uid = ?",
+            (soul, uid),
+        )
+        if row:
+            self._relation_cache[cache_key] = dict(row)
+            return dict(row)
+        return None
+
+    async def _ensure_relation_row(
+        self, soul_id: str, profile: UserProfile
+    ) -> dict[str, Any]:
+        """Load a Soul relation row, seeding it once from the legacy users columns."""
+        soul = self._soul_key(soul_id)
+        uid = str(profile.global_uid or "").strip()
+        existing = await self._load_relation(soul, uid)
+        if existing is not None:
+            return existing
+        now = int(time.time())
+        seed = {
+            "soul_id": soul,
+            "global_uid": uid,
+            "tier": int(profile.tier.value),
+            "interaction_count": int(profile.interaction_count),
+            "affinity": float(profile.affinity),
+            "nickname": profile.nickname or "",
+            "attitude": profile.attitude or "",
+            "updated_at": now,
+        }
+        try:
+            await self.db.execute(
+                """
+                INSERT OR IGNORE INTO user_relations (
+                    soul_id, global_uid, tier, interaction_count, affinity,
+                    nickname, attitude, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    soul,
+                    uid,
+                    seed["tier"],
+                    seed["interaction_count"],
+                    seed["affinity"],
+                    seed["nickname"],
+                    seed["attitude"],
+                    now,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - degrade to in-memory defaults
+            logger.warning(f"[OnlyYou] seed user_relations failed: {exc}")
+        row = await self.db.fetchone(
+            "SELECT * FROM user_relations WHERE soul_id = ? AND global_uid = ?",
+            (soul, uid),
+        )
+        final = dict(row) if row else seed
+        self._relation_cache[(soul, uid)] = final
+        return dict(final)
+
+    async def _upsert_relation(self, profile: UserProfile) -> None:
+        soul = self._soul_key(profile.soul_id)
+        uid = str(profile.global_uid or "").strip()
+        if not soul or not uid:
+            return
+        now = int(time.time())
+        payload = (
+            int(profile.tier.value),
+            int(profile.interaction_count),
+            float(profile.affinity),
+            profile.nickname or "",
+            profile.attitude or "",
+            now,
+        )
+        await self.db.execute(
+            """
+            INSERT INTO user_relations (
+                soul_id, global_uid, tier, interaction_count, affinity,
+                nickname, attitude, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(soul_id, global_uid) DO UPDATE SET
+                tier = excluded.tier,
+                interaction_count = excluded.interaction_count,
+                affinity = excluded.affinity,
+                nickname = excluded.nickname,
+                attitude = excluded.attitude,
+                updated_at = excluded.updated_at
+            """,
+            (soul, uid) + payload,
+        )
+        self._relation_cache[(soul, uid)] = {
+            "soul_id": soul,
+            "global_uid": uid,
+            "tier": int(profile.tier.value),
+            "interaction_count": int(profile.interaction_count),
+            "affinity": float(profile.affinity),
+            "nickname": profile.nickname or "",
+            "attitude": profile.attitude or "",
+            "updated_at": now,
+        }
+
     async def get_or_create_user(
         self,
         user_id: str,
@@ -471,19 +648,21 @@ class UserRelationManager:
         is_event_admin: bool = False,
         bump_interaction: bool = False,
         platform_id: Optional[str] = None,
+        soul_id: Optional[str] = None,
     ) -> UserProfile:
-        """Get or create a UserProfile by platform identity.
+        """Get or create a UserProfile by platform identity (identity + per-Soul relation).
 
-        v2.8.4: the identity is the canonical ``platform_id:native_uid`` account
-        (e.g. ``qq bot:2975066889``) built from the event's UMO prefix + sender id.
-        Legacy profiles that only stored the bare sender id are healed lazily: the
-        bare id is upgraded to the qualified account on the next message instead of
-        being kept as an undeletable ghost entry.
+        v2.8.4: identity is the canonical ``platform_id:native_uid`` account.
+        v2.9: when ``soul_id`` is given, the relationship fields come from the
+        ``user_relations(soul_id, global_uid)`` row (seeded from the legacy users
+        columns on first use); without ``soul_id`` the legacy ``users`` columns are
+        used (backward compatibility).
         """
         uid = str(user_id).strip() or "anonymous"
         name = (display_name or uid).strip()
         pid = str(platform_id or "").strip() or _platform_id_from_umo(umo)
         account = make_platform_account(pid, uid) if pid else ""
+        soul = self._soul_key(soul_id)
         cfg_tier = self._get_configured_tier(uid, umo=umo, is_event_admin=is_event_admin)
 
         profile = await self._lookup_profile_by_identity(account, uid)
@@ -494,7 +673,7 @@ class UserRelationManager:
             profile = UserProfile(
                 global_uid=new_uid,
                 display_name=name,
-                tier=cfg_tier or UserTier.L1_NORMAL,
+                tier=UserTier.L1_NORMAL,
                 interaction_count=0,
                 affinity=0.0,
                 platform_ids=[new_uid],
@@ -502,17 +681,24 @@ class UserRelationManager:
                 attitude="",
             )
 
-        if name and name != profile.global_uid:
-            profile.display_name = name
+        requested_name = (display_name or "").strip()
+        if requested_name and requested_name != profile.global_uid:
+            profile.display_name = requested_name
 
-        # Config tier always upgrades if higher
+        if soul:
+            await self._ensure_relation_row(soul, profile)
+            relation = await self._load_relation(soul, profile.global_uid)
+            self._apply_relation(profile, soul, relation)
+        else:
+            profile.soul_id = ""
+
         if cfg_tier is not None and cfg_tier.value > profile.tier.value:
             profile.tier = cfg_tier
 
         if bump_interaction:
             profile.interaction_count += 1
             profile.affinity += 1.5
-            # Check automatic L1 -> L2 promotion (never auto-promotes to L3_CORE!)
+            # L1 -> L2 automatic promotion is scoped per Soul (never to L3).
             enable_auto = bool(self.cfg.get("enable_auto_promotion_l2", True))
             if (
                 enable_auto
@@ -525,6 +711,26 @@ class UserRelationManager:
                 profile.tier = UserTier.L2_IMPORTANT
 
         await self.save_user(profile)
+        return profile
+
+    async def get_user(
+        self, global_uid: str, soul_id: Optional[str] = None
+    ) -> Optional[UserProfile]:
+        """Return one user's identity (+ optional per-Soul relation), or ``None``."""
+        uid = str(global_uid or "").strip()
+        if not uid:
+            return None
+        profile = await self._lookup_profile_by_identity(uid, uid)
+        if profile is None:
+            return None
+        soul = self._soul_key(soul_id)
+        if soul:
+            relation = await self._load_relation(soul, profile.global_uid)
+            if relation is None:
+                return None
+            self._apply_relation(profile, soul, relation)
+        else:
+            profile.soul_id = ""
         return profile
 
     async def normalize_user_identity(
@@ -690,25 +896,78 @@ class UserRelationManager:
             )
         return stats
 
-    async def set_user_tier(self, user_id: str, new_tier: UserTier, display_name: str = "") -> UserProfile:
-        """Manually set a user's relationship tier (e.g. via `/onlyyou tier`)."""
-        profile = await self.get_or_create_user(user_id=user_id, display_name=display_name)
+    async def set_user_tier(
+        self,
+        user_id: str,
+        new_tier: UserTier,
+        display_name: str = "",
+        soul_id: Optional[str] = None,
+    ) -> UserProfile:
+        """Manually set a user's relationship tier (e.g. via `/onlyyou tier`).
+
+        v2.9: with ``soul_id`` only that Soul's relation row is changed.
+        """
+        profile = await self.get_or_create_user(
+            user_id=user_id, display_name=display_name, soul_id=soul_id
+        )
         profile.tier = new_tier
         await self.save_user(profile)
         return profile
 
+    async def _upsert_identity(self, profile: UserProfile) -> None:
+        """Write only the global identity columns (legacy relation columns untouched)."""
+        await self.db.execute(
+            """
+            INSERT INTO users (
+                global_uid, display_name, nickname, tier, interaction_count,
+                affinity, platform_ids_json, attitude, updated_at
+            )
+            VALUES (?, ?, '', 1, 0, 0.0, ?, '', ?)
+            ON CONFLICT(global_uid) DO UPDATE SET
+                display_name = excluded.display_name,
+                platform_ids_json = excluded.platform_ids_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                profile.global_uid,
+                profile.display_name,
+                json.dumps(profile.platform_ids, ensure_ascii=False),
+                int(time.time()),
+            ),
+        )
+
+    def _drop_identity_cache(self, global_uid: str) -> None:
+        uid = str(global_uid or "").strip()
+        if not uid:
+            return
+        self._cache.pop(uid, None)
+        for key, value in list(self._cache.items()):
+            if value is not None and value.global_uid == uid:
+                self._cache.pop(key, None)
+
     async def save_user(self, profile: UserProfile) -> None:
-        """Persist UserProfile to SQLite and memory cache.
+        """Persist UserProfile (identity globally; relation per Soul when scoped).
 
         v2.8.4: platform ids are normalized to ``platform:native_uid`` (bare legacy
         ids shadowed by a qualified account are dropped) and the cache never lets a
-        shared bare id silently overwrite another profile (cross-platform collision).
+        shared bare id silently overwrite another profile.
+        v2.9: ``profile.soul_id`` -> write ``user_relations``; identity columns are
+        updated globally. Without ``soul_id`` the legacy users columns are used.
         """
         normalized = _normalize_platform_ids(profile.platform_ids)
         if normalized:
             profile.platform_ids = normalized
         elif profile.global_uid:
             profile.platform_ids = [profile.global_uid]
+        soul = self._soul_key(profile.soul_id)
+
+        if soul:
+            await self._upsert_identity(profile)
+            await self._upsert_relation(profile)
+            # Legacy cache must not leak this Soul's relation fields.
+            self._drop_identity_cache(profile.global_uid)
+            return
+
         self._cache[profile.global_uid] = profile
         for pid in profile.platform_ids:
             existing = self._cache.get(pid)
@@ -756,8 +1015,67 @@ class UserRelationManager:
             ),
         )
 
-    async def list_users(self, tier_filter: Optional[int] = None) -> list[UserProfile]:
-        """List all known users (tiers live in SQLite and are managed by Pages)."""
+    async def list_users(
+        self, tier_filter: Optional[int] = None, soul_id: Optional[str] = None
+    ) -> list[UserProfile]:
+        """List known users.
+
+        ``soul_id`` scoped: only users with a relation row for that Soul, ordered by
+        that Soul's tier/affinity/interactions. ``soul_id=None`` keeps the legacy
+        global list from the ``users`` columns (backward compatibility).
+        """
+        soul = self._soul_key(soul_id)
+        users: list[UserProfile] = []
+        if soul:
+            clauses = ["r.soul_id = ?"]
+            params: list[Any] = [soul]
+            if tier_filter in (1, 2, 3):
+                clauses.append("r.tier = ?")
+                params.append(int(tier_filter))
+            rows = await self.db.fetchall(
+                f"""
+                SELECT u.global_uid AS identity_uid,
+                       u.display_name AS display_name,
+                       u.platform_ids_json AS platform_ids_json,
+                       r.tier AS rel_tier,
+                       r.interaction_count AS rel_interaction_count,
+                       r.affinity AS rel_affinity,
+                       r.nickname AS rel_nickname,
+                       r.attitude AS rel_attitude,
+                       r.updated_at AS rel_updated_at
+                FROM user_relations r
+                JOIN users u ON u.global_uid = r.global_uid
+                WHERE {' AND '.join(clauses)}
+                ORDER BY r.tier DESC, r.affinity DESC, r.interaction_count DESC
+                """,
+                tuple(params),
+            )
+            for row in rows:
+                try:
+                    profile = self._profile_from_row(
+                        {
+                            "global_uid": row.get("identity_uid"),
+                            "display_name": row.get("display_name"),
+                            "platform_ids_json": row.get("platform_ids_json"),
+                        }
+                    )
+                    relation = {
+                        "tier": row.get("rel_tier", 1),
+                        "interaction_count": row.get("rel_interaction_count", 0),
+                        "affinity": row.get("rel_affinity", 0.0),
+                        "nickname": row.get("rel_nickname", ""),
+                        "attitude": row.get("rel_attitude", ""),
+                    }
+                    self._apply_relation(profile, soul, relation)
+                    relation["soul_id"] = soul
+                    relation["global_uid"] = profile.global_uid
+                    relation["updated_at"] = int(row.get("rel_updated_at") or 0)
+                    self._relation_cache[(soul, profile.global_uid)] = relation
+                    users.append(profile)
+                except Exception as exc:  # noqa: BLE001 - one bad row must not break the list
+                    logger.warning(f"[OnlyYou] Failed to parse user relation row: {exc}")
+            return users
+
         if tier_filter in (1, 2, 3):
             rows = await self.db.fetchall(
                 "SELECT * FROM users WHERE tier = ? ORDER BY tier DESC, affinity DESC, interaction_count DESC",
@@ -767,12 +1085,10 @@ class UserRelationManager:
             rows = await self.db.fetchall(
                 "SELECT * FROM users ORDER BY tier DESC, affinity DESC, interaction_count DESC"
             )
-
-        users: list[UserProfile] = []
         for r in rows:
             try:
                 u = self._profile_from_row(r)
-            except Exception as exc:  # noqa: BLE001 - one bad row must not break the list
+            except Exception as exc:  # noqa: BLE001
                 logger.warning(f"[OnlyYou] Failed to parse user row: {exc}")
                 continue
             self._cache[u.global_uid] = u
@@ -786,12 +1102,21 @@ class UserRelationManager:
         nickname: Optional[str] = None,
         tier: Optional[int] = None,
         affinity: Optional[float] = None,
-        platform_ids: Optional[list[str]] = None,
+        platform_ids: Optional[list[Any]] = None,
         attitude: Optional[str] = None,
+        soul_id: Optional[str] = None,
     ) -> UserProfile:
-        """Create or update a user's tier, affinity, nickname, display_name, platform_ids, attitude."""
+        """Update identity fields globally and relationship fields for one Soul.
+
+        v2.9: with ``soul_id`` the tier/affinity/nickname/attitude are written to that
+        Soul's relation row only; ``display_name`` / ``platform_ids`` are global
+        identity fields. Without ``soul_id`` the legacy users columns are updated.
+        """
+        soul = self._soul_key(soul_id)
         profile = await self.get_or_create_user(
-            user_id=global_uid, display_name=display_name or ""
+            user_id=global_uid,
+            display_name=display_name or "",
+            soul_id=soul or None,
         )
         if display_name is not None and display_name.strip():
             profile.display_name = display_name.strip()
@@ -814,53 +1139,315 @@ class UserRelationManager:
         await self.save_user(profile)
         return profile
 
-    async def merge_users(self, primary_uid: str, secondary_uid: str) -> UserProfile:
-        """
-        Merge `secondary_uid` into `primary_uid` (`GlobalUser` unification across platforms):
-        - Combine `platform_ids`, sum `interaction_count`, take max `tier` & `affinity`
-        - Re-link `memories.user_id` from `secondary_uid` to `primary_uid`
-        - Delete `secondary_uid` row from `users`
+    async def merge_users(
+        self,
+        primary_uid: str,
+        secondary_uid: str,
+        soul_id: Optional[str] = None,
+    ) -> UserProfile:
+        """Merge ``secondary_uid`` into ``primary_uid``.
+
+        v2.9: identity is merged globally; relation rows are merged **per Soul** so
+        every role keeps its own relationship state. With ``soul_id`` both users must
+        already exist in that Soul's relation list (Pages merge dropdown contract);
+        otherwise the user only has to exist.
         """
         p_id = (primary_uid or "").strip()
         s_id = (secondary_uid or "").strip()
         if not p_id or not s_id or p_id == s_id:
-            raise ValueError("请选择两个不同的账号进行跨平台合并")
+            raise ValueError("请选择两个不同的用户进行合并")
+        soul = self._soul_key(soul_id)
 
-        primary = await self.get_or_create_user(p_id)
-        secondary = await self.get_or_create_user(s_id)
+        primary = await self._lookup_profile_by_identity(p_id, p_id)
+        secondary = await self._lookup_profile_by_identity(s_id, s_id)
+        if primary is None or secondary is None:
+            raise ValueError("合并目标必须是当前角色关系列表中的已有用户")
+        if soul and (
+            await self._load_relation(soul, primary.global_uid) is None
+            or await self._load_relation(soul, secondary.global_uid) is None
+        ):
+            raise ValueError("合并目标必须是当前角色关系列表中的已有用户")
 
+        primary_uid_value = primary.global_uid
+        secondary_uid_value = secondary.global_uid
         merged_pids = _normalize_platform_ids(
-            list(primary.platform_ids) + [s_id] + list(secondary.platform_ids)
+            list(primary.platform_ids)
+            + [p_id, s_id]
+            + list(secondary.platform_ids)
         )
-
         primary.platform_ids = merged_pids
-        if secondary.tier.value > primary.tier.value:
-            primary.tier = secondary.tier
-        primary.interaction_count += secondary.interaction_count
-        primary.affinity = min(100.0, max(primary.affinity, secondary.affinity) + secondary.affinity * 0.5)
-        if not primary.nickname and secondary.nickname:
-            primary.nickname = secondary.nickname
-        if not primary.attitude and secondary.attitude:
-            primary.attitude = secondary.attitude
+        primary.soul_id = ""
+        await self._upsert_identity(primary)
+        # Legacy columns (pre-v2.9 fallback) keep the historical merge semantics.
+        try:
+            await self.db.execute(
+                """
+                UPDATE users SET
+                    nickname = ?, tier = ?, interaction_count = ?, affinity = ?, attitude = ?
+                WHERE global_uid = ?
+                """,
+                (
+                    primary.nickname or secondary.nickname or "",
+                    max(int(primary.tier.value), int(secondary.tier.value)),
+                    int(primary.interaction_count) + int(secondary.interaction_count),
+                    min(
+                        100.0,
+                        max(float(primary.affinity), float(secondary.affinity))
+                        + float(secondary.affinity) * 0.5,
+                    ),
+                    primary.attitude or secondary.attitude or "",
+                    primary_uid_value,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - legacy fallback only
+            logger.warning(f"[OnlyYou] merge legacy relation columns failed: {exc}")
 
-        await self.save_user(primary)
+        # Merge every Soul's relation rows (not only the currently selected one).
+        try:
+            soul_rows = await self.db.fetchall(
+                "SELECT DISTINCT soul_id FROM user_relations WHERE global_uid IN (?, ?)",
+                (primary_uid_value, secondary_uid_value),
+            )
+        except Exception:
+            soul_rows = []
+        for row in soul_rows:
+            row_soul = self._soul_key(row.get("soul_id"))
+            if not row_soul:
+                continue
+            rel_p = await self._load_relation(row_soul, primary_uid_value) or {
+                "tier": 1,
+                "interaction_count": 0,
+                "affinity": 0.0,
+                "nickname": "",
+                "attitude": "",
+            }
+            rel_s = await self._load_relation(row_soul, secondary_uid_value)
+            if rel_s is not None:
+                merged = {
+                    "tier": max(int(rel_p.get("tier", 1)), int(rel_s.get("tier", 1))),
+                    "interaction_count": int(rel_p.get("interaction_count", 0))
+                    + int(rel_s.get("interaction_count", 0)),
+                    "affinity": min(
+                        100.0,
+                        max(
+                            float(rel_p.get("affinity", 0.0)),
+                            float(rel_s.get("affinity", 0.0)),
+                        )
+                        + float(rel_s.get("affinity", 0.0)) * 0.5,
+                    ),
+                    "nickname": rel_p.get("nickname") or rel_s.get("nickname") or "",
+                    "attitude": rel_p.get("attitude") or rel_s.get("attitude") or "",
+                }
+            else:
+                merged = dict(rel_p)
+            await self.db.execute(
+                """
+                INSERT INTO user_relations (
+                    soul_id, global_uid, tier, interaction_count, affinity,
+                    nickname, attitude, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(soul_id, global_uid) DO UPDATE SET
+                    tier = excluded.tier,
+                    interaction_count = excluded.interaction_count,
+                    affinity = excluded.affinity,
+                    nickname = excluded.nickname,
+                    attitude = excluded.attitude,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    row_soul,
+                    primary_uid_value,
+                    int(merged.get("tier", 1)),
+                    int(merged.get("interaction_count", 0)),
+                    float(merged.get("affinity", 0.0)),
+                    merged.get("nickname") or "",
+                    merged.get("attitude") or "",
+                    int(time.time()),
+                ),
+            )
+            self._relation_cache[(row_soul, primary_uid_value)] = {
+                "soul_id": row_soul,
+                "global_uid": primary_uid_value,
+                "tier": int(merged.get("tier", 1)),
+                "interaction_count": int(merged.get("interaction_count", 0)),
+                "affinity": float(merged.get("affinity", 0.0)),
+                "nickname": merged.get("nickname") or "",
+                "attitude": merged.get("attitude") or "",
+                "updated_at": int(time.time()),
+            }
+            await self.db.execute(
+                "DELETE FROM user_relations WHERE soul_id = ? AND global_uid = ?",
+                (row_soul, secondary_uid_value),
+            )
+            self._relation_cache.pop((row_soul, secondary_uid_value), None)
+
         await self.db.execute(
-            "UPDATE memories SET user_id = ? WHERE user_id = ?", (p_id, s_id)
+            "UPDATE memories SET user_id = ? WHERE user_id IN (?, ?)",
+            (primary_uid_value, secondary_uid_value, s_id),
         )
-        await self.db.execute("DELETE FROM users WHERE global_uid = ?", (s_id,))
-        self._cache[s_id] = primary
-        return primary
+        await self.db.execute(
+            "DELETE FROM user_relations WHERE global_uid = ?", (secondary_uid_value,)
+        )
+        await self.db.execute(
+            "DELETE FROM users WHERE global_uid = ?", (secondary_uid_value,)
+        )
+        self._drop_identity_cache(secondary_uid_value)
+        self._drop_identity_cache(primary_uid_value)
 
-    async def delete_user(self, global_uid: str) -> None:
-        """Delete a user record by `global_uid`."""
+        if soul:
+            merged_profile = await self.get_user(primary_uid_value, soul_id=soul)
+            return merged_profile or primary
+        return await self.get_or_create_user(primary_uid_value)
+
+    async def delete_user(
+        self, global_uid: str, soul_id: Optional[str] = None
+    ) -> None:
+        """Delete a user record.
+
+        v2.9: with ``soul_id`` only the current Soul's relation row is removed; the
+        global identity row is removed only when no other Soul keeps a relation.
+        Without ``soul_id`` the whole identity + all relation rows are deleted
+        (legacy semantics). ``memories`` rows are never deleted here.
+        """
         uid = (global_uid or "").strip()
         if not uid:
             return
-        self._cache.pop(uid, None)
-        for key, value in list(self._cache.items()):
-            if value is not None and value.global_uid == uid:
-                self._cache.pop(key, None)
+        soul = self._soul_key(soul_id)
+        if soul:
+            await self.db.execute(
+                "DELETE FROM user_relations WHERE soul_id = ? AND global_uid = ?",
+                (soul, uid),
+            )
+            self._relation_cache.pop((soul, uid), None)
+            remaining = await self.db.fetchone(
+                "SELECT COUNT(*) AS c FROM user_relations WHERE global_uid = ?",
+                (uid,),
+            )
+            if not remaining or int(remaining.get("c", 0) or 0) == 0:
+                await self.db.execute("DELETE FROM users WHERE global_uid = ?", (uid,))
+                self._drop_identity_cache(uid)
+            return
+        await self.db.execute(
+            "DELETE FROM user_relations WHERE global_uid = ?", (uid,)
+        )
+        for key in [item for item in self._relation_cache if item[1] == uid]:
+            self._relation_cache.pop(key, None)
         await self.db.execute("DELETE FROM users WHERE global_uid = ?", (uid,))
+        self._drop_identity_cache(uid)
+
+    async def migrate_user_relations(
+        self,
+        platform_to_soul: dict[str, str],
+        default_soul_id: str = "",
+        soul_ids: Optional[list[str]] = None,
+    ) -> dict[str, int]:
+        """One-shot migration: legacy users columns -> per-Soul ``user_relations``.
+
+        Splits each identity row by the Soul owning its platform accounts; accounts
+        without a binding fall back to ``default_soul_id`` (or the only Soul if there
+        is exactly one). Idempotent via ``plugin_settings["user_relations_migrated_v1"]``
+        which is only written after a fully successful pass.
+        """
+        stats = {"users_processed": 0, "relations_created": 0, "skipped": 0}
+        try:
+            already = bool(
+                await self.db.get_setting("user_relations_migrated_v1", False)
+            )
+        except Exception:
+            already = False
+        if already:
+            return stats
+        souls = [str(item or "").strip() for item in (soul_ids or [])]
+        souls = [item for item in souls if item]
+        if not souls:
+            return stats
+        fallback_soul = str(default_soul_id or "").strip()
+        if not fallback_soul and len(souls) == 1:
+            fallback_soul = souls[0]
+        mapping = {
+            str(platform or "").strip(): str(soul or "").strip()
+            for platform, soul in dict(platform_to_soul or {}).items()
+            if str(platform or "").strip() and str(soul or "").strip()
+        }
+        try:
+            rows = await self.db.fetchall("SELECT * FROM users")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[OnlyYou] user_relations migration read users failed: {exc}")
+            return stats
+        try:
+            evidence = await self._collect_platform_evidence()
+        except Exception:  # noqa: BLE001 - evidence inference is best-effort
+            evidence = {}
+        try:
+            for row in rows:
+                identity = self._profile_from_row(row)
+                target_souls: set[str] = set()
+                for account in identity.platform_ids:
+                    parsed = split_platform_account(account)
+                    if parsed is not None:
+                        bound = mapping.get(parsed[0], "")
+                        if bound:
+                            target_souls.add(bound)
+                    else:
+                        # Legacy bare id: infer its platform from persisted private
+                        # UMO evidence first, then fall back to the default/routing Soul.
+                        for platform_id in sorted(evidence.get(account, set())):
+                            bound = mapping.get(platform_id, "")
+                            if bound:
+                                target_souls.add(bound)
+                        if not target_souls and fallback_soul:
+                            target_souls.add(fallback_soul)
+                if not target_souls and fallback_soul:
+                    target_souls.add(fallback_soul)
+                if not target_souls:
+                    stats["skipped"] += 1
+                    continue
+                for soul in sorted(target_souls):
+                    if await self._load_relation(soul, identity.global_uid) is not None:
+                        continue
+                    await self.db.execute(
+                        """
+                        INSERT OR IGNORE INTO user_relations (
+                            soul_id, global_uid, tier, interaction_count, affinity,
+                            nickname, attitude, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            soul,
+                            identity.global_uid,
+                            int(identity.tier.value),
+                            int(identity.interaction_count),
+                            float(identity.affinity),
+                            identity.nickname or "",
+                            identity.attitude or "",
+                            int(time.time()),
+                        ),
+                    )
+                    self._relation_cache[(soul, identity.global_uid)] = {
+                        "soul_id": soul,
+                        "global_uid": identity.global_uid,
+                        "tier": int(identity.tier.value),
+                        "interaction_count": int(identity.interaction_count),
+                        "affinity": float(identity.affinity),
+                        "nickname": identity.nickname or "",
+                        "attitude": identity.attitude or "",
+                        "updated_at": int(time.time()),
+                    }
+                    stats["relations_created"] += 1
+                stats["users_processed"] += 1
+            # Users skipped for lack of any platform/default evidence are retried on
+            # the next startup (they would otherwise never join a Soul list); once a
+            # default Soul exists the fallback guarantees they are processed.
+            if stats["skipped"] == 0 or fallback_soul:
+                await self.db.set_setting("user_relations_migrated_v1", True)
+        except Exception as exc:  # noqa: BLE001 - retry next startup
+            logger.warning(f"[OnlyYou] user_relations migration incomplete: {exc}")
+            return stats
+        if stats["relations_created"] or stats["skipped"]:
+            logger.info(
+                "[OnlyYou] user_relations migration: %s", stats
+            )
+        return stats
 
     # ==================================================================
     # v2.8 group chat profiles (contract §4.2 / §6.3)

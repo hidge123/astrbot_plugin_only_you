@@ -982,8 +982,14 @@ class OnlyYouWebAPI:
             "sessions": await self._session_entries(soul),
         }
 
-    async def _group_items(self) -> list[dict[str, Any]]:
-        """Frozen ``GroupItem`` list for ``users/list`` (contract §6.2 / §6.3)."""
+    async def _group_items(self, soul: Any = None) -> list[dict[str, Any]]:
+        """Frozen ``GroupItem`` list for ``users/list`` (contract §6.2 / §6.3).
+
+        v2.9 (§4.4): when ``soul`` is given only the groups governed by that Soul are
+        returned — ``group.bound_soul_id == soul_id`` or the group's platform is one
+        of the Soul's bound robots (covers groups whose ``bound_soul_id`` was never
+        backfilled). ``soul=None`` keeps the legacy all-groups view.
+        """
         manager = getattr(self.plugin, "user_relation", None)
         lister = getattr(manager, "list_groups", None) if manager is not None else None
         if not callable(lister):
@@ -996,6 +1002,13 @@ class OnlyYouWebAPI:
         except Exception as exc:
             logger.warning(f"[OnlyYou] list_groups failed: {exc}")
             return []
+        wanted_soul = (
+            str(getattr(soul, "soul_id", "") or "").strip() if soul is not None else ""
+        )
+        wanted_platforms: set[str] = set()
+        if wanted_soul:
+            wanted_platforms = set(await self._bound_platforms_of(wanted_soul))
+            wanted_platforms.update(_as_str_list(getattr(soul, "bound_platforms", None)))
         bindings = await self._platform_bindings()
         name_map = await self._soul_name_map()
         items: list[dict[str, Any]] = []
@@ -1009,6 +1022,13 @@ class OnlyYouWebAPI:
             bound_soul_id = str(data.get("bound_soul_id") or "").strip() or bindings.get(
                 platform_id, ""
             )
+            # v2.9 §4.4: per-Soul group scope.
+            if (
+                wanted_soul
+                and bound_soul_id != wanted_soul
+                and platform_id not in wanted_platforms
+            ):
+                continue
             items.append(
                 {
                     "umo": umo,
@@ -1039,19 +1059,114 @@ class OnlyYouWebAPI:
             "total": len(users),
         }
 
-    async def _user_counts(self) -> dict[str, int]:
+    async def _list_users_safe(
+        self, tier_filter: Optional[int] = None, soul_id: str = ""
+    ) -> list[Any]:
+        """``user_relation.list_users`` with an optional v2.9 per-Soul scope.
+
+        Legacy / partial manager implementations without the ``soul_id`` keyword are
+        tolerated (they simply keep the global view), mirroring the other defensive
+        bridges in this module.
+        """
+        manager = getattr(self.plugin, "user_relation", None)
+        lister = getattr(manager, "list_users", None) if manager is not None else None
+        if not callable(lister):
+            return []
+        scope = (soul_id or "").strip()
+        try:
+            value = (
+                lister(tier_filter=tier_filter, soul_id=scope)
+                if scope
+                else lister(tier_filter=tier_filter)
+            )
+        except TypeError:
+            value = lister(tier_filter=tier_filter)
+        if inspect.isawaitable(value):
+            value = await value
+        return list(value or [])
+
+    async def _user_counts(self, soul_id: str = "") -> dict[str, int]:
         manager = getattr(self.plugin, "user_relation", None)
         lister = getattr(manager, "list_users", None) if manager is not None else None
         if not callable(lister):
             return self._counts_from_users([])
         try:
-            value = lister(tier_filter=None)
-            if inspect.isawaitable(value):
-                value = await value
-            return self._counts_from_users(list(value or []))
+            return self._counts_from_users(await self._list_users_safe(None, soul_id))
         except Exception as exc:
             logger.warning(f"[OnlyYou] list_users for counts failed: {exc}")
             return self._counts_from_users([])
+
+    async def _soul_or_none(self, soul_id: str) -> Any:
+        """Resolve exactly ``soul_id`` (no default fallback); ``None`` when unknown."""
+        sid = (soul_id or "").strip()
+        if not sid:
+            return None
+        manager = getattr(self.plugin, "soul_manager", None)
+        getter = getattr(manager, "get_soul_by_id", None) if manager is not None else None
+        if not callable(getter):
+            return None
+        try:
+            value = getter(sid)
+            if inspect.isawaitable(value):
+                value = await value
+        except Exception as exc:
+            logger.warning(f"[OnlyYou] get_soul_by_id({sid}) failed: {exc}")
+            return None
+        return value
+
+    async def _scoped_user(self, global_uid: str, soul_id: str) -> Any:
+        """``user_relation.get_user(uid, soul_id=...)`` — ``None`` when not related.
+
+        Used by ``users/update`` merge/delete validation (contract §4.2: both merge
+        targets must already exist in the current Soul's relation list).
+        """
+        manager = getattr(self.plugin, "user_relation", None)
+        getter = getattr(manager, "get_user", None) if manager is not None else None
+        if not callable(getter):
+            return None
+        try:
+            value = getter(global_uid, soul_id=soul_id)
+        except TypeError:
+            value = getter(global_uid)
+        if inspect.isawaitable(value):
+            value = await value
+        return value
+
+    async def _scoped_group_items(self, soul_id: str = "") -> list[dict[str, Any]]:
+        """Groups scoped to ``soul_id`` (all groups when empty; none when unknown)."""
+        scope = (soul_id or "").strip()
+        if not scope:
+            return await self._group_items()
+        soul = await self._soul_or_none(scope)
+        return await self._group_items(soul) if soul is not None else []
+
+    async def _scoped_user_payload(
+        self,
+        soul_id: str = "",
+        tier_filter: Optional[int] = None,
+        with_groups: bool = True,
+    ) -> dict[str, Any]:
+        """Frozen ``users/list`` data payload (contract §4.1).
+
+        ``soul_id=""`` reproduces the legacy global view (all users from the legacy
+        ``users`` columns + all groups); a non-empty scope filters users, counts and
+        groups to that Soul. ``tier_filter`` only narrows ``users`` — ``counts`` stay
+        derived from the full scoped list, exactly like the v2.8 handler.
+        ``with_groups=False`` omits the (heavier) group scan for mutation responses.
+        """
+        scope = (soul_id or "").strip()
+        users = await self._list_users_safe(tier_filter, scope)
+        all_users = (
+            users if tier_filter is None else await self._list_users_safe(None, scope)
+        )
+        payload: dict[str, Any] = {
+            "soul_id": scope,
+            "users": [user.to_dict() for user in users],
+            "counts": self._counts_from_users(list(all_users)),
+        }
+        if with_groups:
+            payload["groups"] = await self._scoped_group_items(scope)
+        return payload
 
     def _tier1_limit(self) -> int:
         """``memory_and_context_config.max_tier1_memories`` (default 30, contract §5.6)."""
@@ -1497,14 +1612,18 @@ class OnlyYouWebAPI:
             except Exception:  # pragma: no cover - defensive only
                 pass
 
-    async def _relation_counts(self) -> dict[str, int]:
-        """Dashboard relation counters derived from `user_relation.list_users()`."""
+    async def _relation_counts(self, soul_id: str = "") -> dict[str, int]:
+        """Dashboard relation counters derived from `user_relation.list_users()`.
+
+        v2.9 §4.3: when ``soul_id`` is given the counters only cover that Soul's
+        relation rows (same shape as the legacy global counters).
+        """
         counts = {"l1": 0, "l2": 0, "l3": 0, "total": 0}
         manager = getattr(self.plugin, "user_relation", None)
         if manager is None:
             return counts
         try:
-            users = list(await manager.list_users() or [])
+            users = await self._list_users_safe(None, soul_id)
         except Exception as exc:
             logger.warning(f"[OnlyYou] dashboard relation counts failed: {exc}")
             return counts
@@ -2106,33 +2225,30 @@ class OnlyYouWebAPI:
     async def api_users_list(self) -> dict[str, Any]:
         try:
             await self.plugin._ensure_initialized()
+            # v2.9 §4.1: optional per-Soul scope; empty => legacy global view.
+            soul_id = self._get_query_param("soul_id")
             tier_str = self._get_query_param("tier")
             tier_filter = int(tier_str) if tier_str in ("1", "2", "3") else None
-            users = await self.plugin.user_relation.list_users(tier_filter=tier_filter)
-            all_users = (
-                users
-                if tier_filter is None
-                else await self.plugin.user_relation.list_users(tier_filter=None)
-            )
             return ok_response(
-                {
-                    "users": [u.to_dict() for u in users],
-                    "counts": self._counts_from_users(list(all_users)),
-                    # v2.8: discovered group chats (contract §6.2 GroupItem).
-                    "groups": await self._group_items(),
-                }
+                await self._scoped_user_payload(soul_id, tier_filter)
             )
         except Exception as e:
             return err_response(f"获取用户关系列表失败: {e}")
 
     async def _handle_group_action(self, action: str, body: dict[str, Any]) -> dict[str, Any]:
-        """v2.8 ``users/update`` group actions (contract §6.2)."""
+        """v2.8 ``users/update`` group actions (contract §6.2).
+
+        v2.9 §4.4: when the request carries ``soul_id`` the returned ``groups`` are
+        scoped to that Soul (and ``counts`` to its relation list); without it the
+        legacy all-groups payload shape is preserved byte-for-byte.
+        """
         manager = getattr(self.plugin, "user_relation", None)
         if manager is None:
             return err_response("UserRelationManager 未初始化")
         umo = str(body.get("umo") or "").strip()
         if not umo:
             return err_response("群聊 UMO 不能为空")
+        soul_id = str(body.get("soul_id") or "").strip()
 
         if action == "update_group":
             updater = getattr(manager, "update_group", None)
@@ -2165,13 +2281,13 @@ class OnlyYouWebAPI:
                 return err_response(f"未找到群聊档案: {umo}")
             message = f"已移除群聊档案 {umo}"
 
-        return ok_response(
-            {
-                "groups": await self._group_items(),
-                "counts": await self._user_counts(),
-            },
-            message=message,
-        )
+        payload: dict[str, Any] = {
+            "groups": await self._scoped_group_items(soul_id),
+            "counts": await self._user_counts(soul_id),
+        }
+        if soul_id:
+            payload["soul_id"] = soul_id
+        return ok_response(payload, message=message)
 
     async def api_users_update(self) -> dict[str, Any]:
         try:
@@ -2186,6 +2302,9 @@ class OnlyYouWebAPI:
             if action == "normalize_identity":
                 # v2.8.4: one-click repair of legacy bare platform ids (旧数据只有
                 # 裸 global_uid) into ``platform_id:native_uid`` form.
+                # v2.9 §4.2: identity repair stays identity-global; ``soul_id`` only
+                # selects which relation view the returned ``users`` reflect.
+                soul_id = str(body.get("soul_id") or "").strip()
                 uid = str(body.get("global_uid") or "").strip()
                 platform_id = str(body.get("platform_id") or "").strip()
                 if not uid:
@@ -2200,40 +2319,117 @@ class OnlyYouWebAPI:
                         user = await user
                 except ValueError as exc:
                     return err_response(str(exc))
-                users = await self.plugin.user_relation.list_users()
+                users = await self._list_users_safe(None, soul_id)
                 return ok_response(
                     {
                         "user": user.to_dict() if user is not None else {},
                         "users": [u.to_dict() for u in users],
+                        "soul_id": soul_id,
                     },
                     message=f"已补全用户 {uid} 的平台账号标识",
                 )
 
             if action == "merge":
+                # v2.9 §4.2: merge targets must both exist in the **current Soul's**
+                # relation list (Pages merge dropdown), never a free-text uid.
+                soul_id = str(body.get("soul_id") or "").strip()
                 primary_uid = str(body.get("primary_uid") or "").strip()
                 secondary_uid = str(body.get("secondary_uid") or "").strip()
-                merged = await self.plugin.user_relation.merge_users(primary_uid, secondary_uid)
-                users = await self.plugin.user_relation.list_users()
+                if not primary_uid or not secondary_uid:
+                    return err_response("合并目标必须是当前角色关系列表中的已有用户")
+                if primary_uid == secondary_uid:
+                    return err_response("请选择两个不同的用户进行合并")
+                manager = getattr(self.plugin, "user_relation", None)
+                if soul_id:
+                    primary = await self._scoped_user(primary_uid, soul_id)
+                    secondary = await self._scoped_user(secondary_uid, soul_id)
+                    if primary is None or secondary is None:
+                        return err_response("合并目标必须是当前角色关系列表中的已有用户")
+                    primary_uid = str(getattr(primary, "global_uid", "") or primary_uid)
+                    secondary_uid = str(
+                        getattr(secondary, "global_uid", "") or secondary_uid
+                    )
+                    if primary_uid == secondary_uid:
+                        return err_response("请选择两个不同的用户进行合并")
+                try:
+                    merged = (
+                        manager.merge_users(primary_uid, secondary_uid, soul_id=soul_id)
+                        if soul_id
+                        else manager.merge_users(primary_uid, secondary_uid)
+                    )
+                    if inspect.isawaitable(merged):
+                        merged = await merged
+                except TypeError:
+                    merged = manager.merge_users(primary_uid, secondary_uid)
+                    if inspect.isawaitable(merged):
+                        merged = await merged
+                except ValueError as exc:
+                    return err_response(str(exc))
+                # v2.9 §4.2 frozen payload: {merged_user, users(current Soul),
+                # counts, soul_id}; without a scope keep the v2.8 legacy shape.
+                if soul_id:
+                    payload = await self._scoped_user_payload(
+                        soul_id, with_groups=False
+                    )
+                else:
+                    users = await self._list_users_safe()
+                    payload = {"users": [user.to_dict() for user in users]}
+                payload["merged_user"] = merged.to_dict()
                 return ok_response(
-                    {
-                        "merged_user": merged.to_dict(),
-                        "users": [u.to_dict() for u in users],
-                    },
+                    payload,
                     message=f"已将账号 {secondary_uid} 合并至 {primary_uid}",
                 )
 
             if action == "delete":
+                # v2.9 §4.2: with ``soul_id`` only the current role's relation file
+                # is removed; identity / other roles / memories stay untouched.
+                soul_id = str(body.get("soul_id") or "").strip()
                 uid = str(body.get("global_uid") or "").strip()
-                await self.plugin.user_relation.delete_user(uid)
-                users = await self.plugin.user_relation.list_users()
+                if not uid:
+                    return err_response("用户账号 ID (global_uid) 不能为空")
+                manager = getattr(self.plugin, "user_relation", None)
+                deleter = getattr(manager, "delete_user", None)
+                if not callable(deleter):
+                    return err_response("UserRelationManager 未实现 delete_user")
+                if soul_id:
+                    scoped = await self._scoped_user(uid, soul_id)
+                    if scoped is not None:
+                        uid = str(getattr(scoped, "global_uid", "") or uid)
+                    try:
+                        outcome = deleter(uid, soul_id=soul_id)
+                        if inspect.isawaitable(outcome):
+                            await outcome
+                    except TypeError:
+                        # Legacy / partial manager without the v2.9 ``soul_id`` kwarg.
+                        outcome = deleter(uid)
+                        if inspect.isawaitable(outcome):
+                            await outcome
+                    # v2.9 §4.2 frozen payload: {users(current Soul), counts, soul_id}.
+                    payload = await self._scoped_user_payload(
+                        soul_id, with_groups=False
+                    )
+                    return ok_response(
+                        payload,
+                        message=(
+                            "已移除当前角色对该用户的关系档案（其他角色/角色记忆不受影响）"
+                        ),
+                    )
+                outcome = deleter(uid)
+                if inspect.isawaitable(outcome):
+                    await outcome
+                # Legacy v2.8 shape: {users} only.
+                users = await self._list_users_safe()
                 return ok_response(
-                    {"users": [u.to_dict() for u in users]},
+                    {"users": [user.to_dict() for user in users]},
                     message=f"已删除用户 {uid}",
                 )
 
             uid = str(body.get("global_uid") or "").strip()
             if not uid:
                 return err_response("用户账号 ID (global_uid) 不能为空")
+            # v2.9 §4.2: relation fields are written to the current Soul's
+            # ``user_relations`` row; identity fields stay global.
+            soul_id = str(body.get("soul_id") or "").strip()
 
             tier_val = body.get("tier")
             aff_val = body.get("affinity")
@@ -2280,17 +2476,28 @@ class OnlyYouWebAPI:
                 update_kwargs["attitude"] = (
                     None if attitude_raw is None else str(attitude_raw).strip()[:300]
                 )
+            if soul_id:
+                update_kwargs["soul_id"] = soul_id
 
             try:
                 updated = await self.plugin.user_relation.update_user_details(**update_kwargs)
+            except TypeError:
+                # Legacy / partial manager without the v2.9 ``soul_id`` keyword.
+                update_kwargs.pop("soul_id", None)
+                updated = self.plugin.user_relation.update_user_details(**update_kwargs)
+                if inspect.isawaitable(updated):
+                    updated = await updated
             except ValueError as exc:
                 return err_response(str(exc))
-            users = await self.plugin.user_relation.list_users()
+            users = await self._list_users_safe(None, soul_id)
+            payload: dict[str, Any] = {
+                "user": updated.to_dict(),
+                "users": [user.to_dict() for user in users],
+            }
+            if soul_id:
+                payload["soul_id"] = soul_id
             return ok_response(
-                {
-                    "user": updated.to_dict(),
-                    "users": [u.to_dict() for u in users],
-                },
+                payload,
                 message=f"已更新用户 {updated.display_name} ({updated.tier.label})",
             )
         except Exception as e:
@@ -2738,7 +2945,7 @@ class OnlyYouWebAPI:
                     "encounters": [],
                     "busy_results": schedule_payload["busy_results"],
                     "counts": {
-                        "relations": await self._relation_counts(),
+                        "relations": await self._relation_counts(soul.soul_id),
                         "memories": await self._memory_counts(soul.soul_id),
                         "videos": await self._video_count(soul.soul_id),
                     },

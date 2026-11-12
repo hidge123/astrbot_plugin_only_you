@@ -5075,3 +5075,179 @@ html[data-theme="dark"] .rel-chip.is-active .rel-chip-count {
   border-color: color-mix(in srgb, var(--warning, #d97706) 45%, transparent);
   background: color-mix(in srgb, var(--warning, #d97706) 10%, transparent);
 }
+
+/* ==================== v2.9 soul relations ==================== */
+/* 关系页 v2.9：按当前角色（Soul）作用域展示 —— 头部作用域提示、
+ * 「全局身份 / 当前角色关系」字段标签、编辑弹窗分区、合并用户下拉与空候选状态。 */
+
+/* ---- 页面头部：当前角色作用域提示 ---- */
+.rel-scope-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: -4px 0 12px;
+}
+
+.rel-scope-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--primary) 38%, transparent);
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.rel-scope-chip b {
+  font-weight: 600;
+}
+
+.rel-scope-chip .oy-icon,
+.rel-scope-hint .oy-icon {
+  flex: 0 0 auto;
+}
+
+.rel-scope-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+
+/* ---- 「全局身份 vs 当前角色关系」说明条 ---- */
+.rel-scope-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 9px 12px;
+  margin-bottom: 14px;
+  border: 1px solid color-mix(in srgb, var(--primary) 26%, var(--border));
+  border-left: 3px solid var(--primary);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--primary-soft) 55%, var(--surface));
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
+.rel-scope-note .oy-icon {
+  flex: 0 0 auto;
+  margin-top: 1px;
+  color: var(--primary);
+}
+
+.rel-scope-note b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* ---- 字段作用域标签：全局身份 / 当前角色 ---- */
+.rel-scope-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  margin-left: 4px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1.6;
+  white-space: nowrap;
+  color: var(--tier-l2);
+  border: 1px solid color-mix(in srgb, var(--tier-l2) 42%, transparent);
+  background: color-mix(in srgb, var(--tier-l2) 10%, transparent);
+}
+
+.rel-scope-tag.is-global {
+  color: var(--primary);
+  border-color: color-mix(in srgb, var(--primary) 42%, transparent);
+  background: var(--primary-soft);
+}
+
+/* ---- 编辑弹窗分区：全局身份 / 当前角色关系 ---- */
+.rel-form-section {
+  margin-top: 16px;
+}
+
+.rel-form-section:first-of-type {
+  margin-top: 0;
+}
+
+.rel-form-section-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px dashed var(--border);
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.rel-form-section-head .oy-icon {
+  flex: 0 0 auto;
+  color: var(--text-3);
+}
+
+.rel-form-section-tip {
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+/* ---- 合并用户下拉 ---- */
+.rel-merge-select {
+  width: 100%;
+  margin-top: 2px;
+}
+
+.rel-merge-select:disabled {
+  color: var(--text-3);
+  cursor: not-allowed;
+  background: var(--surface-2);
+}
+
+.rel-merge-empty {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  color: var(--text-3);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
+.rel-merge-empty .oy-icon {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.rel-merge-arrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin: 0 0 12px;
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.rel-merge-arrow .oy-icon {
+  color: var(--primary);
+}
+
+@media (max-width: 640px) {
+  .rel-form-section-tip {
+    display: none;
+  }
+}
