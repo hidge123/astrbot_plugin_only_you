@@ -45,30 +45,25 @@ class CyberSurfingPipeline:
         return self.plugin_config.get("surfing_config", {}) or {}
 
     def is_enabled(self, soul: Any = None) -> bool:
-        """Whether cyber surfing is enabled for ``soul`` (v2.8 §5.2).
+        """Whether cyber surfing is enabled for ``soul`` (v2.8.2 Pages-only switch).
 
-        The per-Soul ``settings.surfing_enabled`` value wins; when the Soul does not
-        carry that key, fall back to the global ``surfing_config.surfing_enabled``
-        (default ``True``).
+        The switch is fully owned by the Pages「冲浪」page and persisted in the Soul
+        JSON as ``settings.surfing_enabled`` (default ``True``).  The plugin's general
+        config intentionally no longer carries a global ``surfing_enabled`` fallback
+        (removed from ``_conf_schema.json``) to keep a single source of truth.
         """
-        try:
-            global_enabled = bool(self.cfg.get("surfing_enabled", True))
-        except Exception:  # noqa: BLE001 - defensive, never gate on config errors
-            global_enabled = True
         if soul is None:
-            return global_enabled
+            return True
         settings = getattr(soul, "settings", None)
-        if isinstance(settings, dict):
-            if "surfing_enabled" in settings:
-                return bool(settings.get("surfing_enabled"))
-            return global_enabled
+        if isinstance(settings, dict) and "surfing_enabled" in settings:
+            return bool(settings.get("surfing_enabled"))
         if isinstance(soul, dict) and "surfing_enabled" in soul:
             return bool(soul.get("surfing_enabled"))
         # Tolerate lightweight duck-typed Souls exposing the flag directly.
         attribute = getattr(soul, "surfing_enabled", None)
         if isinstance(attribute, bool):
             return attribute
-        return global_enabled
+        return True
 
     async def surf_once(
         self,

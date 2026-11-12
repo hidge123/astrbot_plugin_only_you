@@ -154,8 +154,7 @@ def make_plugin_config(**overrides):
             "allow_l3_wake_from_resting": True,
         },
         "relationship_config": {
-            "core_user_ids": [],
-            "important_user_ids": [],
+            # v2.8.2: user ID lists removed from the general config (Pages owns tiers).
             "enable_auto_promotion_l2": True,
         },
         "surfing_config": {"enable_bilibili": True, "enable_douyin": False},

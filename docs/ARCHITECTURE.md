@@ -325,7 +325,7 @@ async def on_any_message(self, event: AstrMessageEvent):
 4. **任意 `IDLE` 块（`SURF` / `IDLE_ROAM`）在驱动自身行为前，先执行【私聊未读补回】**：
    - `_catch_up_private_unread()` 取私聊未读队列，按会话逐条喂给 `UNREAD_PRIVATE_CATCHUP_PROMPT`，生成一句“刚睡醒/刚忙完才看到”的自然补回消息并经 `PlatformBridge.send_proactive_message()` 发送；每个私聊会话受 `unread_private_cooldown_minutes` 冷却限制，单次心跳最多补回 2 个会话，发送成功即 ack 该批未读（失败保留重试）。
 5. **当当前块为 `② SURF` (`BotState.IDLE`)**：
-   - **总开关优先**：若该 Soul 的 `settings.surfing_enabled == False`（缺失时回退全局 `_conf_schema.json → surfing_config.surfing_enabled`），本次 `SURF` 自动**降级为 `IDLE_ROAM` 分支**，不刷视频；
+   - **总开关优先**：若该 Soul 的 `settings.surfing_enabled == False`（Pages「冲浪」页按角色管理，缺失默认 True；v2.8.2 起普通配置不再提供全局开关），本次 `SURF` 自动**降级为 `IDLE_ROAM` 分支**，不刷视频；
    - **触发真实刷视频 (`CyberSurfingPipeline`)**：结合角色卡 `surfing_prefs` 拉取 B站/抖音推荐流与热评，由 `vision` 模型看片打分，写入看片记忆；随后由 `_maybe_share_surfed_video()` 做**五条件分享门禁**（非 fallback 结果 / 本 Soul 未分享过该视频 / 分数 ≥ `surf_share_min_score` / 冲浪分享冷却 / IDLE_ROAM 冷却 / 存在 ★L3 私聊目标），**发送成功才记录 video_id 与时间戳**（失败保留重试机会），详见 §6.8。
 6. **当当前块为 `③ IDLE_ROAM` (`BotState.IDLE`)**：
    - **分支 A —— 翻群记录吃瓜 (`GROUP_LURK`，先决策后回复)**：从【群聊未读队列】按「未读条数 × 新鲜度」排序选一个群 → 先用 `ATMOSPHERE_EVAL_PROMPT` 对“未读批次 + 最近窗口”跑一次决策模型（`REPLY` / `IGNORE`）；只有 `REPLY` 才用 `IDLE_ROAM_PROACTIVE_PROMPT` 生成冒泡/私聊 ★L3 吐槽并发送；`IGNORE` 则静默消费该批未读（不重复评估）。消费即从队列移除，并受 `unread_group_cooldown_minutes` 每群冷却限制；
@@ -1024,7 +1024,7 @@ async def clear_platform_memory_state(platform_id: str) -> dict[str, int]
 
 #### 2. 冲浪总开关
 
-- 生效值：**Soul `settings.surfing_enabled` 优先**，缺失回退全局 `_conf_schema.json → surfing_config.surfing_enabled`（默认 True）；
+- 生效值：**Soul `settings.surfing_enabled` 是唯一真源**（Pages「冲浪」页按角色管理，缺失默认 True；v2.8.2 起普通配置不再提供全局开关）；
 - `CyberSurfingPipeline.is_enabled(soul)` 判开关；关闭时 `surf_once()` 返回 `None`，心跳 `SURF` 时段**自动降级为 `IDLE_ROAM` 分支**；`/onlyyou surf` 直接回复「赛博冲浪总开关已关闭…请先到 Pages 冲浪页开启」；
 - `surf_once()` 候选全部已在 `_watched_ids` 时直接返回 `None`（不再回退 `candidates[0]`）。
 
@@ -1088,199 +1088,204 @@ async def touch_memories_for_muse(memory_ids) -> None
 | 群聊档案 | `plugin_settings["group_profiles"]` | Pages「关系与群聊」页 / 消息采集 |
 | 一次性迁移 flag / 上次 GC 日期 | `plugin_settings["legacy_umo_bindings_migrated"]`、`model_config_migrated_to_souls`、`last_forgetting_gc_date` | 插件内部 |
 | 用户关系 / 分级记忆 / 冲浪历史 | SQLite `users` / `memories` / `surfing_history` | Pages「关系」「记忆」「冲浪」页 |
-| 三态门禁、读空气、冲浪、记忆与上下文阈值 | `_conf_schema.json` | AstrBot 插件配置面板 |
+| 三态门禁、读空气、冲浪行为参数、记忆与上下文阈值 | `_conf_schema.json` | AstrBot 插件配置面板（用户等级 / 名单、按角色冲浪总开关、模型配置均不在此） |
 
 ### 7.2 最终 `_conf_schema.json`
 
-以下为 v2.8 最终 schema 全文（不含任何模型绑定，保持 JSON 合法；v2.5 移除 `daily_encounter_count`、新增 `idle_roam_cooldown_minutes` 与 6 个未读消息配置，v2.8 新增 `surfing_enabled / surf_share_min_score / surf_share_cooldown_minutes / max_tier1_memories`）：
+以下为 v2.8.2 最终 schema 全文（不含任何模型绑定，保持 JSON 合法）。**v2.8.2 普通配置与 Pages 去重**：移除全局冲浪开关 `surfing_config.surfing_enabled`（改由 Pages「冲浪」页按角色 `settings.surfing_enabled` 唯一管理）、移除 `relationship_config.core_user_ids / important_user_ids`（用户等级与名单改由 Pages「关系与群聊」页管理，L3 仅由平台 `admins_id` 自动确定）；每项配置标题尽量简短，详细说明放入 `hint`。v2.5 曾移除 `daily_encounter_count`、新增 `idle_roam_cooldown_minutes` 与 6 个未读消息配置，v2.8 新增 `surf_share_min_score / surf_share_cooldown_minutes / max_tier1_memories`。
 
 ```json
 {
   "roguelite_schedule_config": {
-    "description": "🎲 Roguelite 随机日程引擎与三态微调设置",
+    "description": "🎲 随机日程与三态微调",
     "type": "object",
     "items": {
       "enable_roguelite_schedule": {
-        "description": "开启每日 24h 动态时间轴自动构筑（按角色作息曲线从四类行动卡池随机拼接弹性时间块）",
+        "description": "启用随机日程",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "开启后按角色作息曲线把四类行动卡拼成 0:00~24:00 的动态弹性时间轴；关闭后使用固定时段日程。"
       },
       "max_mutations_per_day": {
-        "description": "每日日程最大微调次数上限（根据收到的消息或刷到的视频临时改变状态的次数上限）",
+        "description": "每日微调上限",
         "type": "int",
-        "default": 2
+        "default": 2,
+        "hint": "根据用户消息或刚刷到的视频临时改变状态的每日次数上限，默认 2。"
       },
       "mutation_cooldown_minutes": {
-        "description": "日程状态微调后的冷却锁定时间（分钟，防止频繁横跳）",
+        "description": "微调冷却（分钟）",
         "type": "int",
-        "default": 120
-      },
-      "allow_l3_wake_from_resting": {
-        "description": "允许 ★L3核心用户 在【休息中】状态下通过私聊唤醒 Bot",
-        "type": "bool",
-        "default": true
+        "default": 120,
+        "hint": "两次日程微调之间的最短间隔，防止状态频繁横跳，默认 120。"
       },
       "idle_roam_cooldown_minutes": {
-        "description": "【空闲游荡卡 (IDLE_ROAM)】翻群吃瓜 / 发呆记忆联想的主动搭话冷却时间（分钟）",
+        "description": "闲逛搭话冷却（分钟）",
         "type": "int",
-        "default": 45
+        "default": 45,
+        "hint": "空闲游荡（翻群吃瓜 / 记忆联想）主动搭话的冷却时间，避免频繁骚扰，默认 45。"
+      },
+      "allow_l3_wake_from_resting": {
+        "description": "允许 ★L3 唤醒",
+        "type": "bool",
+        "default": true,
+        "hint": "★L3 核心用户私聊强呼叫时，允许在休息中切出清醒窗并回应。"
       },
       "unread_private_reply_enabled": {
-        "description": "【未读消息】私聊未读主动补回开关：IDLE 空闲时对休息/繁忙期间错过的私聊消息主动补发一条自然回复",
+        "description": "私聊未读补回",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "空闲时主动补回休息 / 繁忙期间错过的私聊消息。"
       },
       "unread_group_ttl_minutes": {
-        "description": "【未读消息】群聊未读消息的有效期（分钟）：超过后不再翻群吃瓜，避免翻隔夜旧瓜",
+        "description": "群未读有效期（分钟）",
         "type": "int",
-        "default": 120
+        "default": 120,
+        "hint": "超过该时间的群未读不再翻群吃瓜，避免翻隔夜旧瓜，默认 120。"
       },
       "unread_private_ttl_minutes": {
-        "description": "【未读消息】私聊未读消息的有效期（分钟）：醒来/忙完后仍会补回的时限（默认 12 小时）",
+        "description": "私聊未读有效期（分钟）",
         "type": "int",
-        "default": 720
+        "default": 720,
+        "hint": "超过该时间的私聊未读不再主动补回，默认 720（12 小时）。"
       },
       "unread_max_per_chat": {
-        "description": "【未读消息】单个群/私聊会话最多保留的未读消息条数（超出丢弃最旧）",
+        "description": "单会话未读上限",
         "type": "int",
-        "default": 20
+        "default": 20,
+        "hint": "每个群 / 私聊会话最多保留的未读消息条数，超出时丢弃最旧，默认 20。"
       },
       "unread_group_cooldown_minutes": {
-        "description": "【未读消息】同一个群的翻群吃瓜冷却（分钟），防止反复翻同一个群",
+        "description": "翻群冷却（分钟）",
         "type": "int",
-        "default": 60
+        "default": 60,
+        "hint": "同一个群两次翻群吃瓜的最小间隔，默认 60。"
       },
       "unread_private_cooldown_minutes": {
-        "description": "【未读消息】同一个私聊会话主动补回的冷却（分钟），防止连续补发",
+        "description": "私聊补回冷却（分钟）",
         "type": "int",
-        "default": 60
+        "default": 60,
+        "hint": "同一个私聊会话两次主动补回的最小间隔，默认 60。"
       }
     }
   },
   "relationship_config": {
-    "description": "💖 三级用户关系设置 (普通L1 / 重要用户L2 / 核心用户L3)",
+    "description": "💝 关系行为",
     "type": "object",
     "items": {
-      "core_user_ids": {
-        "description": "★ L3 核心用户 (管理员) 账号列表",
-        "type": "list",
-        "items": {
-          "type": "string"
-        },
-        "default": []
-      },
-      "important_user_ids": {
-        "description": "◆ 初始指定的 L2 重要用户列表（繁忙状态下依然会回复的对象）",
-        "type": "list",
-        "items": {
-          "type": "string"
-        },
-        "default": []
-      },
       "enable_auto_promotion_l2": {
-        "description": "允许普通用户(L1)通过群聊良性互动自动晋升为重要用户(L2)",
+        "description": "L1 自动晋升 L2",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "允许普通用户通过群聊良性互动自动晋升为重要用户（仅晋升到 L2；★L3 仅由平台管理员身份或 Pages「关系与群聊」页手动确定）。用户等级与名单统一在 Pages「关系与群聊」页管理，本配置不再提供用户 ID 名单。"
       }
     }
   },
   "atmosphere_config": {
-    "description": "🌬️ 群聊主战场：解线团与“读空气”引擎设置",
+    "description": "🌬️ 群聊读空气",
     "type": "object",
     "items": {
       "takeover_group_chat": {
-        "description": "全面接管群聊（结合当前三态与读空气决定是否回复）",
+        "description": "接管群聊回复",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "结合当前三态与五维读空气决定是否接话；关闭后仅在 @ / 唤醒 / 引用 Bot 时回复。"
       },
       "debounce_seconds": {
-        "description": "群聊听话防抖等待窗口（秒）",
+        "description": "防抖等待（秒）",
         "type": "float",
-        "default": 4.0
+        "default": 4.0,
+        "hint": "群聊消息后等待该时间再判断是否接话；等待期间有新消息则由新消息处理。"
       }
     }
   },
   "surfing_config": {
-    "description": "📱 赛博冲浪：空闲状态下刷 B站 & 抖音设置",
+    "description": "📱 赛博冲浪",
     "type": "object",
     "items": {
       "enable_bili_surfing": {
-        "description": "在【空闲中】状态下主动刷哔哩哔哩 (Bilibili)",
+        "description": "启用 B站冲浪",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "空闲状态下主动刷哔哩哔哩 (Bilibili)。"
       },
       "bili_cookie": {
-        "description": "B站 Cookie (选填)",
+        "description": "B站 Cookie（可选）",
         "type": "text",
         "secret": true,
-        "default": ""
+        "default": "",
+        "hint": "未登录 B 站时填写的 Cookie 可提高推荐流可用性；只保存在本地插件配置中。"
       },
       "enable_douyin_surfing": {
-        "description": "在【空闲中】状态下主动刷抖音 (Douyin)",
+        "description": "启用抖音冲浪",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "空闲状态下主动刷抖音 (Douyin)。"
       },
       "douyin_api_base": {
-        "description": "抖音解析 API 服务地址",
+        "description": "抖音解析接口",
         "type": "string",
-        "default": "https://api.douyin.wtf"
+        "default": "https://api.douyin.wtf",
+        "hint": "抖音无水印视频解析服务地址，默认 https://api.douyin.wtf。"
       },
       "send_raw_video": {
-        "description": "优先直发无水印视频文件",
+        "description": "直发无水印视频",
         "type": "bool",
-        "default": true
-      },
-      "surfing_enabled": {
-        "description": "赛博冲浪总开关（全局默认值；每个角色可在 Pages 冲浪页单独覆盖）",
-        "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "主动分享时优先直接发送无水印视频文件；关闭则只发链接 / 文本。"
       },
       "surf_share_min_score": {
-        "description": "冲浪视频主动分享的最低 vision 评分（达到后才会分享给 ★L3）",
+        "description": "分享评分门槛",
         "type": "int",
-        "default": 80
+        "default": 80,
+        "hint": "视觉模型看片评分低于该值时只记录视频、不主动分享，默认 80。"
       },
       "surf_share_cooldown_minutes": {
-        "description": "两次冲浪视频主动分享之间的冷却时间（分钟）",
+        "description": "分享冷却（分钟）",
         "type": "int",
-        "default": 90
+        "default": 90,
+        "hint": "两次 SURF 主动分享之间的最小间隔，默认 90。"
       }
     }
   },
   "memory_and_context_config": {
-    "description": "🧠 精简版分级记忆、自动遗忘与上下文预算控制",
+    "description": "🧠 分级记忆与上下文预算",
     "type": "object",
     "items": {
       "enable_tiered_memory": {
-        "description": "开启分级记忆与每日自动遗忘清理 (Forgetting GC)",
+        "description": "启用分级记忆",
         "type": "bool",
         "default": true,
-        "hint": "自动提炼核心记忆(永久)与近期记忆(随时间衰减并由定时程序自动清理不重要记忆)。"
+        "hint": "开启分级记忆与每日遗忘清理 GC；关闭后不会写入新记忆（含 /onlyyou memory add、繁忙成果、记忆提炼），也不会向 Prompt 注入记忆，仅保留会话滑窗。"
       },
       "sliding_window_size": {
-        "description": "单会话短期滑动窗口保留消息条数（清空平台 req.contexts 后由插件注入的近期消息上限，滑出窗口即送去提炼记忆）",
+        "description": "会话滑窗条数",
         "type": "int",
-        "default": 15
+        "default": 15,
+        "hint": "插件接管上下文后，每次对话注入的最近消息条数；滑出窗口的消息会送去提炼记忆。"
       },
       "extract_every_n_messages": {
-        "description": "滑出窗口每累计多少条有效消息触发一次后台小脑记忆提炼",
+        "description": "提炼触发条数",
         "type": "int",
-        "default": 15
+        "default": 15,
+        "hint": "滑出窗口每累计多少条有效消息触发一次后台决策模型记忆提炼。"
       },
       "max_injected_memories": {
-        "description": "单次对话最多允许插入的记忆条数上限",
+        "description": "单次注入条数",
         "type": "int",
-        "default": 6
+        "default": 6,
+        "hint": "每次对话最多注入的记忆条数，默认 6。"
       },
       "max_memory_chars_budget": {
-        "description": "单次对话插入记忆的最大总字数预算（汉字数，防止费用过高）",
+        "description": "单次注入字数",
         "type": "int",
-        "default": 400
+        "default": 400,
+        "hint": "每次对话注入记忆的总字数预算（汉字），默认 400，用于控制 Token 费用。"
       },
       "max_tier1_memories": {
-        "description": "每个角色最多保留的 Tier 1 瞬时记忆条数（超出按创建时间淘汰最旧；同时用于 Pages 记忆页「上限 N 条」提示）",
+        "description": "T1 数量上限",
         "type": "int",
-        "default": 30
+        "default": 30,
+        "hint": "每个角色的 Tier1 瞬时记忆数量上限，超出后按创建时间 FIFO 淘汰最旧，默认 30。"
       }
     }
   }

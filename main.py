@@ -337,7 +337,7 @@ def _umo_in_platform_scope(
     "astrbot_plugin_only_you",
     "hidge123",
     "OnlyYou (只有你) —— 具备生命节律、三级记忆与赛博冲浪能力的高自治 AI 伴侣与数字网友插件",
-    "2.8.0",
+    "2.8.2",
     "https://github.com/hidge123/astrbot_plugin_only_you",
 )
 class OnlyYouPlugin(Star):
@@ -2731,6 +2731,12 @@ class OnlyYouPlugin(Star):
                 yield event.plain_result(f"🧠 已从当前会话滑窗提炼并入库 {count} 条分级记忆。")
                 return
             if action == "add" and len(tokens) >= 6:
+                if not self.memory_manager.enabled:
+                    yield event.plain_result(
+                        "🧠 分级记忆已在 AstrBot 插件配置中关闭（enable_tiered_memory=false），"
+                        "本次未写入。"
+                    )
+                    return
                 mtier = int(tokens[2]) if tokens[2] in ("1", "2", "3") else 2
                 imp = int(tokens[3]) if tokens[3].isdigit() else 6
                 kws = tokens[4]

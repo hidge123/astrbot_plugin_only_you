@@ -126,7 +126,15 @@ class MemoryManager:
         vitality: float = 100.0,
         created_at: Optional[int] = None,
     ) -> int:
-        """Insert a memory item (truncated to <=60 chars per design spec)."""
+        """Insert a memory item (truncated to <=60 chars per design spec).
+
+        v2.8.2: honours the global ``enable_tiered_memory`` switch — when tiered
+        memory is disabled this is a no-op returning ``0`` (all other write paths
+        such as command / Web API add, BUSY_TASK completion and extraction already
+        go through this method, so the switch is now enforced consistently).
+        """
+        if not self.enabled:
+            return 0
         clean_content = (content or "").strip()[:60]
         if not clean_content:
             return 0

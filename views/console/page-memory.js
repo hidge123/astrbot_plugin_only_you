@@ -267,11 +267,12 @@
       budget +
       " 字；会话滑窗保留最近 " +
       windowSize +
-      ' 条消息">每次注入 ≤' +
+      ' 条消息。预算 / 滑窗 / 提炼阈值等运行参数统一在「AstrBot 插件配置 → OnlyYou → 记忆与上下文」中修改。">每次注入 ≤' +
       esc(injected) +
       " 条 · " +
       esc(budget) +
-      " 字</span>"
+      " 字</span>" +
+      '<span class="text-xs muted" data-role="memory-budget-config-hint">· 前往 AstrBot 插件配置修改预算</span>'
     );
   }
 

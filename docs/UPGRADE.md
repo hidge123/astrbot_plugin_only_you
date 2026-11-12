@@ -3,7 +3,7 @@
 > 适用对象：从 **v2.7.x（或更早 v2.6 / v2.5）** 升级到 **v2.8** 的 AstrBot 部署。
 > 本文只描述升级 / 迁移 / 校验 / 回滚流程与排障语义，**不包含任何真实服务器地址、密钥或密码**；命令中的 `$SERVER_IP`、`$ASTRBOT_URL`、`<数据目录>`、`/path/to/OnlyYou` 均为占位符，请按实际环境替换。
 >
-> 版本口径：插件产品版本 **v2.8**，`metadata.yaml` → `version: 2.8.0`；Web API 路由 **31 条**；角色卡 **10 分区 / 36 字段**。文档不写死测试用例数量，验收以实际运行结果为准。
+> 版本口径：插件产品版本 **v2.8**，`metadata.yaml` → `version: 2.8.2`；Web API 路由 **31 条**；角色卡 **10 分区 / 36 字段**。文档不写死测试用例数量，验收以实际运行结果为准。
 
 ---
 
@@ -241,7 +241,7 @@ sqlite3 only_you.db \
 
 ## 7. 升级后仍不生效的排查顺序
 
-1. **确认文件真的换新了**：检查插件目录 `metadata.yaml` 的 `version: 2.8.0`、`core/runtime_state.py` 是否存在、`core/web_api.py` 路由注册处是否为 31 条；
+1. **确认文件真的换新了**：检查插件目录 `metadata.yaml` 的 `version: 2.8.2`、`core/runtime_state.py` 是否存在、`core/web_api.py` 路由注册处是否为 31 条；
 2. **确认没有旧字节码 / 混装**：删除插件目录下所有 `__pycache__` 后再次热重载；确认没有把压缩包解压到旧目录的子目录里；
 3. **确认日志**：`Registered 31 Web API routes` 是否出现；`Plugin initialized successfully` 是否出现；
 4. **确认数据目录**：`souls/` 是否在 `only_you.db` 的同级目录；是否存在权限问题（§9.3）；
@@ -387,5 +387,20 @@ A：修改了依赖（`requirements.txt`）、升级涉及 AstrBot 配置结构�
 [ ] 旧 UMO 绑定出现在会话页「机器人接口」
 [ ] 某个角色聊天路由 / 模型按角色生效
 [ ] 冲浪总开关、分享门禁、T1 上限、重启去重抽检通过
+[ ] 普通配置项与 Pages 无重复（无全局冲浪开关 / 用户等级名单）
 [ ] 记录升级时间、版本号、备份路径与回滚步骤
 ```
+
+---
+
+## 14. v2.8.2 配置去重（普通配置 ↔ Pages）升级注意
+
+v2.8.2 起，插件「普通配置」（AstrBot 插件配置面板 / `_conf_schema.json`）只保留**运行参数**，用户级 / 角色级开关与名单全部交给 Pages：
+
+1. **角色冲浪总开关**：普通配置中的全局 `surfing_config.surfing_enabled` 已删除；每个角色在 Pages「冲浪」页用 `settings.surfing_enabled` 独立管理（缺省开启）。升级后旧配置中的 `surfing_enabled` 即使残留也不会被读取，AstrBot 也可能按新 schema 丢弃；若之前全局关闭，需要在 Pages 里逐角色确认开关。
+2. **用户等级 / 名单**：普通配置中的 `relationship_config.core_user_ids` / `important_user_ids` 已删除；用户等级存 SQLite `users.tier`，统一在 Pages「关系与群聊」页管理；★L3 仍会由 AstrBot `admins_id` 自动确定。旧名单不再自动 seed，已存在的用户等级不受影响。
+3. **分级记忆开关统一**：`memory_and_context_config.enable_tiered_memory=false` 时，除记忆注入 / 召回 / 提炼外，`add_memory` 也直接 no-op（`/onlyyou memory add`、Pages 新增记忆、繁忙成果写入均不会落库），命令与 Web API 会显式提示。
+4. **配置标题简化**：所有配置项标题缩短，详细说明移入 `hint`；升级后请在 AstrBot 插件配置页确认显示正常（必要时刷新页面）。
+5. **Pages 记忆页引导**：注入预算提示条新增「前往 AstrBot 插件配置修改预算」，预算 / 滑窗 / 提炼阈值等仍在普通配置中修改。
+
+以上均**不涉及数据库迁移**，热重载或重启即可生效。

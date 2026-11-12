@@ -1064,20 +1064,17 @@ class OnlyYouWebAPI:
             return 30
 
     def _soul_surfing_enabled(self, soul: Any) -> bool:
-        """Effective ``surfing_enabled``: Soul setting -> global config -> True."""
+        """Effective ``surfing_enabled``: Soul setting only (Pages-owned, default True).
+
+        v2.8.2: the global ``surfing_config.surfing_enabled`` fallback was removed
+        from ``_conf_schema.json``; Pages「冲浪」page is the single source of truth.
+        """
         value = getattr(soul, "surfing_enabled", None)
         if isinstance(value, bool):
             return value
         settings = getattr(soul, "settings", None)
         if isinstance(settings, dict) and "surfing_enabled" in settings:
             return _as_bool(settings.get("surfing_enabled"), default=True)
-        config = getattr(self.plugin, "config", None)
-        try:
-            surf_cfg = config.get("surfing_config") if isinstance(config, dict) else None
-        except Exception:  # pragma: no cover - exotic config mapping
-            surf_cfg = None
-        if isinstance(surf_cfg, dict) and "surfing_enabled" in surf_cfg:
-            return _as_bool(surf_cfg.get("surfing_enabled"), default=True)
         return True
 
     async def _clear_umo_memory(self, umo: str) -> dict[str, int]:
@@ -2379,6 +2376,10 @@ class OnlyYouWebAPI:
                 )
 
             # Default: `action == "add"`
+            if not self.plugin.memory_manager.enabled:
+                return err_response(
+                    "分级记忆已在 AstrBot 插件配置（enable_tiered_memory）中关闭，未写入记忆"
+                )
             content = str(body.get("content") or "").strip()
             if not content:
                 return err_response("记忆内容不能为空")

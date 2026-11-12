@@ -484,7 +484,7 @@ sequenceDiagram
 | Persona / 关系上下文 / 记忆 | 按 `soul_id` 注入 | 不变；但 `soul_id` 现在由接口绑定优先决定 |
 | decision / vision / tts | 全局配置 | 同一 Soul 的四角色配置；`call_llm_*` 传 `soul_id`（或 `umo` 路由），互不串配置 |
 | 心跳 | 单 Soul | 逐 Soul 独立跑（各自时间轴 / 模型 / 未读范围，见 ARCHITECTURE §6.4） |
-| 冲浪开关 | 全局 `surfing_config.surfing_enabled` | Soul `settings.surfing_enabled` 优先，缺失才回退全局 |
+| 冲浪开关 | Soul `settings.surfing_enabled`（Pages 冲浪页唯一真源；普通配置不再提供全局开关） | 按角色独立，缺失默认开启 |
 
 > 工程注意：历史单测用 `SimpleNamespace` 直接绑定 `main.py` 方法、且 stub 不接受新关键字参数——调用 `model_hub.call_llm_json(..., soul_id=...)` 时必须 `TypeError` 回退旧签名；未 attach `SoulManager` 时 ModelHub 完全保持 v2.7 全局行为。
 

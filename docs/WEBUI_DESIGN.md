@@ -25,7 +25,7 @@ AstrBot 默认的 `_conf_schema.json` 只适合静态、扁平的基础键值对
 | 层 | 位置 | 职责 |
 | :--- | :--- | :--- |
 | **交互式管理** | `views/console/`（本页） | 角色卡、行动卡池、今日日程、用户关系与群聊档案、分级记忆、冲浪视频池与总开关、**四角色模型配置（按当前角色）**、机器人接口绑定与活跃会话内存 |
-| **运行参数** | `_conf_schema.json`（AstrBot 插件配置面板） | Roguelite 阈值、三级关系名单、读空气、冲浪（含 `surfing_enabled / surf_share_min_score / surf_share_cooldown_minutes`）、记忆与上下文预算（含 `max_tier1_memories`）等**静态参数**。v2.4 起**不再包含任何模型绑定** |
+| **运行参数** | `_conf_schema.json`（AstrBot 插件配置面板） | Roguelite 阈值、读空气、冲浪行为参数（B站/抖音/分享门槛/冷却；**不含按角色总开关**）、记忆与上下文预算（含 `max_tier1_memories`）等**静态参数**。用户等级 / 名单与按角色冲浪总开关由 Pages 管理；v2.4 起**不再包含任何模型绑定** |
 | **Soul 独立文件** | `souls/<安全文件名>.json`（v2.8 唯一真源） | 角色卡 10 分区、四类行动卡池、`model_config`、`bound_platforms`、`settings`（至少 `surfing_enabled`）、`revision`、`updated_at`。SQLite `souls` 仅索引 |
 | **插件自治设置** | SQLite `plugin_settings` 表 | `default_soul_id`（默认兜底角色）、`runtime_state_v1`（运行态快照）、`group_profiles`（群聊档案）、两个一次性迁移 flag、`last_forgetting_gc_date`、v2.7 兼容的全局 `model_config`。不放进 AstrBotConfig，避免 schema 完整性检查删键 |
 
@@ -174,7 +174,7 @@ AstrBot 默认的 `_conf_schema.json` 只适合静态、扁平的基础键值对
    - 「专属态度」textarea（`maxlength=300`，说明会注入 System Prompt；placeholder 例如「把 Ta 当成最信任的损友，说话可以毒舌一点但关键时刻很护短」）；
    - 平台账号编辑（逗号/换行分隔的 `platform:uid`）+「合并其他用户账号到此档案」（`users/update action="merge"`，`primary_uid` / `secondary_uid`）；
    - 底部：左「删除用户」（危险二次确认，`users/update action="delete"`）、右「取消」「保存修改」（`users/update` 默认 update，提交 `display_name / nickname / tier / affinity / attitude / platform_ids`）。
-6. **★L3 = 管理员级（v2.7 契约在 v2.8 继续有效）**：L3 不通过好感度产生（好感度自动晋升只到 L2），也不展示好感度。入口 ① `admins_id` / `relationship_config.core_user_ids` 自动确定；② 用户详情弹窗显式设为 L3（二次确认，`users/update` 写入 `tier=3`），或 `/onlyyou tier <uid> 3`。
+6. **★L3 = 管理员级（v2.7 契约在 v2.8 继续有效）**：L3 不通过好感度产生（好感度自动晋升只到 L2），也不展示好感度。入口 ① `admins_id` 自动确定（普通配置不再维护用户等级名单）；② 用户详情弹窗显式设为 L3（二次确认，`users/update` 写入 `tier=3`），或 `/onlyyou tier <uid> 3`。
 7. **群聊分区（v2.8 新增，数据来自 `users/list.data.groups`）**：
    - 横向卡片行：群名 + `💬 群聊` 标签、`platform_id`、`滑窗 N 条 · 未读 M`、`绑定:{soul_name}`、最近活跃时间、备注、`group_id`、详情入口；
    - 点击打开**群聊详情弹窗**：`group_id`、完整 `umo`、`platform_id`、管辖 `soul_id`、滑窗/未读条数；可编辑「群显示名称」「群备注」（`users/update action="update_group"`）；「清空该群内存滑窗与未读」（`action="clear_group_memory"`，二次确认）、「移除群聊记录」（`action="delete_group"`，二次确认）。
@@ -187,7 +187,7 @@ AstrBot 默认的 `_conf_schema.json` 只适合静态、扁平的基础键值对
 1. **层级分布概览条 `.memory-summary-strip`**：全部 / T3 核心 / T2 近期 / T1 瞬时 计数 + 彩色分段占比条；点击即切换单层筛选（与工具栏筛选合并为一个，不重复）。
 2. **分组列表 `.memory-group`**：默认按 `T3 → T2 → T1` 纵向排列，分组头显示图标标题 + 计数 + 说明（T3 永久保留免疫 GC / T2 按活力衰减可晋升 / T1 48 小时过期），点击可折叠展开；空分组渲染 `.memory-group-empty` 并默认收起。
 3. **结构化记忆行 `.memory-row`**（`grid-template-columns: 76px minmax(0,1fr) 190px auto`，窄屏响应式折行）：列1 `T3/T2/T1` 徽章 + 重要度；列2 正文 + `#关键词` 胶囊；列3 关联用户标签 + 活力条（T3 显示「永久保存」）+ 召回次数/时间；列4 仅显示**当前层级以外**的升降级按钮 + 编辑 + 删除。
-4. **工具栏**：关联用户下拉（`users/list`）、关键词搜索（400ms 防抖）、上下文注入预算提示，以及页头 **提炼**（`memories/mutate`，`action="extract"`，对最近滑窗执行一次决策模型记忆提炼）、**GC**（`action="gc"`，手动触发遗忘清理）、**刷新**、**新增记忆**（`action="add"`）。数据仍来自 `memories/list`（`{memories, stats}`）。
+4. **工具栏**：关联用户下拉（`users/list`）、关键词搜索（400ms 防抖）、上下文注入预算提示（v2.8.2 在提示条追加「前往 AstrBot 插件配置修改预算」引导，避免用户找不到预算/滑窗修改入口），以及页头 **提炼**（`memories/mutate`，`action="extract"`，对最近滑窗执行一次决策模型记忆提炼）、**GC**（`action="gc"`，手动触发遗忘清理）、**刷新**、**新增记忆**（`action="add"`）。数据仍来自 `memories/list`（`{memories, stats}`）。
 5. **T1 行显示（v2.8）**：T1 不再显示活力百分比条，改为 `⏳ 剩余 Xh 清除`（`X = max(0, 48 - (now-created_at)/3600)`，悬浮提示「Tier 1 瞬时记忆创建后 48 小时过期，剩余约 X 小时由遗忘清理 GC 删除」）；T1 分组头与工具栏提示「上限 N 条」（`N = data.tier1_limit`，来自 `memory_config.max_tier1_memories`，默认 30）。T2 保持活力条与到期衰减说明，T3 显示「永久保存」。
 
 ### 3.6 冲浪（`page-surfing.js`，v2.8 总开关）

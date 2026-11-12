@@ -37,7 +37,7 @@
 ### ④ 三级用户关系体系（L1 普通 / L2 重要用户 / ★L3 核心用户）与群聊档案
 - **L1 普通用户**：仅在 Bot 处于 `空闲中` 时通过群聊读空气互动；`繁忙中` 直接忽略。
 - **L2 重要用户（群聊熟人，支持好感度自动晋升）**：即便 Bot 处于 `繁忙中` 也会抽空回复；在 `空闲中` 刷到对口视频会在群里主动 `@` 他。
-- **★ L3 核心用户（管理员 / OnlyYou）**：最高优先级，消息最容易击穿 `繁忙` 护甲让它停下手头事陪你；独享高频私聊陪伴与“群聊吃瓜，私聊耳语”。**★L3 为管理员级：不参与好感度计算、不会被自动晋升产生**，可由 AstrBot `admins_id` / `core_user_ids` 自动确定，也可在关系页详情弹窗中显式设置。
+- **★ L3 核心用户（管理员 / OnlyYou）**：最高优先级，消息最容易击穿 `繁忙` 护甲让它停下手头事陪你；独享高频私聊陪伴与“群聊吃瓜，私聊耳语”。**★L3 为管理员级：不参与好感度计算、不会被自动晋升产生**，可由 AstrBot `admins_id` 自动确定，也可在关系页详情弹窗中显式设置（用户等级与名单由 Pages 管理，插件普通配置不再维护）。
 - **群聊档案（v2.8）**：`GroupProfile` 记录群名、备注、所属平台、绑定角色、最近活跃时间与滑窗 / 未读计数，存于 `plugin_settings["group_profiles"]`；关系页「💬 群聊」分区可查看并维护群备注、清空该群内存滑窗与未读、移除群聊记录。
 
 ### ⑤ 精简版分级记忆、定时自动遗忘与上下文预算管理
@@ -88,7 +88,7 @@
 3. 视觉评分 `>= surfing_config.surf_share_min_score`（默认 80）；
 4. 距上次冲浪分享 `>= surfing_config.surf_share_cooldown_minutes`（默认 90 分钟）；
 5. 距上次 `IDLE_ROAM` 主动搭话 `>= roguelite_schedule_config.idle_roam_cooldown_minutes`（默认 45 分钟）。
-**分享成功才记录**视频 id 与时间戳（失败保留重试机会）。冲浪总开关按角色保存在 `settings.surfing_enabled`（缺失回退全局 `surfing_config.surfing_enabled`）；关闭时心跳 SURF 时段自动降级为空闲闲逛、`/onlyyou surf` 提示先到 Pages 冲浪页开启。v2.8 还修复了「候选视频都看过时误回退第一个」的问题——候选耗尽直接跳过。
+**分享成功才记录**视频 id 与时间戳（失败保留重试机会）。冲浪总开关完全由 Pages「冲浪」页按角色管理（`settings.surfing_enabled`，缺省开启；插件普通配置不再提供全局开关）；关闭时心跳 SURF 时段自动降级为空闲闲逛、`/onlyyou surf` 提示先到 Pages 冲浪页开启。v2.8 还修复了「候选视频都看过时误回退第一个」的问题——候选耗尽直接跳过。
 
 ### ⑬ 记忆工程化：T1 去重 / 上限 / 清理 + MEMORY_MUSE 三层分桶
 - **T1 去重**：同一角色 + 完全相同内容已存在时刷新其 `last_accessed_at` 并返回原 id，不新增；
@@ -189,7 +189,7 @@
 
 ```text
 OnlyYou/
-├── metadata.yaml                # 插件元数据（version: 2.8.0）
+├── metadata.yaml                # 插件元数据（version: 2.8.2）
 ├── _conf_schema.json            # AstrBot WebUI 配置 Schema（仅运行参数；无模型绑定）
 ├── requirements.txt             # Python 依赖
 ├── main.py                      # 插件入口：三态门禁 / selected_provider / LLM 钩子 / on_decorating_result TTS / 后台任务 / 指令

@@ -12,8 +12,8 @@ Contract: ``.team/V28_IMPLEMENTATION_CONTRACT.md`` §5 (T1 backend-memory-surf s
    (default 30); Tier 2 / Tier 3 untouched.
 4. ``MemoryManager.cleanup_tier1`` — >48h expiry + per-Soul overflow stats.
 5. ``CyberSurfingPipeline.surf_once`` — candidate exhaustion returns ``None``
-   (never falls back to ``candidates[0]``); ``is_enabled`` honours the per-Soul
-   setting first then the global switch, and gates even manual triggers.
+   (never falls back to ``candidates[0]``); ``is_enabled`` is fully owned by the
+   per-Soul Pages switch (no global-config fallback) and gates even manual triggers.
 6. ``VideoReviewResult.is_fallback`` — default ``False`` / included in
    ``to_dict()``; vision failure or malformed output -> ``score=60`` +
    ``is_fallback=True`` while normal success is unchanged.
@@ -102,6 +102,40 @@ class MemoryTestBase(DatabaseAsyncTestCase):
     async def _pick(self, **kwargs):
         kwargs.setdefault("soul_id", "soul-a")
         return await self.manager.sample_muse_memories(**kwargs)
+
+
+class TestTieredMemoryDisabled(DatabaseAsyncTestCase):
+    """v2.8.2: ``enable_tiered_memory=False`` makes ``add_memory`` a no-op too."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.config = make_plugin_config()
+        self.config["memory_and_context_config"]["enable_tiered_memory"] = False
+        self.manager = MemoryManager(self.db, StubModelHub(), self.config)
+
+    async def test_add_memory_returns_zero_and_writes_nothing(self):
+        mid = await self.manager.add_memory(
+            soul_id="soul-off",
+            content="这条不应该被写入",
+            keywords="关闭",
+            importance=8,
+            user_tier=3,
+        )
+        assert mid == 0
+        rows = await self.db.fetchall("SELECT * FROM memories")
+        assert rows == []
+
+    async def test_disabled_memory_keeps_retrieval_and_muse_empty(self):
+        assert await self.manager.retrieve_candidates("soul-off") == []
+        assert await self.manager.sample_muse_memories("soul-off") == []
+        count = await self.manager.extract_memories_from_transcript(
+            soul_id="soul-off",
+            soul_name="星野",
+            transcript_text="用户: 你好\n星野: 你也是",
+        )
+        assert count == 0
+        rows = await self.db.fetchall("SELECT * FROM memories")
+        assert rows == []
 
 
 class TestSampleMuseMemories(MemoryTestBase):
@@ -621,9 +655,7 @@ class TestSurfingEnabledSwitch(SurfingPipelineTestBase):
         assert self.pipeline.is_enabled(None) is True
         assert self.pipeline.is_enabled(SimpleNamespace(settings={})) is True
 
-    async def test_soul_setting_wins_over_global(self):
-        self.config["surfing_config"]["surfing_enabled"] = False
-        assert self.pipeline.is_enabled(SimpleNamespace(settings={})) is False
+    async def test_soul_setting_controls_switch(self):
         assert (
             self.pipeline.is_enabled(SimpleNamespace(settings={"surfing_enabled": True}))
             is True
@@ -635,15 +667,17 @@ class TestSurfingEnabledSwitch(SurfingPipelineTestBase):
         # Legacy duck-typed Soul exposing the flag directly (no settings dict).
         assert self.pipeline.is_enabled(SimpleNamespace(surfing_enabled=False)) is False
 
-    async def test_soul_switch_can_reenable_global_off(self):
+    async def test_legacy_global_switch_key_is_ignored(self):
+        """v2.8.2: Pages owns the switch; an old global config key must not gate."""
         self.config["surfing_config"]["surfing_enabled"] = False
-        self.config["surfing_config"]["enable_bili_surfing"] = True
-        self.bili_feed = [_video("bv-soul-on")]
+        self.soul.settings = {}
+        self.bili_feed = [_video("bv-pages-default")]
+        assert self.pipeline.is_enabled(self.soul) is True
         review = await self.pipeline.surf_once(
             self.soul, mods.state_machine.BotState.IDLE
         )
         assert review is not None
-        assert review.video.video_id == "bv-soul-on"
+        assert review.video.video_id == "bv-pages-default"
 
     async def test_disabled_soul_returns_none_even_for_manual_trigger(self):
         self.soul.settings = {"surfing_enabled": False}
@@ -658,17 +692,6 @@ class TestSurfingEnabledSwitch(SurfingPipelineTestBase):
         assert self.vision.calls == []
         assert await self._tier1_rows() == []
         assert await self._history_rows() == []
-
-    async def test_global_switch_off_returns_none_when_soul_unset(self):
-        self.config["surfing_config"]["surfing_enabled"] = False
-        self.soul.settings = {}
-        self.bili_feed = [_video("bv-global-off")]
-        assert self.pipeline.is_enabled(self.soul) is False
-        review = await self.pipeline.surf_once(
-            self.soul, mods.state_machine.BotState.IDLE, ignore_state_gate=True
-        )
-        assert review is None
-        assert self.adapter_calls == {"bilibili": 0, "douyin": 0}
 
     async def test_state_gate_still_applies_when_enabled(self):
         self.bili_feed = [_video("bv-resting")]

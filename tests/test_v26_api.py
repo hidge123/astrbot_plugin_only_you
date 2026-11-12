@@ -507,7 +507,7 @@ class TestUsersUpdateL3ManualAssignment(WebApiTestBase):
         assert data["user"]["attitude"] == "样样都听 Ta 的"
 
     async def test_admin_identity_still_auto_l3(self):
-        """★L3 仍可由管理员身份 / core_user_ids 自动确定，与显式设置并行。"""
+        """★L3 仍可由管理员身份自动确定，与 Pages 显式设置并行（v2.8.2 无配置名单）。"""
         profile = await self.plugin.user_relation.get_or_create_user(
             "u-auto-l3b", "管理员", is_event_admin=True
         )

@@ -117,8 +117,8 @@ class GroupProfile:
 class UserRelationManager:
     """
     三级用户关系管理器:
-    - ★ L3_CORE (3): 管理员 / OnlyYou (配置在 core_user_ids 或平台 admins_id 中)
-    - ◆ L2_IMPORTANT (2): 重要熟人 (配置在 important_user_ids 或通过良性互动从 L1 自动晋升)
+    - ★ L3_CORE (3): 管理员 / OnlyYou（由平台 admins_id 自动确定，或 Pages「关系与群聊」页显式设置）
+    - ◆ L2_IMPORTANT (2): 重要熟人（Pages 显式设置，或通过良性互动从 L1 自动晋升）
     - ○ L1_NORMAL (1): 普通用户（群友）
     """
 
@@ -146,22 +146,19 @@ class UserRelationManager:
     def _get_configured_tier(
         self, sender_id: str, umo: Optional[str] = None, is_event_admin: bool = False
     ) -> Optional[UserTier]:
-        """Check if `sender_id` is explicitly configured as L3_CORE or L2_IMPORTANT."""
+        """Resolve the auto-determined L3 tier (Pages / SQLite owns the rest).
+
+        v2.8.2: the plugin's general config no longer carries per-user ID lists
+        (``core_user_ids`` / ``important_user_ids``); user tiers are managed in the
+        Pages「关系与群聊」page (``users`` table) and L3 is auto-determined only by
+        the platform admin identity (``admins_id`` / event admin flag).
+        """
         sid = str(sender_id).strip()
         if not sid:
             return None
-
-        core_ids = {str(x).strip() for x in (self.cfg.get("core_user_ids") or []) if str(x).strip()}
         platform_admins = set(self.platform_bridge.get_platform_admins(umo=umo))
-        if sid in core_ids or sid in platform_admins or is_event_admin:
+        if sid in platform_admins or is_event_admin:
             return UserTier.L3_CORE
-
-        important_ids = {
-            str(x).strip() for x in (self.cfg.get("important_user_ids") or []) if str(x).strip()
-        }
-        if sid in important_ids:
-            return UserTier.L2_IMPORTANT
-
         return None
 
     async def resolve_user(self, event: Any) -> UserProfile:
@@ -325,14 +322,7 @@ class UserRelationManager:
         )
 
     async def list_users(self, tier_filter: Optional[int] = None) -> list[UserProfile]:
-        """List all known users (seeding configured L3/L2 IDs if not yet in SQLite)."""
-        for cid in self.cfg.get("core_user_ids") or []:
-            if str(cid).strip():
-                await self.get_or_create_user(str(cid).strip())
-        for iid in self.cfg.get("important_user_ids") or []:
-            if str(iid).strip():
-                await self.get_or_create_user(str(iid).strip())
-
+        """List all known users (tiers live in SQLite and are managed by Pages)."""
         if tier_filter in (1, 2, 3):
             rows = await self.db.fetchall(
                 "SELECT * FROM users WHERE tier = ? ORDER BY tier DESC, affinity DESC, interaction_count DESC",

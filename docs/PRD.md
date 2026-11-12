@@ -384,7 +384,7 @@ flowchart TB
   4. 距上次冲浪分享 ≥ `surfing_config.surf_share_cooldown_minutes`（默认 90 分钟）；
   5. 距上次 `IDLE_ROAM` 主动搭话 ≥ `roguelite_schedule_config.idle_roam_cooldown_minutes`（默认 45 分钟）。
   分享成功才记录 video_id 与时间戳（失败保留重试机会）；冷却 / 去重状态由运行态持久化跨重启保留（见 6.6）。
-- **总开关**：角色 `settings.surfing_enabled` 优先，缺失回退全局 `surfing_config.surfing_enabled`（默认 True）。关闭时心跳 SURF 时段自动降级为 `IDLE_ROAM`、`surf_once()` 返回 `None`；`/onlyyou surf` 直接提示「赛博冲浪总开关已关闭…请先到 Pages 冲浪页开启」；候选视频都已被本角色看过时直接跳过（不得回退第一个候选）。
+- **总开关**：完全由 Pages「冲浪」页按角色管理（`settings.surfing_enabled`，缺失默认 True；v2.8.2 起插件普通配置不再提供全局开关）。关闭时心跳 SURF 时段自动降级为 `IDLE_ROAM`、`surf_once()` 返回 `None`；`/onlyyou surf` 直接提示「赛博冲浪总开关已关闭…请先到 Pages 冲浪页开启」；候选视频都已被本角色看过时直接跳过（不得回退第一个候选）。
 - **API**：`surfing/list_and_trigger` GET 增加 `surfing_enabled / soul_id`；POST 增加 `action="toggle_surfing"`（body `{soul_id, enabled}`），保存角色设置并返回最新开关。
 
 ### 6.5 记忆：T1 去重 / 上限 / 实时清理 + MEMORY_MUSE 三层分桶
