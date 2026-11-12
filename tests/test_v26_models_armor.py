@@ -488,45 +488,45 @@ class TestActionTypeArmorTiers(unittest.TestCase):
 # ===========================================================================
 class TestStateEventCardArmor(unittest.TestCase):
     def test_default_armor_follows_action_type(self):
+        # action_type is the single authority: state / armor are always derived
+        # from it (the legacy title-keyword inference was removed in v2.9).
         cases = [
-            (BotState.RESTING, "呼呼大睡", ActionType.SLEEP, 80),
-            (BotState.IDLE, "躺沙发上刷B站视频", ActionType.SURF, 40),
-            (BotState.IDLE, "趴在窗边发呆", ActionType.IDLE_ROAM, 25),
-            (BotState.BUSY, "沉浸式处理手头正事", ActionType.BUSY_TASK, 65),
+            (ActionType.SLEEP, "呼呼大睡", 80),
+            (ActionType.SURF, "窝沙发刷搞笑视频", 40),
+            (ActionType.IDLE_ROAM, "趴在窗边发呆", 25),
+            (ActionType.BUSY_TASK, "专注处理手头正事", 65),
         ]
-        for state, title, action, armor in cases:
-            card = StateEventCard(card_id="c", title=title, state=state)
+        for action, title, armor in cases:
+            card = StateEventCard(card_id="c", title=title, action_type=action)
             assert card.action == action
+            assert card.state == action.bound_state
             assert card.armor == armor
 
-    def test_explicit_armor_is_still_honored_for_compat(self):
+    def test_explicit_armor_override_is_ignored(self):
+        # v2.9: armor is a fixed tier derived from action_type only.
         card = StateEventCard(
             card_id="c",
-            title="躺沙发上刷B站",
-            state=BotState.IDLE,
+            title="窝沙发刷搞笑视频",
             action_type=ActionType.SURF,
             armor=33,
         )
-        assert card.armor == 33
-        # clamp
-        assert (
-            StateEventCard(
-                card_id="c2",
-                title="躺沙发上刷B站",
-                state=BotState.IDLE,
-                action_type=ActionType.SURF,
-                armor=999,
-            ).armor
-            == 100
+        assert card.armor == ActionType.SURF.fixed_armor == 40
+        card = StateEventCard(
+            card_id="c2",
+            title="窝沙发刷搞笑视频",
+            action_type=ActionType.SURF,
+            armor=999,
         )
+        assert card.armor == ActionType.SURF.fixed_armor == 40
 
     def test_from_dict_missing_armor_uses_fixed_tier(self):
-        for payload, action in (
-            ({"card_id": "a", "title": "关灯睡觉", "state": "RESTING"}, ActionType.SLEEP),
-            ({"card_id": "b", "title": "刷B站视频", "state": "IDLE"}, ActionType.SURF),
-            ({"card_id": "c", "title": "发呆", "state": "IDLE"}, ActionType.IDLE_ROAM),
-            ({"card_id": "d", "title": "赶稿", "state": "BUSY"}, ActionType.BUSY_TASK),
-        ):
+        for action in ActionType:
+            payload = {
+                "card_id": "a",
+                "title": "窝沙发刷搞笑视频",
+                "state": "IDLE",
+                "action_type": action.value,
+            }
             card = StateEventCard.from_dict(payload)
             assert card.action == action, payload
             assert card.armor == action.fixed_armor, payload
@@ -534,21 +534,40 @@ class TestStateEventCardArmor(unittest.TestCase):
     def test_from_dict_none_or_blank_armor_uses_fixed_tier(self):
         for value in (None, "", "  "):
             card = StateEventCard.from_dict(
-                {"card_id": "a", "title": "关灯睡觉", "state": "RESTING", "armor": value}
+                {
+                    "card_id": "a",
+                    "title": "夜间关灯沉睡休息",
+                    "action_type": "SLEEP",
+                    "armor": value,
+                }
             )
             assert card.armor == ActionType.SLEEP.fixed_armor
 
-    def test_from_dict_explicit_armor_is_kept(self):
+    def test_from_dict_explicit_armor_is_ignored(self):
         card = StateEventCard.from_dict(
-            {"card_id": "a", "title": "关灯睡觉", "state": "RESTING", "armor": "45"}
+            {
+                "card_id": "a",
+                "title": "夜间关灯沉睡休息",
+                "state": "RESTING",
+                "action_type": "SLEEP",
+                "armor": "45",
+            }
         )
-        assert card.armor == 45
+        assert card.armor == ActionType.SLEEP.fixed_armor == 80
         # authoritative action type wins for the action field
         card = StateEventCard.from_dict(
             {"card_id": "b", "title": "x", "state": "IDLE", "action_type": "BUSY_TASK"}
         )
         assert card.action == ActionType.BUSY_TASK
         assert card.armor == ActionType.BUSY_TASK.fixed_armor
+
+    def test_from_dict_without_action_type_defaults_to_idle_roam(self):
+        card = StateEventCard.from_dict(
+            {"card_id": "legacy", "title": "躺沙发上刷B站视频", "state": "IDLE"}
+        )
+        assert card.action == ActionType.IDLE_ROAM
+        assert card.armor == ActionType.IDLE_ROAM.fixed_armor == 25
+        assert "valid_slots" not in card.to_dict()
 
     def test_default_card_pool_uses_fixed_tiers(self):
         assert DEFAULT_STATE_EVENT_CARDS

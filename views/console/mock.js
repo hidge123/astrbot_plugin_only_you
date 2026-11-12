@@ -163,13 +163,12 @@
     return def ? def.armor : 25;
   }
 
-  /** 旧数据兜底：无 action_type 时按 state / title 推导（与后端 from_dict 迁移规则一致） */
-  function actionTypeFromLegacy(state, title) {
+  /** 仅按三态兜底推导行动类型（与后端 BotState -> ActionType 固定映射一致；
+   *  不再根据标题关键词猜测——action_type 是唯一权威字段） */
+  function actionTypeFromState(state) {
     var id = String(state || "").toUpperCase();
-    var text = String(title || "");
     if (id === "RESTING") return "SLEEP";
     if (id === "BUSY") return "BUSY_TASK";
-    if (/刷|B站|b站|抖音|视频|冲浪/.test(text)) return "SURF";
     return "IDLE_ROAM";
   }
 
@@ -187,7 +186,7 @@
   function normalizeCard(raw) {
     raw = raw || {};
     var legacyState = String(raw.state || "IDLE").toUpperCase();
-    var actionType = coerceActionType(raw.action_type) || actionTypeFromLegacy(legacyState, raw.title);
+    var actionType = coerceActionType(raw.action_type) || actionTypeFromState(legacyState);
     var minHours = roundHalf(raw.min_hours != null ? raw.min_hours : 1.0);
     var maxHours = roundHalf(raw.max_hours != null ? raw.max_hours : 2.5);
     if (minHours > maxHours) {
@@ -202,8 +201,6 @@
       action_type: actionType,
       min_hours: minHours,
       max_hours: maxHours,
-      /* 保留旧字段仅为兼容旧 UI / 旧数据，排轴不再使用 */
-      valid_slots: [],
       base_weight: clamp(raw.base_weight, 1, 100),
       /* v2.6：护甲由 action_type 固定档位决定，忽略旧数据 / 请求里的手动 armor */
       armor: fixedArmorOf(actionType),
@@ -907,8 +904,6 @@
       surfing_preferences: soul.surfing_preferences,
       chronotype: soulChronotype(soul),
       state_event_cards: deck.customCards,
-      /* 奇遇卡已从系统移除：仅保留空数组兼容旧字段 */
-      encounter_talk_cards: [],
       /* v2.8：Soul 独立配置文件字段（契约 §1.1 / §6.2） */
       model_config: soul.model_config,
       bound_platforms: soul.bound_platforms,
@@ -1591,7 +1586,7 @@
         return video.soul_id === soul.soul_id;
       }).length
     };
-    var actionType = coerceActionType(current.action_type) || actionTypeFromLegacy(current.state, current.title);
+    var actionType = coerceActionType(current.action_type) || actionTypeFromState(current.state);
     var actionTypeLabel = actionLabelOf(actionType) || current.label;
     return {
       soul: {
@@ -1725,27 +1720,45 @@
     return buildCardsPayload(soul.soul_id);
   }
 
-  /** AI 生成一批四类专属行动卡（mock：固定一批模拟卡，返回 generated_cards） */
-  function aiGenerateCards(soulId) {
-    var soul = findSoul(soulId) || activeSoul();
+  /** 重抽日程卡池用的 9 张 mock 行动卡（2 睡觉 / 3 繁忙 / 2 冲浪 / 2 闲逛） */
+  var REGENERATED_DECK_SPECS = [
+    ["夜间关灯沉睡休息", "SLEEP", 4.5, 7.5, 80],
+    ["午后戴眼罩趴桌小憩", "SLEEP", 1.0, 2.0, 55],
+    ["专注处理手头正事", "BUSY_TASK", 1.0, 3.0, 60],
+    ["推进日常工作任务", "BUSY_TASK", 1.0, 2.5, 55],
+    ["关起门来专心赶工", "BUSY_TASK", 1.0, 2.5, 50],
+    ["窝在沙发刷搞笑视频", "SURF", 0.5, 2.0, 75],
+    ["吃饭顺便刷下饭视频", "SURF", 0.5, 1.5, 60],
+    ["泡杯热茶靠窗发呆", "IDLE_ROAM", 0.5, 2.0, 70],
+    ["翻群记录偷偷吃瓜", "IDLE_ROAM", 0.5, 1.5, 65]
+  ];
+
+  /** 清空当前角色自定义行动卡并生成一套新卡（不触碰今日已排好的 run / slots） */
+  function regenerateDeckCards(soul) {
     var deck = deckOf(soul.soul_id);
     var stamp = Date.now();
-    var generatedCards = [
-      { card_id: "evt_ai_" + stamp + "_1", title: "边看番边吃宵夜", action_type: "SURF", min_hours: 0.5, max_hours: 2.0, base_weight: 62, synergy_tags: {} },
-      { card_id: "evt_ai_" + stamp + "_2", title: "被甲方临时改需求", action_type: "BUSY_TASK", min_hours: 1.0, max_hours: 2.5, base_weight: 55, synergy_tags: {} },
-      { card_id: "evt_ai_" + stamp + "_3", title: "出门买杯冰美式", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.0, base_weight: 48, synergy_tags: {} },
-      { card_id: "evt_ai_" + stamp + "_4", title: "戴着耳机发呆", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.5, base_weight: 36, synergy_tags: {} },
-      { card_id: "evt_ai_" + stamp + "_5", title: "补个长长的回笼觉", action_type: "SLEEP", min_hours: 1.0, max_hours: 3.0, base_weight: 42, synergy_tags: {} }
-    ].map(normalizeCard);
-    generatedCards.forEach(function (card) {
-      var exists = false;
-      for (var i = 0; i < deck.customCards.length; i++) {
-        if (deck.customCards[i].title === card.title) exists = true;
-      }
-      if (!exists) deck.customCards.unshift(card);
+    deck.customCards = REGENERATED_DECK_SPECS.map(function (spec, index) {
+      return normalizeCard({
+        card_id: "evt_ai_" + stamp + "_" + (index + 1),
+        title: spec[0],
+        action_type: spec[1],
+        min_hours: spec[2],
+        max_hours: spec[3],
+        base_weight: spec[4],
+        synergy_tags: {}
+      });
     });
+    return deck.customCards;
+  }
+
+  /** AI 生成一批四类专属行动卡（mock：覆盖替换当前卡池，返回 generated_cards） */
+  function aiGenerateCards(soulId) {
+    var soul = findSoul(soulId) || activeSoul();
+    var generatedCards = regenerateDeckCards(soul);
     var payload = buildCardsPayload(soul.soul_id);
     payload.generated_cards = clone(generatedCards);
+    payload.card_source = "fallback";
+    payload.replaced = true;
     return payload;
   }
 
@@ -2177,8 +2190,18 @@
   function rerollSchedule(body) {
     var soul = findSoul(String(body.soul_id || "")) || activeSoul();
     if (!soul) throw new Error("没有可用角色");
-    db.schedules[soul.soul_id] = buildRun(soul.soul_id, true);
-    return { schedule: buildSchedulePayload(soul.soul_id) };
+    /* 先确保今日时间轴已物化，重抽卡池后今日 slots 完全保持不变 */
+    getRun(soul.soul_id);
+    var cards = regenerateDeckCards(soul);
+    var schedule = buildSchedulePayload(soul.soul_id);
+    return {
+      soul_id: soul.soul_id,
+      schedule: schedule,
+      current_slot: schedule.current_slot,
+      cards: clone(cards),
+      card_source: "fallback",
+      total: cards.length
+    };
   }
 
   /* ================================================================== *

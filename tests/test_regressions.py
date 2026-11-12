@@ -49,7 +49,6 @@ mods = load_plugin_modules()
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 RogueliteDeckEngine = mods.roguelite_deck.RogueliteDeckEngine
-SLOT_DEFINITIONS = mods.roguelite_deck.SLOT_DEFINITIONS
 StateController = mods.state_machine.StateController
 BotState = mods.state_machine.BotState
 UserTier = mods.state_machine.UserTier
@@ -337,53 +336,118 @@ class TestRogueliteDeck(unittest.IsolatedAsyncioTestCase):
             for weights in (early_1am, owl_1am, early_9am, owl_9am):
                 assert weights[action] > 0
 
-    def test_legacy_card_dict_migrates_action_type_and_hours(self):
-        surf = StateEventCard.from_dict(
-            {"card_id": "a", "title": "躺沙发上刷B站", "state": "IDLE", "armor": 20}
+    def test_action_card_title_normalization(self):
+        normalize = mods.roguelite_deck.normalize_action_card_title
+        # 1) category colons / role-name prefixes are stripped
+        assert (
+            normalize("正事：守着限定联名外卖开抢", ActionType.BUSY_TASK)
+            == "守着限定联名外卖开抢"
         )
-        assert surf.action_type == ActionType.SURF
-        assert surf.state == BotState.IDLE
-        assert (surf.min_hours, surf.max_hours) == (0.5, 2.0)
-
-        sleep = StateEventCard.from_dict(
-            {"card_id": "b", "title": "关灯钻进被窝呼呼大睡", "state": "RESTING"}
+        # ... then the title is hard-capped at 12 chars
+        assert normalize("主业：假装找活干其实在群里等开饭") == "假装找活干其实在群里等开"
+        # 2) multi-clause one-shot micro-stories keep only the first clause
+        assert normalize("帮群友代肝活动，边打边发乐") == "帮群友代肝活动"
+        assert normalize("午后小憩，手机还挂着游戏实况") == "午后小憩"
+        # ... unless the first clause is too short, then merge the next clause
+        assert normalize("摸鱼，顺便刷下剧", ActionType.IDLE_ROAM) == "摸鱼顺便刷下剧"
+        # 3) wrapping quotes / brackets are trimmed
+        assert normalize("「画室赶商业插画稿」") == "画室赶商业插画稿"
+        # 4) empty / all-prefix titles fall back to the action-type default phrase
+        assert normalize("   ") == mods.roguelite_deck.DEFAULT_ACTION_TITLES[
+            ActionType.IDLE_ROAM
+        ]
+        assert (
+            normalize("睡觉：", ActionType.SLEEP)
+            == mods.roguelite_deck.DEFAULT_ACTION_TITLES[ActionType.SLEEP]
         )
-        assert sleep.action_type == ActionType.SLEEP
-        assert (sleep.min_hours, sleep.max_hours) == (4.0, 7.5)
+        # 5) hard cap = 12 chars
+        assert len(normalize("一二三四五六七八九十十一十二十三")) == 12
 
-        nap = StateEventCard.from_dict(
-            {"card_id": "c", "title": "戴眼罩午休眯一会儿", "state": "RESTING"}
-        )
-        assert nap.action_type == ActionType.SLEEP
-        assert (nap.min_hours, nap.max_hours) == (1.0, 2.0)
+        for card in mods.roguelite_deck.DEFAULT_STATE_EVENT_CARDS:
+            assert card.title, card.card_id
+            assert 4 <= len(card.title) <= 12, card.title
+            assert "：" not in card.title and ":" not in card.title
+            assert not any(punct in card.title for punct in "，,；;。！!？?")
+            assert card.armor == card.action.fixed_armor
 
-        busy = StateEventCard.from_dict(
-            {"card_id": "d", "title": "沉浸式处理手头正事", "state": "BUSY"}
-        )
-        assert busy.action_type == ActionType.BUSY_TASK
-        assert (busy.min_hours, busy.max_hours) == (1.0, 3.0)
-
-        roam = StateEventCard.from_dict(
-            {"card_id": "e", "title": "趴在窗边发呆", "state": "IDLE"}
-        )
-        assert roam.action_type == ActionType.IDLE_ROAM
-        assert (roam.min_hours, roam.max_hours) == (0.5, 2.0)
-
-        # explicit action_type wins over the (legacy) state field
-        explicit = StateEventCard.from_dict(
+    def test_state_event_card_is_action_type_authoritative(self):
+        card = mods.roguelite_deck.StateEventCard.from_dict(
             {
-                "card_id": "f",
-                "title": "冲浪刷片",
-                "state": "BUSY",
-                "action_type": "SURF",
-                "min_hours": 0.2,
-                "max_hours": 12.0,
+                "card_id": "a",
+                "title": "正事：专注赶稿",
+                "state": "IDLE",
+                "action_type": "BUSY_TASK",
+                "min_hours": 1.0,
+                "max_hours": 3.0,
+                "armor": 3,
             }
         )
-        assert explicit.action_type == ActionType.SURF
-        assert explicit.state == BotState.IDLE
-        assert explicit.min_hours == 0.5
-        assert explicit.max_hours == 8.0
+        assert card.action_type == ActionType.BUSY_TASK
+        assert card.state == BotState.BUSY
+        assert card.armor == ActionType.BUSY_TASK.fixed_armor == 65
+        assert card.title == "专注赶稿"
+        assert "valid_slots" not in card.to_dict()
+
+        # Without an explicit action_type there is no more title-keyword guessing:
+        # the authoritative default is IDLE_ROAM.
+        legacy = mods.roguelite_deck.StateEventCard.from_dict(
+            {"card_id": "b", "title": "躺沙发上刷B站视频", "state": "IDLE"}
+        )
+        assert legacy.action_type == ActionType.IDLE_ROAM
+
+    def test_legacy_action_cards_without_action_type_are_dropped(self):
+        profile = mods.soul_manager.SoulProfile.from_dict(
+            {
+                "soul_id": "legacy-cards",
+                "card": make_soul().card,
+                "state_event_cards": [
+                    {"card_id": "legacy", "title": "刷B站视频", "state": "IDLE"},
+                    {
+                        "card_id": "ok",
+                        "title": "专注处理手头正事",
+                        "action_type": "BUSY_TASK",
+                        "min_hours": 1.0,
+                        "max_hours": 2.0,
+                    },
+                ],
+                # legacy encounter cards are simply ignored on load
+                "encounter_talk_cards": ["旧奇遇谈资"],
+            }
+        )
+        assert [card.card_id for card in profile.state_event_cards] == ["ok"]
+        assert "encounter_talk_cards" not in profile.to_dict()
+
+    async def test_card_pool_change_keeps_today_timeline_frozen(self):
+        """Re-rolling the card pool must never rewrite today's already-drawn run."""
+        old_pool = [
+            StateEventCard(
+                card_id="old_busy",
+                title="专注处理手头正事",
+                action_type=ActionType.BUSY_TASK,
+                min_hours=1.0,
+                max_hours=2.0,
+            )
+        ]
+        first = await self.engine.get_or_build_today_run(
+            "soul-pool-lock", custom_cards=old_pool, chronotype="normal"
+        )
+        snapshot = first.to_dict()
+
+        new_pool = [
+            StateEventCard(
+                card_id="new_sleep",
+                title="夜间关灯沉睡休息",
+                action_type=ActionType.SLEEP,
+                min_hours=4.0,
+                max_hours=7.0,
+            )
+        ]
+        # Simulate "re-roll the card pool, then load today's run again".
+        second = await self.engine.get_or_build_today_run(
+            "soul-pool-lock", custom_cards=new_pool, chronotype="normal"
+        )
+        assert second.slots == first.slots
+        assert second.to_dict()["slots"] == snapshot["slots"]
 
     async def test_legacy_six_slot_run_is_redrawn(self):
         date_str = self.engine.today_str()
@@ -470,13 +534,14 @@ class TestRogueliteDeck(unittest.IsolatedAsyncioTestCase):
         assert surf.busy_settled is False
         assert surf.completion_result == ""
 
-        # bare ``state IDLE`` keeps the current SURF action ...
+        # v2.9: a bare ``state IDLE`` now maps to the fixed IDLE_ROAM action
+        # (the old "keep the current SURF action" compatibility hack was removed).
         bare_idle = await self.engine.force_set_current_state(
             "soul-force", BotState.IDLE, now_dt=now_dt
         )
-        assert bare_idle.action_type == ActionType.SURF
-        assert bare_idle.armor == ActionType.SURF.fixed_armor == 40
-        # ... while an explicit non-surf title derives IDLE_ROAM again.
+        assert bare_idle.action_type == ActionType.IDLE_ROAM
+        assert bare_idle.armor == ActionType.IDLE_ROAM.fixed_armor == 25
+        # ... an explicit title never changes the fixed state -> action mapping.
         roam = await self.engine.force_set_current_state(
             "soul-force",
             BotState.IDLE,

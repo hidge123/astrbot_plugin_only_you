@@ -26,7 +26,12 @@ from datetime import datetime
 from typing import Any, Optional
 
 from .model_hub import ModelHub
-from .roguelite_deck import DailyScheduleRun, RogueliteDeckEngine, SlotInstance
+from .roguelite_deck import (
+    DailyScheduleRun,
+    RogueliteDeckEngine,
+    SlotInstance,
+    default_action_type_for_state,
+)
 from .soul_manager import SoulProfile
 from .state_machine import ActionType, BotState, UserTier
 from ..prompts.templates import BOUNDED_STATE_MUTATION_PROMPT
@@ -61,10 +66,6 @@ URGENT_KEYWORDS = (
     "！！",
     "!!",
 )
-
-#: Title keywords used to infer ``SURF`` from legacy (action_type-less) blocks.
-_SURF_TITLE_KEYWORDS = ("刷", "B站", "b站", "抖音", "视频", "冲浪", "追剧", "看剧")
-
 
 def _snap_hour(value: Any, default: float = 0.0) -> float:
     """Snap an hour value onto the 0.5h grid (defensive against legacy data)."""
@@ -146,19 +147,16 @@ class BoundedScheduleMutator:
 
     @staticmethod
     def _slot_action(slot: Any) -> ActionType:
-        """Best-effort ``ActionType`` of a block: action_type first, then state/title."""
+        """Best-effort ``ActionType`` of a block: action_type first, then bare state.
+
+        Legacy title-keyword guessing (刷 / B站 / 午 …) was removed: ``action_type``
+        is the single authority, with the fixed ``BotState -> ActionType`` mapping
+        as the only fallback for bare-state stubs.
+        """
         action = ActionType.coerce(getattr(slot, "action_type", None), None)
         if action is not None:
             return action
-        state = BoundedScheduleMutator._slot_state(slot)
-        if state == BotState.RESTING:
-            return ActionType.SLEEP
-        if state == BotState.BUSY:
-            return ActionType.BUSY_TASK
-        title = str(getattr(slot, "title", "") or "")
-        if any(keyword in title for keyword in _SURF_TITLE_KEYWORDS):
-            return ActionType.SURF
-        return ActionType.IDLE_ROAM
+        return default_action_type_for_state(BoundedScheduleMutator._slot_state(slot))
 
     @staticmethod
     def _slot_title(slot: Any) -> str:
@@ -204,7 +202,6 @@ class BoundedScheduleMutator:
         kwargs: dict[str, Any] = {
             "soul_id": getattr(soul, "soul_id", ""),
             "custom_cards": getattr(soul, "state_event_cards", None),
-            "custom_encounters": getattr(soul, "encounter_talk_cards", []),
             "now_dt": now_dt,
         }
         fetch = self.deck_engine.get_current_and_next_slot

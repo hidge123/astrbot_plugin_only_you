@@ -34,11 +34,13 @@ from .character_card import (
     empty_card,
     migrate_legacy,
     normalize_card,
+    render_card_summary,
 )
 from .model_hub import DEFAULT_MODEL_CONFIG, normalize_model_config
 from .roguelite_deck import StateEventCard
 from .state_machine import ActionType
 from ..prompts.templates import (
+    ACTION_DECK_GENERATE_PROMPT,
     CARD_AND_DECK_SEED_PROMPT,
     CHARACTER_CARD_GENERATE_PROMPT,
     CHARACTER_CARD_SECTION_PROMPT,
@@ -66,6 +68,15 @@ _SETTING_LEGACY_UMO_MIGRATED = "legacy_umo_bindings_migrated"
 #: master switch; ``surfing_sources`` (v2.8.3) is the per-Soul background video
 #: source preference, defaulting to both when the key is absent.
 DEFAULT_SOUL_SETTINGS: dict[str, Any] = {"surfing_enabled": True}
+
+#: Four-action card ratio enforced by the AI deck prompt / completion fallback
+#: (SLEEP 2 / BUSY_TASK 3 / SURF 2 / IDLE_ROAM 2 = 9 cards).
+ACTION_DECK_RATIO: tuple[tuple[ActionType, int], ...] = (
+    (ActionType.SLEEP, 2),
+    (ActionType.BUSY_TASK, 3),
+    (ActionType.SURF, 2),
+    (ActionType.IDLE_ROAM, 2),
+)
 
 #: Supported background video sources (Pages「冲浪」page owns the per-Soul choice).
 SURFING_SOURCE_PLATFORMS: tuple[str, ...] = ("bilibili", "douyin")
@@ -317,6 +328,34 @@ def _extract_persona_keywords(persona_prompt: Any) -> list[str]:
     return keywords[:3]
 
 
+def _parse_state_event_cards(items: Any) -> list[StateEventCard]:
+    """Parse persisted / imported action cards into ``StateEventCard`` objects.
+
+    v2.4 cards had no ``action_type`` and were migrated by guessing from
+    ``state + title`` keywords; that compatibility path is gone, so any legacy
+    dict without a valid ``action_type`` is dropped instead of being silently
+    coerced into a wrong action archetype.
+    """
+    cards: list[StateEventCard] = []
+    for item in items or []:
+        try:
+            if isinstance(item, StateEventCard):
+                cards.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            if ActionType.coerce(item.get("action_type"), None) is None:
+                logger.warning(
+                    "[OnlyYou] Dropped legacy action card without action_type: "
+                    f"{item.get('title', '')!r}"
+                )
+                continue
+            cards.append(StateEventCard.from_dict(item))
+        except Exception as e:  # noqa: BLE001 - never crash on a single bad card
+            logger.warning(f"[OnlyYou] Failed to parse state event card: {e}")
+    return cards
+
+
 class SoulProfile:
     """A character (soul): detailed ``card`` + Roguelite card pool data.
 
@@ -330,7 +369,6 @@ class SoulProfile:
         soul_id: str = DEFAULT_SOUL_ID,
         card: Optional[dict[str, Any]] = None,
         state_event_cards: Optional[list[Any]] = None,
-        encounter_talk_cards: Optional[list[Any]] = None,
         model_config: Optional[dict[str, Any]] = None,
         bound_platforms: Optional[list[str]] = None,
         settings: Optional[dict[str, Any]] = None,
@@ -366,19 +404,9 @@ class SoulProfile:
             base["interests"]["surfing_preferences"] = legacy["surfing_preferences"]
         self.card: dict[str, Any] = normalize_card(base)
 
-        cards: list[StateEventCard] = []
-        for item in state_event_cards or []:
-            try:
-                if isinstance(item, StateEventCard):
-                    cards.append(item)
-                elif isinstance(item, dict):
-                    cards.append(StateEventCard.from_dict(item))
-            except Exception as e:  # noqa: BLE001 - never crash on a single bad card
-                logger.warning(f"[OnlyYou] Failed to parse state event card: {e}")
-        self.state_event_cards: list[StateEventCard] = cards
-        self.encounter_talk_cards: list[str] = [
-            text for text in (_clean_text(x) for x in (encounter_talk_cards or [])) if text
-        ]
+        self.state_event_cards: list[StateEventCard] = _parse_state_event_cards(
+            state_event_cards
+        )
 
     # ---- Legacy flat-field compatibility properties (backed by the card) ----
 
@@ -493,7 +521,6 @@ class SoulProfile:
             "native_persona_prompt": self.native_persona_prompt,
             "surfing_preferences": list(self.surfing_preferences),
             "state_event_cards": [card.to_dict() for card in self.state_event_cards],
-            "encounter_talk_cards": list(self.encounter_talk_cards),
             "model_config": normalize_model_config(self.model_config),
             "bound_platforms": _normalize_bound_platforms(self.bound_platforms),
             "settings": _normalize_soul_settings(self.settings),
@@ -514,18 +541,7 @@ class SoulProfile:
         else:
             card = migrate_legacy(data)
 
-        cards: list[StateEventCard] = []
-        for item in data.get("state_event_cards") or []:
-            try:
-                if isinstance(item, StateEventCard):
-                    state_card = item
-                elif isinstance(item, dict):
-                    state_card = StateEventCard.from_dict(item)
-                else:
-                    continue
-                cards.append(state_card)
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"[OnlyYou] Failed to parse stored state event card: {e}")
+        cards = _parse_state_event_cards(data.get("state_event_cards"))
         # v2.6: armor is a fixed per-action tier now; normalize cards persisted by
         # an older version on load so cards/list & the UI never surface stale values.
         for state_card in cards:
@@ -535,11 +551,6 @@ class SoulProfile:
             soul_id=_clean_text(data.get("soul_id")) or DEFAULT_SOUL_ID,
             card=card,
             state_event_cards=cards,
-            encounter_talk_cards=[
-                text
-                for text in (_clean_text(x) for x in (data.get("encounter_talk_cards") or []))
-                if text
-            ],
             model_config=data.get("model_config"),
             bound_platforms=data.get("bound_platforms"),
             settings=data.get("settings"),
@@ -1670,38 +1681,31 @@ class SoulManager:
         Covers all four action types (``BUSY_TASK`` x3 / ``SURF`` x2 /
         ``IDLE_ROAM`` x3 / ``SLEEP`` x2: one long sleep + one nap) and never
         produces encounter cards. Every card's ``state`` is bound to its
-        ``action_type.bound_state``.
+        ``action_type.bound_state``, and titles follow the unified 6~10 char
+        single-clause rule (no category prefix / role-name prefix / commas).
         """
-        short_name = _clean_text(soul_name)[:6] or "小星"
+        del soul_name  # titles must never carry a role-name prefix
         keywords = _extract_persona_keywords(persona_prompt)
         focus = keywords[0] if keywords else ""
         hobby = keywords[1] if len(keywords) > 1 else ""
 
-        if focus:
-            busy_title_1 = f"{short_name}埋头忙{focus}的活"
-            busy_title_2 = f"{short_name}专心搞{focus}相关事"
-        else:
-            busy_title_1 = f"{short_name}埋头赶手头的正事"
-            busy_title_2 = f"{short_name}专心推进今日正事"
-        surf_title_2 = (
-            f"{short_name}窝着刷{hobby}短视频"
-            if hobby
-            else f"{short_name}窝在被窝刷短视频"
-        )
+        busy_title_1 = f"埋头忙{focus}的活" if focus else "埋头赶手头正事"
+        busy_title_2 = f"专心搞{focus}相关事" if focus else "专心推进今日任务"
+        surf_title_2 = f"窝着刷{hobby}短视频" if hobby else "窝在被窝刷短视频"
 
         # (title, action_type, min_hours, max_hours, base_weight)
         # 护甲不再由卡池配置：卡片自动取 action_type.fixed_armor（v2.6 四档固定护甲）。
         specs: list[tuple[str, ActionType, float, float, int]] = [
             (busy_title_1, ActionType.BUSY_TASK, 1.0, 3.0, 60),
             (busy_title_2, ActionType.BUSY_TASK, 1.5, 3.0, 55),
-            (f"{short_name}关起门来专注赶进度", ActionType.BUSY_TASK, 1.0, 2.5, 50),
-            (f"{short_name}瘫沙发刷B站视频", ActionType.SURF, 0.5, 2.0, 75),
+            ("关起门来专心赶工", ActionType.BUSY_TASK, 1.0, 2.5, 50),
+            ("瘫沙发刷一会儿视频", ActionType.SURF, 0.5, 2.0, 75),
             (surf_title_2, ActionType.SURF, 1.0, 2.0, 70),
-            (f"{short_name}趴着发呆放空", ActionType.IDLE_ROAM, 0.5, 2.0, 70),
-            (f"{short_name}翻群记录偷偷吃瓜", ActionType.IDLE_ROAM, 1.0, 2.0, 65),
-            (f"{short_name}泡杯茶悠闲摸鱼", ActionType.IDLE_ROAM, 0.5, 1.5, 60),
-            (f"{short_name}戴眼罩呼呼大睡", ActionType.SLEEP, 4.0, 7.5, 80),
-            (f"{short_name}趴桌上小憩一会儿", ActionType.SLEEP, 1.0, 2.0, 60),
+            ("趴着发呆放空脑袋", ActionType.IDLE_ROAM, 0.5, 2.0, 70),
+            ("翻群记录偷偷吃瓜", ActionType.IDLE_ROAM, 1.0, 2.0, 65),
+            ("泡杯茶悠闲摸会儿鱼", ActionType.IDLE_ROAM, 0.5, 1.5, 60),
+            ("戴眼罩呼呼大睡", ActionType.SLEEP, 4.0, 7.5, 80),
+            ("趴桌上小憩一会儿", ActionType.SLEEP, 1.0, 2.0, 60),
         ]
 
         cards: list[StateEventCard] = []
@@ -1715,11 +1719,189 @@ class SoulManager:
                     action_type=action_type,
                     min_hours=min_hours,
                     max_hours=max_hours,
-                    valid_slots=[],
                     base_weight=base_weight,
                 )
             )
         return cards
+
+    # ==================================================================
+    # AI action-deck generation / re-roll (clear old pool, new cards for tomorrow)
+    # ==================================================================
+    #: Default number of cards generated by the AI deck prompt (SLEEP×2 /
+    #: BUSY_TASK×3 / SURF×2 / IDLE_ROAM×2).
+    ACTION_DECK_DEFAULT_COUNT = 9
+
+    async def generate_action_cards(
+        self, soul: SoulProfile, count: int = 9
+    ) -> tuple[list[StateEventCard], str]:
+        """Generate a brand-new four-type action deck for ``soul`` (not persisted).
+
+        Returns ``(cards, source)`` where ``source`` is ``"ai"`` when the decision
+        model answered with usable cards, or ``"fallback"`` (the deterministic
+        per-character deck) so card re-rolling never fails offline.
+        """
+        try:
+            total = max(1, int(count or self.ACTION_DECK_DEFAULT_COUNT))
+        except (TypeError, ValueError):
+            total = self.ACTION_DECK_DEFAULT_COUNT
+
+        cards = await self._generate_action_cards_with_llm(soul, total)
+        if cards:
+            return cards, "ai"
+
+        persona_prompt = (
+            getattr(soul, "native_persona_prompt", "")
+            or f"{soul.name} {soul.archetype} {soul.speaking_style}".strip()
+        )
+        fallback = self.build_fallback_custom_deck(soul.name or soul.soul_id, persona_prompt)
+        return list(fallback), "fallback"
+
+    @staticmethod
+    def _render_action_deck_summary(soul: SoulProfile) -> str:
+        """Compact character brief injected into ``ACTION_DECK_GENERATE_PROMPT``.
+
+        Beyond the shared ``render_card_summary`` (定位 / 性格 / 说话方式) this
+        adds the fields that matter for choosing daily activities: 职业、居所、
+        日常作息与爱好. Never raises — a malformed card just yields a shorter brief.
+        """
+        try:
+            card = getattr(soul, "card", {}) or {}
+            identity = card.get("identity") or {}
+            rhythm = card.get("rhythm") or {}
+            interests = card.get("interests") or {}
+            parts = [render_card_summary(card, max_chars=200)]
+            extras = (
+                ("职业", _clean_text(identity.get("occupation"))),
+                ("居所", _clean_text(identity.get("city"))),
+                ("日常作息", _clean_text(rhythm.get("daily_routine"))),
+                ("爱好", "、".join(_clean_list(interests.get("hobbies")))),
+            )
+            for label, value in extras:
+                if value:
+                    parts.append(f"{label}：{value}")
+            return "；".join(part for part in parts if part)[:400]
+        except Exception:  # noqa: BLE001 - summary is best-effort context only
+            return ""
+
+    @staticmethod
+    def _action_deck_quotas(total: int) -> dict[ActionType, int]:
+        """Split ``total`` cards across the fixed four-action ratio (largest remainder)."""
+        try:
+            target = max(len(ACTION_DECK_RATIO), int(total or 0))
+        except (TypeError, ValueError):
+            target = sum(weight for _, weight in ACTION_DECK_RATIO)
+        weight_sum = sum(weight for _, weight in ACTION_DECK_RATIO) or 1
+        quotas: dict[ActionType, int] = {}
+        remainders: list[tuple[float, int, ActionType]] = []
+        assigned = 0
+        for order, (action, weight) in enumerate(ACTION_DECK_RATIO):
+            exact = target * weight / weight_sum
+            count = int(exact)
+            quotas[action] = count
+            assigned += count
+            remainders.append((exact - count, order, action))
+        for _, _, action in sorted(remainders, key=lambda item: (-item[0], item[1]))[
+            : target - assigned
+        ]:
+            quotas[action] += 1
+        return quotas
+
+    def _complete_action_deck(
+        self, cards: list[StateEventCard], soul: SoulProfile, count: int
+    ) -> list[StateEventCard]:
+        """Pad a partial AI deck to the required four-type ratio with fallback cards.
+
+        Real decision models occasionally return fewer than 9 cards or forget a
+        whole action type (e.g. every ``SLEEP`` card). Without this, a re-rolled
+        pool could silently lose a type and the timeline would fall back to the
+        generic built-in cards. Missing / under-represented types are filled from
+        ``build_fallback_custom_deck`` for the same Soul.
+        """
+        quotas = self._action_deck_quotas(count)
+        persona_prompt = (
+            getattr(soul, "native_persona_prompt", "")
+            or f"{soul.name} {soul.archetype} {soul.speaking_style}".strip()
+        )
+        fallback = self.build_fallback_custom_deck(
+            soul.name or soul.soul_id, persona_prompt
+        )
+        fallback_by_action: dict[ActionType, list[StateEventCard]] = {
+            action: [card for card in fallback if card.action == action]
+            for action in ActionType
+        }
+        result: list[StateEventCard] = []
+        for action in ActionType:
+            wanted = quotas.get(action, 0)
+            picked = [card for card in cards if card.action == action][:wanted]
+            fillers = fallback_by_action.get(action) or []
+            while len(picked) < wanted and fillers:
+                picked.append(fillers[len(picked) % len(fillers)])
+            result.extend(picked)
+        return result
+
+    async def _generate_action_cards_with_llm(
+        self, soul: SoulProfile, count: int
+    ) -> list[StateEventCard]:
+        if self.model_hub is None:
+            return []
+        try:
+            soul_summary = self._render_action_deck_summary(soul)
+            prompt = ACTION_DECK_GENERATE_PROMPT.format(
+                soul_name=soul.name or soul.soul_id,
+                soul_archetype=soul.archetype or "（未填写）",
+                speaking_style=soul.speaking_style or "（未填写）",
+                chronotype=soul.chronotype,
+                surfing_preferences="、".join(soul.surfing_preferences) or "无特别偏好",
+                soul_summary=soul_summary or "（无）",
+            )
+            data = await self.model_hub.call_llm_json(
+                prompt=prompt, role="decision", default=None
+            )
+        except Exception as e:  # noqa: BLE001 - AI generation must never crash callers
+            logger.warning(f"[OnlyYou] Action deck generation failed: {e}")
+            return []
+
+        if isinstance(data, dict):
+            items = data.get("state_event_cards")
+            if not isinstance(items, list):
+                items = data.get("cards")
+        elif isinstance(data, list):
+            items = data
+        else:
+            items = []
+        cards = _parse_state_event_cards(items)
+        if not cards:
+            return []
+
+        # The model may under-deliver (fewer cards / a missing action type): pad to
+        # the fixed 2/3/2/2 ratio with deterministic fallback cards before saving.
+        cards = self._complete_action_deck(cards, soul, count)
+
+        # Unique ids per batch so re-rolling twice never collides in the UI.
+        stamp = int(time.time())
+        for index, card in enumerate(cards):
+            card.card_id = f"evt_ai_{stamp}_{index + 1}"
+        return cards[:count]
+
+    async def regenerate_action_cards(
+        self, soul_id: str, count: int = 9
+    ) -> tuple[list[StateEventCard], str]:
+        """Clear a Soul's action-card pool and replace it with a new generated one.
+
+        Today's already-materialized 24h timeline is untouched (it snapshots the
+        cards it drew); the new pool is used from the next day's ``today_str`` on.
+        """
+        soul = await self.get_soul_by_id(soul_id)
+        if soul is None:
+            raise ValueError(f"角色 {soul_id} 不存在")
+        cards, source = await self.generate_action_cards(soul, count=count)
+        soul.state_event_cards = list(cards)
+        await self.save_soul(soul)
+        logger.info(
+            f"[OnlyYou] Regenerated {len(cards)} action cards for soul "
+            f"'{soul.soul_id}' (source={source})."
+        )
+        return soul.state_event_cards, source
 
     # ==================================================================
     # Native Persona import
@@ -1745,8 +1927,7 @@ class SoulManager:
         - ``avatar`` (optional): emoji / short text / image URL / ``data:image/...``
           Base64 avatar; written into ``card["identity"]["avatar"]`` (normalized)
           after the card is inferred or AI-generated, then persisted with the soul.
-        - Encounter cards are gone from the system: imported souls always store
-          ``encounter_talk_cards = []``.
+        - Encounter cards were removed from the system entirely (v2.9 cleanup).
         """
         pname = _clean_text(persona_name) or DEFAULT_SOUL_ID
         soul_id = _clean_text(target_soul_id or pname) or pname
@@ -1800,13 +1981,7 @@ class SoulManager:
                     data = None
 
             if isinstance(data, dict):
-                for item in data.get("state_event_cards") or []:
-                    if not isinstance(item, dict):
-                        continue
-                    try:
-                        state_cards.append(StateEventCard.from_dict(item))
-                    except Exception as e:  # noqa: BLE001
-                        logger.warning(f"[OnlyYou] Failed to parse imported card: {e}")
+                state_cards = _parse_state_event_cards(data.get("state_event_cards"))
                 if not ai_generate_card:
                     card = self._fill_card_from_seed_data(card, data, pname)
 
@@ -1823,7 +1998,6 @@ class SoulManager:
             soul_id=soul_id,
             card=card,
             state_event_cards=state_cards,
-            encounter_talk_cards=[],
         )
         return await self.save_soul(profile)
 

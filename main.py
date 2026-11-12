@@ -1813,7 +1813,6 @@ class OnlyYouPlugin(Star):
         run, current_slot, _ = await self.deck_engine.get_current_and_next_slot(
             soul_id=soul.soul_id,
             custom_cards=soul.state_event_cards,
-            custom_encounters=soul.encounter_talk_cards,
             chronotype=soul.chronotype,
         )
 
@@ -2284,7 +2283,6 @@ class OnlyYouPlugin(Star):
         current_slot = await self.deck_engine.get_current_slot(
             soul_id=soul.soul_id,
             custom_cards=soul.state_event_cards,
-            custom_encounters=soul.encounter_talk_cards,
             chronotype=soul.chronotype,
         )
 
@@ -2355,7 +2353,6 @@ class OnlyYouPlugin(Star):
         run, current_slot, _ = await self.deck_engine.get_current_and_next_slot(
             soul_id=soul.soul_id,
             custom_cards=soul.state_event_cards,
-            custom_encounters=soul.encounter_talk_cards,
             chronotype=soul.chronotype,
         )
 
@@ -2394,7 +2391,6 @@ class OnlyYouPlugin(Star):
         run, current_slot, _ = await self.deck_engine.get_current_and_next_slot(
             soul_id=soul.soul_id,
             custom_cards=soul.state_event_cards,
-            custom_encounters=soul.encounter_talk_cards,
             chronotype=soul.chronotype,
         )
         if current_slot.mutation_monologue:
@@ -2581,7 +2577,7 @@ class OnlyYouPlugin(Star):
             "OnlyYou 指令列表（别名 /oy，仅管理员可用；直接发送 /onlyyou 可查看指令树）：\n"
             "• /onlyyou status - 查看 24h 动态时间轴、繁忙进度与今日繁忙成果\n"
             "• /onlyyou state <RESTING|BUSY|IDLE> [标题] - 切换当前时间块状态（护甲按行动类型固定档位）\n"
-            "• /onlyyou reroll - 重新抽取今日动态时间轴与专属行动卡\n"
+            "• /onlyyou reroll - 重抽专属行动卡池（今日时间轴保持不变，明日生效）\n"
             "• /onlyyou tier [user_id] [1|2|3] - 查看或修改用户关系等级（★L3=管理员级，无好感度）\n"
             "• /onlyyou memory [list|gc|extract|add] - 管理三级记忆与遗忘GC\n"
             "• /onlyyou surf - 在 IDLE 状态下触发一次刷视频\n"
@@ -2607,7 +2603,6 @@ class OnlyYouPlugin(Star):
             run, cur_slot, next_slot = await self.deck_engine.get_current_and_next_slot(
                 soul_id=soul.soul_id,
                 custom_cards=soul.state_event_cards,
-                custom_encounters=soul.encounter_talk_cards,
                 chronotype=soul.chronotype,
             )
             # Lazily settle finished BUSY_TASK blocks so "今日繁忙成果" is fresh.
@@ -2668,7 +2663,6 @@ class OnlyYouPlugin(Star):
                 run, cur_slot, _ = await self.deck_engine.get_current_and_next_slot(
                     soul_id=soul.soul_id,
                     custom_cards=soul.state_event_cards,
-                    custom_encounters=soul.encounter_talk_cards,
                     chronotype=soul.chronotype,
                 )
                 await self._settle_finished_busy_blocks(soul, run)
@@ -2745,25 +2739,37 @@ class OnlyYouPlugin(Star):
             return
 
         if sub == "reroll":
+            # v2.9: freeze today's already-materialized timeline first, then clear
+            # the Soul's action-card pool and generate a brand-new one (tomorrow on).
             run = await self.deck_engine.get_or_build_today_run(
                 soul_id=soul.soul_id,
                 custom_cards=soul.state_event_cards,
-                custom_encounters=soul.encounter_talk_cards,
-                force_reroll=True,
+                force_reroll=False,
                 chronotype=soul.chronotype,
             )
             _, cur_slot, _ = await self.deck_engine.get_current_and_next_slot(
                 soul_id=soul.soul_id,
                 custom_cards=soul.state_event_cards,
-                custom_encounters=soul.encounter_talk_cards,
                 chronotype=soul.chronotype,
             )
+            try:
+                cards, card_source = await self.soul_manager.regenerate_action_cards(
+                    soul.soul_id
+                )
+            except Exception as e:
+                yield event.plain_result(f"❌ 重抽专属行动卡池失败：{e}")
+                return
+            source_label = "AI 生成" if card_source == "ai" else "离线兜底"
+            card_lines = "\n".join(
+                f"- [{card.action.label}] {card.title}"
+                f"（{card.min_hours:g}~{card.max_hours:g}h）"
+                for card in cards
+            )
             yield event.plain_result(
-                f"🎲 已重新抽取今日 Roguelite 动态时间轴！\n"
-                f"• 今日基调：【{run.vigor_title}】\n"
-                f"• 新时间块数量：{len(run.slots)} 块\n"
-                f"• 当前时间块：【{cur_slot.action.label}】{cur_slot.state.value} | "
-                f"{cur_slot.title} (护甲:Lv.{cur_slot.action.armor_tier}·{cur_slot.armor})"
+                f"🎲 已重抽专属行动卡池（{len(cards)} 张 · {source_label}）！\n"
+                f"• 今日时间轴保持不变：{len(run.slots)} 块"
+                f"（当前：【{cur_slot.action.label}】{cur_slot.state.value} | {cur_slot.title}）\n"
+                f"• 新行动卡池（明日 00:00 起从新卡池抽取）：\n{card_lines}"
             )
             return
 
@@ -2873,7 +2879,6 @@ class OnlyYouPlugin(Star):
             cur_slot = await self.deck_engine.get_current_slot(
                 soul_id=soul.soul_id,
                 custom_cards=soul.state_event_cards,
-                custom_encounters=soul.encounter_talk_cards,
                 chronotype=soul.chronotype,
             )
             if not StateController.can_surf_video(cur_slot.state):

@@ -412,7 +412,8 @@ class TestSoulProfileCompatibility(unittest.TestCase):
         assert payload["surfing_preferences"] == ["搞笑整活", "萌宠日常"]
         assert payload["native_persona_prompt"].startswith("原生人设原文")
         assert payload["state_event_cards"] == []
-        assert payload["encounter_talk_cards"] == []
+        # v2.9 cleanup: legacy encounter-talk-card field was removed entirely.
+        assert "encounter_talk_cards" not in payload
 
     def test_from_dict_prefers_card(self):
         soul = SoulProfile.from_dict(

@@ -14,7 +14,8 @@
  *    顶部按四类行动类型筛选（全部 / 睡觉 / 冲浪 / 闲逛 / 繁忙）
  *  - 新建 / 编辑行动卡：title / action_type / min_hours / max_hours / base_weight / scope
  *    → POST cards/save；删除 → POST cards/delete
- *  - 重抽日程 → POST schedule/reroll；AI 生成专属行动卡 → POST cards/ai_generate
+ *  - 重抽日程卡池 → POST schedule/reroll：删除当前角色全部自定义行动卡并重新生成
+ *    一套新卡；今日已排好的 24h 时间轴保持原样，明日 00:00 起从新卡池抽取
  *  - v2.6：隐藏手动护甲设置（行动卡 / 时间块抽屉均不再出现护甲滑条，POST 不再携带 armor）
  *  - 已移除奇遇谈资卡全部 UI 与逻辑
  *
@@ -294,7 +295,7 @@
         '<div class="empty-title">' +
         esc(emptyTitle) +
         "</div>" +
-        '<div class="empty-text">切换筛选条件，或点击右上角「新增」创建一张；也可以让 AI 根据角色卡自动生成四类专属行动卡。</div></div>';
+        '<div class="empty-text">切换筛选条件，或点击右上角「新建卡片」手动创建一张；也可以点「重抽日程卡池」让 AI 重新生成一整套四类专属行动卡。</div></div>';
     return (
       '<section class="card"><div class="card-head">' +
       '<div class="card-title">' +
@@ -314,7 +315,7 @@
       "</div>" +
       '<button class="btn btn-outline btn-sm" type="button" data-action="new-card">' +
       icon("plus", 13) +
-      "新增</button>" +
+      "新建卡片</button>" +
       "</div></div>" +
       body +
       "</section>"
@@ -369,7 +370,7 @@
         slots.length +
         " 个时间块</span></div>";
     } else {
-      html += '<div class="stat-empty">今日日程尚未生成，点击右上角「重抽日程」抽取。</div>';
+      html += '<div class="stat-empty">今日日程尚未生成，点击右上角「刷新」或发送 /onlyyou status 生成今日时间轴。</div>';
     }
     html += "</div></section>";
     return html;
@@ -386,12 +387,9 @@
       '<button class="btn btn-ghost btn-sm" type="button" data-action="refresh-page">' +
       icon("refresh", 14) +
       "刷新</button>" +
-      '<button class="btn btn-ghost btn-sm" type="button" data-action="ai-generate">' +
-      icon("wand", 14) +
-      "AI 生成卡片</button>" +
       '<button class="btn btn-primary btn-sm" type="button" data-action="reroll">' +
-      icon("spark", 14) +
-      "重抽日程</button>" +
+      icon("wand", 14) +
+      "重抽日程卡池</button>" +
       "</div></div>";
     html += timelineBlock(app, data);
     html += cardsBlock(app, data);
@@ -540,50 +538,59 @@
   }
 
   /* ------------------------------------------------------------------ *
-   * 交互：重抽 / AI 生成 / 删除
+   * 交互：重抽日程卡池 / 删除
    * ------------------------------------------------------------------ */
+  /**
+   * 重抽日程卡池：删除当前角色全部自定义行动卡，由 AI（离线时自动兜底）重新
+   * 生成一套新卡。今日已排好的 24h 时间轴保持不变，明天起从新卡池抽取。
+   */
   async function doReroll(app, container) {
     await app.confirm({
-      title: "重抽今日日程",
-      message: "将按角色作息重新拼接今日 24 小时动态时间轴，当前时间块的活动会被覆盖。",
+      title: "确认重抽行动卡池？",
+      message:
+        "将删除当前角色的所有行动卡并由 AI 重新生成一套新卡片。" +
+        "今日已排好的 24h 时间轴保持不变，明天起将从新卡池中抽取日程。",
       confirmLabel: "重抽",
       onConfirm: async function () {
-        var data = await app.apiPost("schedule/reroll", {
-          soul_id: app.state.currentSoulId
-        });
-        if (data && data.schedule) app.state.activeSchedule = data.schedule;
-        pageData.schedule = app.state.activeSchedule;
-        paint(container, app, {
-          schedule: pageData.schedule,
-          cards: pageData.cards
-        });
-        app.toast("已重新抽取今日动态日程");
+        var btn = container.querySelector('[data-action="reroll"]');
+        if (btn) btn.classList.add("is-loading");
+        try {
+          var res = await app.apiPost("schedule/reroll", {
+            soul_id: app.state.currentSoulId
+          });
+          /* 今日时间轴保持不变：直接用后端返回的 schedule 覆盖（内容与重抽前一致） */
+          if (res && res.schedule) {
+            app.state.activeSchedule = res.schedule;
+            pageData.schedule = res.schedule;
+          }
+          /* 下方行动卡网格用新卡池刷新；action_types / chronotype 等元数据沿用旧值 */
+          var generated = res && Array.isArray(res.cards) ? res.cards : [];
+          if (generated.length) {
+            var base = pageData.cards || {};
+            pageData.cards = Object.assign({}, base, {
+              custom_cards: generated.map(function (card) {
+                var copy = Object.assign({}, card);
+                copy.scope = "soul";
+                return copy;
+              })
+            });
+          }
+          paint(container, app, {
+            schedule: pageData.schedule,
+            cards: pageData.cards
+          });
+          app.toast(
+            "已重抽 " +
+              (generated.length || 0) +
+              " 张行动卡（今日时间轴保持不变，明日生效）"
+          );
+        } catch (err) {
+          app.toast("重抽行动卡池失败：" + (err.message || err), true);
+        } finally {
+          if (btn) btn.classList.remove("is-loading");
+        }
       }
     });
-  }
-
-  async function doAiGenerate(app, container) {
-    var btn = container.querySelector('[data-action="ai-generate"]');
-    if (btn) btn.classList.add("is-loading");
-    try {
-      var data = await app.apiPost("cards/ai_generate", {
-        soul_id: app.state.currentSoulId,
-        auto_save: true
-      });
-      var generatedCards = data && Array.isArray(data.generated_cards) ? data.generated_cards : [];
-      if (data && (Array.isArray(data.custom_cards) || Array.isArray(data.general_cards))) {
-        pageData.cards = data;
-      }
-      paint(container, app, {
-        schedule: pageData.schedule,
-        cards: pageData.cards
-      });
-      app.toast("AI 已生成 " + generatedCards.length + " 张专属行动卡");
-    } catch (err) {
-      app.toast("AI 生成失败：" + (err.message || err), true);
-    } finally {
-      if (btn) btn.classList.remove("is-loading");
-    }
   }
 
   function findCardById(cardId) {
@@ -807,8 +814,6 @@
           render(container, app);
         } else if (action === "reroll") {
           doReroll(app, container);
-        } else if (action === "ai-generate") {
-          doAiGenerate(app, container);
         } else if (action === "filter-cards") {
           pageData.filter = actionEl.getAttribute("data-filter") || "ALL";
           paint(container, app, {

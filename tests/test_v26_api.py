@@ -425,7 +425,8 @@ class TestCardsFixedArmor(WebApiTestBase):
         assert "base_weight" in prompt
 
         generated = data["generated_cards"]
-        assert len(generated) == 4
+        # The LLM returned 4 cards; v2.9 pads them to the fixed 9-card ratio.
+        assert len(generated) == 9
         by_action = {card["action_type"]: card for card in generated}
         assert set(by_action) == set(FIXED_ARMOR)
         for action_value, expected_armor in FIXED_ARMOR.items():

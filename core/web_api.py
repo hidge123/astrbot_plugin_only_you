@@ -238,6 +238,9 @@ def _enrich_slot(slot: Any, now_dt: Optional[datetime] = None) -> dict[str, Any]
     return data
 
 
+#: Card fields mirrored from the flat body into the nested `card` payload.
+#: ``valid_slots`` / ``armor`` are intentionally gone (legacy v2.4 fields; armor is
+#: a derived fixed tier per ``action_type`` and is never client-writable).
 _CARD_PAYLOAD_FIELDS = (
     "card_id",
     "title",
@@ -245,9 +248,7 @@ _CARD_PAYLOAD_FIELDS = (
     "action_type",
     "min_hours",
     "max_hours",
-    "valid_slots",
     "base_weight",
-    "armor",
     "synergy_tags",
 )
 
@@ -1957,24 +1958,61 @@ class OnlyYouWebAPI:
     # 2. Schedule Control & Action Cards (`schedule/*`, `cards/*`)
     # ==========================================================================
     async def api_schedule_reroll(self) -> dict[str, Any]:
+        """Re-roll the Soul's action-card pool while freezing today's timeline.
+
+        v2.9 behavior (replaces the old "re-draw today's timeline" reroll):
+
+        1. materialize today's 24h timeline from the **old** card pool *before*
+           replacing the pool, so today's already-drawn blocks stay identical;
+        2. clear the old pool and generate a brand-new one (``ACTION_DECK_GENERATE_PROMPT``
+           via the decision model, deterministic fallback when offline);
+        3. return the unchanged schedule + the new ``cards`` (used from tomorrow on).
+        """
         try:
             await self.plugin._ensure_initialized()
             body = await self._get_json_body()
             soul_id = str(body.get("soul_id") or "default_soul").strip()
-            soul = await self.plugin.soul_manager.get_soul_by_id(soul_id)
+            manager = self.plugin.soul_manager
+            soul = await manager.get_soul_by_id(soul_id)
             if soul is None:
-                soul = (await self.plugin.soul_manager.list_souls())[0]
+                soul = (await manager.list_souls())[0]
 
+            # 1) Lock today's timeline BEFORE the pool is cleared.
             await self.plugin.deck_engine.get_or_build_today_run(
                 soul_id=soul.soul_id,
                 custom_cards=soul.state_event_cards,
-                force_reroll=True,
+                force_reroll=False,
                 chronotype=self._soul_chronotype(soul),
             )
+
+            # 2) Clear the old cards and generate a new pool for tomorrow onwards.
+            raw_count = body.get("count")
+            try:
+                count = int(raw_count) if raw_count is not None else 9
+            except (TypeError, ValueError):
+                count = 9
+            _, card_source = await manager.regenerate_action_cards(
+                soul.soul_id, count=count
+            )
+
+            # Re-read so the response payload reflects the new pool.
+            soul = await manager.get_soul_by_id(soul.soul_id)
+            if soul is None:
+                soul = (await manager.list_souls())[0]
             sched_payload = await self._build_schedule_payload(soul)
+            cards = [card.to_dict() for card in soul.state_event_cards]
             return ok_response(
-                {"schedule": sched_payload},
-                message="已重新抽取今日 24h 动态日程",
+                {
+                    "soul_id": soul.soul_id,
+                    "schedule": sched_payload,
+                    "current_slot": sched_payload.get("current_slot"),
+                    "cards": cards,
+                    "card_source": card_source,
+                    "total": len(cards),
+                },
+                message=(
+                    f"已重抽 {len(cards)} 张行动卡（今日时间轴保持不变，明日生效）"
+                ),
             )
         except Exception as e:
             return err_response(f"重抽日程失败: {e}")
@@ -2132,74 +2170,50 @@ class OnlyYouWebAPI:
             return err_response(f"删除卡片失败: {e}")
 
     async def api_cards_ai_generate(self) -> dict[str, Any]:
+        """Generate a brand-new four-type card pool (auto-save replaces the old one).
+
+        v2.9: shares ``ACTION_DECK_GENERATE_PROMPT`` + the title normalizer with
+        ``schedule/reroll``. ``auto_save=True`` (default) **replaces** the current
+        Soul's whole pool instead of inserting into it; today's already-materialized
+        timeline is frozen first and stays unchanged.
+        """
         try:
             await self.plugin._ensure_initialized()
             body = await self._get_json_body()
             soul_id = str(body.get("soul_id") or "default_soul").strip()
             auto_save = bool(body.get("auto_save", True))
-            soul = await self.plugin.soul_manager.get_soul_by_id(soul_id)
+            manager = self.plugin.soul_manager
+            soul = await manager.get_soul_by_id(soul_id)
             if soul is None:
-                soul = (await self.plugin.soul_manager.list_souls())[0]
+                soul = (await manager.list_souls())[0]
 
-            prompt = (
-                f"请为角色【{soul.name}】（人设定位：{soul.archetype}；口癖：{soul.speaking_style}；"
-                f"冲浪喜好：{', '.join(soul.surfing_preferences) or '无特别偏好'}）"
-                f"生成 8~12 张贴合该角色身份与爱好的专属行动卡，必须覆盖四类行动：\n"
-                f"- SLEEP（睡觉 / 休眠，绑定 RESTING）：长睡 4.0~7.5 小时，或小憩 1.0~2.0 小时\n"
-                f"- SURF（冲浪刷片，绑定 IDLE）：0.5~2.0 小时\n"
-                f"- IDLE_ROAM（空闲闲逛，绑定 IDLE）：0.5~2.0 小时\n"
-                f"- BUSY_TASK（繁忙主业，绑定 BUSY）：1.0~3.0 小时\n"
-                f"每张卡需要：title（贴合角色的活动标题）、action_type、min_hours、max_hours"
-                f"（0.5 步长，min_hours <= max_hours）、base_weight（1~100）。\n"
-                '仅输出合法 JSON：{"state_event_cards": [{"card_id": "evt_ai_1", "title": "...", '
-                '"action_type": "BUSY_TASK", "min_hours": 1.5, "max_hours": 3.0, '
-                '"base_weight": 55}]}'
+            # Freeze today's timeline before replacing the pool (same as reroll).
+            await self.plugin.deck_engine.get_or_build_today_run(
+                soul_id=soul.soul_id,
+                custom_cards=soul.state_event_cards,
+                force_reroll=False,
+                chronotype=self._soul_chronotype(soul),
             )
-            data = await self.plugin.model_hub.call_llm_json(
-                prompt=prompt, role="decision", default=None
-            )
-            gen_cards: list[StateEventCard] = []
-            if isinstance(data, dict) and data.get("state_event_cards"):
-                for raw_c in data.get("state_event_cards") or []:
-                    if not isinstance(raw_c, dict):
-                        continue
-                    try:
-                        gen_cards.append(StateEventCard.from_dict(raw_c))
-                    except Exception as exc:  # never let one bad card break the batch
-                        logger.warning(f"[OnlyYou] AI card parse skipped: {exc}")
-
-            persona_prompt = str(getattr(soul, "native_persona_prompt", "") or "")
-            if not persona_prompt:
-                persona_prompt = f"{soul.name} {soul.archetype} {soul.speaking_style}".strip()
-            if not gen_cards:
-                fallback = self.plugin.soul_manager.build_fallback_custom_deck(
-                    soul.name, persona_prompt
-                )
-                # New signature returns `list[StateEventCard]`; tolerate a legacy tuple.
-                if isinstance(fallback, tuple):
-                    fallback = fallback[0] if fallback else []
-                gen_cards = [c for c in (fallback or []) if isinstance(c, StateEventCard)]
-            gen_cards = gen_cards[:12]
-            # v2.6 §3.2/§3.4: armor is derived from the action type, never from the
-            # LLM reply nor the fallback spec list.
-            for card in gen_cards:
-                card.armor = card.action.fixed_armor
-            # Rewrite card ids so every generated card is unique per batch.
-            stamp = int(time.time())
-            for idx, card in enumerate(gen_cards):
-                card.card_id = f"evt_ai_{stamp}_{idx + 1}"
 
             if auto_save:
-                existing_titles = {c.title for c in soul.state_event_cards}
-                for card in gen_cards:
-                    if card.title not in existing_titles:
-                        soul.state_event_cards.insert(0, card)
-                        existing_titles.add(card.title)
-                await self.plugin.soul_manager.save_soul(soul)
+                gen_cards, card_source = await manager.regenerate_action_cards(
+                    soul.soul_id
+                )
+                soul = await manager.get_soul_by_id(soul.soul_id) or soul
+            else:
+                gen_cards, card_source = await manager.generate_action_cards(soul)
 
             payload = await self.api_cards_list_for_soul(soul)
-            payload["data"]["generated_cards"] = [c.to_dict() for c in gen_cards]
-            payload["message"] = f"已为 {soul.name} 生成 {len(gen_cards)} 张专属行动卡"
+            payload["data"]["generated_cards"] = [card.to_dict() for card in gen_cards]
+            payload["data"]["card_source"] = card_source
+            payload["data"]["replaced"] = bool(auto_save)
+            if auto_save:
+                payload["message"] = (
+                    f"已为 {soul.name} 重抽 {len(gen_cards)} 张专属行动卡"
+                    "（今日时间轴保持不变，明日生效）"
+                )
+            else:
+                payload["message"] = f"已为 {soul.name} 生成 {len(gen_cards)} 张专属行动卡（未保存）"
             return payload
         except Exception as e:
             return err_response(f"AI 生成卡片失败: {e}")

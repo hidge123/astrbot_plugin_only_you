@@ -10,8 +10,9 @@ now comes from BUSY_TASK completion results / watched videos / idle-roam memorie
 
 import json
 import random
+import re
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
 
@@ -26,22 +27,82 @@ MAX_TIME_BLOCKS = 11
 CHRONOTYPES = ("early", "normal", "night_owl")
 DEFAULT_CHRONOTYPE = "normal"
 
-# Legacy fixed 6-slot definitions. Kept only for backward-compatible imports
-# (old WebUI payloads / third-party integrations); the timeline engine no longer
-# uses them.
-SLOT_DEFINITIONS: list[dict[str, Any]] = [
-    {"slot_key": "morning", "label": "清晨早起", "start_hour": 7, "end_hour": 9},
-    {"slot_key": "forenoon", "label": "上午正事", "start_hour": 9, "end_hour": 12},
-    {"slot_key": "noon", "label": "午休干饭", "start_hour": 12, "end_hour": 14},
-    {"slot_key": "afternoon", "label": "下午时光", "start_hour": 14, "end_hour": 18},
-    {"slot_key": "evening", "label": "晚间黄金档", "start_hour": 18, "end_hour": 23},
-    {"slot_key": "night", "label": "深夜睡眠", "start_hour": 23, "end_hour": 7},
-]
+#: Hard cap (Chinese chars) of a normalized action-card title.
+MAX_ACTION_TITLE_CHARS = 12
+
+#: Standard default title per action type (used when a generated title is empty
+#: after normalization, so a card can never render as a blank grid cell).
+DEFAULT_ACTION_TITLES: dict[ActionType, str] = {
+    ActionType.SLEEP: "闭眼安静睡一会儿",
+    ActionType.BUSY_TASK: "专注处理手头正事",
+    ActionType.SURF: "窝着刷会儿视频",
+    ActionType.IDLE_ROAM: "闲下来发会儿呆",
+}
+
+#: Fixed `BotState -> ActionType` mapping (the only authority when a legacy /
+#: external caller supplies a bare state without an ``action_type``).
+STATE_ACTION_MAP: dict[BotState, ActionType] = {
+    BotState.RESTING: ActionType.SLEEP,
+    BotState.BUSY: ActionType.BUSY_TASK,
+    BotState.IDLE: ActionType.IDLE_ROAM,
+}
+
+#: Leading category prefixes that must never appear in an action-card title.
+_ACTION_TITLE_PREFIX_RE = re.compile(
+    r"^(?:繁忙主业|空闲闲逛|正事|主业|繁忙|工作|闲逛|空闲|摸鱼|冲浪|刷视频|休息|睡觉|睡眠|午休|夜间)[：:\-\s]+"
+)
+#: Punctuation used to cut one-shot micro-stories down to their first clause.
+_ACTION_TITLE_CLAUSE_SPLIT_RE = re.compile(r"[，,；;。！!？?、]+")
+#: Quotes / brackets / whitespace trimmed from both ends of a title.
+_ACTION_TITLE_WRAP_CHARS = " \t\r\n「」『』“”\"'‘’（）()【】[]《》<>"
 
 
 # ===========================================================================
 # Helpers
 # ===========================================================================
+def normalize_action_card_title(title: Any, action_type: Any = None) -> str:
+    """Normalize an action-card title into the unified 5~10-char single clause.
+
+    Enforced rules (prompt + code double guarantee, see ``ACTION_DECK_GENERATE_PROMPT``):
+
+    1. strip any leading category prefix (``正事：`` / ``主业：`` / ``冲浪：`` …);
+    2. keep only the first clause of a comma / semicolon sentence — unless that
+       clause is shorter than 4 chars (then merge the next clause so the title
+       still carries a complete meaning);
+    3. trim wrapping quotes / brackets / whitespace;
+    4. hard-cap at ``MAX_ACTION_TITLE_CHARS`` (12) chars and fall back to the
+       action-type default title when nothing usable is left.
+    """
+    action = ActionType.coerce(action_type, ActionType.IDLE_ROAM)
+    text = str(title or "").strip()
+    if not text:
+        return DEFAULT_ACTION_TITLES[action]
+
+    text = _ACTION_TITLE_PREFIX_RE.sub("", text).strip()
+    clauses = [
+        clause.strip()
+        for clause in _ACTION_TITLE_CLAUSE_SPLIT_RE.split(text)
+        if clause.strip()
+    ]
+    if not clauses:
+        return DEFAULT_ACTION_TITLES[action]
+
+    normalized = clauses[0]
+    if len(normalized) < 4 and len(clauses) > 1:
+        normalized = f"{normalized}{clauses[1]}"
+    normalized = normalized.strip(_ACTION_TITLE_WRAP_CHARS).strip()
+    normalized = _ACTION_TITLE_PREFIX_RE.sub("", normalized).strip()
+    normalized = normalized.strip(_ACTION_TITLE_WRAP_CHARS).strip()
+    if len(normalized) > MAX_ACTION_TITLE_CHARS:
+        normalized = normalized[:MAX_ACTION_TITLE_CHARS].strip()
+    return normalized or DEFAULT_ACTION_TITLES[action]
+
+
+def default_action_type_for_state(state: Any) -> ActionType:
+    """Map a bare ``BotState`` to its canonical action type (``IDLE -> IDLE_ROAM``)."""
+    return STATE_ACTION_MAP.get(_coerce_state(state, BotState.IDLE), ActionType.IDLE_ROAM)
+
+
 def snap_hour(value: Any, default: float = 0.0) -> float:
     """Snap an hour value onto the 0.5h grid."""
     try:
@@ -82,27 +143,9 @@ def format_hour(hour: Any) -> str:
     return f"{total_minutes // 60:02d}:{total_minutes % 60:02d}"
 
 
-_SURF_TITLE_KEYWORDS = ("刷", "B站", "b站", "抖音", "视频", "冲浪", "追剧", "看剧")
-_NAP_TITLE_KEYWORDS = ("午", "小憩", "打个盹", "趴", "nap", "眯")
-
-
-def _derive_action_type(state: BotState, title: str = "") -> ActionType:
-    """Infer an ``ActionType`` from a legacy card's state + title (migration rule)."""
-    if state == BotState.RESTING:
-        return ActionType.SLEEP
-    if state == BotState.BUSY:
-        return ActionType.BUSY_TASK
-    text = str(title or "")
-    if any(keyword in text for keyword in _SURF_TITLE_KEYWORDS):
-        return ActionType.SURF
-    return ActionType.IDLE_ROAM
-
-
-def default_hour_range(action_type: ActionType, title: str = "") -> tuple[float, float]:
-    """Default ``[min_hours, max_hours]`` range for a migrated action card."""
+def default_hour_range(action_type: ActionType) -> tuple[float, float]:
+    """Default ``[min_hours, max_hours]`` range of a four-action card."""
     if action_type == ActionType.SLEEP:
-        if any(keyword in str(title or "") for keyword in _NAP_TITLE_KEYWORDS):
-            return 1.0, 2.0
         return 4.0, 7.5
     if action_type == ActionType.BUSY_TASK:
         return 1.0, 3.0
@@ -141,43 +184,35 @@ class DayVigorCard:
 class StateEventCard:
     """② 四类行动卡定义（兼容旧名 ``StateEventCard``）。
 
-    New fields ``action_type`` / ``min_hours`` / ``max_hours`` drive the dynamic
-    stitched timeline; ``valid_slots`` is kept only so legacy serialized decks keep
-    deserializing (the engine no longer reads it).
+    ``action_type`` is the single authoritative behavior enum (defaults to
+    ``IDLE_ROAM``); ``state`` / ``armor`` are always derived from it.  The legacy
+    ``valid_slots`` field was removed together with the v2.4 six-slot migration.
     """
 
     card_id: str
     title: str
     state: BotState = BotState.IDLE
-    valid_slots: list[str] = field(default_factory=list)
     base_weight: int = 50
-    # v2.6: ``None`` means "use the fixed armor tier of ``action_type``".  An
-    # explicit value is still honored here for old persisted data / test helpers,
-    # but every business entry point (deck draw / force_state / cards save)
-    # overwrites it with ``action.fixed_armor``.
-    armor: Optional[int] = None
     synergy_tags: dict[str, float] = field(default_factory=dict)
     action_type: Optional[ActionType] = None
     min_hours: float = 1.0
     max_hours: float = 2.5
+    # Derived-only field kept in the dataclass so old payloads / test helpers can
+    # still pass it positionally; ``__post_init__`` always pins the fixed tier.
+    armor: Optional[int] = None
 
     def __post_init__(self) -> None:
-        self.state = _coerce_state(self.state, BotState.IDLE)
-        derived = ActionType.coerce(self.action_type, None)
-        if derived is None:
-            derived = _derive_action_type(self.state, self.title)
-        self.action_type = derived
-        self.state = derived.bound_state
+        action = ActionType.coerce(self.action_type, ActionType.IDLE_ROAM)
+        self.action_type = action
+        self.state = action.bound_state
+        self.title = normalize_action_card_title(self.title, action)
         self.min_hours = clamp_hours(self.min_hours, 1.0)
         self.max_hours = clamp_hours(self.max_hours, self.min_hours)
         if self.max_hours < self.min_hours:
             self.max_hours = self.min_hours
         self.base_weight = max(1, min(100, int(self.base_weight or 50)))
-        if self.armor is None:
-            self.armor = derived.fixed_armor
-        else:
-            self.armor = max(0, min(100, int(self.armor)))
-        self.valid_slots = [str(item) for item in (self.valid_slots or []) if str(item).strip()]
+        # v2.6 four fixed armor tiers: never accept an external ``armor`` override.
+        self.armor = action.fixed_armor
         self.synergy_tags = {
             str(key): float(value) for key, value in (self.synergy_tags or {}).items()
         }
@@ -194,7 +229,6 @@ class StateEventCard:
             "action_type": self.action.value,
             "min_hours": float(self.min_hours),
             "max_hours": float(self.max_hours),
-            "valid_slots": list(self.valid_slots),
             "base_weight": int(self.base_weight),
             "armor": int(self.armor),
             "synergy_tags": dict(self.synergy_tags),
@@ -203,11 +237,8 @@ class StateEventCard:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "StateEventCard":
         data = data if isinstance(data, dict) else {}
-        state = _coerce_state(data.get("state"), BotState.IDLE)
-        title = str(data.get("title", "日常发呆摸鱼"))
-        raw_action = ActionType.coerce(data.get("action_type"), None)
-        action = raw_action if raw_action is not None else _derive_action_type(state, title)
-        default_min, default_max = default_hour_range(action, title)
+        action = ActionType.coerce(data.get("action_type"), ActionType.IDLE_ROAM)
+        default_min, default_max = default_hour_range(action)
         try:
             min_hours = clamp_hours(data.get("min_hours", default_min), default_min)
         except (TypeError, ValueError):
@@ -218,45 +249,15 @@ class StateEventCard:
             max_hours = default_max
         if max_hours < min_hours:
             max_hours = min_hours
-        kwargs: dict[str, Any] = {
-            "card_id": str(data.get("card_id", f"evt_{random.randint(1000, 9999)}")),
-            "title": title,
-            "state": action.bound_state,
-            "valid_slots": list(data.get("valid_slots") or []),
-            "base_weight": int(data.get("base_weight", 50) or 50),
-            "synergy_tags": dict(data.get("synergy_tags") or {}),
-            "action_type": action,
-            "min_hours": min_hours,
-            "max_hours": max_hours,
-        }
-        # v2.6: only keep an explicitly provided armor value (legacy cards / tests);
-        # missing / None / blank -> leave it to ``__post_init__`` (fixed tier).
-        raw_armor = data.get("armor")
-        if raw_armor is not None and str(raw_armor).strip() != "":
-            try:
-                kwargs["armor"] = int(float(raw_armor))
-            except (TypeError, ValueError):
-                pass
-        return cls(**kwargs)
-
-
-@dataclass
-class EncounterCard:
-    """③ 奇遇谈资卡 —— 已从产品逻辑移除，仅保留类定义兼容旧反序列化。"""
-
-    encounter_id: str
-    content: str
-    used: bool = False
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "EncounterCard":
         return cls(
-            encounter_id=str(data.get("encounter_id", "enc_0")),
-            content=str(data.get("content", "")),
-            used=bool(data.get("used", False)),
+            card_id=str(data.get("card_id", f"evt_{random.randint(1000, 9999)}")),
+            title=str(data.get("title", "") or ""),
+            state=action.bound_state,
+            base_weight=int(data.get("base_weight", 50) or 50),
+            synergy_tags=dict(data.get("synergy_tags") or {}),
+            action_type=action,
+            min_hours=min_hours,
+            max_hours=max_hours,
         )
 
 
@@ -287,7 +288,9 @@ class SlotInstance:
         self.state = _coerce_state(self.state, BotState.IDLE)
         derived = ActionType.coerce(self.action_type, None)
         if derived is None:
-            derived = _derive_action_type(self.state, self.title)
+            # action_type is authoritative; a bare legacy state maps to the fixed
+            # four-action equivalent (no more title-keyword guessing).
+            derived = default_action_type_for_state(self.state)
         self.action_type = derived
         self.state = derived.bound_state
         self.label = str(self.label or derived.label)
@@ -387,7 +390,9 @@ class DailyScheduleRun:
     vigor_title: str
     vigor_desc: str
     slots: list[SlotInstance]
-    encounters: list[EncounterCard] = field(default_factory=list)
+    # Deprecated legacy field: encounter cards were removed from the product; it
+    # stays as an always-empty list so old serialized runs still deserialize.
+    encounters: list[Any] = field(default_factory=list)
     mutations_used: int = 0
     last_mutation_ts: float = 0.0
     last_mutation_log: str = ""
@@ -487,7 +492,7 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
     # ---- SLEEP ----
     StateEventCard(
         card_id="gen_sleep_night",
-        title="关灯钻进被窝呼呼大睡",
+        title="夜间关灯沉睡休息",
         state=BotState.RESTING,
         action_type=ActionType.SLEEP,
         min_hours=4.0,
@@ -496,7 +501,7 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
     ),
     StateEventCard(
         card_id="gen_sleep_nap",
-        title="戴上眼罩趴桌上午休小憩",
+        title="午后戴眼罩趴桌小憩",
         state=BotState.RESTING,
         action_type=ActionType.SLEEP,
         min_hours=1.0,
@@ -507,7 +512,7 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
     # ---- BUSY_TASK ----
     StateEventCard(
         card_id="gen_busy_focus",
-        title="沉浸式处理手头正事与学习",
+        title="专注处理手头正事",
         state=BotState.BUSY,
         action_type=ActionType.BUSY_TASK,
         min_hours=1.5,
@@ -517,7 +522,7 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
     ),
     StateEventCard(
         card_id="gen_busy_afternoon",
-        title="跟烦人的任务死磕赶进度",
+        title="推进日常工作任务",
         state=BotState.BUSY,
         action_type=ActionType.BUSY_TASK,
         min_hours=1.0,
@@ -527,7 +532,7 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
     ),
     StateEventCard(
         card_id="gen_busy_rank",
-        title="专注连麦打排位冲分",
+        title="开黑打排位冲分",
         state=BotState.BUSY,
         action_type=ActionType.BUSY_TASK,
         min_hours=1.0,
@@ -537,7 +542,7 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
     # ---- SURF ----
     StateEventCard(
         card_id="gen_surf_evening",
-        title="躺沙发上快乐刷视频吹水",
+        title="窝在沙发刷搞笑视频",
         state=BotState.IDLE,
         action_type=ActionType.SURF,
         min_hours=0.5,
@@ -547,7 +552,7 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
     ),
     StateEventCard(
         card_id="gen_surf_meal",
-        title="点外卖边干饭边刷下饭视频",
+        title="吃饭顺便刷下饭视频",
         state=BotState.IDLE,
         action_type=ActionType.SURF,
         min_hours=0.5,
@@ -557,7 +562,7 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
     ),
     StateEventCard(
         card_id="gen_surf_night",
-        title="躲被窝里熬夜刷手机舍不得睡",
+        title="躲被窝熬夜刷手机",
         state=BotState.IDLE,
         action_type=ActionType.SURF,
         min_hours=0.5,
@@ -568,7 +573,7 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
     # ---- IDLE_ROAM ----
     StateEventCard(
         card_id="gen_roam_commute",
-        title="叼着面包赶早八通勤刷手机",
+        title="通勤路上随手看消息",
         state=BotState.IDLE,
         action_type=ActionType.IDLE_ROAM,
         min_hours=0.5,
@@ -578,7 +583,7 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
     ),
     StateEventCard(
         card_id="gen_roam_slack",
-        title="表面正经干活实则偷偷摸鱼",
+        title="假装干活偷偷摸鱼",
         state=BotState.IDLE,
         action_type=ActionType.IDLE_ROAM,
         min_hours=0.5,
@@ -588,7 +593,7 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
     ),
     StateEventCard(
         card_id="gen_roam_tea",
-        title="喝下午茶瘫在椅子上逛B站水群",
+        title="泡杯热茶靠窗发呆",
         state=BotState.IDLE,
         action_type=ActionType.IDLE_ROAM,
         min_hours=0.5,
@@ -598,7 +603,7 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
     ),
     StateEventCard(
         card_id="gen_roam_emo",
-        title="趴在窗边发呆看云放空脑袋",
+        title="趴在窗边发呆放空",
         state=BotState.IDLE,
         action_type=ActionType.IDLE_ROAM,
         min_hours=0.5,
@@ -606,9 +611,6 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
         base_weight=35,
     ),
 ]
-
-# Deprecated: encounter cards were removed from the product logic.
-DEFAULT_ENCOUNTER_POOL: list[str] = []
 
 
 class RogueliteDeckEngine:
@@ -1145,13 +1147,11 @@ class RogueliteDeckEngine:
         self,
         soul_id: str,
         custom_cards: Optional[list[Any]] = None,
-        custom_encounters: Optional[list[Any]] = None,  # deprecated, ignored
         force_reroll: bool = False,
         now_dt: Optional[datetime] = None,
         chronotype: str = DEFAULT_CHRONOTYPE,
     ) -> DailyScheduleRun:
         """Load today's timeline from cache/SQLite or build a new dynamic run."""
-        del custom_encounters  # encounter cards removed from the product logic
         date_str = self.today_str(now_dt)
         cache_key = (soul_id, date_str)
 
@@ -1250,7 +1250,6 @@ class RogueliteDeckEngine:
         self,
         soul_id: str,
         custom_cards: Optional[list[Any]] = None,
-        custom_encounters: Optional[list[Any]] = None,
         now_dt: Optional[datetime] = None,
         chronotype: str = DEFAULT_CHRONOTYPE,
     ) -> tuple[DailyScheduleRun, SlotInstance, SlotInstance]:
@@ -1258,7 +1257,6 @@ class RogueliteDeckEngine:
         run = await self.get_or_build_today_run(
             soul_id=soul_id,
             custom_cards=custom_cards,
-            custom_encounters=custom_encounters,
             now_dt=now_dt,
             chronotype=chronotype,
         )
@@ -1271,7 +1269,6 @@ class RogueliteDeckEngine:
         self,
         soul_id: str,
         custom_cards: Optional[list[Any]] = None,
-        custom_encounters: Optional[list[Any]] = None,
         now_dt: Optional[datetime] = None,
         chronotype: str = DEFAULT_CHRONOTYPE,
     ) -> SlotInstance:
@@ -1279,7 +1276,6 @@ class RogueliteDeckEngine:
         _, current_slot, _ = await self.get_current_and_next_slot(
             soul_id=soul_id,
             custom_cards=custom_cards,
-            custom_encounters=custom_encounters,
             now_dt=now_dt,
             chronotype=chronotype,
         )
@@ -1316,22 +1312,14 @@ class RogueliteDeckEngine:
             target_slot.action_type = parsed_action
             target_slot.state = parsed_action.bound_state
         elif new_state is not None:
+            # Bare state override (e.g. `/onlyyou state IDLE`): use the fixed
+            # `BotState -> ActionType` mapping, never a title-keyword heuristic.
             coerced_state = _coerce_state(
                 new_state.value if isinstance(new_state, BotState) else new_state,
                 BotState.IDLE,
             )
             target_slot.state = coerced_state
-            derived_action = _derive_action_type(coerced_state, new_title or target_slot.title)
-            # Keep the existing SURF action only when the caller did NOT give a new
-            # title (bare ``state IDLE``); an explicit non-surf title must win so
-            # `/onlyyou state IDLE 发呆` can turn the block into IDLE_ROAM.
-            if (
-                coerced_state == BotState.IDLE
-                and target_slot.action == ActionType.SURF
-                and not new_title
-            ):
-                derived_action = ActionType.SURF
-            target_slot.action_type = derived_action
+            target_slot.action_type = default_action_type_for_state(coerced_state)
         target_slot.label = target_slot.action.label
 
         if new_title:
