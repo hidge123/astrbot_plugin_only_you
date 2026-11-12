@@ -326,6 +326,7 @@ async def on_any_message(self, event: AstrMessageEvent):
    - `_catch_up_private_unread()` 取私聊未读队列，按会话逐条喂给 `UNREAD_PRIVATE_CATCHUP_PROMPT`，生成一句“刚睡醒/刚忙完才看到”的自然补回消息并经 `PlatformBridge.send_proactive_message()` 发送；每个私聊会话受 `unread_private_cooldown_minutes` 冷却限制，单次心跳最多补回 2 个会话，发送成功即 ack 该批未读（失败保留重试）。
 5. **当当前块为 `② SURF` (`BotState.IDLE`)**：
    - **总开关优先**：若该 Soul 的 `settings.surfing_enabled == False`（Pages「冲浪」页按角色管理，缺失默认 True；v2.8.2 起普通配置不再提供全局开关），本次 `SURF` 自动**降级为 `IDLE_ROAM` 分支**，不刷视频；
+   - **后台视频源偏好（v2.8.3）**：`settings.surfing_sources` 按角色保存（缺省 `bilibili + douyin`）；只启用 B站 时不走抖音兜底、只启用抖音时直接抓抖音、显式 `platform_filter` 的手动触发可覆盖偏好；
    - **触发真实刷视频 (`CyberSurfingPipeline`)**：结合角色卡 `surfing_prefs` 拉取 B站/抖音推荐流与热评，由 `vision` 模型看片打分，写入看片记忆；随后由 `_maybe_share_surfed_video()` 做**五条件分享门禁**（非 fallback 结果 / 本 Soul 未分享过该视频 / 分数 ≥ `surf_share_min_score` / 冲浪分享冷却 / IDLE_ROAM 冷却 / 存在 ★L3 私聊目标），**发送成功才记录 video_id 与时间戳**（失败保留重试机会），详见 §6.8。
 6. **当当前块为 `③ IDLE_ROAM` (`BotState.IDLE`)**：
    - **分支 A —— 翻群记录吃瓜 (`GROUP_LURK`，先决策后回复)**：从【群聊未读队列】按「未读条数 × 新鲜度」排序选一个群 → 先用 `ATMOSPHERE_EVAL_PROMPT` 对“未读批次 + 最近窗口”跑一次决策模型（`REPLY` / `IGNORE`）；只有 `REPLY` 才用 `IDLE_ROAM_PROACTIVE_PROMPT` 生成冒泡/私聊 ★L3 吐槽并发送；`IGNORE` 则静默消费该批未读（不重复评估）。消费即从队列移除，并受 `unread_group_cooldown_minutes` 每群冷却限制；
@@ -986,7 +987,7 @@ async def clear_platform_memory_state(platform_id: str) -> dict[str, int]
 | 14 | `users/update` | POST | **新增 action**：`update_group / clear_group_memory / delete_group`（body `{umo, display_name?, notes?}`） |
 | 15 | `memories/list` | GET | **新增 `tier1_limit`**（默认 30） |
 | 16 | `memories/mutate` | POST | 不变 |
-| 17 | `surfing/list_and_trigger` | GET/POST | GET 新增 `surfing_enabled / soul_id`；POST 新增 `action="toggle_surfing"`（`{soul_id, enabled}`） |
+| 17 | `surfing/list_and_trigger` | GET/POST | GET 新增 `surfing_enabled / surfing_sources / soul_id`；POST 新增 `action="toggle_surfing"`（`{soul_id, enabled}`）与 `action="set_surfing_sources"`（`{soul_id, sources}`） |
 | 18 | `dashboard/overview` | GET | 不变（进入前惰性结算繁忙块） |
 | 19 | `card/schema` | GET | 不变 |
 | 20 | `card/save` | POST | 不变 |
@@ -1022,9 +1023,10 @@ async def clear_platform_memory_state(platform_id: str) -> dict[str, int]
 
 此外必须存在 ★L3 私聊目标（`_latest_l3_umo()`）；分享文本用 `PROACTIVE_CHAT_PROMPT` 生成，`PlatformBridge.send_proactive_message()` 发送并写入会话滑窗。
 
-#### 2. 冲浪总开关
+#### 2. 冲浪总开关与后台视频源
 
 - 生效值：**Soul `settings.surfing_enabled` 是唯一真源**（Pages「冲浪」页按角色管理，缺失默认 True；v2.8.2 起普通配置不再提供全局开关）；
+- **后台视频源（v2.8.3）**：Soul `settings.surfing_sources`（`["bilibili", "douyin"]` 的子集，缺失默认两者都启用）由 Pages「冲浪」页「后台视频源」开关维护；只启用 B站 时 `surf_once()` 不会再用抖音兜底，只启用抖音时直接抓抖音；`platform_filter` 仅在手动触发时显式覆盖偏好，不影响心跳；
 - `CyberSurfingPipeline.is_enabled(soul)` 判开关；关闭时 `surf_once()` 返回 `None`，心跳 `SURF` 时段**自动降级为 `IDLE_ROAM` 分支**；`/onlyyou surf` 直接回复「赛博冲浪总开关已关闭…请先到 Pages 冲浪页开启」；
 - `surf_once()` 候选全部已在 `_watched_ids` 时直接返回 `None`（不再回退 `candidates[0]`）。
 
@@ -1088,11 +1090,11 @@ async def touch_memories_for_muse(memory_ids) -> None
 | 群聊档案 | `plugin_settings["group_profiles"]` | Pages「关系与群聊」页 / 消息采集 |
 | 一次性迁移 flag / 上次 GC 日期 | `plugin_settings["legacy_umo_bindings_migrated"]`、`model_config_migrated_to_souls`、`last_forgetting_gc_date` | 插件内部 |
 | 用户关系 / 分级记忆 / 冲浪历史 | SQLite `users` / `memories` / `surfing_history` | Pages「关系」「记忆」「冲浪」页 |
-| 三态门禁、读空气、冲浪行为参数、记忆与上下文阈值 | `_conf_schema.json` | AstrBot 插件配置面板（用户等级 / 名单、按角色冲浪总开关、模型配置均不在此） |
+| 三态门禁、读空气、冲浪接口与分享门槛、记忆与上下文阈值 | `_conf_schema.json` | AstrBot 插件配置面板（用户等级 / 名单、按角色冲浪总开关、后台视频源、模型配置均不在此） |
 
 ### 7.2 最终 `_conf_schema.json`
 
-以下为 v2.8.2 最终 schema 全文（不含任何模型绑定，保持 JSON 合法）。**v2.8.2 普通配置与 Pages 去重**：移除全局冲浪开关 `surfing_config.surfing_enabled`（改由 Pages「冲浪」页按角色 `settings.surfing_enabled` 唯一管理）、移除 `relationship_config.core_user_ids / important_user_ids`（用户等级与名单改由 Pages「关系与群聊」页管理，L3 仅由平台 `admins_id` 自动确定）；每项配置标题尽量简短，详细说明放入 `hint`。v2.5 曾移除 `daily_encounter_count`、新增 `idle_roam_cooldown_minutes` 与 6 个未读消息配置，v2.8 新增 `surf_share_min_score / surf_share_cooldown_minutes / max_tier1_memories`。
+以下为 v2.8.3 最终 schema 全文（不含任何模型绑定，保持 JSON 合法）。**普通配置与 Pages 去重**：v2.8.2 移除全局冲浪开关 `surfing_config.surfing_enabled`（改由 Pages「冲浪」页按角色 `settings.surfing_enabled` 唯一管理）与用户等级名单 `relationship_config.core_user_ids / important_user_ids`（改由 Pages「关系与群聊」页管理，L3 仅由平台 `admins_id` 自动确定）；v2.8.3 再移除全局平台源开关 `enable_bili_surfing / enable_douyin_surfing`（改由 Pages「冲浪」页按角色 `settings.surfing_sources` 管理）。每项配置标题尽量简短，详细说明放入 `hint`。v2.5 曾移除 `daily_encounter_count`、新增 `idle_roam_cooldown_minutes` 与 6 个未读消息配置，v2.8 新增 `surf_share_min_score / surf_share_cooldown_minutes / max_tier1_memories`。
 
 ```json
 {
@@ -1199,27 +1201,15 @@ async def touch_memories_for_muse(memory_ids) -> None
     }
   },
   "surfing_config": {
-    "description": "📱 赛博冲浪",
+    "description": "📱 赛博冲浪（后台源在 Pages 按角色选择）",
     "type": "object",
     "items": {
-      "enable_bili_surfing": {
-        "description": "启用 B站冲浪",
-        "type": "bool",
-        "default": true,
-        "hint": "空闲状态下主动刷哔哩哔哩 (Bilibili)。"
-      },
       "bili_cookie": {
         "description": "B站 Cookie（可选）",
         "type": "text",
         "secret": true,
         "default": "",
         "hint": "未登录 B 站时填写的 Cookie 可提高推荐流可用性；只保存在本地插件配置中。"
-      },
-      "enable_douyin_surfing": {
-        "description": "启用抖音冲浪",
-        "type": "bool",
-        "default": true,
-        "hint": "空闲状态下主动刷抖音 (Douyin)。"
       },
       "douyin_api_base": {
         "description": "抖音解析接口",

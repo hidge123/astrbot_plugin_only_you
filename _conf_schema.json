@@ -102,27 +102,15 @@
     }
   },
   "surfing_config": {
-    "description": "📱 赛博冲浪",
+    "description": "📱 赛博冲浪（后台源在 Pages 按角色选择）",
     "type": "object",
     "items": {
-      "enable_bili_surfing": {
-        "description": "启用 B站冲浪",
-        "type": "bool",
-        "default": true,
-        "hint": "空闲状态下主动刷哔哩哔哩 (Bilibili)。"
-      },
       "bili_cookie": {
         "description": "B站 Cookie（可选）",
         "type": "text",
         "secret": true,
         "default": "",
         "hint": "未登录 B 站时填写的 Cookie 可提高推荐流可用性；只保存在本地插件配置中。"
-      },
-      "enable_douyin_surfing": {
-        "description": "启用抖音冲浪",
-        "type": "bool",
-        "default": true,
-        "hint": "空闲状态下主动刷抖音 (Douyin)。"
       },
       "douyin_api_base": {
         "description": "抖音解析接口",

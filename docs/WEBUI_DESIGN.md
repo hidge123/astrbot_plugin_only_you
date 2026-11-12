@@ -24,9 +24,9 @@ AstrBot 默认的 `_conf_schema.json` 只适合静态、扁平的基础键值对
 
 | 层 | 位置 | 职责 |
 | :--- | :--- | :--- |
-| **交互式管理** | `views/console/`（本页） | 角色卡、行动卡池、今日日程、用户关系与群聊档案、分级记忆、冲浪视频池与总开关、**四角色模型配置（按当前角色）**、机器人接口绑定与活跃会话内存 |
-| **运行参数** | `_conf_schema.json`（AstrBot 插件配置面板） | Roguelite 阈值、读空气、冲浪行为参数（B站/抖音/分享门槛/冷却；**不含按角色总开关**）、记忆与上下文预算（含 `max_tier1_memories`）等**静态参数**。用户等级 / 名单与按角色冲浪总开关由 Pages 管理；v2.4 起**不再包含任何模型绑定** |
-| **Soul 独立文件** | `souls/<安全文件名>.json`（v2.8 唯一真源） | 角色卡 10 分区、四类行动卡池、`model_config`、`bound_platforms`、`settings`（至少 `surfing_enabled`）、`revision`、`updated_at`。SQLite `souls` 仅索引 |
+| **交互式管理** | `views/console/`（本页） | 角色卡、行动卡池、今日日程、用户关系与群聊档案、分级记忆、冲浪视频池 / 总开关 / 后台视频源、**四角色模型配置（按当前角色）**、机器人接口绑定与活跃会话内存 |
+| **运行参数** | `_conf_schema.json`（AstrBot 插件配置面板） | Roguelite 阈值、读空气、冲浪接口与分享门槛/冷却、记忆与上下文预算（含 `max_tier1_memories`）等**静态参数**。用户等级 / 名单、按角色冲浪总开关与后台视频源由 Pages 管理；v2.4 起**不再包含任何模型绑定** |
+| **Soul 独立文件** | `souls/<安全文件名>.json`（v2.8 唯一真源） | 角色卡 10 分区、四类行动卡池、`model_config`、`bound_platforms`、`settings`（至少 `surfing_enabled`；v2.8.3 可选 `surfing_sources`）、`revision`、`updated_at`。SQLite `souls` 仅索引 |
 | **插件自治设置** | SQLite `plugin_settings` 表 | `default_soul_id`（默认兜底角色）、`runtime_state_v1`（运行态快照）、`group_profiles`（群聊档案）、两个一次性迁移 flag、`last_forgetting_gc_date`、v2.7 兼容的全局 `model_config`。不放进 AstrBotConfig，避免 schema 完整性检查删键 |
 
 ---
@@ -126,7 +126,7 @@ AstrBot 默认的 `_conf_schema.json` 只适合静态、扁平的基础键值对
 | 角色卡 | 角色卡 | `#/character` | 角色 | `card/*`、`souls/*` |
 | 关系 | 关系（页内「关系与群聊」） | `#/relations` | — | `users/list`（含 `groups`）、`users/update`（含群档案 action） |
 | 记忆 | 记忆 | `#/memory` | — | `memories/list`（含 `tier1_limit`）、`memories/mutate` |
-| 冲浪 | 冲浪 | `#/surfing` | — | `surfing/list_and_trigger`（含 `toggle_surfing`） |
+| 冲浪 | 冲浪 | `#/surfing` | — | `surfing/list_and_trigger`（含 `toggle_surfing` / `set_surfing_sources`） |
 | 模型 | 模型 | `#/models` | 系统 | `models/*`（按当前角色带 `soul_id`） |
 | 会话 | 会话（页内「机器人接口」） | `#/sessions` | 系统 | `sessions/platforms`、`sessions/bind_platform`、`sessions/unbind_platform`、`sessions/clear_memory`、`sessions/default_soul` |
 
@@ -190,12 +190,13 @@ AstrBot 默认的 `_conf_schema.json` 只适合静态、扁平的基础键值对
 4. **工具栏**：关联用户下拉（`users/list`）、关键词搜索（400ms 防抖）、上下文注入预算提示（v2.8.2 在提示条追加「前往 AstrBot 插件配置修改预算」引导，避免用户找不到预算/滑窗修改入口），以及页头 **提炼**（`memories/mutate`，`action="extract"`，对最近滑窗执行一次决策模型记忆提炼）、**GC**（`action="gc"`，手动触发遗忘清理）、**刷新**、**新增记忆**（`action="add"`）。数据仍来自 `memories/list`（`{memories, stats}`）。
 5. **T1 行显示（v2.8）**：T1 不再显示活力百分比条，改为 `⏳ 剩余 Xh 清除`（`X = max(0, 48 - (now-created_at)/3600)`，悬浮提示「Tier 1 瞬时记忆创建后 48 小时过期，剩余约 X 小时由遗忘清理 GC 删除」）；T1 分组头与工具栏提示「上限 N 条」（`N = data.tier1_limit`，来自 `memory_config.max_tier1_memories`，默认 30）。T2 保持活力条与到期衰减说明，T3 显示「永久保存」。
 
-### 3.6 冲浪（`page-surfing.js`，v2.8 总开关）
+### 3.6 冲浪（`page-surfing.js`，v2.8.3 总开关 + 后台视频源）
 
 1. **顶部「赛博冲浪总开关」（v2.8）**：switch 绑定当前角色 `settings.surfing_enabled`（GET `surfing/list_and_trigger` 返回）；切换时**乐观更新 UI + 失败回滚**，POST `action="toggle_surfing"`（body `{soul_id, enabled}`）。关闭时顶部显示说明「已关闭：SURF 时段将自动降级为空闲闲逛，不再主动刷视频」；手动冲浪按钮保留，后端关闭时返回错误则 toast 展示。
-2. 视频卡片墙：封面、评分徽章、标题、UP 主、AI 吐槽文案；分享与删除收进卡片悬浮菜单。
-3. 工具栏：立即刷一次 B 站 / 抖音（`surfing/list_and_trigger`，`action="surf"`，可勾选忽略状态门禁用于调试）。
-4. 分享弹窗：选择目标会话（`known_umos`）后 `action="share"`；删除走 `action="delete"`。
+2. **「后台视频源」B站 / 抖音开关（v2.8.3）**：同属总开关卡片，绑定当前角色 `settings.surfing_sources`（GET 返回 `surfing_sources`）；POST `action="set_surfing_sources"`（body `{soul_id, sources}`），乐观更新 + 失败回滚；至少保留一个源（后端拒绝空列表）。仅影响 SURF 心跳自动抓取，手动触发仍可用工具栏「平台筛选」显式指定平台。
+3. 视频卡片墙：封面、评分徽章、标题、UP 主、AI 吐槽文案；分享与删除收进卡片悬浮菜单。
+4. 工具栏：立即刷一次 B 站 / 抖音（`surfing/list_and_trigger`，`action="surf"`，可勾选忽略状态门禁用于调试；平台筛选会覆盖后台视频源偏好）。
+5. 分享弹窗：选择目标会话（`known_umos`）后 `action="share"`；删除走 `action="delete"`。
 
 ### 3.7 模型（`page-models.js`，v2.8 按当前角色）
 
@@ -352,7 +353,7 @@ window.OY_PAGES["overview"] = {
 | 14 | `users/update` | POST | `{ action:"update"\|"merge"\|"delete"\|"update_group"\|"clear_group_memory"\|"delete_group", ... }`（v2.8 群档案 action body `{umo, display_name?, notes?}`） | update：`{ user, users }`；merge：`{ merged_user, users }`；delete：`{ users }`；**v2.8 群档案 action：`{ groups, counts }`**；v2.6 `attitude` 去空白后截断 300 字持久化 |
 | 15 | `memories/list` | GET | `?soul_id&memory_tier=1\|2\|3&user_id&keyword` | `{ memories, stats, tier1_limit }`；`stats` 含 `tier3_count/tier2_count/tier1_count/total` 与上下文预算参数；**v2.8 新增 `tier1_limit`（默认 30，来自 `memory_and_context_config.max_tier1_memories`）** |
 | 16 | `memories/mutate` | POST | `{ action:"add"\|"edit"\|"delete"\|"pin_core"\|"extract"\|"gc", soul_id, id?, content?, keywords?, importance?, memory_tier?, vitality?, user_id?, umo? }` | 各 action 返回对应结果（`memories` / `memory` / `gc_stats` / `extracted_count` 等） |
-| 17 | `surfing/list_and_trigger` | GET / POST | GET：`?soul_id=`；POST：`{ action:"surf"\|"share"\|"delete"\|"toggle_surfing", soul_id?, enabled?, ... }` | GET：`{ videos, known_umos, surfing_enabled, soul_id }`（v2.8 新增后两项）；surf：`{ review, videos, schedule }`；share：`{ sent, target_umo, share_text }`；delete：`{ videos }`；**v2.8 `toggle_surfing`：`{ soul_id, surfing_enabled, soul }`** |
+| 17 | `surfing/list_and_trigger` | GET / POST | GET：`?soul_id=`；POST：`{ action:"surf"\|"share"\|"delete"\|"toggle_surfing"\|"set_surfing_sources", soul_id?, enabled?, sources?, ... }` | GET：`{ videos, known_umos, surfing_enabled, surfing_sources, soul_id }`（v2.8 新增总开关，v2.8.3 新增后台视频源）；surf：`{ review, videos, schedule }`；share：`{ sent, target_umo, share_text }`；delete：`{ videos }`；**v2.8 `toggle_surfing`：`{ soul_id, surfing_enabled, soul }`；v2.8.3 `set_surfing_sources`：`{ soul_id, surfing_sources, soul }`** |
 
 ### 5.2 Pages 路由 10 条（v2.4 引入；v2.8 扩展见 §5.4）
 
@@ -468,7 +469,7 @@ window.OY_PAGES["overview"] = {
 | `users/list` | `groups` | `GroupItem = {umo, group_id, platform_id, display_name, notes, bound_soul_id, bound_soul_name, window_count, unread_count, last_active_at}` |
 | `users/update` | `update_group / clear_group_memory / delete_group` | `update_group` 改群名/备注；`clear_group_memory` 只清该群内存；`delete_group` 删群档案。三者均返回 `{groups, counts}` |
 | `memories/list` | `tier1_limit` | 默认 30，来自 `memory_and_context_config.max_tier1_memories`；记忆页 T1「上限 N 条」 |
-| `surfing/list_and_trigger` | GET `surfing_enabled / soul_id`；POST `action="toggle_surfing"` | 总开关读写；关闭时 SURF 时段降级 IDLE_ROAM |
+| `surfing/list_and_trigger` | GET `surfing_enabled / surfing_sources / soul_id`；POST `action="toggle_surfing" / "set_surfing_sources"` | 总开关与后台视频源读写；总开关关闭时 SURF 时段降级 IDLE_ROAM |
 | `models/config` | `?soul_id=` / body `{soul_id, model_config}`；data `soul_id` | 按当前角色读写四角色配置 |
 | `models/test` | body 可选 `soul_id` | 测试当前角色的指定模型角色 |
 | `souls/delete` / `souls/rename` | 文件名联动 | 删除 / 重命名会同步删除 / 重命名 `souls/*.json` 并级联 SQLite 索引与绑定关系 |
@@ -483,7 +484,7 @@ window.OY_PAGES["overview"] = {
    - 每个 soul 带 `model_config / bound_platforms / settings / updated_at`，`souls/save` 支持 `model_config / bound_platforms / settings` 透传；
    - `users/list` 带 `groups`（GroupItem），`users/update` 支持 `update_group / clear_group_memory / delete_group`；
    - `memories/list` 带 `tier1_limit`（30）；
-   - `surfing/list_and_trigger` GET 带 `surfing_enabled / soul_id`，POST 支持 `action="toggle_surfing"`；
+   - `surfing/list_and_trigger` GET 带 `surfing_enabled / surfing_sources / soul_id`，POST 支持 `action="toggle_surfing"` / `"set_surfing_sources"`；
    - v2.6 既有 mock 形状保留：models 带 `inherit/inherit_from`、users 带 `attitude`、`action_types`/时间块带固定 `armor`/`armor_tier`、角色卡 schema 为 10 分区 / 36 字段、`identity.avatar` 含极小 `data:image/png;base64` 示例。
 3. **视觉验收**：浅色 / 深色主题各截图一次；确认无 emoji 图标、无长副标题、悬浮提示可读、主操作按钮唯一；v2.8 额外检查关系页宽幅弹窗在窄屏（≤720px）下不溢出、chips 可横向滚动、群聊卡片不换行错位。
 4. **交互验收（v2.8）**：

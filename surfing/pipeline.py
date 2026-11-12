@@ -12,7 +12,11 @@ from ..core.context_budget import SessionBuffer
 from ..core.memory_manager import MemoryManager, MemoryTier
 from ..core.model_hub import ModelHub
 from ..core.schedule_mutator import BoundedScheduleMutator
-from ..core.soul_manager import SoulProfile
+from ..core.soul_manager import (
+    DEFAULT_SURFING_SOURCES,
+    SoulProfile,
+    normalize_surfing_sources,
+)
 from ..core.state_machine import BotState, StateController
 
 
@@ -65,6 +69,32 @@ class CyberSurfingPipeline:
             return attribute
         return True
 
+    def sources_for_soul(self, soul: Any = None) -> list[str]:
+        """Background video sources enabled for ``soul`` (Pages-owned, v2.8.3).
+
+        ``settings.surfing_sources`` is persisted per Soul by the Pages「冲浪」page.
+        When the key is absent (old Soul JSON), both B站 + 抖音 stay enabled; an
+        explicitly empty list means the background heartbeat should not fetch any
+        source (manual surfing with an explicit ``platform_filter`` still works).
+        """
+        if soul is None:
+            return list(DEFAULT_SURFING_SOURCES)
+        try:
+            value = getattr(soul, "surfing_sources", None)
+            if value is not None:
+                return normalize_surfing_sources(value)
+        except Exception:  # noqa: BLE001 - never gate on a malformed Soul
+            pass
+        try:
+            settings = getattr(soul, "settings", None)
+            if isinstance(settings, dict) and "surfing_sources" in settings:
+                return normalize_surfing_sources(settings.get("surfing_sources"))
+            if isinstance(soul, dict) and "surfing_sources" in soul:
+                return normalize_surfing_sources(soul.get("surfing_sources"))
+        except Exception:  # noqa: BLE001
+            pass
+        return list(DEFAULT_SURFING_SOURCES)
+
     async def surf_once(
         self,
         soul: SoulProfile,
@@ -84,15 +114,20 @@ class CyberSurfingPipeline:
 
         p_filter = (platform_filter or "").strip().lower()
         candidates: list[VideoItem] = []
+        # v2.8.3: per-Soul background source preference (Pages「冲浪」page).  An
+        # explicit ``platform_filter`` is a manual/debug override and ignores it.
+        soul_sources = set(self.sources_for_soul(soul))
 
-        if p_filter == "bilibili" or (not p_filter and self.cfg.get("enable_bili_surfing", True)):
+        if p_filter == "bilibili" or (
+            not p_filter and "bilibili" in soul_sources
+        ):
             bili = BilibiliAdapter(cookie=str(self.cfg.get("bili_cookie") or ""))
             candidates.extend(
                 await bili.fetch_recommend_feed(preferences=soul.surfing_preferences, limit=4)
             )
 
         if p_filter == "douyin" or (
-            not candidates and not p_filter and self.cfg.get("enable_douyin_surfing", True)
+            not candidates and not p_filter and "douyin" in soul_sources
         ):
             douyin = DouyinAdapter(
                 api_base=str(self.cfg.get("douyin_api_base") or "https://api.douyin.wtf")

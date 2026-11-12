@@ -94,6 +94,22 @@ class TestSoulProfileV28(unittest.TestCase):
         # unknown keys survive the round trip
         assert soul.settings["extra"] == 7
 
+    def test_surfing_sources_default_normalize_and_setter(self):
+        # v2.8.3: absent key keeps both sources enabled (old Soul JSON compatible)
+        soul = SoulProfile(soul_id="s1")
+        assert soul.surfing_sources == ["bilibili", "douyin"]
+        assert "surfing_sources" not in soul.settings
+        # stored value is normalized (dedupe / unknown drop / canonical order)
+        soul.settings = {"surfing_sources": ["douyin", "bilibili", "x"]}
+        assert soul.surfing_sources == ["bilibili", "douyin"]
+        # setter persists a normalized list and keeps other settings
+        soul.surfing_sources = [" douyin ", "douyin"]
+        assert soul.surfing_sources == ["douyin"]
+        assert soul.settings["surfing_sources"] == ["douyin"]
+        # explicit empty list means "no background source" (manual trigger still works)
+        soul.surfing_sources = []
+        assert soul.surfing_sources == []
+
     def test_model_config_normalization(self):
         soul = SoulProfile(
             soul_id="s1",
@@ -603,8 +619,6 @@ class TestMainRuntimeHelpers(DatabaseAsyncTestCase):
         await super().asyncSetUp()
         self.config = make_plugin_config(
             surfing_config={
-                "enable_bili_surfing": True,
-                "surfing_enabled": True,
                 "surf_share_min_score": 80,
                 "surf_share_cooldown_minutes": 90,
             },

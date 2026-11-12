@@ -14,6 +14,7 @@ Contract: ``.team/V28_IMPLEMENTATION_CONTRACT.md`` §5 (T1 backend-memory-surf s
 5. ``CyberSurfingPipeline.surf_once`` — candidate exhaustion returns ``None``
    (never falls back to ``candidates[0]``); ``is_enabled`` is fully owned by the
    per-Soul Pages switch (no global-config fallback) and gates even manual triggers.
+   v2.8.3: background sources come from ``settings.surfing_sources`` (per Soul).
 6. ``VideoReviewResult.is_fallback`` — default ``False`` / included in
    ``to_dict()``; vision failure or malformed output -> ``score=60`` +
    ``is_fallback=True`` while normal success is unchanged.
@@ -700,6 +701,58 @@ class TestSurfingEnabledSwitch(SurfingPipelineTestBase):
         )
         assert review is None
         assert self.adapter_calls == {"bilibili": 0, "douyin": 0}
+
+
+class TestSurfingSourcePreferences(SurfingPipelineTestBase):
+    """v2.8.3: background video sources are per-Soul (``settings.surfing_sources``)."""
+
+    async def test_defaults_to_both_sources(self):
+        assert self.pipeline.sources_for_soul(self.soul) == ["bilibili", "douyin"]
+        assert self.pipeline.sources_for_soul(None) == ["bilibili", "douyin"]
+
+    async def test_bilibili_only_never_falls_back_to_douyin(self):
+        self.soul.settings = {"surfing_enabled": True, "surfing_sources": ["bilibili"]}
+        self.bili_feed = []
+        self.douyin_feed = [_video("dy-should-not-run", platform="douyin")]
+        review = await self.pipeline.surf_once(
+            self.soul, mods.state_machine.BotState.IDLE
+        )
+        assert review is None
+        assert self.adapter_calls == {"bilibili": 1, "douyin": 0}
+
+    async def test_douyin_only_fetches_douyin_directly(self):
+        self.soul.settings = {"surfing_enabled": True, "surfing_sources": ["douyin"]}
+        self.bili_feed = [_video("bv-should-not-run")]
+        self.douyin_feed = [_video("dy-only", platform="douyin")]
+        review = await self.pipeline.surf_once(
+            self.soul, mods.state_machine.BotState.IDLE
+        )
+        assert review is not None
+        assert review.video.video_id == "dy-only"
+        assert self.adapter_calls == {"bilibili": 0, "douyin": 1}
+
+    async def test_empty_sources_skip_background_surfing(self):
+        self.soul.settings = {"surfing_enabled": True, "surfing_sources": []}
+        self.bili_feed = [_video("bv-skip")]
+        self.douyin_feed = [_video("dy-skip", platform="douyin")]
+        review = await self.pipeline.surf_once(
+            self.soul, mods.state_machine.BotState.IDLE
+        )
+        assert review is None
+        assert self.adapter_calls == {"bilibili": 0, "douyin": 0}
+
+    async def test_explicit_platform_filter_overrides_soul_sources(self):
+        self.soul.settings = {"surfing_enabled": True, "surfing_sources": ["bilibili"]}
+        self.bili_feed = [_video("bv-skip")]
+        self.douyin_feed = [_video("dy-manual", platform="douyin")]
+        review = await self.pipeline.surf_once(
+            self.soul,
+            mods.state_machine.BotState.IDLE,
+            platform_filter="douyin",
+        )
+        assert review is not None
+        assert review.video.video_id == "dy-manual"
+        assert self.adapter_calls == {"bilibili": 0, "douyin": 1}
 
 
 class TestSurfOnceCycle(SurfingPipelineTestBase):

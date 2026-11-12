@@ -12,7 +12,11 @@ from .roguelite_deck import (
     DEFAULT_STATE_EVENT_CARDS,
     StateEventCard,
 )
-from .soul_manager import SoulProfile
+from .soul_manager import (
+    DEFAULT_SURFING_SOURCES,
+    SoulProfile,
+    normalize_surfing_sources,
+)
 from .state_machine import ACTION_TYPE_DEFINITIONS, ActionType, BotState, UserTier
 
 try:
@@ -1076,6 +1080,16 @@ class OnlyYouWebAPI:
         if isinstance(settings, dict) and "surfing_enabled" in settings:
             return _as_bool(settings.get("surfing_enabled"), default=True)
         return True
+
+    def _soul_surfing_sources(self, soul: Any) -> list[str]:
+        """Effective per-Soul background video sources (Pages-owned, default both)."""
+        value = getattr(soul, "surfing_sources", None)
+        if value is not None:
+            return normalize_surfing_sources(value)
+        settings = getattr(soul, "settings", None)
+        if isinstance(settings, dict) and "surfing_sources" in settings:
+            return normalize_surfing_sources(settings.get("surfing_sources"))
+        return list(DEFAULT_SURFING_SOURCES)
 
     async def _clear_umo_memory(self, umo: str) -> dict[str, int]:
         """Drop one session's sliding window / evicted buffer / unread backlog."""
@@ -2429,6 +2443,8 @@ class OnlyYouWebAPI:
                         "known_umos": self._collect_known_umos(bindings),
                         # v2.8 §5.2: per-soul cyber-surfing master switch.
                         "surfing_enabled": self._soul_surfing_enabled(soul),
+                        # v2.8.3: per-soul background video sources (Pages-owned).
+                        "surfing_sources": self._soul_surfing_sources(soul),
                         "soul_id": str(getattr(soul, "soul_id", "") or ""),
                     }
                 )
@@ -2471,6 +2487,36 @@ class OnlyYouWebAPI:
                         "soul": to_dict() if callable(to_dict) else {},
                     },
                     message=("已开启" if effective else "已关闭") + "赛博冲浪总开关",
+                )
+
+            if action == "set_surfing_sources":
+                sources = normalize_surfing_sources(body.get("sources"))
+                if not sources:
+                    return err_response("至少启用一个后台视频源（B站 / 抖音）")
+                setter = getattr(self.plugin.soul_manager, "set_soul_setting", None)
+                if callable(setter):
+                    try:
+                        updated = setter(soul.soul_id, "surfing_sources", sources)
+                        if inspect.isawaitable(updated):
+                            updated = await updated
+                        if updated is not None:
+                            soul = updated
+                    except Exception as exc:
+                        return err_response(f"保存后台视频源失败: {exc}")
+                else:  # pragma: no cover - defensive fallback
+                    try:
+                        soul.surfing_sources = sources
+                        await self.plugin.soul_manager.save_soul(soul)
+                    except Exception as exc:
+                        return err_response(f"保存后台视频源失败: {exc}")
+                to_dict = getattr(soul, "to_dict", None)
+                return ok_response(
+                    {
+                        "soul_id": str(getattr(soul, "soul_id", "") or soul_id),
+                        "surfing_sources": self._soul_surfing_sources(soul),
+                        "soul": to_dict() if callable(to_dict) else {},
+                    },
+                    message="后台视频源已更新",
                 )
 
             if action == "delete":

@@ -623,6 +623,83 @@ class TestSurfingToggle(WebApiV28TestBase):
         assert data["videos"] == []
         assert isinstance(data["known_umos"], list)
 
+    async def test_get_surfing_includes_default_sources(self):
+        soul = await self.first_soul()
+        data = self.assert_ok(
+            await self.call(
+                "GET", self.api.api_surfing_list_and_trigger, query={"soul_id": soul.soul_id}
+            )
+        )
+        assert data["surfing_sources"] == ["bilibili", "douyin"]
+
+    async def test_set_surfing_sources_persists_per_soul(self):
+        soul = await self.first_soul()
+        response = await self.call(
+            "POST",
+            self.api.api_surfing_list_and_trigger,
+            body={
+                "action": "set_surfing_sources",
+                "soul_id": soul.soul_id,
+                "sources": ["douyin", "bilibili", "unknown"],
+            },
+        )
+        data = self.assert_ok(response)
+        assert data["soul_id"] == soul.soul_id
+        assert data["surfing_sources"] == ["bilibili", "douyin"]
+        stored = await self.read_soul_file(soul.soul_id)
+        assert stored["settings"]["surfing_sources"] == ["bilibili", "douyin"]
+
+        # single-source preference persists and GET reflects it
+        data = self.assert_ok(
+            await self.call(
+                "POST",
+                self.api.api_surfing_list_and_trigger,
+                body={
+                    "action": "set_surfing_sources",
+                    "soul_id": soul.soul_id,
+                    "sources": ["douyin"],
+                },
+            )
+        )
+        assert data["surfing_sources"] == ["douyin"]
+        get_data = self.assert_ok(
+            await self.call(
+                "GET", self.api.api_surfing_list_and_trigger, query={"soul_id": soul.soul_id}
+            )
+        )
+        assert get_data["surfing_sources"] == ["douyin"]
+        # other Souls keep the default both sources
+        second = await self.create_soul("soul_sources_b", "第二个角色")
+        second_data = self.assert_ok(
+            await self.call(
+                "GET",
+                self.api.api_surfing_list_and_trigger,
+                query={"soul_id": second.soul_id},
+            )
+        )
+        assert second_data["surfing_sources"] == ["bilibili", "douyin"]
+
+    async def test_set_surfing_sources_rejects_empty(self):
+        soul = await self.first_soul()
+        response = await self.call(
+            "POST",
+            self.api.api_surfing_list_and_trigger,
+            body={
+                "action": "set_surfing_sources",
+                "soul_id": soul.soul_id,
+                "sources": [],
+            },
+        )
+        error = self.assert_error(response)
+        assert "至少启用一个后台视频源" in error["message"]
+        # unchanged default not persisted as an empty list
+        get_data = self.assert_ok(
+            await self.call(
+                "GET", self.api.api_surfing_list_and_trigger, query={"soul_id": soul.soul_id}
+            )
+        )
+        assert get_data["surfing_sources"] == ["bilibili", "douyin"]
+
     async def test_toggle_surfing_persists_per_soul(self):
         soul = await self.first_soul()
         response = await self.call(

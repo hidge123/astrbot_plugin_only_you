@@ -20,7 +20,11 @@ SCHEMA_PATH = os.path.join(PROJECT_ROOT, "_conf_schema.json")
 
 #: 普通配置中禁止再出现的、与 Pages / Soul JSON 职责重叠的键。
 FORBIDDEN_PLUGIN_CONFIG_KEYS = {
-    "surfing_config": {"surfing_enabled"},
+    "surfing_config": {
+        "surfing_enabled",
+        "enable_bili_surfing",
+        "enable_douyin_surfing",
+    },
     "relationship_config": {"core_user_ids", "important_user_ids"},
 }
 

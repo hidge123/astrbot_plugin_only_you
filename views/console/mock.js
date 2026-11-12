@@ -20,8 +20,8 @@
  * v2.8 同步（契约 §6.2）：Soul 独立配置（每个 soul 带 model_config / bound_platforms / settings）；
  *  机器人接口绑定 sessions/platforms + sessions/bind_platform / unbind_platform / clear_memory；
  *  users/list 返回 `groups` 群聊档案，users/update 支持 update_group / clear_group_memory / delete_group；
- *  memories/list 返回 `tier1_limit`；surfing/list_and_trigger 返回 surfing_enabled / soul_id 并支持
- *  POST `action="toggle_surfing"`。关系页（T3）与会话 / 模型 / 记忆 / 冲浪页（T4）共用这些形状。
+ *  memories/list 返回 `tier1_limit`；surfing/list_and_trigger 返回 surfing_enabled /
+ *  surfing_sources / soul_id，并支持 POST `action="toggle_surfing"` / `"set_surfing_sources"`。关系页（T3）与会话 / 模型 / 记忆 / 冲浪页（T4）共用这些形状。
  *
  * 用途：无 AstrBot 后端时直接双击打开 `index.html?mock=1` 即可渲染所有页面 / 截图验收。
  * 数据是可变的：force_state / reroll / cards 增删改 / 默认角色 / UMO 绑定等操作都会更新内存状态。
@@ -793,6 +793,9 @@
     });
     if (!soul.settings || typeof soul.settings !== "object") soul.settings = {};
     if (typeof soul.settings.surfing_enabled !== "boolean") soul.settings.surfing_enabled = true;
+    if (!Array.isArray(soul.settings.surfing_sources)) {
+      soul.settings.surfing_sources = ["bilibili", "douyin"];
+    }
     if (typeof soul.updated_at !== "number") soul.updated_at = nowSeconds();
     return soul;
   }
@@ -2433,7 +2436,14 @@
       known_umos: knownUmos(),
       /* v2.8：冲浪总开关 + 当前角色（契约 §5.2 / §6.2） */
       soul_id: soul ? soul.soul_id : "",
-      surfing_enabled: soul && soul.settings ? soul.settings.surfing_enabled !== false : true
+      surfing_enabled: soul && soul.settings ? soul.settings.surfing_enabled !== false : true,
+      /* v2.8.3：后台视频源偏好（按角色；缺省 B站 + 抖音） */
+      surfing_sources:
+        soul && soul.settings && Array.isArray(soul.settings.surfing_sources)
+          ? soul.settings.surfing_sources.filter(function (platform) {
+              return platform === "bilibili" || platform === "douyin";
+            })
+          : ["bilibili", "douyin"]
     };
   }
 
@@ -2449,6 +2459,23 @@
       return {
         soul_id: soul.soul_id,
         surfing_enabled: soul.settings.surfing_enabled,
+        soul: toSoulDict(soul)
+      };
+    }
+    if (action === "set_surfing_sources") {
+      var valid = ["bilibili", "douyin"];
+      var picked = (Array.isArray(body.sources) ? body.sources : []).filter(function (platform) {
+        return valid.indexOf(platform) >= 0;
+      });
+      picked = valid.filter(function (platform) {
+        return picked.indexOf(platform) >= 0;
+      });
+      if (!picked.length) throw new Error("至少启用一个后台视频源（B站 / 抖音）");
+      soul.settings.surfing_sources = picked;
+      soul.updated_at = nowSeconds();
+      return {
+        soul_id: soul.soul_id,
+        surfing_sources: picked,
         soul: toSoulDict(soul)
       };
     }

@@ -1150,7 +1150,6 @@ class TestSurfShareGates(DatabaseAsyncTestCase):
         await super().asyncSetUp()
         self.config = make_plugin_config(
             surfing_config={
-                "enable_bilibili": True,
                 "surf_share_min_score": 80,
                 "surf_share_cooldown_minutes": 90,
             }

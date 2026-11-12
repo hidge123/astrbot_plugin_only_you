@@ -156,7 +156,7 @@ stateDiagram-v2
    - 决定动作：`IGNORE`（潜水）、`REPLY`（短句接话）、`GROUP_SHARE_VIDEO`（当处于 `空闲中` 且兜里有刚刷到的应景视频时，顺手甩进群里）、或 `WHISPER_TO_CORE`（群内闭嘴，转头私聊找 L3 核心用户耳语吐槽）。
 
 ### 3.2 空闲状态下的 B站 / 抖音冲浪与分享闭环
-仅当 AI 处于 **`☕ 空闲中 (IDLE)`** 状态、且**当前角色的赛博冲浪总开关开启**时，后台冲浪任务激活（关闭时 SURF 时段自动降级为空闲闲逛）：
+仅当 AI 处于 **`☕ 空闲中 (IDLE)`** 状态、且**当前角色的赛博冲浪总开关开启**时，后台冲浪任务激活（关闭时 SURF 时段自动降级为空闲闲逛）。**后台视频源（B站 / 抖音）也按角色独立选择**（`settings.surfing_sources`，缺省两者都启用；关闭 B站 后后台不再抓取 B站，关闭抖音后不再使用抖音兜底）：
 1. **拉取与热评初筛**：通过 B站/抖音 API 获取推荐流与前排高赞神评，决策模型挑出最有趣的 1 个视频；若候选视频都已被本角色看过，直接跳过（不回退）。
 2. **多模态真看画面**：通过短视频直传或 **FFmpeg `3x3` 时间戳关键帧九宫格拼图 + 字幕 + 热评** 看懂画面细节与笑点。
 3. **分享门禁（v2.8）**：视觉评分低于门槛、视觉模型兜底、本角色已分享过同一视频、冲浪分享冷却 / 闲逛冷却未到、或没有 ★L3 私聊目标时，**只写入看片记忆、不主动分享**；全部门禁通过才把视频与口语吐槽私聊发给 **★ L3 核心用户**。
@@ -384,8 +384,8 @@ flowchart TB
   4. 距上次冲浪分享 ≥ `surfing_config.surf_share_cooldown_minutes`（默认 90 分钟）；
   5. 距上次 `IDLE_ROAM` 主动搭话 ≥ `roguelite_schedule_config.idle_roam_cooldown_minutes`（默认 45 分钟）。
   分享成功才记录 video_id 与时间戳（失败保留重试机会）；冷却 / 去重状态由运行态持久化跨重启保留（见 6.6）。
-- **总开关**：完全由 Pages「冲浪」页按角色管理（`settings.surfing_enabled`，缺失默认 True；v2.8.2 起插件普通配置不再提供全局开关）。关闭时心跳 SURF 时段自动降级为 `IDLE_ROAM`、`surf_once()` 返回 `None`；`/onlyyou surf` 直接提示「赛博冲浪总开关已关闭…请先到 Pages 冲浪页开启」；候选视频都已被本角色看过时直接跳过（不得回退第一个候选）。
-- **API**：`surfing/list_and_trigger` GET 增加 `surfing_enabled / soul_id`；POST 增加 `action="toggle_surfing"`（body `{soul_id, enabled}`），保存角色设置并返回最新开关。
+- **总开关与后台视频源**：完全由 Pages「冲浪」页按角色管理（`settings.surfing_enabled` / `settings.surfing_sources`，缺失分别默认 True / 两者都启用；v2.8.2 起普通配置不再提供全局开关，v2.8.3 起也不再提供 B站/抖音平台开关）。关闭总开关时心跳 SURF 时段自动降级为 `IDLE_ROAM`、`surf_once()` 返回 `None`；`/onlyyou surf` 直接提示「赛博冲浪总开关已关闭…请先到 Pages 冲浪页开启」；候选视频都已被本角色看过时直接跳过（不得回退第一个候选）。后台视频源只影响心跳自动抓取；手动冲浪可显式指定 `platform` 覆盖偏好。
+- **API**：`surfing/list_and_trigger` GET 增加 `surfing_enabled / surfing_sources / soul_id`；POST 增加 `action="toggle_surfing"`（body `{soul_id, enabled}`）与 `action="set_surfing_sources"`（body `{soul_id, sources}`），保存角色设置并返回最新值。
 
 ### 6.5 记忆：T1 去重 / 上限 / 实时清理 + MEMORY_MUSE 三层分桶
 
@@ -426,7 +426,7 @@ flowchart TB
 
 - 统一前缀 `/astrbot_plugin_only_you`，统一信封 `{status, message, data}`，路由总数 **31** 条。
 - **新增 4 条**：`GET sessions/platforms?soul_id=`、`POST sessions/bind_platform {soul_id, platform_id}`、`POST sessions/unbind_platform {platform_id}`、`POST sessions/clear_memory {umo?|platform_id?}`；保留 `sessions/default_soul`。
-- **扩展**：`users/list` 增加 `groups`；`users/update` 增加 `update_group / clear_group_memory / delete_group`；`memories/list` 增加 `tier1_limit`（默认 30）；`surfing/list_and_trigger` GET 增加 `surfing_enabled / soul_id`、POST 增加 `action="toggle_surfing"`；`models/config` 支持 `?soul_id=` 与 body `{soul_id, model_config}`；`init_summary` 增加 `platform_bindings`；`souls/save` 透传 `model_config / bound_platforms / settings` 并在 JSON 写失败时返回 `data.storage` 降级信息。
+- **扩展**：`users/list` 增加 `groups`；`users/update` 增加 `update_group / clear_group_memory / delete_group`；`memories/list` 增加 `tier1_limit`（默认 30）；`surfing/list_and_trigger` GET 增加 `surfing_enabled / surfing_sources / soul_id`、POST 增加 `action="toggle_surfing" / "set_surfing_sources"`；`models/config` 支持 `?soul_id=` 与 body `{soul_id, model_config}`；`init_summary` 增加 `platform_bindings`；`souls/save` 透传 `model_config / bound_platforms / settings` 并在 JSON 写失败时返回 `data.storage` 降级信息。
 - **群聊档案**：`GroupProfile` 存 `plugin_settings["group_profiles"]`；`touch_group` 新群立即持久化、已有群最多每 60s 持久化一次 `last_active_at`，全部 defensive（异常静默，不影响消息处理）。
 
 ### 6.9 解绑 / 清空的「清理 vs 保留」语义

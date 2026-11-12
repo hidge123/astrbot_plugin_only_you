@@ -63,8 +63,13 @@ _SETTING_DEFAULT_SOUL_ID = "default_soul_id"
 _SETTING_LEGACY_UMO_MIGRATED = "legacy_umo_bindings_migrated"
 
 #: Default per-Soul plugin settings (v2.8).  ``surfing_enabled`` is the per-Soul
-#: override of the global cyber-surfing switch.
+#: master switch; ``surfing_sources`` (v2.8.3) is the per-Soul background video
+#: source preference, defaulting to both when the key is absent.
 DEFAULT_SOUL_SETTINGS: dict[str, Any] = {"surfing_enabled": True}
+
+#: Supported background video sources (Pages「冲浪」page owns the per-Soul choice).
+SURFING_SOURCE_PLATFORMS: tuple[str, ...] = ("bilibili", "douyin")
+DEFAULT_SURFING_SOURCES: list[str] = list(SURFING_SOURCE_PLATFORMS)
 
 #: Characters that are illegal in a cross-platform file name (plus control chars).
 _UNSAFE_FILENAME_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
@@ -164,6 +169,27 @@ def _clean_list(value: Any) -> list[str]:
     return result
 
 
+def normalize_surfing_sources(value: Any) -> list[str]:
+    """Normalize a per-Soul background video source list (v2.8.3).
+
+    Accepts a list / tuple / set / comma-separated string, drops unknown values,
+    dedupes and returns them in canonical order (``bilibili`` first, then
+    ``douyin``).  An explicitly empty list stays empty ("no background source").
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items: list[Any] = []
+        for piece in re.split(r"[,，、/;；|\s]+", value):
+            items.append(piece)
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        items = [value]
+    selected = {_clean_text(item).lower() for item in items}
+    return [p for p in SURFING_SOURCE_PLATFORMS if p in selected]
+
+
 def _normalize_soul_settings(value: Any) -> dict[str, Any]:
     """Normalize ``SoulProfile.settings`` (known keys coerced, unknown keys kept)."""
     settings: dict[str, Any] = dict(DEFAULT_SOUL_SETTINGS)
@@ -182,6 +208,12 @@ def _normalize_soul_settings(value: Any) -> dict[str, Any]:
         )
     else:
         settings["surfing_enabled"] = bool(surfing)
+    # v2.8.3: normalize the per-Soul background video sources only when the key
+    # exists, so existing Soul JSON files keep their compact settings shape.
+    if "surfing_sources" in settings:
+        settings["surfing_sources"] = normalize_surfing_sources(
+            settings.get("surfing_sources")
+        )
     return settings
 
 
@@ -405,6 +437,29 @@ class SoulProfile:
     def surfing_enabled(self, value: Any) -> None:
         self.settings = _normalize_soul_settings(
             {**dict(self.settings or {}), "surfing_enabled": value}
+        )
+
+    @property
+    def surfing_sources(self) -> list[str]:
+        """Per-Soul background video sources (``settings.surfing_sources``).
+
+        v2.8.3: the Pages「冲浪」page owns this preference.  When the key is
+        absent the Soul keeps both sources enabled (backward compatible with
+        v2.8.2 Soul JSON files); an explicitly stored empty list means "no
+        background source" (manual surfing still works).
+        """
+        settings = self.settings if isinstance(self.settings, dict) else {}
+        if "surfing_sources" not in settings:
+            return list(DEFAULT_SURFING_SOURCES)
+        return normalize_surfing_sources(settings.get("surfing_sources"))
+
+    @surfing_sources.setter
+    def surfing_sources(self, value: Any) -> None:
+        self.settings = _normalize_soul_settings(
+            {
+                **dict(self.settings or {}),
+                "surfing_sources": normalize_surfing_sources(value),
+            }
         )
 
     @property

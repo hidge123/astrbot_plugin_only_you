@@ -1,16 +1,21 @@
 /**
  * OnlyYou Plugin Pages — 冲浪页 (`views/console/page-surfing.js`)
  *
- * 数据源（v2.8）：
- *   GET  `surfing/list_and_trigger?soul_id=`    → { videos: [...], known_umos: [...], surfing_enabled: bool, soul_id }
- *   POST `surfing/list_and_trigger` { action }   → surf / share / delete / toggle_surfing
+ * 数据源（v2.8.3）：
+ *   GET  `surfing/list_and_trigger?soul_id=`    → { videos: [...], known_umos: [...],
+ *                                                   surfing_enabled: bool,
+ *                                                   surfing_sources: ["bilibili","douyin"],
+ *                                                   soul_id }
+ *   POST `surfing/list_and_trigger` { action }   → surf / share / delete / toggle_surfing /
+ *                                                   set_surfing_sources
  *          toggle_surfing body {soul_id, enabled} → {soul_id, surfing_enabled, soul}
+ *          set_surfing_sources body {soul_id, sources} → {soul_id, surfing_sources, soul}
  *
- * 页面结构：顶部「赛博冲浪总开关」（按角色独立保存，乐观更新 + 失败回滚）→ 工具栏（平台筛选 /
- * 忽略状态门禁 / 统计 / 手动冲浪）→ 视频卡片墙（封面、标题、UP 主、评分徽章、吐槽、平台标签）；
- * 卡片悬浮菜单：分享（可选目标 UMO）/ 删除。
+ * 页面结构：顶部「赛博冲浪总开关」+「后台视频源（B站 / 抖音）」（均按角色独立保存，乐观更新 +
+ * 失败回滚）→ 工具栏（平台筛选 / 忽略状态门禁 / 统计 / 手动冲浪）→ 视频卡片墙（封面、标题、
+ * UP 主、评分徽章、吐槽、平台标签）；卡片悬浮菜单：分享（可选目标 UMO）/ 删除。
  * 关闭总开关时顶部显示「已关闭：SURF 时段将自动降级为空闲闲逛，不再主动刷视频」，手动冲浪按钮保留，
- * 后端拒绝时以 toast 展示错误。
+ * 后端拒绝时以 toast 展示错误。后台视频源仅影响 SURF 心跳，手动冲浪的「平台筛选」不受其限制。
  *
  * 注册：window.OY_PAGES.surfing = { id, title, icon, render(container, ctx), destroy() }
  */
@@ -28,6 +33,9 @@
     /* v2.8：赛博冲浪总开关（Soul settings.surfing_enabled，来自 GET；默认 true） */
     surfingEnabled: true,
     toggleBusy: false,
+    /* v2.8.3：后台视频源（Soul settings.surfing_sources，来自 GET；默认 B站 + 抖音） */
+    surfingSources: ["bilibili", "douyin"],
+    sourceBusy: false,
     platform: "",
     ignoreGate: true,
     busy: false
@@ -88,6 +96,45 @@
   /* ------------------------------------------------------------------ *
    * HTML
    * ------------------------------------------------------------------ */
+  function normalizeSources(sources) {
+    var valid = ["bilibili", "douyin"];
+    var list = Array.isArray(sources) ? sources : [];
+    return valid.filter(function (platform) {
+      return list.indexOf(platform) >= 0;
+    });
+  }
+
+  function sourcesLabel(sources) {
+    var list = normalizeSources(sources);
+    return list.length
+      ? list
+          .map(function (platform) {
+            return platformLabel(platform);
+          })
+          .join(" + ")
+      : "未启用";
+  }
+
+  function sourceSwitchesHtml() {
+    var has = function (platform) {
+      return normalizeSources(S.surfingSources).indexOf(platform) >= 0;
+    };
+    return (
+      '<div class="row wrap" style="gap:16px;margin-top:10px;padding-top:10px;border-top:1px dashed var(--border)" data-role="surf-sources">' +
+      '<span class="text-xs" style="font-weight:600">后台视频源</span>' +
+      '<label class="switch-label" data-tip="关闭后后台 SURF 心跳不再抓取 B 站；手动冲浪不受影响">' +
+      '<span class="switch"><input type="checkbox" data-role="source-bilibili"' +
+      (has("bilibili") ? " checked" : "") +
+      ' /><span class="switch-track"></span></span>B站</label>' +
+      '<label class="switch-label" data-tip="关闭后后台 SURF 心跳不再用抖音兜底；手动冲浪不受影响">' +
+      '<span class="switch"><input type="checkbox" data-role="source-douyin"' +
+      (has("douyin") ? " checked" : "") +
+      ' /><span class="switch-track"></span></span>抖音</label>' +
+      '<span class="text-xs muted">仅影响后台自动冲浪，至少保留一个</span>' +
+      "</div>"
+    );
+  }
+
   function platformSegmentedHtml() {
     var options = [
       { value: "", label: "不限平台" },
@@ -195,6 +242,7 @@
       (on
         ? ""
         : '<div class="text-xs muted mt-8" data-role="surfing-off-hint">已关闭：SURF 时段将自动降级为空闲闲逛，不再主动刷视频</div>') +
+      sourceSwitchesHtml() +
       "</div></div>"
     );
   }
@@ -328,6 +376,10 @@
     S.knownUmos = Array.isArray(data.known_umos) ? data.known_umos : [];
     /* v2.8：总开关按当前角色返回；旧后端缺字段时保持当前值（默认开启） */
     if (data.surfing_enabled != null) S.surfingEnabled = !!data.surfing_enabled;
+    /* v2.8.3：后台视频源按当前角色返回；旧后端缺字段时默认 B站 + 抖音 */
+    if (Array.isArray(data.surfing_sources)) {
+      S.surfingSources = normalizeSources(data.surfing_sources);
+    }
   }
 
   async function reload(showToast) {
@@ -382,6 +434,54 @@
       app.toast("切换赛博冲浪总开关失败：" + (err.message || err), true);
     } finally {
       S.toggleBusy = false;
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 操作：后台视频源（B站 / 抖音，按角色保存；乐观更新 + 失败回滚）
+   * ------------------------------------------------------------------ */
+  async function toggleSurfingSource(platform, enabled) {
+    var app = S.app;
+    if (!app || S.destroyed) return;
+    if (S.sourceBusy) {
+      /* 请求进行中再次切换：以服务端中的状态为准重绘 */
+      paint();
+      return;
+    }
+    var previous = normalizeSources(S.surfingSources);
+    var next = previous.filter(function (item) {
+      return item !== platform;
+    });
+    if (enabled) next.push(platform);
+    next = normalizeSources(next);
+    if (!next.length) {
+      paint();
+      app.toast("至少保留一个后台视频源（B站 / 抖音）", true);
+      return;
+    }
+    if (next.join(",") === previous.join(",")) return;
+    S.surfingSources = next;
+    paint();
+    S.sourceBusy = true;
+    try {
+      var data = await app.apiPost("surfing/list_and_trigger", {
+        action: "set_surfing_sources",
+        soul_id: soulId(),
+        sources: next
+      });
+      if (S.destroyed) return;
+      if (data && Array.isArray(data.surfing_sources)) {
+        S.surfingSources = normalizeSources(data.surfing_sources);
+      }
+      paint();
+      app.toast("后台视频源已更新：" + sourcesLabel(S.surfingSources));
+    } catch (err) {
+      if (S.destroyed) return;
+      S.surfingSources = previous;
+      paint();
+      app.toast("更新后台视频源失败：" + (err.message || err), true);
+    } finally {
+      S.sourceBusy = false;
     }
   }
 
@@ -565,6 +665,10 @@
         S.ignoreGate = !!target.checked;
       } else if (role === "surfing-enabled") {
         toggleSurfing(!!target.checked);
+      } else if (role === "source-bilibili") {
+        toggleSurfingSource("bilibili", !!target.checked);
+      } else if (role === "source-douyin") {
+        toggleSurfingSource("douyin", !!target.checked);
       }
     });
   }
