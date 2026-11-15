@@ -1,6 +1,8 @@
 """Group chat atmosphere reader: debounce window, reply-chain untangling, and 5D evaluation."""
 
 import asyncio
+import random
+import time
 from typing import Any, Optional
 
 from .context_budget import SessionBuffer
@@ -24,6 +26,15 @@ except ImportError:  # pragma: no cover - character_card is created in parallel
         return ""
 
 
+def _as_bool(value: Any, default: bool = True) -> bool:
+    """Coerce a config value into bool (handles ``"false"`` / ``0`` / ``"off"``)."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() not in ("", "false", "0", "no", "off", "none")
+
+
 def _soul_summary(soul: Any) -> str:
     """Render the compact `{soul_summary}` snippet of a soul (safe fallback)."""
     try:
@@ -38,7 +49,17 @@ def _soul_summary(soul: Any) -> str:
 class AtmosphereReader:
     """
     群聊主战场：防抖等待窗口、多人对话“解线团”、五维读空气器 (`core/atmosphere_reader.py`)
+
+    v2.10 adds a probability / budget reply gate **between** the direct-mention +
+    BUSY fast paths and the debounce window: ordinary (non-@) group messages are
+    sampled by ``reply_gate_probability`` and optionally capped by
+    ``reply_gate_hourly_limit`` before any decision-model call happens. @ / wake /
+    quote messages, BUSY special cases and private chats return earlier and are
+    never affected by the gate.
     """
+
+    #: Rolling gate budget window (one hour, in seconds).
+    GATE_BUDGET_WINDOW_SECONDS = 3600.0
 
     def __init__(
         self,
@@ -50,6 +71,9 @@ class AtmosphereReader:
         self.model_hub = model_hub
         self.plugin_config = plugin_config
         self._latest_seq: dict[str, int] = {}
+        # v2.10: per-UMO timestamps of ordinary group messages that passed the
+        # probabilistic gate (used only when ``reply_gate_hourly_limit`` > 0).
+        self._gate_pass_ts: dict[str, list[float]] = {}
 
     @property
     def cfg(self) -> dict[str, Any]:
@@ -62,6 +86,99 @@ class AtmosphereReader:
     @property
     def debounce_seconds(self) -> float:
         return max(0.0, float(self.cfg.get("debounce_seconds", 4.0)))
+
+    # ------------------------------------------------------------------
+    # v2.10: probability / budget reply gate (non-@ ordinary group messages only)
+    # ------------------------------------------------------------------
+    @property
+    def reply_gate_enabled(self) -> bool:
+        """Whether the probabilistic reply gate is active (default: on)."""
+        return _as_bool(self.cfg.get("reply_gate_enabled", True), True)
+
+    @property
+    def reply_gate_probability(self) -> float:
+        """Percentage (0~100) of ordinary group messages admitted to read-air."""
+        try:
+            value = float(self.cfg.get("reply_gate_probability", 80))
+        except (TypeError, ValueError):
+            return 80.0
+        return max(0.0, min(100.0, value))
+
+    @property
+    def reply_gate_hourly_limit(self) -> int:
+        """Max gate passes per UMO per rolling hour (``0`` = unlimited)."""
+        try:
+            value = int(float(self.cfg.get("reply_gate_hourly_limit", 0)))
+        except (TypeError, ValueError):
+            return 0
+        return max(0, value)
+
+    def _passes_reply_gate(self, umo: str) -> bool:
+        """Decide whether one non-@ ordinary group message may enter read-air.
+
+        Order of checks: probability first, then the optional rolling hourly
+        budget. Rejected messages are logged once and never reach the decision
+        model or the debounce window; they are **not** unread (they already
+        passed the three-state gate), so the unread backlog is untouched.
+        """
+        if not self.reply_gate_enabled:
+            return True
+
+        probability = self.reply_gate_probability
+        if probability < 100.0:
+            if random.random() * 100.0 >= probability:
+                logger.info(
+                    "[OnlyYou] Reply gate dropped non-@ group message "
+                    f"(probability={probability:.0f}%, umo={umo})"
+                )
+                return False
+
+        limit = self.reply_gate_hourly_limit
+        if limit <= 0:
+            return True
+
+        now = time.time()
+        cutoff = now - self.GATE_BUDGET_WINDOW_SECONDS
+        stamps = [
+            stamp
+            for stamp in self._gate_pass_ts.get(umo, [])
+            if float(stamp) >= cutoff
+        ]
+        if len(stamps) >= limit:
+            self._gate_pass_ts[umo] = stamps
+            logger.info(
+                "[OnlyYou] Reply gate dropped non-@ group message "
+                f"(hourly limit={limit}, umo={umo})"
+            )
+            return False
+        stamps.append(now)
+        self._gate_pass_ts[umo] = stamps
+        return True
+
+    def clear_gate_budget(
+        self, umo: Optional[str] = None, platform_id: str = ""
+    ) -> int:
+        """Drop rolling gate-budget bookkeeping and return the removed UMO count.
+
+        - ``umo`` given: clear that one session only;
+        - ``platform_id`` given: clear every session of that bot instance
+          (used by ``main.clear_platform_memory_state`` on Soul unbind);
+        - neither: clear everything.
+        """
+        if umo:
+            return 1 if self._gate_pass_ts.pop(umo, None) is not None else 0
+        clean = str(platform_id or "").strip()
+        if not clean:
+            removed = len(self._gate_pass_ts)
+            self._gate_pass_ts.clear()
+            return removed
+        prefix = f"{clean}:"
+        doomed = [
+            key for key in list(self._gate_pass_ts.keys()) if str(key).startswith(prefix)
+        ]
+        for key in doomed:
+            self._gate_pass_ts.pop(key, None)
+        return len(doomed)
 
     @staticmethod
     def extract_reply_topology(event: Any) -> tuple[str, bool]:
@@ -157,10 +274,13 @@ class AtmosphereReader:
         - In private chat: always reply (`True`) once state gate allows.
         - In group chat:
           * If `takeover_group_chat` is False: follow native `is_direct_mention`.
-          * Apply debounce wait window (`debounce_seconds`) if not a direct mention; if a newer
-            message arrives in the same group during debounce, let the newer message handle the turn.
           * If directly mentioned (`@` / quote / wake word) or sent by L3 Core User in IDLE: reply.
           * In BUSY state (only L2/L3 reach here): only reply in group if directly mentioned or L3.
+          * v2.10 probability / budget gate: ordinary (non-@) group messages are
+            sampled by `reply_gate_probability` (+ optional `reply_gate_hourly_limit`)
+            before the debounce window and before any decision-model call.
+          * Apply debounce wait window (`debounce_seconds`) if not a direct mention; if a newer
+            message arrives in the same group during debounce, let the newer message handle the turn.
           * In IDLE state: run small-LLM 5D atmosphere evaluation (`ATMOSPHERE_EVAL_PROMPT`).
         """
         if self.is_private_event(event):
@@ -183,6 +303,12 @@ class AtmosphereReader:
         # Fast-path: direct mention in IDLE state
         if is_direct_mention:
             return True
+
+        # v2.10: probability / budget gate — only non-@ ordinary group messages reach
+        # here (private / BUSY / direct-mention paths returned above). A rejected
+        # message is dropped before debounce and before any decision-model call.
+        if not self._passes_reply_gate(umo):
+            return False
 
         # Group debounce window for un-mentioned group messages
         seq = self._latest_seq.get(umo, 0) + 1

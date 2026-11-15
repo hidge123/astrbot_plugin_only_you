@@ -2636,7 +2636,9 @@ class OnlyYouWebAPI:
                 if soul is None:
                     soul = (await self.plugin.soul_manager.list_souls())[0]
                 transcript = (
-                    self.plugin.session_buffer.get_window_transcript(umo=umo, max_turns=15)
+                    self.plugin.session_buffer.get_extraction_transcript(
+                        umo=umo, max_turns=15
+                    )
                     if umo
                     else ""
                 )

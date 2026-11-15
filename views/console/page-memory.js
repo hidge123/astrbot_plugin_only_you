@@ -104,6 +104,26 @@
     return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
   }
 
+  /**
+   * v2.10：记忆形成时间的绝对展示（`created_at_text` 优先，缺失时用本地时间回退计算）。
+   */
+  function fmtDateTime(seconds) {
+    var ts = num(seconds, 0);
+    if (!ts) return "";
+    var d = new Date(ts * 1000);
+    return (
+      d.getFullYear() +
+      "-" +
+      pad2(d.getMonth() + 1) +
+      "-" +
+      pad2(d.getDate()) +
+      " " +
+      pad2(d.getHours()) +
+      ":" +
+      pad2(d.getMinutes())
+    );
+  }
+
   function tierMeta(tier) {
     return TIER_META[Number(tier)] || TIER_META[2];
   }
@@ -415,8 +435,16 @@
       })
       .join("");
     var recall = Math.max(0, Math.round(num(memory.access_count, 0)));
-    var when = fmtAgo(memory.last_accessed_at) || fmtAgo(memory.created_at);
-    var recallText = "召回 " + recall + " 次" + (when ? " · " + when : "");
+    /* v2.10：记忆形成时间是其相对时间表述的锚点，展示绝对时间 + 相对时间。 */
+    var createdTs = num(memory.created_at, 0);
+    var createdText = String(memory.created_at_text || "") || fmtDateTime(createdTs);
+    var lastText =
+      String(memory.last_accessed_at_text || "") || fmtDateTime(num(memory.last_accessed_at, 0));
+    var when = fmtAgo(createdTs);
+    var recallText = "召回 " + recall + " 次" + (when ? " · 形成于 " + when : "");
+    var recallTip = createdText
+      ? "形成于 " + createdText + (lastText ? " · 最近提及 " + lastText : "")
+      : "记忆形成时间未知";
     return (
       '<div class="memory-row" data-memory-id="' +
       esc(memory.id) +
@@ -448,7 +476,9 @@
       '<div class="memory-row-meta">' +
       userLabelHtml(memory) +
       vitalityHtml(memory, tier) +
-      '<span class="memory-recall">' +
+      '<span class="memory-recall" data-tip="' +
+      esc(recallTip) +
+      '">' +
       esc(recallText) +
       "</span></div>" +
       /* 列4：升降级 + 编辑 + 删除 */

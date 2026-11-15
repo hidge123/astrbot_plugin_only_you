@@ -150,8 +150,12 @@ stateDiagram-v2
 1. **第一关（状态门禁）**：
    - 若当前为 **`💤 休息中 (RESTING)`** $\rightarrow$ 直接拦截返回（不回消息，零 Token 消耗）。
    - 若当前为 **`🔥 繁忙中 (BUSY)`** $\rightarrow$ 检查发言者等级：若全为 `L1 普通用户`，直接拦截返回；只有包含 `L2 重要用户` 或 `★ L3 核心用户` 时才放行进入防抖窗口！
-   - 若当前为 **`☕ 空闲中 (IDLE)`** $\rightarrow$ 全员放行进入防抖等待窗口（`3~6 秒`）。
-2. **第二关（多人对话解线团与决策模型读空气）**：
+   - 若当前为 **`☕ 空闲中 (IDLE)`** $\rightarrow$ 全员放行，进入下一关。
+2. **第二关（概率 / 预算门闸，v2.10）**：
+   - 只作用于**非 @ 的普通群消息**：@ / 唤醒 / 引用 Bot 的消息与 `BUSY` 特判路径在第一关之后已直接放行，不经过本关。
+   - 先按 `reply_gate_probability`（默认 **80%**）抽样，再过 `reply_gate_hourly_limit`（同一群聊滚动 1 小时内的判定次数上限，默认 **0 = 不限**）；任一项未通过即**直接放弃本次消息**——不进入防抖、不调用读空气决策模型，也不进入未读队列（已通过三态门禁，只是不参与读空气）。
+   - `reply_gate_enabled=false` 或概率 100% 时与旧行为完全一致；概率 0% 时普通群消息完全不读空气（@ 仍会回复）。拦截原因会写入日志 `[OnlyYou] Reply gate dropped non-@ group message (...)`。
+3. **第三关（多人对话解线团与决策模型读空气）**：
    - 梳理群内引用回复（`Reply`）与 `@` 拓扑，认清谁在跟谁说话。
    - 决定动作：`IGNORE`（潜水）、`REPLY`（短句接话）、`GROUP_SHARE_VIDEO`（当处于 `空闲中` 且兜里有刚刷到的应景视频时，顺手甩进群里）、或 `WHISPER_TO_CORE`（群内闭嘴，转头私聊找 L3 核心用户耳语吐槽）。
 
@@ -230,7 +234,19 @@ $$\Delta \text{Vitality} = -\frac{\text{BaseDecay}}{\text{Importance} \times \te
 
 ---
 
-### 4.4 🛡️ 简易上下文管理器 (Lightweight Context & Budget Manager)
+### 4.4 🕰️ 记忆时间锚点与相对时间解冻（v2.10）
+
+> **问题**：T3 核心记忆永久保留，其中的「这周末 / 明天 / 昨天」等相对时间表述在几周后仍原样出现，模型既无法还原其绝对指向，也无法判断这条记忆是否已经过期；冷群 15 条滑窗横跨数天时，提炼模型也不知道「今天」是哪一天。
+
+- **存储侧时间基准**：记忆仍以 `memories.created_at`（形成/被抽取时刻）为唯一权威时间基准，`MemoryItem.to_dict()` 额外输出 `created_at_text` / `last_accessed_at_text` 可读时间；Pages「记忆」页在召回信息上展示「形成于 YYYY-MM-DD HH:MM」绝对时间 tooltip（无数据库结构变更、GC 语义不变）。
+- **注入侧逐条标注**：`ContextBudgetManager` 注入记忆时写为 `- [层级 · 形成于 2026-11-05（星期四，10 天前）] 记忆正文`，并在记忆块之前注入 `MEMORY_TIME_CONTEXT_PROMPT`：说明该时间是**记忆形成时间（记忆锚点）**而非当前时间、正文中的相对时间按锚点换算、换算后已过去的日期视为历史/可能过期、未到才是未来安排；形成越久越当旧回忆。**记忆正文保持原样，不做任何日期改写**。
+- **提炼窗口带时间**：会话滑窗注入提炼模型时，`SessionBuffer.get_extraction_transcript()` 生成 `【窗口时间范围】首条时间 ~ 末条时间（跨度 N 天），共 N 条消息` 头部 + 每条消息 `[YYYY-MM-DD HH:MM]` 真实发送时间；`MEMORY_EXTRACT_AND_GRADE_PROMPT` 同时给出 `当前真实时间：YYYY-MM-DD（星期）HH:MM`，让模型能定位窗口覆盖的日期范围、判断消息先后与新鲜度（仍不强制把相对时间改写成绝对日期，正文 50 字上限不变）。
+- **其他注入链路**：`IDLE_ROAM(MEMORY_MUSE)` 的记忆素材同样带形成时间；`/onlyyou memory list` 展示每条记忆的形成时间。
+- **边界**：不改 `req.contexts` 聊天滑窗格式（时间基准只进提炼与记忆注入链路）；时间戳非法 / 缺失 / 未来（时钟回拨）时标签安全降级为空串，绝不阻塞 LLM 请求。
+
+---
+
+### 4.5 🛡️ 简易上下文管理器 (Lightweight Context & Budget Manager)
 
 为了防止随着使用时间增长，插入的记忆过多或历史对话过长导致 **Token 费用激增** 与 **上下文窗口超载（Context Overflow）**，插件内置一个零 LLM 开销的简易上下文管理器：
 
@@ -448,3 +464,24 @@ flowchart TB
 - **降级语义**：`souls/` 目录不可写时降级为 SQLite-only（数据不丢），日志 / 保存响应显式告警；恢复目录权限后读取 / 保存会自动回填 JSON。
 - **回滚**：v2.8 保持 SQLite `souls` 索引与 `plugin_settings` 同步，因此回退到 v2.7 仍可读取旧数据（新版新增的 `revision` / `model_config` / `bound_platforms` / `settings` 字段旧版会忽略）；回滚步骤与数据校验见 `docs/UPGRADE.md`。
 - **验收**：全量离线 unittest 回归全绿（数量以实际运行为准，不在文档写死）；`compileall` 与 `node --check` 通过；Pages 8 页可打开；升级日志包含 `Registered 31 Web API routes for Plugin Pages.` 与 `Plugin initialized successfully.` 且无 Traceback。
+
+---
+
+## 七、 v2.10 增量需求：记忆时间标注 + 读空气概率/预算门闸
+
+> v2.10 不改变「三态门禁 × 四类行动卡 × 24h 动态时间轴」的产品主干，只补齐两个长期体验问题：**记忆里的相对时间会冻结、跨天滑窗无法定位**，以及**读空气判定密度过高导致 AI 过于活跃**。
+
+### 7.1 记忆时间标注（T1）
+
+- **目标**：记忆在存储与注入两个环节都带时间基准；模型朗读记忆时能把「这周末 / 明天」解冻为绝对日期并判断是否过期；提炼模型拿到跨天窗口时知道每条消息属于哪一天、「今天」是哪一天。
+- **实现要点**：新增 `core/time_utils.py`；`to_dict()` 增可读时间字段 + Pages 展示；`MEMORY_EXTRACT_AND_GRADE_PROMPT` 注入当前时间与逐条消息时间戳；记忆注入逐条标注「形成于 …（星期，N 天前）」并注入 `MEMORY_TIME_CONTEXT_PROMPT`；MEMORY_MUSE 素材同样带时间。
+- **不做什么**：不改写记忆正文（不强制把相对时间换算成绝对日期）、不改数据库结构、不改 GC / T1 去重 / 预算裁剪语义、不改 `req.contexts` 聊天滑窗格式。
+- **验收**：见 `docs/TODO.md` T1 验收标准（已勾选）。
+
+### 7.2 读空气概率/预算门闸（T2）
+
+- **目标**：在「BUSY 特判 + 直接提及快速放行」之后、「防抖等待 + 读空气决策模型」之前增加概率 / 预算门闸，只影响非 @ 普通群消息，降低无意义判定与抢话频率。
+- **默认值**：开启 + 通过概率 **80%** + 每小时判定上限 **0（不限）**；`100%` 或不开启 = 与旧版一致，`0%` = 普通群消息不读空气（@ 仍回复）。
+- **配置**：`_conf_schema.json → atmosphere_config.reply_gate_enabled / reply_gate_probability / reply_gate_hourly_limit`（普通配置即可见、可调、可关闭，修改后即时生效）。
+- **可观测**：拦截日志 `[OnlyYou] Reply gate dropped non-@ group message (probability=…% | hourly limit=…, umo=…)`；被拦截消息不进入防抖、不调用决策模型、不算未读。
+- **验收**：见 `docs/TODO.md` T2 验收标准（已勾选）。

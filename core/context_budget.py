@@ -12,10 +12,17 @@ from .memory_manager import MemoryManager, MemoryTier
 from .roguelite_deck import DailyScheduleRun, SlotInstance
 from .soul_manager import SoulProfile
 from .state_machine import ActionType, BotState
+from .time_utils import (
+    current_datetime_text,
+    describe_time_anchor,
+    describe_time_span,
+    format_transcript_stamp,
+)
 from .user_relation import UserProfile
 from ..prompts.templates import (
     BUSY_STATE_INJECTION_PROMPT,
     IDLE_STATE_INJECTION_PROMPT,
+    MEMORY_TIME_CONTEXT_PROMPT,
     MUTATION_MONOLOGUE_INJECTION_PROMPT,
     USER_RELATION_CONTEXT_PROMPT,
 )
@@ -63,12 +70,22 @@ class BufferedMessage:
         header = f"[{self.user_tier_label} {self.sender_name}(ID:{self.sender_id}){reply_tag}]"
         return {"role": "user", "content": f"{header}: {self.content}"}
 
-    def format_for_transcript(self) -> str:
-        """Format as a single line for memory extraction / atmosphere reading."""
+    def format_for_transcript(self, with_time: bool = False) -> str:
+        """Format as a single line for memory extraction / atmosphere reading.
+
+        v2.10: ``with_time=True`` prefixes the message's real local send time
+        (``[2026-11-15 21:04]``) so a cold window spanning several days can be
+        located by the extraction model. The default stays ``False`` to keep
+        every pre-v2.10 prompt (atmosphere / unread batch) byte-identical.
+        """
+        stamp = f"[{format_transcript_stamp(self.timestamp)}] " if with_time else ""
         if self.role == "assistant":
-            return f"[{self.sender_name}(Bot)]: {self.content}"
+            return f"{stamp}[{self.sender_name}(Bot)]: {self.content}"
         reply_tag = f" -> 回复 {self.reply_to}" if self.reply_to else ""
-        return f"[{self.user_tier_label} {self.sender_name}(ID:{self.sender_id}){reply_tag}]: {self.content}"
+        return (
+            f"{stamp}[{self.user_tier_label} {self.sender_name}"
+            f"(ID:{self.sender_id}){reply_tag}]: {self.content}"
+        )
 
 
 class SessionBuffer:
@@ -406,7 +423,7 @@ class SessionBuffer:
         if len(evicted) >= self.extract_every_n_messages:
             batch = list(evicted)
             evicted.clear()
-            transcript = "\n".join(m.format_for_transcript() for m in batch)
+            transcript = self.format_extraction_transcript(batch)
             if on_overflow_callback is not None:
                 try:
                     loop = asyncio.get_running_loop()
@@ -444,6 +461,41 @@ class SessionBuffer:
         if not win:
             return "（暂无近期对话）"
         return "\n".join(m.format_for_transcript() for m in win)
+
+    # ------------------------------------------------------------------
+    # v2.10: time-stamped transcript handed to the memory-extraction model
+    # ------------------------------------------------------------------
+    def format_extraction_transcript(self, messages: list[BufferedMessage]) -> str:
+        """Render evicted/window messages with per-message real send times.
+
+        Layout (TODO T1 acceptance #2: the extraction model must be able to tell
+        which day the first / last message belongs to and what "today" is)::
+
+            【窗口时间范围】2026-11-10 09:12 ~ 2026-11-15 21:04（跨度 6 天），共 15 条消息
+            [2026-11-10 09:12] [L1 阿一(ID:u-1)]: 这周末去考试吗
+            ...
+
+        The current real time is injected separately by
+        ``MemoryManager.extract_memories_from_transcript`` via
+        ``MEMORY_EXTRACT_AND_GRADE_PROMPT.current_datetime``.
+        """
+        batch = [m for m in (messages or []) if m is not None]
+        if not batch:
+            return "（暂无近期对话）"
+        stamps = [float(getattr(m, "timestamp", 0.0) or 0.0) for m in batch]
+        span = describe_time_span(min(stamps), max(stamps))
+        lines = [f"【窗口时间范围】{span}，共 {len(batch)} 条消息"]
+        lines.extend(m.format_for_transcript(with_time=True) for m in batch)
+        return "\n".join(lines)
+
+    def get_extraction_transcript(self, umo: str, max_turns: int = 15) -> str:
+        """Time-stamped transcript of ``umo``'s last ``max_turns`` messages.
+
+        Used by the sliding-window overflow callback and by the manual
+        ``/onlyyou memory extract`` / Pages「记忆 → 提炼」entries.
+        """
+        win = self._windows.get(umo, [])[-max_turns:]
+        return self.format_extraction_transcript(win)
 
     def get_window_sender_ids(self, umo: str) -> list[str]:
         """Return distinct user ``sender_id`` values of ``umo``'s window (newest first).
@@ -832,7 +884,14 @@ class ContextBudgetManager:
             else:
                 tag = "瞬时记忆"
 
-            selected_lines.append(f"- [{tag}] {mem.content}")
+            # v2.10: every recalled memory carries its formation-time anchor so the
+            # model can resolve relative expressions ("这周末 / 明天") and judge
+            # whether the memory is already stale. Content itself stays untouched.
+            anchor = describe_time_anchor(mem.created_at, now)
+            if anchor:
+                selected_lines.append(f"- [{tag} · 形成于 {anchor}] {mem.content}")
+            else:
+                selected_lines.append(f"- [{tag}] {mem.content}")
             current_chars += len(mem.content)
             recalled_ids.append(mem.id)
 
@@ -914,6 +973,13 @@ class ContextBudgetManager:
             additions.append(relation_block)
 
         if selected_lines:
+            # v2.10: the instruction block must precede the memory lines so the model
+            # treats each "形成于 …" label as the anchor for relative expressions.
+            additions.append(
+                MEMORY_TIME_CONTEXT_PROMPT.format(
+                    current_datetime=current_datetime_text(now)
+                )
+            )
             additions.append(
                 "[脑海中的相关记忆 (精简注入)]:\n" + "\n".join(selected_lines)
             )

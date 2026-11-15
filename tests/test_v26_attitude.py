@@ -567,8 +567,12 @@ class TestUserRelationPromptInjection(UserRelationInjectionTestBase):
         )
         sp = req.system_prompt
         assert "当前三态控制器" in sp
-        assert sp.index("[用户关系等级与重要度法则]") < sp.index("[脑海中的相关记忆")
-        assert "- [近期记忆] 用户喜欢猫" in sp
+        assert sp.index("[用户关系等级与重要度法则]") < sp.index("[记忆时间基准]")
+        assert sp.index("[记忆时间基准]") < sp.index("[脑海中的相关记忆")
+        # v2.10: recalled memories are annotated with their formation-time anchor
+        # (the relative-time anchor), content itself stays untouched.
+        assert "- [近期记忆 · 形成于 " in sp
+        assert "] 用户喜欢猫" in sp
 
 
 # ===========================================================================

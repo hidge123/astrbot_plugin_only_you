@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from .model_hub import ModelHub
+from .time_utils import current_datetime_text, format_local_datetime
 from ..prompts.templates import MEMORY_EXTRACT_AND_GRADE_PROMPT
 from ..storage.db import DatabaseManager
 
@@ -71,6 +72,9 @@ class MemoryItem:
             "access_count": self.access_count,
             "created_at": self.created_at,
             "last_accessed_at": self.last_accessed_at,
+            # v2.10: human readable local time (the epoch fields stay authoritative).
+            "created_at_text": format_local_datetime(self.created_at),
+            "last_accessed_at_text": format_local_datetime(self.last_accessed_at),
         }
 
 
@@ -471,17 +475,28 @@ class MemoryManager:
         soul_name: str,
         transcript_text: str,
         umo: Optional[str] = None,
+        now_ts: Optional[int] = None,
     ) -> int:
         """
         Invoke the decision model with `MEMORY_EXTRACT_AND_GRADE_PROMPT` on evicted sliding-window
         messages and store extracted memories into SQLite.
+
+        v2.10: the prompt receives the **current local time** (weekday included); the
+        transcript itself is expected to carry one ``[YYYY-MM-DD HH:MM]`` stamp per
+        message (``SessionBuffer.format_extraction_transcript``). Memory content is
+        stored verbatim (no forced date rewriting) — relative expressions are
+        resolved later when the memory is injected with its formation-time anchor.
+        All memories extracted in one batch share ``now_ts`` as their ``created_at``
+        anchor so the injected time label is consistent.
         """
         if not self.enabled or not (transcript_text or "").strip():
             return 0
 
+        anchor_ts = int(now_ts if now_ts is not None else time.time())
         prompt = MEMORY_EXTRACT_AND_GRADE_PROMPT.format(
             soul_name=soul_name,
             recent_chat_transcript=transcript_text,
+            current_datetime=current_datetime_text(anchor_ts),
         )
         items = await self.model_hub.call_llm_json(
             prompt=prompt, role="decision", umo=umo, default=[]
@@ -512,6 +527,7 @@ class MemoryManager:
                 user_id=str(user_id) if user_id else None,
                 user_tier=user_tier,
                 memory_tier=int(memory_tier) if memory_tier in (1, 2, 3) else None,
+                created_at=anchor_ts,
             )
             if row_id > 0:
                 inserted += 1

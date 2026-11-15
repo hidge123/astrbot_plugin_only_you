@@ -478,3 +478,36 @@ v2.9 起用户数据拆成两层：`users` 只保存**全局身份**（`global_u
 - 迁移失败/无 Soul 时不会写入 flag，下次启动自动重试；可重复执行不产生重复行。
 - `users` 旧关系列保留作回退，**请勿手工删除**；回滚到 v2.8 时旧列仍可读，但 v2.9 期间按角色修改的关系不会回写旧列。
 - 回滚步骤：恢复升级前的 `only_you.db` 备份 + 旧版插件文件，重启；`user_relations` 表可保留（旧版不读取）。
+
+---
+
+## 18. v2.10.0 记忆时间标注 + 读空气概率/预算门闸
+
+> 本版本**无数据库结构变更、无 Web API 路由增减、无一次性迁移 flag**；部署方式与 v2.9 → v2.10 一致：备份 → 覆盖插件文件 → 热重载 / 重启容器 → 确认日志无 Traceback。
+
+### 18.1 升级后行为变化
+
+| 变化 | 影响 | 需要做什么 |
+| :--- | :--- | :--- |
+| **读空气概率门闸默认开启 80%** | 普通（非 @）群消息默认约 20% 不再进入读空气决策模型；@ / 唤醒 / 引用 Bot、`BUSY` 特判与私聊不受影响 | 想保持旧行为：把 `atmosphere_config.reply_gate_probability` 改为 `100` 或关闭 `reply_gate_enabled`；想更安静：调到 0~70 或设置 `reply_gate_hourly_limit` |
+| **记忆注入新增 `[记忆时间基准]` 块** | System Prompt 多一小段固定指令（约 190 字），每条记忆前多「形成于 …（星期，N 天前）」标注 | 无需操作；Token 预算仍由 `max_injected_memories` / `max_memory_chars_budget` 控制（预算只统计记忆正文） |
+| **记忆提炼 Prompt 带时间基准** | 提炼模型拿到「当前时间 + 每条消息真实发送时间 + 窗口时间范围」，更会判断消息新鲜度；**记忆正文写法与 50 字上限不变** | 无需操作（无数据库变化） |
+| **Pages 记忆页显示形成时间** | 召回列显示 `形成于 N 天前` + 绝对时间 tooltip | 刷新页面即可（静态资源随插件覆盖） |
+
+### 18.2 部署与校验步骤
+
+1. **备份**（可选但推荐）：`docker exec astrbot cp /AstrBot/data/plugin_data/astrbot_plugin_only_you/only_you.db /AstrBot/data/plugin_data/astrbot_plugin_only_you/only_you.db.bak_v29`。
+2. 覆盖 `data/plugins/astrbot_plugin_only_you/` 下的插件文件（先删除旧 `__pycache__`），热重载或重启容器。
+3. 确认日志出现：
+   - `[OnlyYou] Registered 31 Web API routes for Plugin Pages.`
+   - `[OnlyYou] Plugin initialized successfully.`
+   - 无 Python Traceback。
+4. 行为抽查：
+   - 普通群消息被门闸拦截时出现 `[OnlyYou] Reply gate dropped non-@ group message (...)`；私聊 / @ 消息不会出现该日志。
+   - Pages「记忆」页每行显示「形成于 …」；`/onlyyou memory extract` 后可看到新记忆带形成时间。
+5. 无数据迁移需要校验；`memories` 表结构与 v2.9 完全一致。
+
+### 18.3 回滚
+
+- 回滚到 v2.9：恢复旧插件文件并热重载即可；`plugin_settings` / `souls/*.json` / `memories` 结构未变，v2.9 可正常读取。
+- 唯一「降级差异」：v2.10 期间由门闸拦下的普通群消息不会补回（本来就不算未读）；记忆里的相对时间在 v2.9 下重新失去注入时间锚点，但不影响数据。

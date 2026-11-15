@@ -26,6 +26,7 @@
 - **每天都不同的繁忙成果**：`BUSY_TASK` 每次走完 100%（或中途被打断）都会由决策模型生成一句**当天专属、带随机小细节的完成结果**（如*“回春丹炼成了但最后一炉差点炸炉”*），直接写入 Tier 1 短时记忆，彻底替代旧版奇遇卡作为聊天谈资。
 - **旧数据平滑迁移**：旧 6 时段 / 过夜日程会被自动重抽；旧事件卡按 `state + title` 自动推导 `action_type` 与合理时长区间，无需手工改库。
 - **未读消息补回**：睡觉 / 繁忙时被门禁拦下的消息会进入独立未读队列（读空气判“不回复”的不算）；醒来或忙完后，**私聊主动补回一句自然回复**，**群聊先读空气决策再决定是否插话**，消费即清空，可 `/onlyyou unread [list|flush|clear]` 调试。**未读队列是内存态，重启会清空（既定产品语义，见 ⑭）**。
+- **读空气概率/预算门闸（v2.10）**：在「BUSY 特判 + @/唤醒/引用快速放行」之后、「防抖等待 + 读空气决策模型」之前，对**非 @ 普通群消息**先按 `reply_gate_probability`（默认 **80%**）抽样、再过 `reply_gate_hourly_limit`（同一群聊每小时判定上限，默认 **0 = 不限**）；未通过直接放弃，**不调用决策模型、不进入防抖、不算未读**。@ / 唤醒 / 引用、`BUSY` 特判与私聊完全不受影响；关闭门闸或概率调 100% 即与旧版一致（见 ⑰）。
 
 ### ③ 输入驱动的受限日程微调（动态切分 / 延展真实时间块）
 - **无输入不变卦**：AI 绝不凭空乱改计划，只有收到高冲击力的真实外部输入——即 **读取到的用户消息**（如 ★L3核心用户找它、或 L2熟人群聊爆大瓜）或 **刚刷到的 B站/抖音高分视频** 时，才会击穿当前时间块护甲并实时改写时间轴：
@@ -43,6 +44,7 @@
 ### ⑤ 精简版分级记忆、定时自动遗忘与上下文预算管理
 - **参考并精简自 `livingmemory`**：剔除笨重的 2D/3D 图谱看板与高延迟的 Agent Tool 调用，采用轻量化单表 SQLite + 「关键词 + 时间新鲜度 + 重要度」混合打分召回（不使用 Embedding / Rerank）。
 - **三级记忆与定时遗忘（Forgetting GC）**：**Tier 3 核心记忆**（永久保留重要事实与约定）、**Tier 2 近期记忆**（按重要度与访问次数动态衰减）、**Tier 1 瞬时记忆**（今日繁忙卡的随机完成结果、刚看的视频与翻群吃瓜见闻，活 48h）。v2.8 起 T1 增加「同角色内容去重 + 每角色上限（默认 30）+ 启动 / 心跳实时清理 + 跨重启每日 GC 只跑一次」。
+- **记忆时间锚点（v2.10）**：每条记忆的注入行都带「形成于 2026-11-05（星期四，10 天前）」时间锚点，并附 `MEMORY_TIME_CONTEXT_PROMPT` 教模型把正文里的「这周末 / 明天 / 昨天」按形成时间解冻、判断是否已过期；记忆提炼的滑窗也带「当前真实时间 + 窗口首尾时间范围 + 每条消息发送时间」，冷群跨天窗口不再无法定位。**记忆正文不被改写、无数据库结构变更**（见 ⑯）。
 - **上下文预算管理器**：完全接管平台原生历史（`req.contexts.clear()` + 插件滑窗），并严格限制单次注入记忆的最大条数（默认 `<= 6 条`）与总字数预算（默认 `<= 400 字`），杜绝上下文窗口超载与 Token 费用失控。
 
 ### ⑥ 详细角色卡（10 分区 × 36 字段）：人设的单一数据源
@@ -109,6 +111,18 @@
 - **会话 / 机器人接口页**（`page-sessions.js` 重写）：当前角色绑定列表（已绑定 → 解绑并清理该平台内存；被其他角色占用 → 禁绑提示；未绑定 → 绑定到当前角色）、手动输入 `platform_id` 绑定、默认角色兜底开关（`sessions/default_soul`）、当前角色管辖活跃会话内存概览（单会话 / 整平台清空）。旧「默认角色 + UMO 绑定表」UI 已移除（后端 UMO 绑定 API 仅为兼容保留）。
 - **★L3 管理员级**：不展示 / 不可编辑好感度，不参与自动晋升；拖拽改级只在 L1 / L2 之间生效。
 - **模型页**按当前角色读写配置；**记忆页** T1 倒计时 / 上限；**冲浪页**顶部「赛博冲浪总开关」+「后台视频源（B站/抖音）」（均乐观更新 + 失败回滚）；`mock.js` 同步提供 `sessions/platforms`、`groups`、`tier1_limit`、`toggle_surfing` 等 Mock 形状，`views/console/index.html?mock=1` 可离线预览。
+
+### ⑯ 记忆时间标注：相对时间解冻 + 跨天滑窗定位（v2.10）
+- **注入即标注**：记忆块逐条写成 `- [核心记忆 · 形成于 2026-11-05（星期四，10 天前）] 正文`，并在块前注入 `MEMORY_TIME_CONTEXT_PROMPT`，说明该时间是**记忆形成时间（记忆锚点）**而非当前时间：正文里的「这周末 / 明天 / 昨天」按锚点换算成绝对日期，已过去的视为历史 / 可能过期，未到的才作为未来安排。**记忆正文保持原样，不做日期改写**。
+- **提炼窗口带时间**：`MEMORY_EXTRACT_AND_GRADE_PROMPT` 注入「当前真实时间（含星期）」，滑窗 transcript 带 `【窗口时间范围】首尾时间（跨度 N 天），共 N 条消息` 头部与逐条 `[YYYY-MM-DD HH:MM]` 发送时间——冷群跨多天的 15 条窗口也能定位每一天与「今天」。
+- **可读时间贯穿**：`MemoryItem.to_dict()` 增 `created_at_text / last_accessed_at_text`，Pages 记忆页展示「形成于 …」绝对时间；`/onlyyou memory list` 与 `IDLE_ROAM(MEMORY_MUSE)` 素材同样带形成时间。
+- **兼容边界**：无数据库结构变更、不改 GC / T1 去重语义、不改 `req.contexts` 聊天滑窗格式；新增 `core/time_utils.py` 统一本地时间格式化（固定中文星期、非法/未来时间戳安全降级）。
+
+### ⑰ 读空气概率 / 预算门闸：抑制 AI 过于活跃（v2.10）
+- **位置**：`AtmosphereReader.evaluate_should_reply` 中「BUSY 特判 + @/唤醒/引用快速放行」之后、「防抖等待 + 读空气决策模型」之前。
+- **只作用于非 @ 普通群消息**：先按 `reply_gate_probability`（默认 **80%**）抽样，再按 `reply_gate_hourly_limit`（同一群聊滚动 1 小时判定上限，默认 **0 = 不限**）限流；未通过则直接放弃——**不调用决策模型、不进入防抖、不进入未读队列**，日志输出 `[OnlyYou] Reply gate dropped non-@ group message (...)`。
+- **旁路完全不受影响**：私聊、@ / 唤醒 / 引用 Bot、`BUSY` 的 L2/L3 特判、`takeover_group_chat=false`；心跳「群未读回放决策」走独立冷却，不经过门闸。
+- **兼容**：`reply_gate_enabled=false` 或概率 `100%` 时行为与旧版一致；概率 `0%` 时普通群消息完全不读空气（@ 仍会回复）。三项配置均在 AstrBot 插件配置面板「🌬️ 群聊读空气」中可见、可调、可关闭。
 
 ---
 
@@ -189,7 +203,7 @@
 
 ```text
 OnlyYou/
-├── metadata.yaml                # 插件元数据（version: 2.8.3）
+├── metadata.yaml                # 插件元数据（version: 2.10.0）
 ├── _conf_schema.json            # AstrBot WebUI 配置 Schema（仅运行参数；无模型绑定）
 ├── requirements.txt             # Python 依赖
 ├── main.py                      # 插件入口：三态门禁 / selected_provider / LLM 钩子 / on_decorating_result TTS / 后台任务 / 指令
@@ -201,13 +215,14 @@ OnlyYou/
 │   ├── soul_manager.py          # Soul 独立 JSON 真源 / 索引自愈 / 平台绑定路由 / AI 造卡 / Persona 导入
 │   ├── runtime_state.py         # v2.8 运行态持久化（去重 / 冷却 / ★L3 目标 → plugin_settings）
 │   ├── user_relation.py         # 三级用户关系 + 用户专属态度 + 群聊档案（group_profiles）
-│   ├── memory_manager.py        # 分级记忆 + T1 去重/上限/清理 + MEMORY_MUSE 三桶抽样 + Forgetting GC
+│   ├── memory_manager.py        # 分级记忆 + T1 去重/上限/清理 + MEMORY_MUSE 三桶抽样 + Forgetting GC + v2.10 记忆时间基准
 │   ├── context_budget.py        # 上下文/记忆预算 + Persona 接管
 │   ├── provider_factory.py      # AstrBot Provider 内部结构封装（复用/自建实例、TTS）
 │   ├── model_hub.py             # 插件自治四角色模型网关（v2.8 支持按 Soul 读写）
 │   ├── platform_bridge.py       # 平台协同桥（唤醒 / 分段 / 主动语音消息 / 机器人接口探测）
 │   ├── web_api.py               # 31 条 Plugin Pages Web API
-│   └── atmosphere_reader.py     # 群聊读空气 / 解线团
+│   ├── time_utils.py            # v2.10 共享本地时间格式化（星期 / 形成时间锚点 / 窗口跨度）
+│   └── atmosphere_reader.py     # 群聊读空气 / 解线团 / v2.10 概率与每小时预算门闸
 ├── views/console/               # 控制台前端（无构建 classic script）
 │   ├── index.html / style.css   # 外壳 + 设计令牌（浅色 / 深色）
 │   ├── app.js / icons.js / charts.js / mock.js

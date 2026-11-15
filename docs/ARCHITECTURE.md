@@ -84,14 +84,15 @@ astrbot_plugin_only_you/
 │   ├── character_card.py        # 🎭 详细角色卡单一数据源：CARD_SCHEMA(10 分区/36 字段)、normalize/migrate（含 avatar Data URL 归一化）、Persona Prompt 渲染（头像不注入）
 │   ├── soul_manager.py          # 🗂️ Soul 持久化与路由：souls/*.json 唯一真源 + revision/内容哈希冲突裁决 + 原子写/自愈 + 机器人接口绑定 + 五级 resolve_soul + AI 造卡 / 原生 Persona 导入
 │   ├── user_relation.py         # 三级用户关系管理 (L1普通 / L2重要熟人 / ★L3核心用户) + 单用户专属态度 attitude + 跨平台映射 + 群聊档案 GroupProfile
-│   ├── memory_manager.py        # 🧠 精简版分级记忆引擎 (Tier1瞬时/Tier2近期/Tier3核心 + T1 去重/上限/实时清理 + MEMORY_MUSE 三层分桶 + 定时遗忘GC)
-│   ├── context_budget.py        # 🛡️ 上下文/记忆预算管理器 + _takeover_persona 三分支 + USER_RELATION_CONTEXT_PROMPT 关系上下文注入 + SessionBuffer 平台内存清理
+│   ├── memory_manager.py        # 🧠 精简版分级记忆引擎 (Tier1瞬时/Tier2近期/Tier3核心 + T1 去重/上限/实时清理 + MEMORY_MUSE 三层分桶 + 定时遗忘GC + v2.10 记忆形成时间基准/可读时间字段)
+│   ├── context_budget.py        # 🛡️ 上下文/记忆预算管理器 + _takeover_persona 三分支 + USER_RELATION_CONTEXT_PROMPT 关系上下文注入 + SessionBuffer 平台内存清理 + v2.10 时间戳提炼滑窗与记忆形成时间注入
+│   ├── time_utils.py            # 🕰️ v2.10 共享本地时间格式化（星期/形成时间锚点/窗口跨度），非法或未来时间戳安全降级
 │   ├── provider_factory.py      # 🔧 唯一触碰 AstrBot Provider 内部结构的封装（复用/自建实例、inst_map 自定义 id、TTS、dispose）
 │   ├── model_hub.py             # 🔌 插件自治四角色模型网关 (main/decision/vision/tts，可选继承；v2.8 按 Soul 读写，写 Soul JSON 的 model_config)
 │   ├── platform_bridge.py       # 🤝 AstrBot 平台配置协同桥 (extract_platform_id / list_platform_instances / 原生分段回复 / 流式 / 语音主动消息)
 │   ├── runtime_state.py         # 💾 v2.8 运行态持久化：runtime_state_v1 快照（分享去重 / muse 轮转 / 冷却 / ★L3 目标）跨重启恢复
 │   ├── web_api.py               # 🖥️ 31 条 Plugin Pages Web API 路由（v2.7 的 27 条 + v2.8 新增 sessions/* 4 条）
-│   └── atmosphere_reader.py     # 群聊主战场：防抖等待窗口、多人对话“解线团”、五维读空气器
+│   └── atmosphere_reader.py     # 群聊主战场：防抖等待窗口、多人对话“解线团”、五维读空气器 + v2.10 概率/每小时预算门闸（仅非 @ 普通群消息）
 ├── views/                       # 🎨 AstrBot 插件自定义页面 (Plugin Pages / Views，兼容 pages/)
 │   └── console/                 # 灰白+青绿极简控制台（48px 顶栏 + 216px 侧栏，8 个页面；v2.8 关系页/会话页改版）
 │       ├── index.html           # 外壳：顶栏、侧栏导航、main#view、toast/modal/drawer 容器
@@ -306,13 +307,18 @@ async def on_any_message(self, event: AstrMessageEvent):
             self.platform_bridge.apply_reply_decision(event, False)
             return
 
-    # 4. 群聊走读空气裁决 -> 若决定开口，放行交由 AstrBot 原生管线生成与分段发送
+    # 4. v2.10 概率 / 预算门闸（仅非 @ 普通群消息）：在进入防抖与读空气决策模型之前先按
+    #    reply_gate_probability / reply_gate_hourly_limit 抽样；未通过直接放弃（不调模型、不进防抖、
+    #    也不算未读）。@ / 唤醒 / 引用 与 BUSY 特判在上方已提前返回，私聊恒 True，均不受影响。
+    # 5. 群聊走读空气裁决 -> 若决定开口，放行交由 AstrBot 原生管线生成与分段发送
     #    注意：门禁放行后即使读空气判 IGNORE，这条消息也属于「已读」，不进未读队列
     should_reply = await self.atmosphere_reader.evaluate_should_reply(event, soul, user, current_block)
     self.platform_bridge.apply_reply_decision(event, should_reply)
 ```
 
 > **未读消息定义**：只统计**被三态门禁拦截**的消息（`RESTING` 全部 / `BUSY` 的 `L1`）；被放行后读空气判 `IGNORE` 的消息是“已读但不想回”，不算未读。未读队列由 `SessionBuffer._unread` 独立维护（不依赖 15 条滑窗驱逐、按群聊/私聊分类、TTL/容量/冷却可配）。
+
+> **v2.10 读空气概率/预算门闸**（`AtmosphereReader._passes_reply_gate`）：插在「BUSY 特判 + 直接提及快速放行」之后、「`_latest_seq` 防抖 + `asyncio.sleep(debounce_seconds)`」之前。概率语义 `random.random() * 100 < reply_gate_probability`（默认 **80**，100 = 恒通过、0 = 恒拦截）；`reply_gate_hourly_limit`（默认 **0 = 不限**）按 UMO 维护滚动 1 小时放行时间戳（`_gate_pass_ts`，每次检查顺带裁剪）。拦截分别输出 `Reply gate dropped non-@ group message (probability=…% | hourly limit=…, umo=…)`，消息不推进防抖 `seq`、不进入未读队列。
 
 #### 2. 四类行动卡 (`SLEEP` / `BUSY_TASK` / `SURF` / `IDLE_ROAM`) 的后台心跳调度
 后台异步心跳循环（每 15 分钟）按当前时间块 `current_block.action_type` 驱动真实行为。**v2.8 起心跳按 Soul 驱动**（`_souls_for_heartbeat()`：有机器人接口绑定的 Soul + 默认兜底 Soul 各自独立跑时间轴 / 模型配置 / 未读范围，详见 §6.3），先执行 `_maybe_run_scheduled_gc()` 再做逐 Soul 分发：
@@ -602,6 +608,29 @@ req.system_prompt = new_sp if n else card_block + sp
 5. **AI 造卡**：`generate_card(seed_text, base_card, section)` 用**主模型**生成整卡或单个分区草稿（不落库）；`import_native_persona(..., avatar="")` 把原生人设原文写入 `card["extra"]["native_persona_prompt"]`，可选 AI 整卡生成；四类专属行动卡池由**决策模型**生成（奇遇卡已移除）。
 6. **头像视觉元数据（v2.6）**：`identity.avatar` 经 `_coerce_avatar()` 归一化为「Emoji/短字符 ≤32 字 / `data:image/(png|jpeg|jpg|webp|gif);base64,...` ≤120000 字符 / 图片 URL ≤500 字符」三选一，非法形态归空；`_render_section()` 显式跳过 `identity.avatar`，因此图片 Base64 **绝不进入 System Prompt / Persona 预算**，仅由 Pages 前端 `app.renderAvatarInner()` 渲染。
 7. **关系态度提示词（v2.6）**：系统提示词新增 `USER_RELATION_CONTEXT_PROMPT`（见 `prompts/templates.py`），由 `ContextBudgetManager` 按当前用户与群聊窗口动态填充 `{display_name} / {global_uid} / {tier_label} / {intimacy} / {nickname_text} / {attitude_text} / {notes_text} / {window_peers_block}`；角色卡不再保存千篇一律的等级态度。
+
+---
+
+### 4.6 🕰️ 记忆时间锚点与时间戳提炼滑窗（v2.10）
+
+> 解决「T3 记忆里的『这周末 / 明天』几周后仍原样出现」与「冷群 15 条滑窗横跨多天、提炼模型不知道今天是哪天」两类长期问题。**只做时间标注，不改写记忆正文、不改数据库结构、不改 GC 语义。**
+
+1. **`core/time_utils.py`（新增）**：全部为纯函数、本地时区（与 `datetime.now()` 一致）、无效/缺失/非正/未来时间戳安全降级为空串或「今天/未来」，绝不抛异常。
+   - `format_local_datetime` / `format_local_date` / `format_transcript_stamp`（`YYYY-MM-DD HH:MM`）
+   - `describe_time_anchor(ts, now_ts)` → `2026-11-05（星期四，10 天前）`
+   - `current_datetime_text(now_ts)` → `2026-11-15（星期日）21:30`
+   - `describe_time_span(start, end)` → `2026-11-09 21:30 ~ 2026-11-15 21:30（跨度 6 天）`；同日 → `（同日）`
+   - 星期使用固定中文映射（`星期一`…`星期日`），不使用受 locale 影响的 `%A`。
+2. **存储侧**：`memories.created_at` 仍是唯一权威形成时间；`MemoryItem.to_dict()` 增 `created_at_text` / `last_accessed_at_text`（Web API 自动透出）；Pages「记忆」页 `page-memory.js` 在召回信息上展示「形成于 YYYY-MM-DD HH:MM · 最近提及 …」tooltip。
+3. **提炼侧**：`SessionBuffer.format_extraction_transcript(messages)` 生成
+   ```
+   【窗口时间范围】2026-11-09 21:30 ~ 2026-11-15 21:30（跨度 6 天），共 15 条消息
+   [2026-11-10 09:12] [L1 阿一(ID:u-1)]: 这周末去考试吗
+   ```
+   的 transcript（`format_for_transcript(with_time=True)`，逐条真实发送时间）；`get_extraction_transcript(umo, max_turns)` 供滑窗溢出回调、`/onlyyou memory extract` 与 Pages 提炼统一使用。`MEMORY_EXTRACT_AND_GRADE_PROMPT` 增 `{current_datetime}` 与「时间基准」说明（判断消息先后 / 新鲜度，但不强制改写正文，50 字上限不变）；`extract_memories_from_transcript(..., now_ts=None)` 同批记忆共享传入的形成锚点。
+4. **注入侧**：`ContextBudgetManager.apply_context_and_memory_budget` 为每条回忆记忆生成 `- [核心记忆 · 形成于 2026-11-05（星期四，10 天前）] {content}`，并在记忆块之前注入 `MEMORY_TIME_CONTEXT_PROMPT`（今天是 `{current_datetime}` / 标注是形成时间而非当前时间 / 相对时间按锚点解冻 / 已过去视为历史或可能过期 / 未到才是未来安排）；`injected_chars` 仍只统计正文，保持既有硬预算语义。
+5. **其他链路**：`IDLE_ROAM(MEMORY_MUSE)` 的记忆素材同样带 `【记忆 · 形成时间】`；`/onlyyou memory list` 展示形成时间。
+6. **兼容边界**：不改 `req.contexts` 聊天滑窗格式；`format_for_transcript()` 默认 `with_time=False`，读空气 / 未读补回等旧 Prompt 字节不变；T1 去重 / 上限 / 48h 清理 / Forgetting GC / MEMORY_MUSE 抽样行为全部保持不变。
 
 ---
 
@@ -1197,6 +1226,24 @@ async def touch_memories_for_muse(memory_ids) -> None
         "type": "float",
         "default": 4.0,
         "hint": "群聊消息后等待该时间再判断是否接话；等待期间有新消息则由新消息处理。"
+      },
+      "reply_gate_enabled": {
+        "description": "概率门闸",
+        "type": "bool",
+        "default": true,
+        "hint": "在防抖等待与读空气决策前，先按概率筛掉一部分非 @ 普通群消息；@ / 唤醒 / 引用、BUSY 特判与私聊不受影响，关闭后与旧版一致。"
+      },
+      "reply_gate_probability": {
+        "description": "门闸通过概率(%)",
+        "type": "int",
+        "default": 80,
+        "hint": "0~100：只有该比例的非 @ 普通群消息会继续进入防抖与读空气决策；100 = 不筛选（与旧版一致），0 = 普通群消息不再读空气（@ 仍会回复）。"
+      },
+      "reply_gate_hourly_limit": {
+        "description": "每小时判定上限",
+        "type": "int",
+        "default": 0,
+        "hint": "同一群聊每小时最多允许多少条非 @ 普通消息进入读空气判定；0 = 不限制，只按概率筛选。"
       }
     }
   },
@@ -1349,3 +1396,31 @@ v2.8 完成 Soul→机器人接口绑定后，`users` 表仍是「身份 + 关�
 
 - 启动时 `migrate_user_relations(platform_to_soul, default_soul_id, soul_ids)`：按每个 `users.platform_ids` 中平台归属的 Soul 拆分关系行；裸旧 ID 先按持久化私聊 UMO 证据推断平台，再回退默认/兜底角色；跨 Soul 的多平台用户各角色各一行；legacy 列保留不删。幂等 flag `plugin_settings["user_relations_migrated_v1"]`，失败/无 Soul 时不置位，下次启动重试。
 - 旧调用（无 `soul_id`）保持 `users` 列读写，测试基线（583 → v2.9 的 650+）全绿。
+
+---
+
+## 九、 v2.10 —— 记忆时间标注 + 读空气概率/预算门闸
+
+> 本章为 v2.10.0 收口记录（append-only）。两项改动的完整实现见 `docs/TODO.md` 的「已完成」区与 `docs/PRD.md` §七。
+
+### 9.1 记忆时间标注（T1）
+
+- **新增模块**：`core/time_utils.py`（纯函数本地时间格式化，无外部依赖、无异常逃逸）。
+- **数据流**：`SessionBuffer.get_extraction_transcript()`（`【窗口时间范围】… + 逐条 [YYYY-MM-DD HH:MM]`）→ `MemoryManager.extract_memories_from_transcript(now_ts=…)`（Prompt 含 `当前真实时间`，记忆 `created_at=now_ts`，正文原样、≤50 字）→ SQLite `memories`（无 schema 变更）→ `ContextBudgetManager`（逐条 `形成于 …（星期，N 天前）` + `MEMORY_TIME_CONTEXT_PROMPT`）→ 主模型。
+- **其他注入点**：`IDLE_ROAM(MEMORY_MUSE)` 素材带形成时间；`/onlyyou memory list` 展示形成时间；`MemoryItem.to_dict()` 输出 `created_at_text / last_accessed_at_text`，Pages 记忆页展示绝对时间 tooltip。
+- **必须保持的契约**：不改写记忆正文、不新增数据库列、不改 `created_at` 的 GC 语义、不改 `req.contexts` 聊天滑窗格式；`format_for_transcript()` 默认行为不变（读空气 / 未读补回 Prompt 字节不变）。
+- **测试**：`tests/test_v210_memory_time.py`（时间工具边界、滑窗时间戳与范围头、提炼 Prompt 时间基准、正文原样 + 旧行为、`to_dict` 可读时间、注入时间块与硬预算、MUSE 时间标注）。
+
+### 9.2 读空气概率/预算门闸（T2）
+
+- **插入点**：`AtmosphereReader.evaluate_should_reply` —— 私聊 / `takeover_group_chat=false` / 空文本 / `BUSY` 特判 / `is_direct_mention` 五次提前返回之后，`_latest_seq` 防抖与 `asyncio.sleep(debounce_seconds)` 之前。
+- **配置**：`atmosphere_config.reply_gate_enabled`（默认 `true`）、`reply_gate_probability`（默认 `80`，clamp 0~100）、`reply_gate_hourly_limit`（默认 `0` = 不限）。概率判断 `random.random() * 100 < probability`；每小时上限按 UMO 滚动 1 小时时间戳窗口（`_gate_pass_ts`，检查时顺带裁剪；`clear_gate_budget(umo=None)` 可手动清空）。
+- **语义**：拦截消息不推进防抖 `seq`、不调用决策模型、**不进入未读队列**（已通过三态门禁，只是不参与读空气）；日志 `[OnlyYou] Reply gate dropped non-@ group message (probability=…% | hourly limit=…, umo=…)`。
+- **不受影响**：私聊、@ / 唤醒 / 引用 Bot、`BUSY` 的 L2/L3 特判、`takeover_group_chat=false`；心跳「群未读回放决策」走独立 `unread_group_cooldown_minutes`，不经过该门闸。
+- **测试**：`tests/test_v210_atmosphere_gate.py`（默认值/clamp、关闭与 100% 兼容、0% 零模型调用、概率采样、@/BUSY/私聊/关闭接管旁路、每小时预算与重置、拦截跳过防抖、schema 契约）。
+
+### 9.3 版本与回归基线
+
+- 版本号：`metadata.yaml` 与 `main.py @register` 同步为 **`2.10.0`**。
+- 离线回归：`python3 -m unittest discover -s tests` → **717 tests 全绿**（680 基线 + 37 新增）；`PYTHONPYCACHEPREFIX=/tmp/oy_pycache python3 -m compileall -q core storage surfing prompts main.py` 与 `node --check views/console/*.js` 通过。
+- 无数据库迁移、无 Web API 路由增减；升级只需替换插件文件并热重载。

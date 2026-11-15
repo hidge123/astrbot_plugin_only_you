@@ -98,6 +98,24 @@
         "type": "float",
         "default": 4.0,
         "hint": "群聊消息后等待该时间再判断是否接话；等待期间有新消息则由新消息处理。"
+      },
+      "reply_gate_enabled": {
+        "description": "概率门闸",
+        "type": "bool",
+        "default": true,
+        "hint": "在防抖等待与读空气决策前，先按概率筛掉一部分非 @ 普通群消息；@ / 唤醒 / 引用、BUSY 特判与私聊不受影响，关闭后与旧版一致。"
+      },
+      "reply_gate_probability": {
+        "description": "门闸通过概率(%)",
+        "type": "int",
+        "default": 80,
+        "hint": "0~100：只有该比例的非 @ 普通群消息会继续进入防抖与读空气决策；100 = 不筛选（与旧版一致），0 = 普通群消息不再读空气（@ 仍会回复）。"
+      },
+      "reply_gate_hourly_limit": {
+        "description": "每小时判定上限",
+        "type": "int",
+        "default": 0,
+        "hint": "同一群聊每小时最多允许多少条非 @ 普通消息进入读空气判定；0 = 不限制，只按概率筛选。"
       }
     }
   },

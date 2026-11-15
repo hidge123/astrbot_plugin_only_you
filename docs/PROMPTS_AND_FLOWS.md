@@ -376,10 +376,17 @@ sequenceDiagram
 ## 五、 精简版分级记忆提炼 Prompt (`MEMORY_EXTRACT_AND_GRADE_PROMPT`)
 
 > **调用时机**：每当群聊或私聊累计满 `N` 条（默认 15 条）有效对话时，由后台**决策模型**（`role="decision"`）异步调用，提炼值得记住的信息并打上 **初始重要度（`importance: 1~10`）**，供后续分级存储与定时遗忘程序（`Forgetting GC`）结算。
+>
+> **v2.10 时间基准**：`{recent_chat_transcript}` 由 `SessionBuffer.get_extraction_transcript()` 生成——头部为 `【窗口时间范围】首条时间 ~ 末条时间（跨度 N 天），共 N 条消息`，每条消息前带真实发送时间 `[YYYY-MM-DD HH:MM]`；`{current_datetime}` 为当前真实本地时间（含星期）。目的是让模型能定位跨天窗口的每一天、判断消息先后与新鲜度；**不要求把相对时间改写成绝对日期**，记忆正文写法与 50 字上限保持不变。
 
 ```markdown
 请阅读以下角色【{soul_name}】与用户的近期对话片段，提炼出值得记住的记忆条目，并严格评估每条记忆的【重要度与分级】。
 如果这段对话只是毫无营养的日常寒暄（如“早”、“哈哈”、“111”），请直接返回空数组 `[]`，不要制造垃圾记忆！
+
+## 时间基准（v2.10）
+- 当前真实时间：{current_datetime}
+- 对话记录每行开头的 `[YYYY-MM-DD HH:MM]` 是该条消息的真实发送时间；这段窗口可能横跨数天。
+- 请据此判断消息的先后顺序与新鲜度（明显过期的临时安排不要当成有效信息，长期事实不受时间影响），但不要给记忆正文臆造消息里没有出现过的日期。
 
 ## 近期对话记录（已标注发言者 ID 与关系等级 L1普通 / ◆L2重要用户 / ★L3核心用户）
 {recent_chat_transcript}
@@ -625,3 +632,66 @@ sequenceDiagram
 
 > Pages 记忆页对应展示：T1 行显示 `⏳ 剩余 Xh 清除`（`48 - (now-created_at)/3600`）与 `上限 N 条`（N 来自 `memories/list` 的 `tier1_limit`，默认 30）；T2 保持活力条；T3 显示永久保存。清理 / GC 动作与 v2.6 一致（`memories/mutate` 的 `gc` / `extract` / 增删改）。
 
+
+---
+
+## 八、 v2.10 增量：记忆时间基准注入（`MEMORY_TIME_CONTEXT_PROMPT`）与读空气概率门闸
+
+### 8.1 记忆时间基准注入 Prompt（`MEMORY_TIME_CONTEXT_PROMPT`）
+
+> **调用时机**：`ContextBudgetManager.apply_context_and_memory_budget` 在本次确实注入了回忆记忆时，先于 `[脑海中的相关记忆 (精简注入)]` 块拼进 System Prompt。**记忆正文不做任何日期改写**，模型在朗读时按每条记忆前的「形成时间」把相对时间解冻、并判断是否过期。
+
+```markdown
+[记忆时间基准]:
+- 今天是 {current_datetime}。下面每条记忆前标注的日期，是这条记忆的**形成时间**（记忆锚点），不是当前时间。
+- 记忆内容里的「今天 / 昨天 / 明天 / 这周末 / 下周」等相对时间，一律以该条记忆的形成时间为基准换算成绝对日期后再理解。
+- 若换算后的日期已经过去：当作历史信息或旧回忆，不要当成最近安排 / 当前事实复述（可以自然地说「之前提过…不过应该早过了」）；尚未到来的才可作为未来安排提起。
+- 形成时间越久远（标注里的「N 天前」），越要当作回忆，而不是刚发生的事。
+```
+
+记忆块逐条格式（`{tag}` = 核心记忆 / 近期记忆 / 瞬时记忆）：
+
+```markdown
+- [{tag} · 形成于 2026-11-05（星期四，10 天前）] 阿泽说这周末要去考科目二
+```
+
+占位符：仅 `{current_datetime}`（`core/time_utils.py::current_datetime_text` 生成，固定中文星期）。`injected_chars` 仍只累计记忆正文长度，时间标注属固定小开销。
+
+其他记忆注入链路同样带形成时间：
+
+| 链路 | 格式 | 说明 |
+| :--- | :--- | :--- |
+| 主对话记忆块 | `- [核心记忆 · 形成于 2026-11-05（星期四，10 天前）] 正文` | + 上方 `MEMORY_TIME_CONTEXT_PROMPT` |
+| `IDLE_ROAM(MEMORY_MUSE)` | `- 【记忆 · 2026-11-12（星期四，3 天前）】正文` | 发呆联想素材同样可解冻相对时间 |
+| `/onlyyou memory list` | `[T3核心\|重要度:9\|活力:100\|召回:2\|形成:2026-11-05（星期四，10 天前）]` | 指令调试时可直接看到时间锚点 |
+| Pages 记忆页 | 召回列 `召回 N 次 · 形成于 3 天前`，`data-tip` 为 `形成于 2026-11-05 21:30 · 最近提及 …` | 来源 `to_dict()` 的 `created_at_text` / `last_accessed_at_text` |
+
+### 8.2 读空气概率 / 预算门闸（`AtmosphereReader`）
+
+> 插入位置：`@`/唤醒/引用快速放行 与 `BUSY` 特判**之后**、防抖等待**之前**（只影响非 @ 普通群消息）。
+
+```mermaid
+flowchart TB
+    A["群消息（状态门禁已放行）"] --> B{"私聊 / takeover=false?"}
+    B -->|是| Z["按 is_direct_mention 返回（不经过门闸）"]
+    B -->|否| C{"空文本 @-only?"}
+    C -->|是| Z
+    C -->|否| D{"BUSY 特判?"}
+    D -->|是| E["is_direct_mention or ★L3（不经过门闸）"]
+    D -->|否| F{"直接提及 / 引用 Bot?"}
+    F -->|是| G["True（不经过门闸）"]
+    F -->|否| H{"概率门闸<br/>random()*100 < reply_gate_probability"}
+    H -->|未通过| I["False：不防抖 / 不调决策模型 / 不算未读<br/>日志 Reply gate dropped ..."]
+    H -->|通过| J{"每小时预算<br/>reply_gate_hourly_limit > 0 ?"}
+    J -->|超限| I
+    J -->|通过/不限| K["防抖等待 debounce_seconds"]
+    K --> L["五维读空气决策模型 REPLY / IGNORE"]
+```
+
+| 配置项 | 默认 | 语义 |
+| :--- | :--- | :--- |
+| `atmosphere_config.reply_gate_enabled` | `true` | 关闭后完全等同旧行为 |
+| `atmosphere_config.reply_gate_probability` | `80` | 0~100（%）；100 = 不筛选，0 = 普通群消息不读空气（@ 仍回复） |
+| `atmosphere_config.reply_gate_hourly_limit` | `0` | 同一群聊滚动 1 小时放行上限；0 = 不限 |
+
+边界：心跳里的「群未读回放决策」有独立 `unread_group_cooldown_minutes`，不经过该门闸；被门闸放弃的消息已通过三态门禁，**不算未读**。

@@ -45,6 +45,7 @@ def load_plugin_modules():
         return _MODULES
 
     import OnlyYou.core.character_card as character_card
+    import OnlyYou.core.atmosphere_reader as atmosphere_reader
     import OnlyYou.core.context_budget as context_budget
     import OnlyYou.core.memory_manager as memory_manager
     import OnlyYou.core.model_hub as model_hub
@@ -54,6 +55,7 @@ def load_plugin_modules():
     import OnlyYou.core.schedule_mutator as schedule_mutator
     import OnlyYou.core.soul_manager as soul_manager
     import OnlyYou.core.state_machine as state_machine
+    import OnlyYou.core.time_utils as time_utils
     import OnlyYou.core.user_relation as user_relation
     import OnlyYou.core.web_api as web_api
     import OnlyYou.prompts.templates as templates
@@ -62,6 +64,7 @@ def load_plugin_modules():
 
     _MODULES = SimpleNamespace(
         character_card=character_card,
+        atmosphere_reader=atmosphere_reader,
         context_budget=context_budget,
         memory_manager=memory_manager,
         model_hub=model_hub,
@@ -71,6 +74,7 @@ def load_plugin_modules():
         schedule_mutator=schedule_mutator,
         soul_manager=soul_manager,
         state_machine=state_machine,
+        time_utils=time_utils,
         user_relation=user_relation,
         web_api=web_api,
         templates=templates,

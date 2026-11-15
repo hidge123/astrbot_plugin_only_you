@@ -159,6 +159,7 @@ from .core.runtime_state import (
 from .core.schedule_mutator import BoundedScheduleMutator
 from .core.soul_manager import SoulManager
 from .core.state_machine import ActionType, BotState, StateController, UserTier
+from .core.time_utils import describe_time_anchor
 from .core.user_relation import UserRelationManager
 from .core.web_api import OnlyYouWebAPI
 from .prompts.templates import (
@@ -337,7 +338,7 @@ def _umo_in_platform_scope(
     "astrbot_plugin_only_you",
     "hidge123",
     "OnlyYou (只有你) —— 具备生命节律、三级记忆与赛博冲浪能力的高自治 AI 伴侣与数字网友插件",
-    "2.9.0",
+    "2.10.0",
     "https://github.com/hidge123/astrbot_plugin_only_you",
 )
 class OnlyYouPlugin(Star):
@@ -909,6 +910,15 @@ class OnlyYouPlugin(Star):
                 for key in doomed:
                     mapping.pop(key, None)
                 stats["caches"] += len(doomed)
+
+        # v2.10: the read-air probability gate keeps a rolling hourly budget per UMO.
+        reader = getattr(self, "atmosphere_reader", None)
+        gate_clearer = getattr(reader, "clear_gate_budget", None)
+        if callable(gate_clearer):
+            try:
+                stats["caches"] += int(gate_clearer(platform_id=clean) or 0)
+            except Exception as exc:  # noqa: BLE001 - unbind must never crash
+                logger.debug(f"[OnlyYou] clear reply-gate budget failed: {exc}")
 
         l3 = getattr(self, "_known_l3_umos", None)
         if isinstance(l3, dict):
@@ -1543,7 +1553,9 @@ class OnlyYouPlugin(Star):
                     )
                     return False
                 context_material = "\n".join(
-                    f"- {getattr(item, 'content', '')}" for item in picked_memories
+                    f"- 【记忆 · {describe_time_anchor(getattr(item, 'created_at', 0), now) or '时间未知'}】"
+                    f"{getattr(item, 'content', '')}"
+                    for item in picked_memories
                 )
 
             prompt = IDLE_ROAM_PROACTIVE_PROMPT.format(
@@ -2821,7 +2833,11 @@ class OnlyYouPlugin(Star):
                 )
                 return
             if action == "extract":
-                transcript = self.session_buffer.get_window_transcript(umo=umo, max_turns=15)
+                # v2.10: the extraction transcript carries one [YYYY-MM-DD HH:MM]
+                # stamp per message plus the covered window range.
+                transcript = self.session_buffer.get_extraction_transcript(
+                    umo=umo, max_turns=15
+                )
                 count = await self.memory_manager.extract_memories_from_transcript(
                     soul_id=soul.soul_id,
                     soul_name=soul.name,
@@ -2862,8 +2878,12 @@ class OnlyYouPlugin(Star):
             lines = [f"🧠 【{soul.name} 的分级记忆库 (Top {len(mems)})】"]
             for m in mems:
                 t_label = {1: "T1瞬时", 2: "T2近期", 3: "T3核心"}[m.memory_tier]
+                # v2.10: show the memory formation time (its relative-time anchor).
+                formed = describe_time_anchor(m.created_at)
+                formed_text = f"|形成:{formed}" if formed else ""
                 lines.append(
-                    f"- #{m.id} [{t_label}|重要度:{m.importance}|活力:{m.vitality:.0f}|召回:{m.access_count}] "
+                    f"- #{m.id} [{t_label}|重要度:{m.importance}|活力:{m.vitality:.0f}"
+                    f"|召回:{m.access_count}{formed_text}] "
                     f"{m.content} (关键词:{m.keywords})"
                 )
             yield event.plain_result("\n".join(lines))
