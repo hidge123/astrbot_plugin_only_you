@@ -53,6 +53,7 @@ GROUP_ITEM_KEYS = {
     "notes",
     "bound_soul_id",
     "bound_soul_name",
+    "proactive_enabled",
     "window_count",
     "unread_count",
     "last_active_at",
@@ -434,6 +435,7 @@ class TestUserGroupProfiles(WebApiV28TestBase):
             "display_name",
             "notes",
             "bound_soul_id",
+            "proactive_enabled",
             "last_active_at",
         }
         assert mods.user_relation.GroupProfile.from_dict(data).to_dict() == data

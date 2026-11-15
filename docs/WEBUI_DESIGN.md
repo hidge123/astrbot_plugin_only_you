@@ -168,6 +168,8 @@ AstrBot 默认的 `_conf_schema.json` 只适合静态、扁平的基础键值对
 > 2. **合并用户改为下拉选择**：不再手输 `secondary_uid`，合并弹窗用 `<select>` 列出**当前角色关系列表中的其他用户**（排除自己，label「显示名（等级标签）· global_uid」）；无候选时禁用并提示「当前角色暂无可合并的其他用户」。后端会校验两个账号都必须存在于当前角色关系列表，否则返回错误文案「合并目标必须是当前角色关系列表中的已有用户」。
 > 3. 详情弹窗拆成两个语义分区：**「全局身份（影响所有角色）」**= 显示名称 + 平台账号；**「当前角色关系 · <角色名>」**= 关系等级 / 好感度 / 专属称呼 / 专属态度。删除按钮改为「移除当前角色的关系档案」，二次确认注明其他角色关系与 memories/群档案不受影响（最后一个关系删除时才移除全局身份）。
 > 4. 群聊分区数据由 API 按当前角色的 `bound_soul_id` / 绑定平台过滤，群档案操作同样带 `soul_id`；不传 `soul_id` 时接口保持 v2.8 legacy 全量视图（记忆页等旧调用兼容）。
+>
+> **v2.11 变更（按会话的主动回复开关）**：用户详情弹窗「当前角色关系」分区、群聊详情弹窗表单各新增一行 `.switch-row`「允许主动回复」，复用全局 `.switch` 组件（`data-role="proactive-enabled"` / `data-role="group-proactive-enabled"`），随 `users/update` 提交 `proactive_enabled`；只控制 Bot 主动发起的消息（未读补回 / 翻群冒泡 / 发呆联想 / 视频分享），被动回复不受影响。用户行与群聊行/详情顶部对关闭项显示 `🤐 不主动` 标记；旧数据缺字段时按开启渲染。
 
 1. **页头**：标题「关系与群聊」+ 副标题（关系条数与群聊数）；右侧「刷新」按钮。数据加载中显示 spinner「加载关系与群聊…」。
 2. **筛选 chips**：`[全部] [★L3 核心 (n)] [◆L2 重要 (n)] [L1 普通 (n)] [💬 群聊 (n)]`——点击切换列表内容；选「💬 群聊」时只显示群聊分区，选「全部」时用户区之后显示群聊分区。计数来自 `users/list` 的 `counts` 与 `groups.length`。
@@ -473,8 +475,8 @@ window.OY_PAGES["overview"] = {
 | `init_summary` | `platform_bindings` | `{platform_id: soul_id}`；`souls[]` 自带 Soul JSON 字段 |
 | `souls/detail` | `platform_bindings` | 同上 |
 | `souls/save` | `model_config / bound_platforms / settings`（可选透传）+ `data.storage` | 用于兼容旧页面的 Soul 级配置保存；`storage` 显式暴露 JSON 写降级 |
-| `users/list` | `groups` | `GroupItem = {umo, group_id, platform_id, display_name, notes, bound_soul_id, bound_soul_name, window_count, unread_count, last_active_at}` |
-| `users/update` | `update_group / clear_group_memory / delete_group` | `update_group` 改群名/备注；`clear_group_memory` 只清该群内存；`delete_group` 删群档案。三者均返回 `{groups, counts}` |
+| `users/list` | `groups`；v2.11 起 users / groups 均带 `proactive_enabled` | `GroupItem = {umo, group_id, platform_id, display_name, notes, bound_soul_id, bound_soul_name, proactive_enabled, window_count, unread_count, last_active_at}` |
+| `users/update` | `update_group / clear_group_memory / delete_group`；v2.11 起默认 action 与 `update_group` 均接受 `proactive_enabled` | `update_group` 改群名/备注/主动回复开关；`clear_group_memory` 只清该群内存；`delete_group` 删群档案。三者均返回 `{groups, counts}`；默认 action 返回 `user`（含 `proactive_enabled`） |
 | `memories/list` | `tier1_limit` | 默认 30，来自 `memory_and_context_config.max_tier1_memories`；记忆页 T1「上限 N 条」 |
 | `surfing/list_and_trigger` | GET `surfing_enabled / surfing_sources / soul_id`；POST `action="toggle_surfing" / "set_surfing_sources"` | 总开关与后台视频源读写；总开关关闭时 SURF 时段降级 IDLE_ROAM |
 | `models/config` | `?soul_id=` / body `{soul_id, model_config}`；data `soul_id` | 按当前角色读写四角色配置 |
@@ -489,13 +491,13 @@ window.OY_PAGES["overview"] = {
 2. **离线预览**：直接打开 `views/console/index.html?mock=1`（或 `file://` 打开），在无 AstrBot 后端时页面应能渲染全部 8 个页面并完成主要交互（Mock bridge 覆盖全部 31 条 API）。**v2.8 Mock 已同步**：
    - `sessions/platforms` 返回 `{current_soul_id, default_soul_id, souls, platforms, sessions}`，`sessions/bind_platform` / `sessions/unbind_platform` / `sessions/clear_memory` 具备内存态模拟；
    - 每个 soul 带 `model_config / bound_platforms / settings / updated_at`，`souls/save` 支持 `model_config / bound_platforms / settings` 透传；
-   - `users/list` 带 `groups`（GroupItem），`users/update` 支持 `update_group / clear_group_memory / delete_group`；
+   - `users/list` 带 `groups`（GroupItem，含 v2.11 `proactive_enabled`），`users/update` 支持 `update_group / clear_group_memory / delete_group` 且用户 / 群聊均可回写 `proactive_enabled`（mock 夹具含一个关闭主动回复的用户与群演示 `🤐 不主动` 标记）；
    - `memories/list` 带 `tier1_limit`（30）；
    - `surfing/list_and_trigger` GET 带 `surfing_enabled / surfing_sources / soul_id`，POST 支持 `action="toggle_surfing"` / `"set_surfing_sources"`；
    - v2.6 既有 mock 形状保留：models 带 `inherit/inherit_from`、users 带 `attitude`、`action_types`/时间块带固定 `armor`/`armor_tier`、角色卡 schema 为 10 分区 / 36 字段、`identity.avatar` 含极小 `data:image/png;base64` 示例。
 3. **视觉验收**：浅色 / 深色主题各截图一次；确认无 emoji 图标、无长副标题、悬浮提示可读、主操作按钮唯一；v2.8 额外检查关系页宽幅弹窗在窄屏（≤720px）下不溢出、chips 可横向滚动、群聊卡片不换行错位。
 4. **交互验收（v2.8）**：
-   - 关系页：chips 切换 / 搜索即时过滤 / 点击行打开宽幅弹窗 / 保存后列表即时刷新 / 群聊详情「清空群内存」与「移除群聊记录」二次确认；
+   - 关系页：chips 切换 / 搜索即时过滤 / 点击行打开宽幅弹窗 / 保存后列表即时刷新 / 群聊详情「清空群内存」与「移除群聊记录」二次确认；v2.11 用户与群聊详情弹窗的「允许主动回复」开关保存后行标记即时切换（`🤐 不主动` ↔ 无标记）；
    - 会话页：绑定互斥提示（他人占用按钮禁用）/ 解绑后 toast 显示清理统计 / 手动 `platform_id` 绑定 / 默认兜底角色开关 / 单会话与整平台清空；
    - 模型页：切换角色后顶部角色名与四角色配置同步刷新；自动保存 body 带 `soul_id`；
    - 记忆页：T1 行显示「⏳ 剩余 Xh 清除」与「上限 N 条」；冲浪页：总开关乐观更新 + 失败回滚、关闭提示出现。

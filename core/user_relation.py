@@ -78,6 +78,22 @@ def _is_qualified_account(value: Any) -> bool:
     return split_platform_account(value) is not None
 
 
+def _as_enabled(value: Any, default: bool = True) -> bool:
+    """Coerce a stored toggle into bool (``None``/empty -> ``default``).
+
+    v2.11: used by the per-user / per-group ``proactive_enabled`` flag, which is
+    stored as ``INTEGER 0/1`` in SQLite but must tolerate legacy rows that predate
+    the column as well as string payloads coming from the Pages API.
+    """
+    if value is None or value == "":
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(int(value))
+    return str(value).strip().lower() not in ("0", "false", "no", "off", "none")
+
+
 def _normalize_platform_ids(values: Any) -> list[str]:
     """Normalize console/user payloads into canonical platform account strings.
 
@@ -162,8 +178,12 @@ class UserProfile:
     nickname: str = ""
     # v2.6: the character's custom attitude / tone reserved for this exact user.
     attitude: str = ""
+    # v2.11: whether this Soul may **proactively** message this user (unread catch-up /
+    # MEMORY_MUSE DM / surf-video share). Passive replies are never affected.
+    proactive_enabled: bool = True
     # v2.9: relationship scope. ``""`` = legacy/global callers; otherwise the relation
-    # fields (tier/affinity/interaction/nickname/attitude) belong to this Soul.
+    # fields (tier/affinity/interaction/nickname/attitude/proactive_enabled) belong to
+    # this Soul.
     soul_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -198,6 +218,8 @@ class UserProfile:
             "display_name": self.display_name,
             "nickname": self.nickname,
             "attitude": self.attitude,
+            # v2.11: per-Soul proactive-message switch (default True).
+            "proactive_enabled": bool(self.proactive_enabled),
             "tier": int(self.tier.value),
             "tier_label": self.tier.label,
             "interaction_count": self.interaction_count,
@@ -225,6 +247,9 @@ class GroupProfile:
     display_name: str = ""
     notes: str = ""
     bound_soul_id: str = ""
+    # v2.11: whether the governing Soul may proactively bubble up in this group
+    # (GROUP_LURK / surf share / MEMORY_MUSE). Default True for legacy profiles.
+    proactive_enabled: bool = True
     last_active_at: int = 0
 
     def to_dict(self) -> dict[str, Any]:
@@ -235,6 +260,7 @@ class GroupProfile:
             "display_name": self.display_name,
             "notes": self.notes,
             "bound_soul_id": self.bound_soul_id,
+            "proactive_enabled": bool(self.proactive_enabled),
             "last_active_at": int(self.last_active_at or 0),
         }
 
@@ -257,6 +283,8 @@ class GroupProfile:
             display_name=str(data.get("display_name") or "").strip(),
             notes=str(data.get("notes") or "").strip(),
             bound_soul_id=str(data.get("bound_soul_id") or "").strip(),
+            # v2.11: missing key (pre-v2.11 profile) means "allowed".
+            proactive_enabled=_as_enabled(data.get("proactive_enabled"), True),
             last_active_at=last_active_at,
         )
 
@@ -391,6 +419,7 @@ class UserRelationManager:
             platform_ids=pids,
             nickname=str(row.get("nickname") or ""),
             attitude=str(row.get("attitude") or ""),
+            proactive_enabled=_as_enabled(row.get("proactive_enabled"), True),
         )
 
     @staticmethod
@@ -497,6 +526,7 @@ class UserRelationManager:
             platform_ids=list(profile.platform_ids),
             nickname=profile.nickname,
             attitude=profile.attitude,
+            proactive_enabled=profile.proactive_enabled,
             soul_id="",
         )
 
@@ -511,6 +541,9 @@ class UserRelationManager:
             "affinity": float(row.get("affinity", 0.0)),
             "nickname": str(row.get("nickname") or ""),
             "attitude": str(row.get("attitude") or ""),
+            # v2.11: proactive-message switch (legacy rows without the column default
+            # to True, i.e. exactly the pre-v2.11 behavior).
+            "proactive_enabled": _as_enabled(row.get("proactive_enabled"), True),
         }
 
     def _apply_relation(
@@ -568,6 +601,7 @@ class UserRelationManager:
             "affinity": float(profile.affinity),
             "nickname": profile.nickname or "",
             "attitude": profile.attitude or "",
+            "proactive_enabled": 1 if profile.proactive_enabled else 0,
             "updated_at": now,
         }
         try:
@@ -575,8 +609,8 @@ class UserRelationManager:
                 """
                 INSERT OR IGNORE INTO user_relations (
                     soul_id, global_uid, tier, interaction_count, affinity,
-                    nickname, attitude, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    nickname, attitude, proactive_enabled, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     soul,
@@ -586,6 +620,7 @@ class UserRelationManager:
                     seed["affinity"],
                     seed["nickname"],
                     seed["attitude"],
+                    seed["proactive_enabled"],
                     now,
                 ),
             )
@@ -611,20 +646,22 @@ class UserRelationManager:
             float(profile.affinity),
             profile.nickname or "",
             profile.attitude or "",
+            1 if profile.proactive_enabled else 0,
             now,
         )
         await self.db.execute(
             """
             INSERT INTO user_relations (
                 soul_id, global_uid, tier, interaction_count, affinity,
-                nickname, attitude, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                nickname, attitude, proactive_enabled, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(soul_id, global_uid) DO UPDATE SET
                 tier = excluded.tier,
                 interaction_count = excluded.interaction_count,
                 affinity = excluded.affinity,
                 nickname = excluded.nickname,
                 attitude = excluded.attitude,
+                proactive_enabled = excluded.proactive_enabled,
                 updated_at = excluded.updated_at
             """,
             (soul, uid) + payload,
@@ -637,6 +674,7 @@ class UserRelationManager:
             "affinity": float(profile.affinity),
             "nickname": profile.nickname or "",
             "attitude": profile.attitude or "",
+            "proactive_enabled": 1 if profile.proactive_enabled else 0,
             "updated_at": now,
         }
 
@@ -989,9 +1027,10 @@ class UserRelationManager:
         await self.db.execute(
             """
             INSERT INTO users (
-                global_uid, display_name, nickname, tier, interaction_count, affinity, platform_ids_json, attitude, updated_at
+                global_uid, display_name, nickname, tier, interaction_count, affinity,
+                platform_ids_json, attitude, proactive_enabled, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(global_uid) DO UPDATE SET
                 display_name = excluded.display_name,
                 nickname = excluded.nickname,
@@ -1000,6 +1039,7 @@ class UserRelationManager:
                 affinity = excluded.affinity,
                 platform_ids_json = excluded.platform_ids_json,
                 attitude = excluded.attitude,
+                proactive_enabled = excluded.proactive_enabled,
                 updated_at = excluded.updated_at
             """,
             (
@@ -1011,6 +1051,7 @@ class UserRelationManager:
                 profile.affinity,
                 json.dumps(profile.platform_ids, ensure_ascii=False),
                 profile.attitude,
+                1 if profile.proactive_enabled else 0,
                 int(time.time()),
             ),
         )
@@ -1042,6 +1083,7 @@ class UserRelationManager:
                        r.affinity AS rel_affinity,
                        r.nickname AS rel_nickname,
                        r.attitude AS rel_attitude,
+                       r.proactive_enabled AS rel_proactive_enabled,
                        r.updated_at AS rel_updated_at
                 FROM user_relations r
                 JOIN users u ON u.global_uid = r.global_uid
@@ -1065,6 +1107,7 @@ class UserRelationManager:
                         "affinity": row.get("rel_affinity", 0.0),
                         "nickname": row.get("rel_nickname", ""),
                         "attitude": row.get("rel_attitude", ""),
+                        "proactive_enabled": row.get("rel_proactive_enabled", 1),
                     }
                     self._apply_relation(profile, soul, relation)
                     relation["soul_id"] = soul
@@ -1105,6 +1148,7 @@ class UserRelationManager:
         platform_ids: Optional[list[Any]] = None,
         attitude: Optional[str] = None,
         soul_id: Optional[str] = None,
+        proactive_enabled: Optional[bool] = None,
     ) -> UserProfile:
         """Update identity fields globally and relationship fields for one Soul.
 
@@ -1125,6 +1169,9 @@ class UserRelationManager:
         if attitude is not None:
             # v2.6: per-user custom attitude, hard-capped at 300 chars.
             profile.attitude = attitude.strip()[:300]
+        if proactive_enabled is not None:
+            # v2.11: per-Soul proactive-message switch (passive replies unaffected).
+            profile.proactive_enabled = bool(proactive_enabled)
         if tier in (1, 2, 3):
             profile.tier = UserTier(int(tier))
         if affinity is not None:
@@ -1183,7 +1230,8 @@ class UserRelationManager:
             await self.db.execute(
                 """
                 UPDATE users SET
-                    nickname = ?, tier = ?, interaction_count = ?, affinity = ?, attitude = ?
+                    nickname = ?, tier = ?, interaction_count = ?, affinity = ?,
+                    attitude = ?, proactive_enabled = ?
                 WHERE global_uid = ?
                 """,
                 (
@@ -1196,6 +1244,11 @@ class UserRelationManager:
                         + float(secondary.affinity) * 0.5,
                     ),
                     primary.attitude or secondary.attitude or "",
+                    # v2.11: merging accounts must never silently re-enable a
+                    # proactive-message opt-out (both sides must allow).
+                    1
+                    if (primary.proactive_enabled and secondary.proactive_enabled)
+                    else 0,
                     primary_uid_value,
                 ),
             )
@@ -1220,6 +1273,7 @@ class UserRelationManager:
                 "affinity": 0.0,
                 "nickname": "",
                 "attitude": "",
+                "proactive_enabled": 1,
             }
             rel_s = await self._load_relation(row_soul, secondary_uid_value)
             if rel_s is not None:
@@ -1237,6 +1291,12 @@ class UserRelationManager:
                     ),
                     "nickname": rel_p.get("nickname") or rel_s.get("nickname") or "",
                     "attitude": rel_p.get("attitude") or rel_s.get("attitude") or "",
+                    "proactive_enabled": 1
+                    if (
+                        _as_enabled(rel_p.get("proactive_enabled"), True)
+                        and _as_enabled(rel_s.get("proactive_enabled"), True)
+                    )
+                    else 0,
                 }
             else:
                 merged = dict(rel_p)
@@ -1244,14 +1304,15 @@ class UserRelationManager:
                 """
                 INSERT INTO user_relations (
                     soul_id, global_uid, tier, interaction_count, affinity,
-                    nickname, attitude, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    nickname, attitude, proactive_enabled, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(soul_id, global_uid) DO UPDATE SET
                     tier = excluded.tier,
                     interaction_count = excluded.interaction_count,
                     affinity = excluded.affinity,
                     nickname = excluded.nickname,
                     attitude = excluded.attitude,
+                    proactive_enabled = excluded.proactive_enabled,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -1262,6 +1323,7 @@ class UserRelationManager:
                     float(merged.get("affinity", 0.0)),
                     merged.get("nickname") or "",
                     merged.get("attitude") or "",
+                    int(merged.get("proactive_enabled", 1)),
                     int(time.time()),
                 ),
             )
@@ -1273,6 +1335,7 @@ class UserRelationManager:
                 "affinity": float(merged.get("affinity", 0.0)),
                 "nickname": merged.get("nickname") or "",
                 "attitude": merged.get("attitude") or "",
+                "proactive_enabled": int(merged.get("proactive_enabled", 1)),
                 "updated_at": int(time.time()),
             }
             await self.db.execute(
@@ -1409,8 +1472,8 @@ class UserRelationManager:
                         """
                         INSERT OR IGNORE INTO user_relations (
                             soul_id, global_uid, tier, interaction_count, affinity,
-                            nickname, attitude, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            nickname, attitude, proactive_enabled, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             soul,
@@ -1420,6 +1483,7 @@ class UserRelationManager:
                             float(identity.affinity),
                             identity.nickname or "",
                             identity.attitude or "",
+                            1 if identity.proactive_enabled else 0,
                             int(time.time()),
                         ),
                     )
@@ -1431,6 +1495,7 @@ class UserRelationManager:
                         "affinity": float(identity.affinity),
                         "nickname": identity.nickname or "",
                         "attitude": identity.attitude or "",
+                        "proactive_enabled": 1 if identity.proactive_enabled else 0,
                         "updated_at": int(time.time()),
                     }
                     stats["relations_created"] += 1
@@ -1590,8 +1655,13 @@ class UserRelationManager:
         umo: str,
         display_name: Optional[str] = None,
         notes: Optional[str] = None,
+        proactive_enabled: Optional[bool] = None,
     ) -> Optional[GroupProfile]:
-        """Edit a group's display name / notes (``None`` when the group is unknown)."""
+        """Edit a group's display name / notes / proactive-message switch.
+
+        Returns ``None`` when the group is unknown. v2.11 adds
+        ``proactive_enabled`` (``None`` = leave unchanged).
+        """
         clean = (umo or "").strip()
         if not clean:
             return None
@@ -1611,6 +1681,8 @@ class UserRelationManager:
             )
         if notes is not None:
             profile.notes = str(notes).strip()[:_GROUP_NOTES_MAX_CHARS]
+        if proactive_enabled is not None:
+            profile.proactive_enabled = bool(proactive_enabled)
         await self._persist_groups()
         return profile
 

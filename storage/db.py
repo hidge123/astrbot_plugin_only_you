@@ -109,6 +109,7 @@ class DatabaseManager:
                 affinity REAL NOT NULL DEFAULT 0.0,
                 platform_ids_json TEXT NOT NULL DEFAULT '[]',
                 attitude TEXT NOT NULL DEFAULT '',
+                proactive_enabled INTEGER NOT NULL DEFAULT 1,
                 updated_at INTEGER NOT NULL
             );
             """
@@ -129,6 +130,12 @@ class DatabaseManager:
                 await self.execute(
                     "ALTER TABLE users ADD COLUMN attitude TEXT NOT NULL DEFAULT '';"
                 )
+            # v2.11: per-user "allow proactive messages" toggle (legacy fallback column;
+            # the authoritative value lives in ``user_relations`` when scoped by Soul).
+            if "proactive_enabled" not in column_names:
+                await self.execute(
+                    "ALTER TABLE users ADD COLUMN proactive_enabled INTEGER NOT NULL DEFAULT 1;"
+                )
         except Exception:
             pass
 
@@ -145,11 +152,24 @@ class DatabaseManager:
                 affinity REAL NOT NULL DEFAULT 0.0,
                 nickname TEXT NOT NULL DEFAULT '',
                 attitude TEXT NOT NULL DEFAULT '',
+                proactive_enabled INTEGER NOT NULL DEFAULT 1,
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY (soul_id, global_uid)
             );
             """
         )
+        # v2.11: per-Soul "allow proactive messages" toggle. Safe idempotent ALTER
+        # for databases created before this column existed.
+        try:
+            columns = await self.fetchall("PRAGMA table_info(user_relations);")
+            column_names = {str(row.get("name") or "") for row in columns or []}
+            if "proactive_enabled" not in column_names:
+                await self.execute(
+                    "ALTER TABLE user_relations ADD COLUMN proactive_enabled "
+                    "INTEGER NOT NULL DEFAULT 1;"
+                )
+        except Exception:
+            pass
         await self.execute(
             "CREATE INDEX IF NOT EXISTS idx_user_relations_soul "
             "ON user_relations(soul_id);"

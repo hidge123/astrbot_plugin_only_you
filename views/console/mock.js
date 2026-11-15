@@ -666,6 +666,7 @@
           notes: "酒狐的主场群，晚上最热闹，群友喜欢发猫猫视频。",
           bound_soul_id: "default_soul",
           bound_soul_name: "酒狐",
+          proactive_enabled: true,
           window_count: 14,
           unread_count: 3,
           last_active_at: nowSeconds() - 1200
@@ -678,6 +679,7 @@
           notes: "小满的群，周五晚上固定开黑。",
           bound_soul_id: "soul_xiaoman",
           bound_soul_name: "小满",
+          proactive_enabled: true,
           window_count: 3,
           unread_count: 0,
           last_active_at: nowSeconds() - 7200
@@ -690,6 +692,8 @@
           notes: "只窥屏不冒泡的小群。",
           bound_soul_id: "default_soul",
           bound_soul_name: "酒狐",
+          /* v2.11：演示「已关闭主动回复」的群聊（不会翻群冒泡 / 主动分享视频） */
+          proactive_enabled: false,
           window_count: 0,
           unread_count: 0,
           last_active_at: nowSeconds() - 86400 * 3
@@ -722,7 +726,7 @@
           l2_mikan: { tier: 2, interaction_count: 61, affinity: 57.5, nickname: "小橘子", attitude: "" },
           l1_passerby: { tier: 1, interaction_count: 9, affinity: 12.0, nickname: "", attitude: "" },
           l1_bob: { tier: 1, interaction_count: 4, affinity: 6.5, nickname: "", attitude: "" },
-          l1_anon: { tier: 1, interaction_count: 1, affinity: 2.0, nickname: "", attitude: "" }
+          l1_anon: { tier: 1, interaction_count: 1, affinity: 2.0, nickname: "", attitude: "", proactive_enabled: false }
         },
         soul_xiaoman: {
           /* 同一 global_uid 在另一个角色下 tier / affinity / attitude 完全不同 */
@@ -2259,6 +2263,8 @@
       interaction_count: Number(rel.interaction_count || 0),
       affinity: Math.max(0, Math.min(100, affinity)),
       attitude: String(rel.attitude || ""),
+      /* v2.11：主动回复开关（旧 mock 数据 / 缺省视为开启） */
+      proactive_enabled: rel.proactive_enabled !== false,
       platform_ids: Array.isArray(identity.platform_ids) ? identity.platform_ids.slice() : [],
       updated_at: rel.updated_at || identity.updated_at || 0,
       soul_id: String(soulId || "")
@@ -2281,6 +2287,7 @@
           interaction_count: Number(identity.interaction_count || 0),
           affinity: Math.max(0, Math.min(100, Number(identity.affinity || 0))),
           attitude: String(identity.attitude || ""),
+          proactive_enabled: identity.proactive_enabled !== false,
           platform_ids: Array.isArray(identity.platform_ids) ? identity.platform_ids.slice() : [],
           updated_at: identity.updated_at || 0,
           soul_id: ""
@@ -2382,6 +2389,9 @@
       if (displayName) group.display_name = displayName;
     }
     if (body.notes != null) group.notes = String(body.notes).trim();
+    if (body.proactive_enabled != null) {
+      group.proactive_enabled = !!body.proactive_enabled;
+    }
     group.last_active_at = group.last_active_at || nowSeconds();
     return groupMutationResult({ group: clone(group) }, body.soul_id);
   }
@@ -2509,6 +2519,9 @@
         primaryRel.tier = Math.max(Number(primaryRel.tier || 1), Number(secondaryRel.tier || 1));
         if (!primaryRel.nickname) primaryRel.nickname = String(secondaryRel.nickname || "");
         if (!primaryRel.attitude) primaryRel.attitude = String(secondaryRel.attitude || "");
+        /* v2.11：合并账号不悄悄重开主动回复（双方都允许才保持开启） */
+        primaryRel.proactive_enabled =
+          primaryRel.proactive_enabled !== false && secondaryRel.proactive_enabled !== false;
         primaryRel.updated_at = nowSeconds();
       } else {
         map[primaryUid] = clone(secondaryRel);
@@ -2620,6 +2633,9 @@
     /* v2.6：角色对 Ta 的专属态度，去首尾空白并截断到 300 字（与后端一致） */
     if (body.attitude != null) {
       relation.attitude = String(body.attitude).trim().slice(0, 300);
+    }
+    if (body.proactive_enabled != null) {
+      relation.proactive_enabled = !!body.proactive_enabled;
     }
     relation.updated_at = nowSeconds();
 

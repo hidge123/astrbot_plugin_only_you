@@ -1039,6 +1039,10 @@ class OnlyYouWebAPI:
                     "notes": str(data.get("notes") or "").strip(),
                     "bound_soul_id": bound_soul_id,
                     "bound_soul_name": name_map.get(bound_soul_id, ""),
+                    # v2.11: per-group proactive-message switch (default True).
+                    "proactive_enabled": _as_bool(
+                        data.get("proactive_enabled"), default=True
+                    ),
                     "window_count": self._session_window_count(umo),
                     "unread_count": self._session_unread_count(umo),
                     "last_active_at": int(data.get("last_active_at") or 0),
@@ -2272,6 +2276,11 @@ class OnlyYouWebAPI:
                 umo,
                 display_name=body.get("display_name"),
                 notes=body.get("notes"),
+                proactive_enabled=(
+                    _as_bool(body.get("proactive_enabled"), default=True)
+                    if "proactive_enabled" in body
+                    else None
+                ),
             )
             if inspect.isawaitable(group):
                 group = await group
@@ -2489,6 +2498,13 @@ class OnlyYouWebAPI:
                 attitude_raw = body.get("attitude")
                 update_kwargs["attitude"] = (
                     None if attitude_raw is None else str(attitude_raw).strip()[:300]
+                )
+            if "proactive_enabled" in body:
+                # v2.11: per-Soul "allow proactive messages" switch. Only proactive
+                # messages (unread catch-up / idle-roam DM / surf share) are gated;
+                # passive replies keep working.
+                update_kwargs["proactive_enabled"] = _as_bool(
+                    body.get("proactive_enabled"), default=True
                 )
             if soul_id:
                 update_kwargs["soul_id"] = soul_id

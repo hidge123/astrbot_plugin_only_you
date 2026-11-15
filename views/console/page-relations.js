@@ -139,6 +139,41 @@
     return String((user && user.nickname) || "");
   }
 
+  /** v2.11：主动回复开关（缺省 / 旧数据视为开启）。 */
+  function proactiveEnabledOf(item) {
+    if (!item) return true;
+    var value = item.proactive_enabled;
+    if (value === undefined || value === null || value === "") return true;
+    if (typeof value === "boolean") return value;
+    if (typeof value === "number") return value !== 0;
+    var text = String(value).trim().toLowerCase();
+    return text !== "0" && text !== "false" && text !== "off" && text !== "no";
+  }
+
+  /** v2.11：用户 / 群聊弹窗里的「允许主动回复」开关行（复用全局 .switch 组件）。 */
+  function proactiveSwitchHtml(role, enabled, titleHtml, descHtml) {
+    return (
+      '<div class="field is-full">' +
+      '<div class="switch-row">' +
+      '<div class="switch-row-text">' +
+      '<span class="switch-row-title">' +
+      titleHtml +
+      "</span>" +
+      '<span class="switch-row-desc">' +
+      descHtml +
+      "</span></div>" +
+      '<label class="switch" data-tip="允许当前角色主动回复该会话">' +
+      '<input type="checkbox" data-role="' +
+      esc(role) +
+      '"' +
+      (enabled ? " checked" : "") +
+      ' /><span class="switch-track"></span></label>' +
+      "</div>" +
+      '<div class="field-help">关闭后只会停止「Bot 主动发起」的消息；用户 / 群友发来的消息与 @ 仍会正常回复。</div>' +
+      "</div>"
+    );
+  }
+
   function findUser(uid) {
     var wanted = String(uid == null ? "" : uid);
     for (var i = 0; i < S.users.length; i++) {
@@ -496,6 +531,9 @@
       '">' +
       esc(meta.short) +
       "</span>" +
+      (proactiveEnabledOf(user)
+        ? ""
+        : '<span class="tag tag-muted" data-tip="已关闭主动回复：不会主动补回未读 / 私聊搭话 / 分享视频">🤐 不主动</span>') +
       platformTagsHtml(user.platform_ids, 3) +
       "</div>" +
       '<div class="rel-row-sub">' +
@@ -549,6 +587,9 @@
       esc(group.display_name) +
       "</strong>" +
       '<span class="tag tag-primary rel-group-tag">💬 群聊</span>' +
+      (proactiveEnabledOf(group)
+        ? ""
+        : '<span class="tag tag-muted" data-tip="已关闭该群主动回复：不会翻群冒泡 / 主动分享视频">🤐 不主动</span>') +
       (group.platform_id
         ? '<span class="tag rel-platform-tag">' + esc(group.platform_id) + "</span>"
         : "") +
@@ -1158,6 +1199,12 @@
       "</span>/" +
       ATTITUDE_MAX +
       " 字）</div></div>" +
+      proactiveSwitchHtml(
+        "proactive-enabled",
+        proactiveEnabledOf(user),
+        "允许「" + esc(soulName) + "」主动回复 Ta",
+        "关闭后：仍会正常回复 Ta 发来的私聊与 @，但不会再主动补回未读、发呆联想私聊或分享视频。只影响当前角色「" + esc(soulName) + "」。"
+      ) +
       "</div></div>";
     app.modal({
       title: "用户详情 · " + nameOf(user) + (soulName ? "（" + soulName + "）" : ""),
@@ -1198,6 +1245,7 @@
     var attitudeEl = bodyEl.querySelector('[data-role="attitude"]');
     var tierEl = bodyEl.querySelector('input[name="rel-tier"]:checked');
     var affinityEl = bodyEl.querySelector('[data-role="affinity"]');
+    var proactiveEl = bodyEl.querySelector('[data-role="proactive-enabled"]');
     var displayName = displayEl ? String(displayEl.value || "").trim() : "";
     if (!displayName) {
       app.toast("显示名称不能为空", true);
@@ -1223,6 +1271,9 @@
       attitude: attitudeEl
         ? String(attitudeEl.value || "").trim().slice(0, ATTITUDE_MAX)
         : "",
+      proactive_enabled: proactiveEl
+        ? !!proactiveEl.checked
+        : proactiveEnabledOf(user),
       platform_ids: platformIds
     });
     /* ★L3 管理员级：不提交好感度，避免把无意义数值写回档案 */
@@ -1439,7 +1490,11 @@
       '<div class="rel-identity-main">' +
       '<div class="rel-identity-name">' +
       esc(group.display_name) +
-      '<span class="tag tag-primary rel-group-tag">💬 群聊</span></div>' +
+      '<span class="tag tag-primary rel-group-tag">💬 群聊</span>' +
+      (proactiveEnabledOf(group)
+        ? ""
+        : '<span class="tag tag-muted">🤐 已关闭主动回复</span>') +
+      "</div>" +
       '<div class="rel-identity-meta"><span>最近活跃 ' +
       esc(fmtAgo(group.last_active_at)) +
       "</span><span>绑定角色：" +
@@ -1485,6 +1540,12 @@
       '<input class="input" type="text" data-role="group-notes" maxlength="200" value="' +
       esc(group.notes) +
       '" placeholder="例如：酒狐的主场群，晚上最热闹" /></label>' +
+      proactiveSwitchHtml(
+        "group-proactive-enabled",
+        proactiveEnabledOf(group),
+        "允许在当前群主动回复",
+        "关闭后：仍会正常执行 @ / 唤醒的被动回复，但不再翻群吃瓜冒泡、主动分享视频或发呆联想冒泡。"
+      ) +
       "</div>" +
       '<div class="rel-group-danger-hint">清空该群内存：只清该群的内存滑窗 + 未读队列；保留 SQLite memories / users / surfing_history / 群档案（重启后未读队列会重置）。移除群聊记录：会删除该群档案（下次收到群消息会重新记录），长期记忆与用户档案仍保留。</div>';
     app.modal({
@@ -1527,6 +1588,7 @@
     var group = findGroup(umo);
     var nameEl = bodyEl.querySelector('[data-role="group-name"]');
     var notesEl = bodyEl.querySelector('[data-role="group-notes"]');
+    var proactiveEl = bodyEl.querySelector('[data-role="group-proactive-enabled"]');
     var displayName = nameEl ? String(nameEl.value || "").trim() : "";
     if (!displayName) {
       app.toast("群显示名称不能为空", true);
@@ -1538,7 +1600,10 @@
         action: "update_group",
         umo: umo,
         display_name: displayName,
-        notes: notesEl ? String(notesEl.value || "").trim() : ""
+        notes: notesEl ? String(notesEl.value || "").trim() : "",
+        proactive_enabled: proactiveEl
+          ? !!proactiveEl.checked
+          : proactiveEnabledOf(group)
       })
     );
     applyGroupsPayload(data);
@@ -1546,6 +1611,7 @@
       if (group) {
         group.display_name = displayName;
         group.notes = notesEl ? String(notesEl.value || "").trim() : "";
+        if (proactiveEl) group.proactive_enabled = !!proactiveEl.checked;
       }
     }
     paint();

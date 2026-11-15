@@ -1424,3 +1424,48 @@ v2.8 完成 Soul→机器人接口绑定后，`users` 表仍是「身份 + 关�
 - 版本号：`metadata.yaml` 与 `main.py @register` 同步为 **`2.10.0`**。
 - 离线回归：`python3 -m unittest discover -s tests` → **717 tests 全绿**（680 基线 + 37 新增）；`PYTHONPYCACHEPREFIX=/tmp/oy_pycache python3 -m compileall -q core storage surfing prompts main.py` 与 `node --check views/console/*.js` 通过。
 - 无数据库迁移、无 Web API 路由增减；升级只需替换插件文件并热重载。
+
+## 十、 v2.11 —— 按角色 / 会话的「主动回复」开关
+
+> 本章为 v2.11.0 收口记录（append-only）。数据字段、运行时门闸与控制台入口的完整实现见 `docs/TODO.md` T3 与 `docs/PRD.md` §八。
+
+### 10.1 数据模型与迁移
+
+- **`user_relations.proactive_enabled`**：`INTEGER NOT NULL DEFAULT 1`；`storage/db.py` 建表 + 幂等 `ALTER TABLE`（旧库自动补列，旧行默认 1 = 允许主动回复）。旧 `users` 表同样补列，作为无 `soul_id` 的 legacy 回退（`_profile_from_row` / `save_user`）。
+- **`UserProfile.proactive_enabled: bool = True`**：`to_dict()` 输出；`_relation_fields` / `_apply_relation` / `_ensure_relation_row` / `_upsert_relation` / `list_users` 联表查询 / `update_user_details(proactive_enabled=...)` / `migrate_user_relations` 全部贯通；`merge_users` 对账号合并与逐 Soul 关系行都使用 **AND** 语义（双方都允许才保持开启）。
+- **`GroupProfile.proactive_enabled: bool = True`**：`to_dict()` / `from_dict()`（缺失键默认 True，旧档案自动兼容）；`update_group(proactive_enabled=...)` 持久化到 `plugin_settings["group_profiles"]`；`touch_group` 不会覆盖已有值。
+
+### 10.2 运行时门闸（`main.py`）
+
+新增 5 个辅助方法（全部 defensive，管理器缺失/查询异常时默认**允许**，不影响旧测试替身）：
+
+| 方法 | 语义 |
+| :--- | :--- |
+| `_umo_is_group(umo)` | `platform:GroupMessage:...` → 群聊；其余按私聊处理 |
+| `_uid_for_private_umo(umo)` | 反查 `_known_l3_umos`，aiocqhttp 私聊 UMO 末段兜底；解析不到时视为未配置（允许） |
+| `_user_proactive_enabled(soul, uid)` | 读 `user_relations(soul_id, uid).proactive_enabled`（缺省 True） |
+| `_group_proactive_enabled(umo)` | 读 `GroupProfile.proactive_enabled`（缺省 True） |
+| `_proactive_target_allowed(soul, umo, user_uid="")` | 群聊走群档案、私聊走用户关系档案的统一判定 |
+| `_latest_allowed_l3_umo(soul, allowed_platforms=None)` | 按 MRU 逆序遍历 `_known_l3_umos`，返回第一个仍允许主动回复的 ★L3 私聊 UMO |
+
+接入点：
+
+- `_catch_up_private_unread`：冷却检查之后、写冷却时间戳之前，按最后一条未读的 `sender_id` 判定；关闭则 `continue`（**不 ACK 未读**、不调用 LLM、不写冷却）。
+- `_pick_group_unread_candidate`（v2.11 起为 `async`）：候选排序循环内跳过关闭的群，避免「最热但已关闭」的群每轮霸占候选、饿死其他群。
+- `_run_idle_roam_action`：GROUP_LURK 与 MEMORY_MUSE 在目标确定后、发送前调用 `_proactive_target_allowed`；被拦截时记录日志并走既有「保留未读 / 冷却该群」失败分支。
+- `_maybe_share_surfed_video`：目标从 `_latest_l3_umo()` 改为 `_latest_allowed_l3_umo(soul)`；全部 ★L3 关闭时跳过分享（不记录已分享，保留重试机会）。
+
+### 10.3 Web API / Pages
+
+- `users/list`：`users[]`（`UserProfile.to_dict()`）与 `groups[]`（`GroupItem`，`_group_items` 输出 `proactive_enabled`）都带该字段。
+- `users/update`：默认 action 在 body 含 `proactive_enabled` 时透传 `update_user_details`；`update_group` action 在 body 含该字段时透传 `update_group`（省略 = 保持原值）。
+- `views/console/page-relations.js`：复用全局 `.switch` / `.switch-row` 组件，在用户详情弹窗「当前角色关系」分区与群聊详情弹窗各加一行开关；列表行 / 群详情顶部对关闭项显示 `🤐 不主动` 标记；`proactiveEnabledOf()` 兼容 `true/false/0/1/"0"/"false"` 旧数据。
+- `views/console/mock.js`：夹具与接口同步（一个关闭群 + 一个关闭用户演示），`updateUserRecord` / `updateGroupRecord` / `mergeUsers` 处理该字段。
+
+### 10.4 兼容、边界与回归基线
+
+- **向后兼容**：旧库自动补列且默认 1；旧 `group_profiles` 缺键默认 True；关闭开关不删除任何记忆 / 关系 / 群档案；旧版本插件读取新库时忽略新列。
+- **边界**：只拦「Bot 主动发起」；三态门禁、读空气概率门闸、被动回复、`send_reply` 链路均未改动。
+- **测试**：新增 `tests/test_v211_proactive_toggle.py`（26 tests：schema/迁移、按角色持久化、legacy 回退、合并语义、群档案往返与重启回读、Web API users/update 与 update_group、私聊补回跳过且保留未读、GROUP_LURK 跳关闭群并改选允许群、MEMORY_MUSE 目标拦截、`_latest_allowed_l3_umo`、控制台静态契约）。
+- **基线**：`python3 -m unittest discover -s tests` → **743 tests 全绿**（v2.10 的 717 + 26 新增）；`PYTHONPYCACHEPREFIX=/tmp/oy_pycache python3 -m compileall -q core storage surfing prompts main.py` 与 `node --check views/console/*.js` 通过。
+- **版本**：`metadata.yaml` / `main.py @register` 同步为 **`2.11.0`**；Web API 路由数仍为 **31**（无新增路由）。

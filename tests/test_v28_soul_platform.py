@@ -642,6 +642,19 @@ class TestMainRuntimeHelpers(DatabaseAsyncTestCase):
 
         fake._idle_roam_cooldown_seconds = OnlyYouPlugin._idle_roam_cooldown_seconds.__get__(fake)
         fake._latest_l3_umo = OnlyYouPlugin._latest_l3_umo.__get__(fake)
+        # v2.11 proactive-message switches (fakes have no user_relation -> allow all).
+        fake._umo_is_group = OnlyYouPlugin._umo_is_group
+        fake._uid_for_private_umo = OnlyYouPlugin._uid_for_private_umo.__get__(fake)
+        fake._group_proactive_enabled = (
+            OnlyYouPlugin._group_proactive_enabled.__get__(fake)
+        )
+        fake._user_proactive_enabled = (
+            OnlyYouPlugin._user_proactive_enabled.__get__(fake)
+        )
+        fake._proactive_target_allowed = (
+            OnlyYouPlugin._proactive_target_allowed.__get__(fake)
+        )
+        fake._latest_allowed_l3_umo = OnlyYouPlugin._latest_allowed_l3_umo.__get__(fake)
         # staticmethod: keep it a plain function (no `self` binding)
         fake._render_soul_summary = OnlyYouPlugin._render_soul_summary
         fake._maybe_synthesize_proactive = (

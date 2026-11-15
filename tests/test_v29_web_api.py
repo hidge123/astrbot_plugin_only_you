@@ -364,6 +364,7 @@ class TestUsersListGroupScope(TwoSoulTestBase):
             "notes",
             "bound_soul_id",
             "bound_soul_name",
+            "proactive_enabled",
             "window_count",
             "unread_count",
             "last_active_at",

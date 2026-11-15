@@ -511,3 +511,35 @@ v2.9 起用户数据拆成两层：`users` 只保存**全局身份**（`global_u
 
 - 回滚到 v2.9：恢复旧插件文件并热重载即可；`plugin_settings` / `souls/*.json` / `memories` 结构未变，v2.9 可正常读取。
 - 唯一「降级差异」：v2.10 期间由门闸拦下的普通群消息不会补回（本来就不算未读）；记忆里的相对时间在 v2.9 下重新失去注入时间锚点，但不影响数据。
+
+## 19. v2.11.0 按角色 / 会话的「主动回复」开关
+
+> 本版本只新增会话级开关与两个数据字段，**无破坏性迁移**；不主动修改任何既有设置（旧数据默认允许主动回复）。
+
+### 19.1 数据变化
+
+| 位置 | 变化 | 旧数据默认 |
+| :--- | :--- | :--- |
+| `user_relations.proactive_enabled` | 新增 `INTEGER NOT NULL DEFAULT 1`（`db.initialize()` 幂等 `ALTER TABLE` 自动补列） | `1` = 允许主动回复 |
+| `users.proactive_enabled` | 同上（无 Soul 的 legacy 回退列） | `1` |
+| `plugin_settings["group_profiles"]` 的每个群档案 | 新增 `proactive_enabled: bool` | 缺失 → `True` |
+
+- **不需要备份 DB**：迁移是纯加法；若想保险仍可 `docker exec astrbot cp /AstrBot/data/plugin_data/astrbot_plugin_only_you/only_you.db .../only_you.db.bak_v210`。
+- 角色 Soul JSON（`souls/*.json`）**不受影响**；23 个字段的群档案结构仍兼容旧版本（旧版本插件会忽略新键）。
+
+### 19.2 部署与校验步骤
+
+1. 覆盖插件文件（先清理旧 `__pycache__`），热重载或重启容器。
+2. 确认日志出现 `[OnlyYou] Registered 31 Web API routes for Plugin Pages.`、`[OnlyYou] Plugin initialized successfully.`，无 Python Traceback（路由数不变，仍为 31）。
+3. Pages「关系与群聊」页：
+   - 打开任一用户详情弹窗 → 看到「允许「当前角色」主动回复 Ta」开关，默认开启；
+   - 打开任一「💬 群聊」详情弹窗 → 看到「允许在当前群主动回复」开关，默认开启；
+   - 关闭保存后列表行出现 `🤐 不主动`，刷新页面保持；`users/list` 的 `users[]` / `groups[]` 均返回 `proactive_enabled`。
+4. 行为抽查（可选）：
+   - 关闭某私聊用户的主动回复后，Bot 在 `IDLE` 时不会主动补回该用户的未读（日志 `UNREAD_PRIVATE_CATCHUP skipped: proactive disabled ...`），未读队列保留；
+   - 关闭某群后，`IDLE_ROAM(GROUP_LURK)` 不会挑选该群（日志 `proactive disabled` 或直接无该群决策调用），其他群不受影响。
+
+### 19.3 回滚
+
+- 回滚到 v2.10：恢复旧插件文件并热重载即可；新列 / 新键被旧版本忽略，旧版本会恢复「所有会话都允许主动回复」的行为（关系 / 记忆数据不丢）。
+- 开关值保留在数据库中，重新升级到 v2.11 后立即恢复。

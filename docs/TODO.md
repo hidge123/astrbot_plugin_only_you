@@ -1,7 +1,7 @@
 # OnlyYou 项目 TODO
 
 > 状态约定：`待办` → `进行中` → `已完成`（已完成条目保留，不做删除，便于回溯）
-> 当前版本：**v2.10.0**（2026-11-15）。T1 / T2 均已实现并通过离线回归（`python3 -m unittest discover -s tests`：717 tests 全绿）。
+> 当前版本：**v2.11.0**（2026-11-15）。T1 / T2 / T3 均已实现并通过离线回归（`python3 -m unittest discover -s tests`：743 tests 全绿）。
 
 ---
 
@@ -83,6 +83,37 @@ _（暂无）_
 - [x] 门闸位于两个前置判定之后、防抖之前，可从日志/调用行为确认被拦截的消息不产生决策模型调用。（代码位置 + `test_gate_rejection_skips_debounce_window` + 拦截日志）
 - [x] 配置项已加入插件配置并被正确读取，修改后即时生效。（`_conf_schema.json` 3 项 + `TestReplyGateSchema`；属性每次调用实时读取 `atmosphere_config`）
 
+
+### T3 按角色 / 会话的「主动回复」开关（已完成 2026-11-15，v2.11.0）
+
+**涉及模块**：用户关系与群聊档案、主动消息链路（私聊未读补回 / 群翻群冒泡 / 发呆记忆联想 / 冲浪视频分享）、控制台关系页。
+
+**现状问题**：Bot 的主动消息（主动补回未读、翻群吃瓜冒泡、发呆想起旧事私聊、冲浪分享）是全局按角色驱动的，没有「这个用户 / 这个群不要主动打扰」的会话级粒度。遇到不希望被主动私聊的用户、或只想窥屏不想冒泡的群，只能通过关闭该角色的冲浪 / 未读补回等全局开关整体关闭，牺牲其它会话的体验。
+
+**目标要求**：
+
+1. 在「关系与群聊」页的**每个用户**与**每个群聊**详情弹窗中提供「允许主动回复」开关（按当前角色保存）。
+2. 开关只控制 **Bot 主动发起**的消息；用户 / 群友发来的消息、@ 与读空气接话等被动回复不受影响。
+3. 默认开启（与旧版行为一致）；关闭后该会话不消耗未读、不被翻群候选挤占、视频分享自动改投其他允许的 ★L3。
+4. 数据按角色隔离，旧库自动迁移、旧数据默认开启，无需手工操作。
+
+**实现落点（v2.11.0）**：
+
+- **数据层**：`user_relations.proactive_enabled`（新增列，幂等 `ALTER TABLE`，默认 1）+ 旧 `users.proactive_enabled` 回退列；`UserProfile.proactive_enabled` 进 `to_dict()`、`update_user_details(proactive_enabled=...)`、`list_users`/合并（双方都允许才保持开启）。`GroupProfile.proactive_enabled`（`plugin_settings["group_profiles"]`，缺失默认 True）+ `update_group(proactive_enabled=...)`。
+- **Web API**：`users/list` 的 users / groups 均返回 `proactive_enabled`；`users/update` 主 action 与 `update_group` action 接受并持久化该字段（省略 = 保持原值）。
+- **运行时门闸（`main.py`）**：`_proactive_target_allowed()` / `_user_proactive_enabled()` / `_group_proactive_enabled()` / `_latest_allowed_l3_umo()`；接入 `_catch_up_private_unread`（关闭→跳过且不 ACK 未读）、`_pick_group_unread_candidate`（关闭群直接跳过，不挤占其他群）、`_run_idle_roam_action` 的 GROUP_LURK / MEMORY_MUSE 发送前检查、`_maybe_share_surfed_video` 改用「最新且允许的 ★L3」。
+- **Pages**：用户 / 群聊详情弹窗新增 `.switch` 开关行（复用 `switch-row` 组件），保存时随 `users/update` 提交；列表行与群详情对关闭项显示 `🤐 不主动` 标记；`mock.js` 同步夹具与接口。
+- **兼容/回滚**：无破坏性迁移；旧版本插件忽略新列/新字段。关闭开关不会删除任何记忆、关系或群档案。
+
+**验收标准（自检口径）**：
+
+- [x] 用户 / 群聊弹窗都有开关，保存后 `users/list` 回显、刷新页面保持。（`test_users_update_toggles_user_and_keeps_soul_scope` / `test_update_group_action_toggles_and_exposes_flag` / `test_group_profile_defaults_to_enabled`）
+- [x] 关闭后只停主动消息：私聊未读补回 / 翻群冒泡 / 发呆联想 / 冲浪分享在真实业务链路中被跳过（单测覆盖主链路 + 远程真机 API 验证）。
+- [x] 被动回复不受影响：本次改动未触碰三态门禁、读空气放行、`send_reply` 等被动路径。
+- [x] 默认开启 + 按角色隔离 + 旧库自动迁移：`test_legacy_database_migration_defaults_to_enabled`、`test_scoped_toggle_is_per_soul`、`test_scoped_toggle_persists_in_relation_row`。
+- [x] 关闭群不挤占其他群、关闭 ★L3 不阻塞分享：`test_group_lurk_picks_allowed_group_when_top_one_disabled`、`test_latest_allowed_l3_umo_skips_disabled`。
+
+
 ---
 
 ## 变更记录
@@ -93,3 +124,4 @@ _（暂无）_
 | 2026-11-15 | 录入第二个目标 T2（读空气概率/预算门闸）。 |
 | 2026-11-15 | **v2.10.0：完成 T1** —— `core/time_utils.py` 时间工具 + 记忆形成时间标注（`to_dict` / Pages / 注入 Prompt / MEMORY_MUSE）+ 提炼滑窗时间戳与 `【窗口时间范围】` + `MEMORY_TIME_CONTEXT_PROMPT`。 |
 | 2026-11-15 | **v2.10.0：完成 T2** —— `AtmosphereReader` 概率/每小时预算门闸（默认开启 80% / 不限次数，可关闭或调 0~100%）+ `_conf_schema.json` 3 项配置 + 日志可观测。 |
+| 2026-11-15 | **v2.11.0：完成 T3** —— 按角色 / 会话的「主动回复」开关：`user_relations` / `GroupProfile` 新字段 + `users/list` / `users/update` 透出与持久化 + 四类主动消息门闸 + 控制台用户/群聊详情弹窗开关 + 26 项离线测试。 |

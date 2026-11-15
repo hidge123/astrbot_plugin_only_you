@@ -94,6 +94,7 @@ class TestUserRelationsSchema(SoulRelationsTestBase):
             "affinity",
             "nickname",
             "attitude",
+            "proactive_enabled",
             "updated_at",
         }
 

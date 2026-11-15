@@ -1,6 +1,7 @@
 """Main entry point for astrbot_plugin_only_you (OnlyYou / 只有你)."""
 
 import asyncio
+import inspect
 import os
 import random
 import time
@@ -338,7 +339,7 @@ def _umo_in_platform_scope(
     "astrbot_plugin_only_you",
     "hidge123",
     "OnlyYou (只有你) —— 具备生命节律、三级记忆与赛博冲浪能力的高自治 AI 伴侣与数字网友插件",
-    "2.10.0",
+    "2.11.0",
     "https://github.com/hidge123/astrbot_plugin_only_you",
 )
 class OnlyYouPlugin(Star):
@@ -868,6 +869,117 @@ class OnlyYouPlugin(Star):
                 return str(umo or "")
         return ""
 
+    @staticmethod
+    def _umo_is_group(umo: Any) -> bool:
+        """``platform:GroupMessage:session`` -> True; private sessions -> False."""
+        text = str(umo or "").strip()
+        if not text:
+            return False
+        parts = text.split(":", 2)
+        if len(parts) < 2:
+            return False
+        return "group" in parts[1].strip().lower()
+
+    def _uid_for_private_umo(self, umo: Any) -> str:
+        """Resolve the user id behind a private-chat UMO (best effort, ``""``)."""
+        clean = str(umo or "").strip()
+        if not clean:
+            return ""
+        try:
+            for uid, value in self._known_l3_umos.items():
+                if str(value or "") == clean:
+                    return str(uid)
+        except Exception:  # noqa: BLE001 - detection must never break the action
+            pass
+        parts = clean.split(":", 2)
+        session = parts[2] if len(parts) >= 3 else ""
+        if session and "!" not in session and ":" not in session:
+            # aiocqhttp private UMO carries the native uid as its last segment.
+            return session
+        return ""
+
+    async def _group_proactive_enabled(self, umo: Any) -> bool:
+        """Whether the group's profile allows **proactive** messages (default True)."""
+        manager = getattr(self, "user_relation", None)
+        getter = getattr(manager, "get_group", None) if manager is not None else None
+        if not callable(getter):
+            return True
+        try:
+            group = getter(str(umo or "").strip())
+            if inspect.isawaitable(group):
+                group = await group
+        except Exception as exc:  # noqa: BLE001 - default allow on lookup failure
+            logger.debug(f"[OnlyYou] group proactive lookup failed: {exc}")
+            return True
+        if group is None:
+            return True
+        return bool(getattr(group, "proactive_enabled", True))
+
+    async def _user_proactive_enabled(self, soul: Any, user_uid: Any) -> bool:
+        """Whether this Soul may proactively message ``user_uid`` (default True)."""
+        uid = str(user_uid or "").strip()
+        if not uid:
+            return True
+        manager = getattr(self, "user_relation", None)
+        getter = getattr(manager, "get_user", None) if manager is not None else None
+        if not callable(getter):
+            return True
+        soul_id = str(getattr(soul, "soul_id", "") or "")
+        profile = None
+        try:
+            profile = getter(uid, soul_id=soul_id) if soul_id else getter(uid)
+            if inspect.isawaitable(profile):
+                profile = await profile
+        except TypeError:  # partial manager without the v2.9 ``soul_id`` keyword
+            try:
+                profile = getter(uid)
+                if inspect.isawaitable(profile):
+                    profile = await profile
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"[OnlyYou] user proactive lookup failed: {exc}")
+                return True
+        except Exception as exc:  # noqa: BLE001 - default allow on lookup failure
+            logger.debug(f"[OnlyYou] user proactive lookup failed: {exc}")
+            return True
+        if profile is None:
+            return True
+        return bool(getattr(profile, "proactive_enabled", True))
+
+    async def _proactive_target_allowed(
+        self, soul: Any, umo: Any, user_uid: Any = ""
+    ) -> bool:
+        """v2.11: per-session "allow proactive messages" decision (default True).
+
+        Groups consult ``GroupProfile.proactive_enabled``; private chats consult the
+        per-Soul ``user_relations.proactive_enabled`` of the target user. Only
+        bot-initiated messages are gated — passive replies are never affected.
+        """
+        clean = str(umo or "").strip()
+        if not clean:
+            return True
+        if self._umo_is_group(clean):
+            return await self._group_proactive_enabled(clean)
+        uid = str(user_uid or "").strip() or self._uid_for_private_umo(clean)
+        return await self._user_proactive_enabled(soul, uid)
+
+    async def _latest_allowed_l3_umo(
+        self, soul: Any, allowed_platforms: Any = None
+    ) -> str:
+        """Most recent ★L3 private UMO whose proactive switch is still enabled."""
+        try:
+            items = list(self._known_l3_umos.items())
+        except Exception:  # noqa: BLE001
+            return ""
+        for uid, umo in reversed(items):
+            candidate = str(umo or "")
+            if not candidate or not _umo_in_platform_scope(
+                candidate, allowed_platforms=allowed_platforms
+            ):
+                continue
+            if await self._user_proactive_enabled(soul, str(uid)):
+                return candidate
+        return ""
+
     def _surfing_enabled(self, soul: Any) -> bool:
         """Per-Soul cyber-surfing switch (``settings.surfing_enabled``, default True)."""
         try:
@@ -1196,7 +1308,7 @@ class OnlyYouPlugin(Star):
             logger.warning(f"[OnlyYou] _settle_finished_busy_blocks failed: {exc}")
         return results
 
-    def _pick_group_unread_candidate(
+    async def _pick_group_unread_candidate(
         self,
         allowed_platforms: Any = None,
         blocked_platforms: Any = None,
@@ -1226,6 +1338,10 @@ class OnlyYouPlugin(Star):
             ):
                 continue
             if cooldown > 0 and (now - self._last_group_lurk_ts.get(umo, 0.0)) < cooldown:
+                continue
+            # v2.11: a group whose profile disables proactive messages is skipped
+            # entirely so it cannot starve other eligible groups.
+            if not await self._group_proactive_enabled(umo):
                 continue
             try:
                 transcript = self.session_buffer.get_window_transcript(
@@ -1398,7 +1514,7 @@ class OnlyYouPlugin(Star):
             current_time = datetime.now().strftime("%H:%M")
 
             # ---- 分支 A：翻群记录吃瓜 (GROUP_LURK，先决策后回复) ----
-            lurked = self._pick_group_unread_candidate(
+            lurked = await self._pick_group_unread_candidate(
                 allowed_platforms=allowed_platforms,
                 blocked_platforms=blocked_platforms,
                 soul_id=soul_id,
@@ -1434,6 +1550,14 @@ class OnlyYouPlugin(Star):
                         data, group_hint=umo, allowed_platforms=allowed_platforms
                     )
                     message = self._extract_idle_roam_message(data)
+                    if target_umo and message and not await self._proactive_target_allowed(
+                        soul, target_umo
+                    ):
+                        logger.info(
+                            "[OnlyYou] IDLE_ROAM(GROUP_LURK) skipped: proactive disabled "
+                            f"for target {target_umo}"
+                        )
+                        target_umo = ""
                     if target_umo and message:
                         audio_path = await self._maybe_synthesize_proactive(message, soul)
                         sent = await self.platform_bridge.send_proactive_message(
@@ -1573,6 +1697,14 @@ class OnlyYouPlugin(Star):
                 data, group_hint="", allowed_platforms=allowed_platforms
             )
             message = self._extract_idle_roam_message(data)
+            if target_umo and message and not await self._proactive_target_allowed(
+                soul, target_umo
+            ):
+                logger.info(
+                    "[OnlyYou] IDLE_ROAM(MEMORY_MUSE) skipped: proactive disabled for "
+                    f"target {target_umo}"
+                )
+                target_umo = ""
             if target_umo and message:
                 audio_path = await self._maybe_synthesize_proactive(message, soul)
                 sent = await self.platform_bridge.send_proactive_message(
@@ -1688,6 +1820,17 @@ class OnlyYouPlugin(Star):
             ):
                 continue
             if cooldown > 0 and (now - self._last_private_catchup_ts.get(umo, 0.0)) < cooldown:
+                continue
+            # v2.11: respect the per-user "allow proactive messages" switch. The
+            # backlog is kept (not ACKed) so re-enabling the switch can still catch up.
+            last_message = batch[-1]
+            if not await self._user_proactive_enabled(
+                soul, getattr(last_message, "sender_id", "")
+            ):
+                logger.info(
+                    "[OnlyYou] UNREAD_PRIVATE_CATCHUP skipped: proactive disabled for "
+                    f"{umo}"
+                )
                 continue
             # cool down even if the send fails, so we never tight-loop a broken chat
             self._last_private_catchup_ts[umo] = now
@@ -1973,9 +2116,12 @@ class OnlyYouPlugin(Star):
                 )
                 return False
 
-            target_umo = self._latest_l3_umo()
+            target_umo = await self._latest_allowed_l3_umo(soul)
             if not target_umo:
-                logger.info("[OnlyYou] SURF share skipped: no ★L3 private session")
+                logger.info(
+                    "[OnlyYou] SURF share skipped: no ★L3 private session with "
+                    "proactive messages enabled"
+                )
                 return False
 
             video_text = (

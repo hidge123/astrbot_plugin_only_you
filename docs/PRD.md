@@ -485,3 +485,34 @@ flowchart TB
 - **配置**：`_conf_schema.json → atmosphere_config.reply_gate_enabled / reply_gate_probability / reply_gate_hourly_limit`（普通配置即可见、可调、可关闭，修改后即时生效）。
 - **可观测**：拦截日志 `[OnlyYou] Reply gate dropped non-@ group message (probability=…% | hourly limit=…, umo=…)`；被拦截消息不进入防抖、不调用决策模型、不算未读。
 - **验收**：见 `docs/TODO.md` T2 验收标准（已勾选）。
+
+## 八、 v2.11 增量需求：按角色 / 会话的「主动回复」开关
+
+> v2.11 不改变主动消息的触发条件与生成逻辑，只增加**会话级**的放行开关：同一个角色可以正常回复某个用户 / 群聊的被动消息，但不再对指定会话主动开口。
+
+### 8.1 产品语义
+
+- **只控「Bot 主动发起的消息」**：私聊未读补回（`UNREAD_PRIVATE_CATCHUP`）、`IDLE_ROAM(GROUP_LURK)` 翻群冒泡、`IDLE_ROAM(MEMORY_MUSE)` 发呆联想私聊、`SURF` 视频分享。
+- **被动回复完全不受影响**：用户发来的私聊、@ / 唤醒 / 引用 Bot 的回复、群聊读空气接话、三态门禁与概率门闸逻辑均保持原样。
+- **按角色隔离**：用户开关随 `(soul_id, global_uid)` 关系档案保存；群聊开关随群档案保存（群档案本身归属当前管辖角色）。同一用户在不同角色下可以有不同设置。
+- **默认开启**：旧数据升级后行为与 v2.10 完全一致；关闭是显式选择。
+
+### 8.2 会话级行为矩阵
+
+| 场景 | 开关开启（默认） | 开关关闭 |
+| :--- | :--- | :--- |
+| 私聊用户未读补回 | 按冷却 / 每次最多 2 个会话主动补回 | 跳过该用户，**不 ACK 未读**（保留以便重新开启后补回），不调决策模型 |
+| 群聊 `GROUP_LURK` 翻群 | 参与未读候选排序并可能冒泡 | 候选列表直接跳过该群，**不挤占**其他群的排序与冷却 |
+| `MEMORY_MUSE` 发呆联想 | 目标可为该群 / 该用户 | 发送前拦截；若目标是关闭的用户则本次跳过 |
+| `SURF` 视频分享 | 分享给最近 ★L3 私聊 | 自动改投「最新且仍允许」的 ★L3；全部关闭时不分享（视频保留重试机会） |
+
+### 8.3 数据与接口
+
+- `user_relations.proactive_enabled`（INTEGER，默认 1；旧 `users.proactive_enabled` 为无 Soul 回退列）；`UserProfile.proactive_enabled`、`GroupProfile.proactive_enabled`（`plugin_settings["group_profiles"]`，缺失默认 True）。
+- `users/list` 的 `users[]` 与 `groups[]` 都返回 `proactive_enabled`；`users/update` 默认 action 与 `update_group` action 接受该字段（省略保持原值）。
+- 合并账号时「双方都允许才保持开启」，避免合并把关闭的会话悄悄重新打开。
+
+### 8.4 验收
+
+- 见 `docs/TODO.md` T3 验收标准（已勾选）；离线回归基线 743 tests（v2.10 的 717 + 26 新增）。
+- 真机验收：控制台弹窗保存后 `users/list` 回显、刷新保持；关闭后相关主动消息在日志中被跳过（主链路单测 + 测试服 API 验证）。
