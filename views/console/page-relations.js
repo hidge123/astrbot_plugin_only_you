@@ -235,6 +235,9 @@
       notes: String(group.notes == null ? "" : group.notes),
       bound_soul_id: String(group.bound_soul_id || ""),
       bound_soul_name: String(group.bound_soul_name || ""),
+      /* v2.11：主动回复开关必须随 group 档案一起保留，否则保存后重新打开弹窗/
+         行标记会因字段丢失而回退成「开启」（normalize 白名单曾漏掉该字段）。 */
+      proactive_enabled: proactiveEnabledOf(group),
       window_count: num(group.window_count, 0),
       unread_count: num(group.unread_count, 0),
       last_active_at: num(group.last_active_at, 0)
@@ -800,6 +803,17 @@
       data.counts && typeof data.counts === "object" ? data.counts : computeCounts(S.users);
     if (!isFinite(Number(S.counts.total))) S.counts.total = S.users.length;
     if (Array.isArray(data.groups)) S.groups = normalizeGroups(data.groups);
+  }
+
+  /** 从 users/update 响应里取原始（未 normalize）的群聊项，用于判断后端是否带字段。 */
+  function rawGroupFromPayload(data, umo) {
+    var wanted = String(umo == null ? "" : umo);
+    var list = data && Array.isArray(data.groups) ? data.groups : [];
+    for (var i = 0; i < list.length; i++) {
+      var item = list[i];
+      if (item && String(item.umo || "") === wanted) return item;
+    }
+    return null;
   }
 
   function applyGroupsPayload(data) {
@@ -1607,12 +1621,21 @@
       })
     );
     applyGroupsPayload(data);
-    if (!data || !Array.isArray(data.groups)) {
-      if (group) {
-        group.display_name = displayName;
-        group.notes = notesEl ? String(notesEl.value || "").trim() : "";
-        if (proactiveEl) group.proactive_enabled = !!proactiveEl.checked;
+    var submittedProactive = proactiveEl
+      ? !!proactiveEl.checked
+      : proactiveEnabledOf(group);
+    var refreshed = findGroup(umo);
+    if (refreshed) {
+      /* 服务端返回为准；仅当响应确实没带该字段（旧版本后端 / 精简 payload）时
+         才用刚提交的值兜底，避免旧后端把开关悄悄重置成「开启」。 */
+      var raw = rawGroupFromPayload(data, umo);
+      if (!raw || raw.proactive_enabled === undefined || raw.proactive_enabled === null) {
+        refreshed.proactive_enabled = submittedProactive;
       }
+    } else if (group) {
+      group.display_name = displayName;
+      group.notes = notesEl ? String(notesEl.value || "").trim() : "";
+      group.proactive_enabled = submittedProactive;
     }
     paint();
     app.toast("已更新群聊「" + displayName + "」");

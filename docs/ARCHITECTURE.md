@@ -1466,6 +1466,7 @@ v2.8 完成 Soul→机器人接口绑定后，`users` 表仍是「身份 + 关�
 
 - **向后兼容**：旧库自动补列且默认 1；旧 `group_profiles` 缺键默认 True；关闭开关不删除任何记忆 / 关系 / 群档案；旧版本插件读取新库时忽略新列。
 - **边界**：只拦「Bot 主动发起」；三态门禁、读空气概率门闸、被动回复、`send_reply` 链路均未改动。
-- **测试**：新增 `tests/test_v211_proactive_toggle.py`（26 tests：schema/迁移、按角色持久化、legacy 回退、合并语义、群档案往返与重启回读、Web API users/update 与 update_group、私聊补回跳过且保留未读、GROUP_LURK 跳关闭群并改选允许群、MEMORY_MUSE 目标拦截、`_latest_allowed_l3_umo`、控制台静态契约）。
-- **基线**：`python3 -m unittest discover -s tests` → **743 tests 全绿**（v2.10 的 717 + 26 新增）；`PYTHONPYCACHEPREFIX=/tmp/oy_pycache python3 -m compileall -q core storage surfing prompts main.py` 与 `node --check views/console/*.js` 通过。
-- **版本**：`metadata.yaml` / `main.py @register` 同步为 **`2.11.0`**；Web API 路由数仍为 **31**（无新增路由）。
+- **测试**：新增 `tests/test_v211_proactive_toggle.py`（28 tests：schema/迁移、按角色持久化、legacy 回退、合并语义、群档案往返与重启回读、Web API users/update 与 update_group、私聊补回跳过且保留未读、GROUP_LURK 跳关闭群并改选允许群、MEMORY_MUSE 目标拦截、`_latest_allowed_l3_umo`、控制台静态契约与 normalizeGroup 行为回归）。
+- **基线**：`python3 -m unittest discover -s tests` → **745 tests 全绿**（v2.10 的 717 + 28 新增）；`PYTHONPYCACHEPREFIX=/tmp/oy_pycache python3 -m compileall -q core storage surfing prompts main.py` 与 `node --check views/console/*.js` 通过。
+- **v2.11.1 真机修复**：`views/console/page-relations.js` 的 `normalizeGroup()` 是字段白名单，最初漏掉 `proactive_enabled`，导致群聊弹窗保存后本地缓存/刷新回读时字段丢失、重新打开又显示「开启」。修复为白名单显式保留该字段，并在保存响应缺失该字段时用提交值兜底；新增 `tests/test_v211_proactive_toggle.py` 的 static + node 行为回归（`normalizeGroup(false) === false` / 缺省 true）。后端 API 与落库在 v2.11.0 即为正确。
+- **版本**：`metadata.yaml` / `main.py @register` 同步为 **`2.11.1`**；Web API 路由数仍为 **31**（无新增路由）。

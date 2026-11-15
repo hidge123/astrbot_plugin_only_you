@@ -210,7 +210,7 @@
 
 ```text
 OnlyYou/
-├── metadata.yaml                # 插件元数据（version: 2.11.0）
+├── metadata.yaml                # 插件元数据（version: 2.11.1）
 ├── _conf_schema.json            # AstrBot WebUI 配置 Schema（仅运行参数；无模型绑定）
 ├── requirements.txt             # Python 依赖
 ├── main.py                      # 插件入口：三态门禁 / selected_provider / LLM 钩子 / on_decorating_result TTS / 后台任务 / 指令

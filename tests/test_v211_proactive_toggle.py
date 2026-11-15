@@ -23,8 +23,11 @@ Stdlib ``unittest`` only, fully offline.
 
 import json
 import os
+import shutil
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 
@@ -614,8 +617,64 @@ class TestConsoleProactiveUi(unittest.TestCase):
         assert 'data-role="proactive-enabled"' in source
         assert 'data-role="group-proactive-enabled"' in source
         assert "proactive_enabled: proactiveEl" in source
-        assert "proactive_enabled: proactiveEl" in source
         assert "proactiveEnabledOf" in source
+
+    def test_group_normalizer_keeps_proactive_field(self):
+        """回归：normalizeGroup 的白名单曾漏掉 proactive_enabled，导致保存后重开弹窗
+        又恢复成「开启」（用户实测 bug）。该断言直接冻结 normalizeGroup 保留字段。"""
+        source = self._read("page-relations.js")
+        assert "proactive_enabled: proactiveEnabledOf(group)" in source
+        assert "rawGroupFromPayload" in source
+
+    @unittest.skipUnless(shutil.which("node"), "node 不可用，跳过 JS 行为回归")
+    def test_group_normalizer_behaviour_with_node(self):
+        """用 node 执行真实 normalizeGroup：false 必须保留，缺失字段默认 true。"""
+        harness = """
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[2], "utf8");
+function extract(name) {
+  const start = src.indexOf("function " + name + "(");
+  if (start < 0) throw new Error("missing " + name);
+  let depth = 0;
+  for (let i = src.indexOf("{", start); i < src.length; i++) {
+    if (src[i] === "{") depth++;
+    else if (src[i] === "}") {
+      depth--;
+      if (depth === 0) return src.slice(start, i + 1);
+    }
+  }
+  throw new Error("unbalanced " + name);
+}
+function num(value, fallback) {
+  const n = Number(value);
+  return isFinite(n) ? n : fallback;
+}
+eval(extract("proactiveEnabledOf"));
+eval(extract("normalizeGroup"));
+const off = normalizeGroup({ umo: "qq:GroupMessage:1", proactive_enabled: false });
+const on = normalizeGroup({ umo: "qq:GroupMessage:2", proactive_enabled: true });
+const legacy = normalizeGroup({ umo: "qq:GroupMessage:3" });
+const zero = normalizeGroup({ umo: "qq:GroupMessage:4", proactive_enabled: 0 });
+if (off.proactive_enabled !== false) throw new Error("false lost: " + JSON.stringify(off));
+if (on.proactive_enabled !== true) throw new Error("true lost: " + JSON.stringify(on));
+if (legacy.proactive_enabled !== true) throw new Error("legacy default not true");
+if (zero.proactive_enabled !== false) throw new Error("integer 0 not treated as false");
+process.stdout.write("NORMALIZE_OK");
+"""
+        fd, path = tempfile.mkstemp(suffix=".js")
+        try:
+            os.write(fd, harness.encode("utf-8"))
+            os.close(fd)
+            result = subprocess.run(
+                [shutil.which("node"), path, os.path.join(PROJECT_ROOT, "views", "console", "page-relations.js")],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        finally:
+            os.unlink(path)
+        assert result.returncode == 0, result.stderr
+        assert "NORMALIZE_OK" in result.stdout, result.stdout
 
     def test_mock_exposes_switch(self):
         source = self._read("mock.js")

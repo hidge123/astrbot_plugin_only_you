@@ -1,7 +1,7 @@
 # OnlyYou 项目 TODO
 
 > 状态约定：`待办` → `进行中` → `已完成`（已完成条目保留，不做删除，便于回溯）
-> 当前版本：**v2.11.0**（2026-11-15）。T1 / T2 / T3 均已实现并通过离线回归（`python3 -m unittest discover -s tests`：743 tests 全绿）。
+> 当前版本：**v2.11.1**（2026-11-15）。T1 / T2 / T3 均已实现并通过离线回归（`python3 -m unittest discover -s tests`：745 tests 全绿）。
 
 ---
 
@@ -125,3 +125,4 @@ _（暂无）_
 | 2026-11-15 | **v2.10.0：完成 T1** —— `core/time_utils.py` 时间工具 + 记忆形成时间标注（`to_dict` / Pages / 注入 Prompt / MEMORY_MUSE）+ 提炼滑窗时间戳与 `【窗口时间范围】` + `MEMORY_TIME_CONTEXT_PROMPT`。 |
 | 2026-11-15 | **v2.10.0：完成 T2** —— `AtmosphereReader` 概率/每小时预算门闸（默认开启 80% / 不限次数，可关闭或调 0~100%）+ `_conf_schema.json` 3 项配置 + 日志可观测。 |
 | 2026-11-15 | **v2.11.0：完成 T3** —— 按角色 / 会话的「主动回复」开关：`user_relations` / `GroupProfile` 新字段 + `users/list` / `users/update` 透出与持久化 + 四类主动消息门闸 + 控制台用户/群聊详情弹窗开关 + 26 项离线测试。 |
+| 2026-11-15 | **v2.11.1：修复 T3 真机 bug** —— 关系页 `normalizeGroup()` 白名单漏掉 `proactive_enabled`，导致群聊弹窗保存后重新打开/刷新页面又显示「开启」；补齐字段 + 保存响应缺字段兜底 + 新增 JS 行为回归（745 tests）。 |
