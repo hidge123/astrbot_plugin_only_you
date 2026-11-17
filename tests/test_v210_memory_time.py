@@ -462,9 +462,15 @@ class TestMuseTimeLabel(DatabaseAsyncTestCase):
         fake, bridge = self._make_fake(
             [{"target": "PRIVATE_L3", "message": "突然想起老王说要开黑"}]
         )
-        sent = await fake._run_idle_roam_action(
-            self.soul, self.run, self.current_slot
-        )
+        # Freeze ``main.time.time()`` to the fixture's NOW_TS: the MUSE material
+        # renders a relative anchor ("3 天前") from the *real* clock, so without
+        # this the assertion would decay as days pass.
+        with mock.patch(
+            "OnlyYou.main.time.time", return_value=float(NOW_TS)
+        ):
+            sent = await fake._run_idle_roam_action(
+                self.soul, self.run, self.current_slot
+            )
         assert sent is True
         assert bridge.sent
         prompt = fake.model_hub.calls[0]["prompt"]
