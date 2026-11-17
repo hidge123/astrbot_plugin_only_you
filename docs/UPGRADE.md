@@ -1,545 +1,407 @@
-# OnlyYou v2.8 生产升级与迁移验证指南
+# OnlyYou 生产升级与迁移指南 (v2.11)
 
-> 适用对象：从 **v2.7.x（或更早 v2.6 / v2.5）** 升级到 **v2.8** 的 AstrBot 部署。
-> 本文只描述升级 / 迁移 / 校验 / 回滚流程与排障语义，**不包含任何真实服务器地址、密钥或密码**；命令中的 `$SERVER_IP`、`$ASTRBOT_URL`、`<数据目录>`、`/path/to/OnlyYou` 均为占位符，请按实际环境替换。
->
-> 版本口径：插件产品版本 **v2.8**，`metadata.yaml` → `version: 2.8.3`；Web API 路由 **31 条**；角色卡 **10 分区 / 36 字段**。文档不写死测试用例数量，验收以实际运行结果为准。
-
----
-
-## 0. v2.8 升级会做什么（先理解再操作）
-
-v2.8 是**配置与运行态可信化**版本。升级后首次启动 / 热重载时，插件会**自动、幂等**地完成以下迁移：
-
-1. **Soul 独立 JSON 落盘**：把 SQLite `souls` 表中只有行、没有 JSON 文件的旧角色，逐个写为 `<数据目录>/souls/<soul_id>.json`；此后 **JSON 文件是唯一真源**，SQLite `souls` 表降级为索引。
-2. **旧 UMO 绑定 → 机器人接口（platform）绑定**：读取旧 `umo_soul_bindings`，按 UMO 第一段（`platform_id`）迁移为角色文件的 `bound_platforms`；一次性 flag `legacy_umo_bindings_migrated`。
-3. **旧全局模型配置 → 各角色 `model_config`**：把旧 `plugin_settings["model_config"]` 复制到「主模型为空」的已有角色（不删旧全局键）；一次性 flag `model_config_migrated_to_souls`。
-4. **SQLite `souls` 表补 `revision` 列**（`PRAGMA table_info` + `ALTER TABLE`，幂等）。
-5. **运行态快照初始化**：`plugin_settings["runtime_state_v1"]` 首次读取缺省为空快照，后续在状态变更点自动写入。
-6. 关系页 / 会话页等 Pages 前端更新到 v2.8（无需数据库迁移）。
-
-> **关键原则**：两个一次性迁移 flag **只有在全部条目迁移成功后才会写入**；任一条失败则保留 flag 未写状态并记 warning「下次启动重试」，迁移逻辑本身幂等（已迁移项跳过）。因此**失败可重试，重试不会重复数据**。
+> 适用对象：从 **v2.6.x ~ v2.10.x** 升级到 **v2.11.1** 的 AstrBot 部署（更早版本按同一流程升级，但旧行动卡 / 日程会在 v2.9 清理规则下被重抽或丢弃）。
+> 本文只写升级、迁移、校验、回滚与排障语义，不含真实服务器地址或密钥；命令中的 `$SERVER_IP`、`<数据目录>`、`/path/to/OnlyYou` 均为占位符。
+> 版本口径：插件 `v2.11.1`；Web API **31 条**；控制台 **8 页**；角色卡 **10 分区 / 36 字段**。
 
 ---
 
-## 1. 升级前检查清单
+## 0. 升级会自动做什么
 
-| 检查项 | 要求 / 说明 |
+首次启动 / 热重载时，插件会**自动、幂等**执行以下迁移，无需手工改库：
+
+| # | 迁移 | 触发条件 | 幂等标记 |
+| :--- | :--- | :--- | :--- |
+| 1 | 旧 SQLite 角色 → `souls/<soul_id>.json` 独立文件 | 索引有行、文件不存在 | 无（以文件存在为准） |
+| 2 | `souls` 表补 `revision` 列 | 旧库缺列 | 无（`PRAGMA table_info` + `ALTER TABLE`） |
+| 3 | 旧 UMO 绑定 → 机器人接口（`platform_id`）绑定 | 存在 `umo_soul_bindings` | `legacy_umo_bindings_migrated` |
+| 4 | 旧全局 `model_config` → 各角色 `model_config` | 角色配置为空且有旧全局配置 | `model_config_migrated_to_souls` |
+| 5 | 旧全局 provider id → `(source_id, model)` | 极旧配置 | `legacy_model_migrated` |
+| 6 | 裸用户 ID → `platform_id:native_uid` | `users.platform_ids` 含裸 ID | `legacy_user_identity_migrated_v2` |
+| 7 | `users` 关系列 → 按角色 `user_relations` | 首次启动且存在角色 | `user_relations_migrated_v1` |
+| 8 | 运行态快照初始化 | 首次读取 | 无（缺省空快照） |
+| 9 | `user_relations` / `users` 补 `proactive_enabled` 列（v2.11，纯加法） | 旧库缺列 | 无（幂等 `ALTER TABLE`，默认 1） |
+
+**关键原则**：一次性 flag 只有在**全部条目迁移成功**后才写入；失败保留未写入状态并记 warning「下次启动重试」，迁移逻辑本身幂等（已迁移项跳过，不会重复插入）。
+
+v2.9 另有两点**非迁移**的行为变化：
+
+- 旧行动卡缺少合法 `action_type` 时会被**丢弃**并记 warning（不再按标题关键词猜测类型）；卡池不足时由内置默认卡补齐四类行动。
+- 不符合 24h 时间轴关键约束（首块 `0.0`、末块 `24.0`、块与块首尾相连）的旧日程会被**重抽**，不做旧格式兼容；v2.4 的「7:00 起排 + 过夜回绕」6 时段格式即属此类。
+
+v2.10 与 v2.11 另有**非迁移**的行为变化：
+
+- **v2.10**：非 @ 普通群消息默认先过读空气概率门闸（`reply_gate_probability=80`）；记忆注入与提炼新增时间锚点。无数据库结构变更、无 Web API 路由变化。
+- **v2.11**：用户 / 群聊新增「主动回复」开关（旧数据默认开启）；`user_relations` / `users` 幂等补 `proactive_enabled` 列，群档案缺键按 `true` 处理。无破坏性迁移。
+
+---
+
+## 1. 升级前检查
+
+| 检查项 | 要求 |
 | :--- | :--- |
-| 当前版本 | 记录当前 `metadata.yaml` 的 `version`（v2.7.x / v2.6 / v2.5…）与 `git rev-parse --short HEAD` |
-| AstrBot 版本 | 建议 `>= v4.5.7`（与 PRD 口径一致） |
-| 插件状态 | 升级前确认插件当前**可用**：Dashboard 能打开 Pages、日志无 Traceback |
-| 数据备份 | **必须**完成 §2 的 `only_you.db` 与 `souls/` 备份；生产建议连同整个插件数据目录一起打包 |
-| 磁盘权限 | 插件数据目录（容器内 `/AstrBot/data/plugin_data/astrbot_plugin_only_you/`）对 AstrBot 进程**可读写**；`souls/` 可由插件自动创建 |
-| 维护窗口 | 热重载通常秒级完成；如遇旧版 `@register` 装饰器缓存或依赖变更，可安排 `docker restart` 窗口 |
-| 回滚预案 | 明确回滚命令（§8）与旧代码包位置 |
+| 当前版本 | 记录 `metadata.yaml` 的 `version` 与 `git rev-parse --short HEAD` |
+| AstrBot 版本 | 建议 `>= v4.5.7`（需支持 Plugin Pages / `register_web_api`） |
+| 插件状态 | 升级前 Dashboard 能打开 Pages，日志无 Traceback |
+| 数据备份 | **必须**完成 §2 的 `only_you.db` 与 `souls/` 备份 |
+| 目录权限 | `<数据目录>` 对 AstrBot 进程可读写；`souls/` 可由插件自动创建 |
+| 回滚预案 | 明确旧代码包位置与回滚命令（§7） |
 
-> **不要在插件运行中手工编辑 `souls/*.json`**；如需人工修改，先停插件 / 热重载前操作（见 §9.4）。
+> 不要在插件运行中手工编辑 `souls/*.json`；需要人工修改时先停插件（见 §8.4）。
 
 ---
 
 ## 2. 备份（必做）
 
-插件数据目录（容器内路径）为 `/AstrBot/data/plugin_data/astrbot_plugin_only_you/`；宿主机通常对应 `/root/astrbot/data/plugin_data/astrbot_plugin_only_you/`（以实际挂载为准）。
+插件数据目录（容器内）为 `/AstrBot/data/plugin_data/astrbot_plugin_only_you/`，宿主机通常对应 `/root/astrbot/data/plugin_data/astrbot_plugin_only_you/`。
 
 ```bash
-# ① 进入插件数据目录（容器内或宿主机挂载目录）
 cd /AstrBot/data/plugin_data/astrbot_plugin_only_you
 
-# ② 备份 SQLite（推荐先用 sqlite3 .backup 生成一致性快照，再压缩归档）
+# ① 一致性备份 SQLite
 sqlite3 only_you.db ".backup 'only_you.db.bak-$(date +%Y%m%d%H%M%S)'" \
   || cp only_you.db "only_you.db.bak-$(date +%Y%m%d%H%M%S)"
 
-# ③ 备份整个数据目录（含 souls/、可能有旧备份文件；*.db 已在 .gitignore，不会提交）
+# ② 备份整个数据目录（含 souls/）
 cd /AstrBot/data/plugin_data
 tar -czf "/path/to/onlyyou_data_backup-$(date +%Y%m%d%H%M%S).tar.gz" astrbot_plugin_only_you
 
-# ④ 可选：备份旧版插件代码包（便于回滚）
-#    在本地项目根目录执行：
-#    tar --exclude='.git' --exclude='.env*' --exclude='*.pem' --exclude='__pycache__' \
-#        --exclude='.DS_Store' --exclude='*.db' -czf /path/to/onlyyou_plugin_v2.7.tar.gz -C /path/to/OnlyYou .
+# ③ 可选：备份旧版插件代码，便于回滚
+tar --exclude='.git' --exclude='.env*' --exclude='*.pem' --exclude='__pycache__' \
+    --exclude='.DS_Store' --exclude='*.db' \
+    -czf /path/to/onlyyou_plugin_old.tar.gz -C /path/to/OnlyYou .
 ```
-
-> ⚠️ 数据库文件 `only_you.db` 含用户关系 / 记忆等数据，**严禁提交到 Git 或写入任何文档**。
 
 ---
 
 ## 3. 部署与热重载
 
-### 3.1 上传新版本代码
+1. 上传新代码到插件目录，覆盖后**务必清理缓存与 macOS 资源文件**：
 
-```bash
-# 本地项目根目录打包（排除敏感文件、缓存与数据库）
-tar --exclude='.git' --exclude='.env*' --exclude='*.pem' --exclude='__pycache__' \
-    --exclude='data' --exclude='.DS_Store' --exclude='ssh-key*' --exclude='*.db' \
-    -czf /tmp/onlyyou_plugin.tar.gz -C /path/to/OnlyYou .
+   ```bash
+   find <插件目录> -name __pycache__ -type d -prune -exec rm -rf {} +
+   find <插件目录> -name '._*' -delete
+   ```
 
-scp -i "$SSH_KEY_PATH" /tmp/onlyyou_plugin.tar.gz "$SERVER_USER@$SERVER_IP:/tmp/"
+   `<插件目录>` 指 `data/plugins/astrbot_plugin_only_you`；`<数据目录>` 指 `data/plugin_data/astrbot_plugin_only_you`，两者不要混用。
+2. 热重载插件（Dashboard API 或插件管理页）：
 
-ssh -i "$SSH_KEY_PATH" "$SERVER_USER@$SERVER_IP" \
-  "mkdir -p /root/astrbot/data/plugins/astrbot_plugin_only_you && \
-   tar -xzf /tmp/onlyyou_plugin.tar.gz -C /root/astrbot/data/plugins/astrbot_plugin_only_you && \
-   find /root/astrbot/data/plugins/astrbot_plugin_only_you -name __pycache__ -type d -prune -exec rm -rf {} + && \
-   rm -f /tmp/onlyyou_plugin.tar.gz"
-```
-
-> macOS 打包注意：解压后务必清理 `__pycache__`，并删除 `.astrbot-plugin/i18n/._*.json` 这类 AppleDouble 资源文件，避免插件加载日志出现 i18n 告警。
-
-### 3.2 触发插件热重载
-
-**方式 A：Dashboard UI** —— AstrBot Dashboard → 插件管理 → `astrbot_plugin_only_you` → 重载。
-
-**方式 B：Dashboard API**（先登录拿 JWT，再调用插件重载接口）：
-
-```bash
-# 登录（示例；实际地址/账号以环境为准，凭据只放本地 .env）
-curl -s -c /tmp/oy_cookies.txt -X POST "$ASTRBOT_URL/api/v1/auth/login" \
-  -H "Content-Type: application/json" \
-  -d "{\"username\":\"$ASTRBOT_DASHBOARD_USERNAME\",\"password\":\"$ASTRBOT_DASHBOARD_PASSWORD\"}"
-
-# 热重载插件
-curl -s -b /tmp/oy_cookies.txt -X POST "$ASTRBOT_URL/api/plugin/reload" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "astrbot_plugin_only_you"}'
-```
-
-**方式 C：完整重启容器**（热重载异常或升级了依赖时）：
-
-```bash
-ssh -i "$SSH_KEY_PATH" "$SERVER_USER@$SERVER_IP" "docker restart astrbot"
-```
+   ```bash
+   curl -X POST http://127.0.0.1:6185/api/plugin/reload \
+     -H "Content-Type: application/json" -d '{"name":"astrbot_plugin_only_you"}'
+   ```
+3. 修改了依赖（`requirements.txt`）或热重载后日志异常时，再执行 `docker restart astrbot`。
 
 ---
 
-## 4. 日志校验（升级是否成功的第一步）
+## 4. 日志校验
 
-查看插件最近日志（按实际容器名 / 日志路径调整）：
+升级后按顺序确认：
 
-```bash
-ssh -i "$SSH_KEY_PATH" "$SERVER_USER@$SERVER_IP" \
-  "docker logs --tail 300 astrbot 2>&1 | grep -E 'OnlyYou|Traceback'"
+| 日志 | 含义 |
+| :--- | :--- |
+| `[OnlyYou] Registered 31 Web API routes for Plugin Pages.` | 控制台后端路由挂载成功 |
+| `[OnlyYou] Plugin initialized successfully.` | 初始化完成 |
+| `[OnlyYou] Migrated legacy SQLite soul 'xxx' to ...` | 旧角色已落盘为 JSON |
+| `[OnlyYou] Migrated N legacy UMO bindings to platform bindings.` | 旧绑定迁移完成 |
+| `[OnlyYou] Migrated legacy global model_config into N Soul(s).` | 模型配置迁移完成 |
+| `[OnlyYou] Migrated M legacy user platform id(s) into ...` | 裸用户 ID 规范化完成 |
+| `[OnlyYou] Migrated legacy user relationships into per-Soul user_relations: {...}` | 关系拆分完成 |
+| 无 `Traceback` | 必查项 |
+
+v2.10 / v2.11 没有新增迁移日志：`proactive_enabled` 补列为静默幂等 `ALTER TABLE`，可用 §5.2 的 `PRAGMA table_info` 确认。
+
+若某项 migration incomplete：
+
+```text
+[OnlyYou] legacy UMO binding migration incomplete (...) ; keeping the migration flag unset ...
 ```
 
-| # | 期望日志 | 含义 / 不满足时怎么办 |
+说明该项失败、flag 未写入，修复权限 / 数据后重启即可重试，不需要手工改库。
+
+---
+
+## 5. 数据校验
+
+### 5.1 `souls/*.json`
+
+```bash
+ls -l <数据目录>/souls/
+python3 - <<'EOF'
+import glob, json
+for path in glob.glob('<数据目录>/souls/*.json'):
+    data = json.load(open(path, encoding='utf-8'))
+    assert data['soul_id'], path
+    for key in ('card', 'model_config', 'bound_platforms', 'settings', 'updated_at', 'revision'):
+        assert key in data, (path, key)
+    print(path, data['soul_id'], data['revision'], len(data.get('state_event_cards', [])))
+EOF
+```
+
+预期：每个角色一份文件；`revision >= 1`；`state_event_cards` 中每张卡都有 `action_type`。
+
+### 5.2 SQLite
+
+```bash
+sqlite3 <数据目录>/only_you.db <<'SQL'
+.tables
+PRAGMA table_info(souls);
+PRAGMA table_info(user_relations);
+SELECT soul_id, revision FROM souls;
+SELECT soul_id, COUNT(*), SUM(proactive_enabled) FROM user_relations GROUP BY soul_id;
+SELECT COUNT(*), SUM(proactive_enabled) FROM users;
+SQL
+```
+
+预期：
+
+- `souls` 含 `revision` 列，且每个角色一行；
+- `user_relations` 含 `proactive_enabled` 列（默认 1），每个角色一组计数；`users` 身份数与升级前一致；
+- `daily_schedules` 的旧日程会在访问时自动重抽，无需手工删。
+
+### 5.3 迁移 flag
+
+```bash
+sqlite3 <数据目录>/only_you.db \
+  "SELECT key, value_json FROM plugin_settings WHERE key LIKE '%migrated%' OR key='default_soul_id';"
+```
+
+有旧数据时，`legacy_umo_bindings_migrated` / `model_config_migrated_to_souls` / `legacy_user_identity_migrated_v2` / `user_relations_migrated_v1` 应为 `true`。本来就没有旧数据时 flag 可能不写入，属正常。
+
+### 5.4 Pages 验收（8 页）
+
+| 页面 | 重点检查 |
+| :--- | :--- |
+| 概览 | 当前角色、行动徽章、24h 时间轴、繁忙进度、今日繁忙成果 |
+| 日程 | 7~11 块连续时间轴（静态模式为 3 块）；四类行动卡与固定护甲；「重抽日程卡池」提示今日不变 |
+| 角色卡 | 10 分区表单可读写；头像可上传；离开未保存有确认 |
+| 关系与群聊 | 按当前角色加载；L3/L2/L1 分组；群聊分区；合并只选当前角色用户；用户 / 群聊详情有「主动回复」开关，关闭项显示 `🤐 不主动` |
+| 记忆 | T3/T2/T1 分层；T1 显示剩余时间与上限；每行带「形成于 …」时间；提炼 / GC 可用 |
+| 冲浪 | 总开关与后台视频源按角色保存；视频卡片墙与手动冲浪 |
+| 模型 | 四角色按角色读写；继承模式；测试与 TTS 试听 |
+| 机器人接口 | 平台绑定 / 解绑；默认角色兜底；会话内存清理 |
+
+---
+
+## 6. 功能抽检
+
+| # | 操作 | 预期 |
 | :--- | :--- | :--- |
-| 1 | `[OnlyYou] Registered 31 Web API routes for Plugin Pages.` | Web API 注册成功且数量正确（v2.7 是 27 条）→ 若出现其他数字，说明新旧文件混装 / `core/web_api.py` 未更新 |
-| 2 | `[OnlyYou] Plugin initialized successfully.` | 插件初始化完成 → 缺失则检查是否有初始化异常 |
-| 3 | `[OnlyYou] Migrated N legacy UMO bindings to platform bindings.` | 旧 UMO 绑定迁移成功（N 为迁移条数；无旧绑定时不出现属正常） |
-| 4 | `[OnlyYou] Migrated legacy global model_config into N Soul(s).` | 旧全局模型配置迁移成功（无旧配置 / 各角色已有配置时不出现属正常） |
-| 5 | `[OnlyYou] Migrated legacy SQLite soul '<soul_id>' to .../souls/<file>.json` | 旧 SQLite-only 角色落盘成功（每个旧角色一条） |
-| 6 | `[OnlyYou] Created default soul '<soul_id>' (...)` | 空库自动创建默认角色（首次安装或全新数据目录） |
-| 7 | **无 `Traceback`** | 出现 Traceback 必须停下来排查（常见原因：依赖缺失 / 数据目录权限 / 旧 `__pycache__` / 网络异常） |
-
-**允许出现、但需要关注含义的 warning**：
-
-| 日志 | 含义 | 处理 |
-| :--- | :--- | :--- |
-| `[OnlyYou] write soul file failed after retries (...); falling back to the SQLite index` | `souls/` 目录不可写 / 磁盘满，已降级为 SQLite-only（数据未丢） | 修权限 / 空间后，下一次读取或保存会自动回填 JSON（§9.3） |
-| `[OnlyYou] Restored soul '...' JSON file from the newer SQLite index` | 上次写文件失败后自愈，索引内容回写 JSON | 无需处理，确认 JSON 已出现即可 |
-| `[OnlyYou] Soul '...' JSON file differs from the SQLite index at the same revision` | 检测到 `souls/*.json` 被手工修改，以文件为准重建索引 | 符合预期，核对文件内容即可 |
-| `[OnlyYou] per-soul model_config migration incomplete` / `migrate legacy umo binding failed` | 迁移有条目失败，flag 未写，**下次启动自动重试** | 排查失败原因（权限 / 锁定 / 数据异常），重启后复查 flag |
+| 1 | `/onlyyou status` | 返回角色、作息、7~11 块时间轴、当前进度、微调配额与今日成果 |
+| 2 | `/onlyyou reroll` | 今日块数与逐块内容不变；提示新卡池明日生效 |
+| 3 | `RESTING` 下用 L1/L2 发消息 | 空回复、零 Token；L3 私聊强呼叫可击穿并切出 `IDLE_ROAM` 清醒窗 |
+| 4 | `BUSY` 下 L1 / L2 发消息 | L1 被拦截并进未读；L2 获准且回复克制 |
+| 5 | `IDLE` 下 `/onlyyou surf` | 返回真实视频、`vision` 评分与第一人称吐槽 |
+| 6 | 等待 15 分钟心跳 | `SURF` / `IDLE_ROAM` 日志出现对应行为，且受冷却限制 |
+| 7 | 两个角色分别设置模型 | 各自回复走各自的 `main`；互不影响 |
+| 8 | 同一用户切换角色看关系页 | 等级 / 好感 / 称呼 / 态度按角色隔离，身份信息全局共享 |
+| 9 | 重启插件 | 不重复分享已分享视频、不重复聊同一条繁忙成果；冷却保留；未读清空 |
+| 10 | 修改角色卡口头禅并聊天 | 回复体现该口头禅；还原后无残留 |
+| 11 | 把 `reply_gate_probability` 临时设为 0，在 `IDLE` 群聊发普通消息 | 不出现读空气决策调用，日志出现 `Reply gate dropped non-@ group message (...)`；@ Bot / 私聊仍正常回复 |
+| 12 | 查看 System Prompt 或 Pages 记忆页 | 每条回忆记忆带「形成于 YYYY-MM-DD（星期，N 天前）」；记忆页展示绝对时间；记忆正文未被改写 |
+| 13 | 关系页关闭某用户 / 群聊的「主动回复」后等待心跳 | 该目标不再收到未读补回 / 翻群 / 联想 / 视频分享；被动消息与 @ 不受影响；重新开启后恢复 |
 
 ---
 
-## 5. 数据校验（升级后必须逐项确认）
-
-### 5.1 `souls/*.json` 已生成且字段齐全
+## 7. 回滚
 
 ```bash
+# ① 停插件 / 停止写入
+docker stop astrbot
+
+# ② 恢复升级前备份
 cd /AstrBot/data/plugin_data/astrbot_plugin_only_you
+cp only_you.db.bak-<时间戳> only_you.db
+# 如 souls/ 也需要回退：
+# rm -rf souls && tar -xzf /path/to/onlyyou_data_backup-<时间戳>.tar.gz
 
-# 列出从旧库迁移出来的角色文件
-ls -l souls/
-
-# 逐文件确认关键字段（需要 jq；无 jq 可用 python3 -m json.tool 人工核对）
-for f in souls/*.json; do
-  echo "== $f"
-  python3 - "$f" <<'PY'
-import json, sys
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-required = ("soul_id", "card", "model_config", "bound_platforms", "settings", "updated_at", "revision")
-missing = [k for k in required if k not in data]
-print("missing:", missing)
-print("soul_id:", data.get("soul_id"), "| revision:", data.get("revision"),
-      "| bound_platforms:", data.get("bound_platforms"), "| surfing:", (data.get("settings") or {}).get("surfing_enabled"))
-PY
-done
+# ③ 恢复旧版插件代码并启动
+docker start astrbot
 ```
 
-期望：
-- 每个文件 `missing: []`，且 `revision` 为 ≥ 1 的整数；
-- `card` 含 10 个分区（`identity / appearance / personality / background / interests / speech / social / rhythm / examples / extra`）；
-- `bound_platforms` 为旧 UMO 第一段迁移来的平台列表（可能为空数组）；
-- `settings.surfing_enabled` 为布尔（默认 `true`）。
+回滚注意：
 
-### 5.2 SQLite 索引与一次性 flag
-
-```bash
-cd /AstrBot/data/plugin_data/astrbot_plugin_only_you
-
-# ① 索引表应含 revision 列，且每个角色一行
-sqlite3 only_you.db "PRAGMA table_info(souls);"
-sqlite3 only_you.db "SELECT soul_id, revision, updated_at FROM souls ORDER BY updated_at DESC;"
-
-# ② 两个一次性迁移 flag 应为 true
-sqlite3 only_you.db \
-  "SELECT key, value_json FROM plugin_settings WHERE key IN ('legacy_umo_bindings_migrated','model_config_migrated_to_souls');"
-
-# ③ 运行态快照与每日 GC 日期（存在即正常；不存在会在下一次触发时自动写入）
-sqlite3 only_you.db \
-  "SELECT key, substr(value_json,1,120) FROM plugin_settings WHERE key IN ('runtime_state_v1','last_forgetting_gc_date','default_soul_id');"
-```
-
-期望：
-- `PRAGMA table_info(souls)` 中存在 `revision INTEGER NOT NULL DEFAULT 0`；
-- `legacy_umo_bindings_migrated` / `model_config_migrated_to_souls` 的 `value_json` 为 `true`；
-  - 若为 `false` / 查不到：说明迁移曾失败或本轮无迁移项。无旧数据时属于正常；有旧数据时查看 §4 的 warning，重启插件后复查。
-- `plugin_settings` 中不再依赖 `model_config` 作为运行时真源（旧键仅为迁移来源保留，可忽略）。
-
-> **键名说明**：旧 UMO 迁移 flag 的真实 key 是 **`legacy_umo_bindings_migrated`**（代码 `_SETTING_LEGACY_UMO_MIGRATED`）。排障时不要按口语简写 `legacy_umo_migrated` 去查库；两个 flag 的完整、准确键名见本表 §9.1。
-
-### 5.3 Pages 验收（8 页）
-
-1. 打开 AstrBot Dashboard → 插件 `astrbot_plugin_only_you` → Pages 控制台；
-2. 逐个打开 8 个页面：**概览 / 日程 / 角色卡 / 关系与群聊 / 记忆 / 冲浪 / 模型 / 会话（机器人接口）**；
-3. 确认：
-   - 角色下拉能列出迁移后的全部角色（含旧库角色）；
-   - **关系页**已是最新版「关系与群聊」（筛选 chips + 搜索 + 分组横向列表 + 居中宽幅弹窗 + 群聊分区），**不是**旧三列看板；
-   - **会话页**已是最新版「机器人接口」（绑定列表 / 手动输入 `platform_id` / 默认角色兜底开关 / 会话内存概览），**不是**旧「默认角色 + UMO 绑定表」；
-   - **模型页**顶部显示当前角色，四角色配置能读取；切换角色后数据随之切换；
-   - **冲浪页**顶部有「赛博冲浪总开关」；
-   - **记忆页** T1 行显示 `⏳ 剩余 Xh 清除` 与「上限 N 条」。
-
-### 5.4 旧 UMO 绑定出现在「机器人接口」页
-
-升级前若存在按会话（UMO）绑定的角色，迁移后应体现为**机器人接口绑定**：
-
-- 会话页 → 当前角色 → 已绑定接口列表中出现旧 UMO 对应的 `platform_id`（如 `aiocqhttp`）；
-- 若同一 `platform_id` 出现在多个角色下，以最近更新的角色胜出（严格互斥），其余角色可在会话页解绑 / 重新绑定；
-- 旧 `UMO 精确绑定` 仍保留为**兼容路由兜底**（路由优先级第 ② 层），但会话页不再提供按 UMO 绑定 UI。
+- 回退到 v2.8 时，`user_relations` 表可保留（旧版不读取）；但 v2.9 期间按角色修改的关系**不会回写** `users` 旧关系列。
+- 回退到 v2.9 / v2.10 时，v2.11 新增的 `proactive_enabled` 列会被旧版忽略，行为恢复为「所有会话都允许主动回复」；关系 / 记忆数据不丢，开关值保留在库中，重新升级后恢复。
+- 回退到 v2.7 及更早时，新版 `souls/*.json` 中的 `revision` / `model_config` / `bound_platforms` / `settings` 字段会被旧版忽略，但旧版不读取 JSON 文件，需依赖 SQLite 索引与旧代码逻辑。
+- `souls/*.json` 不是回滚的替代品：**回滚必须以升级前的 `only_you.db` 为准**。
 
 ---
 
-## 6. 功能验收清单（建议逐项勾选）
+## 8. 幂等、失败重试与降级
 
-| # | 场景 | 预期 |
-| :--- | :--- | :--- |
-| 1 | 角色路由 | 在某个已绑定机器人接口的平台发消息 → 路由到绑定角色；未被绑定的平台 → 默认角色兜底 |
-| 2 | 平台互斥 | 会话页把已被角色 A 绑定的接口「绑定到当前角色 B」→ 按钮禁用 / API 返回「该机器人接口已被角色『A』绑定，请先在角色 A 下解绑」 |
-| 3 | 按角色模型 | 角色 A / B 分别配置不同 `main` 模型，各自聊天日志显示走了对应模型；自建实例 id 为 `onlyyou::main::<soul_id>` |
-| 4 | 冲浪总开关 | 冲浪页关闭当前角色总开关 → 下次 SURF 时段日志显示 `SURF disabled for soul=...; degrading to IDLE_ROAM`；`/onlyyou surf` 回复总开关已关闭提示 |
-| 5 | 分享门禁 | 低分 / 视觉兜底 / 已分享过 / 冷却未到的视频不主动分享；`is_fallback=True` 时日志出现 `SURF share skipped: vision fallback result` |
-| 6 | MEMORY_MUSE | IDLE_ROAM 时段日志出现 `IDLE_ROAM(MEMORY_MUSE) ... source=BUSY_RESULT` 或 `source=MEMORY`；同一繁忙成果不会被主动聊第二次 |
-| 7 | T1 规则 | 记忆页 T1 显示倒计时与上限；连续写入相同 T1 内容不会重复计数；T1 数量不超 `max_tier1_memories`（默认 30） |
-| 8 | 跨重启去重 | 分享过某视频后重启插件 → 同一视频不会再被主动分享；近期冲浪分享冷却仍然生效（日志 `SURF share skipped: surf-share cooldown`） |
-| 9 | 每日 GC 不重复 | 同一天内重启插件 → 日志不会重复出现完整 GC（`last_forgetting_gc_date` 已为今天） |
-| 10 | 解绑清理 | 解绑机器人接口后：该平台会话内存清空，但关系页用户 / 记忆页记忆 / 冲浪历史仍在 |
-| 11 | 角色配置热生效 | 模型页修改配置后约 0.7s 自动保存（或 `Ctrl/Cmd+S`），新消息即走新模型 |
-| 12 | 手工改 JSON | 停插件后修改 `souls/<soul_id>.json` 中角色名 → 重启后 Pages 显示新名称（文件胜出并重建索引） |
-
----
-
-## 7. 升级后仍不生效的排查顺序
-
-1. **确认文件真的换新了**：检查插件目录 `metadata.yaml` 的 `version: 2.8.3`、`core/runtime_state.py` 是否存在、`core/web_api.py` 路由注册处是否为 31 条；
-2. **确认没有旧字节码 / 混装**：删除插件目录下所有 `__pycache__` 后再次热重载；确认没有把压缩包解压到旧目录的子目录里；
-3. **确认日志**：`Registered 31 Web API routes` 是否出现；`Plugin initialized successfully` 是否出现；
-4. **确认数据目录**：`souls/` 是否在 `only_you.db` 的同级目录；是否存在权限问题（§9.3）；
-5. **确认 Pages 缓存**：浏览器强制刷新（或清理 Dashboard 静态资源缓存）后再打开 8 个页面；
-6. **确认没有回滚残留**：若此前回滚过旧版本，可能残留在 `plugin_settings` 中的旧 flag / 旧全局模型配置；对照 §5.2 检查。
-
----
-
-## 8. 回滚
-
-**触发条件**：升级后出现持续 Traceback、数据异常、Pages 无法打开且短时间无法修复。
-
-```bash
-# ① 停止插件（或在容器内停止 AstrBot，按实际管理方式）
-#    简单做法：docker stop astrbot（或先在 Dashboard 禁用插件）
-
-# ② 恢复 SQLite 备份（在插件数据目录内）
-cd /AstrBot/data/plugin_data/astrbot_plugin_only_you
-cp -a only_you.db.bak-YYYYmmddHHMMSS only_you.db
-
-# ③ 恢复 souls/ 目录（如升级前已有可回滚备份）
-#    v2.8 新生成的 souls/ 是新增目录，回退 v2.7 时可直接保留（旧版不读它）
-#    若需完全回到升级前状态：删除 v2.8 新生成的文件 / 恢复整目录备份
-tar -xzf /path/to/onlyyou_data_backup-YYYYmmddHHMMSS.tar.gz -C /AstrBot/data/plugin_data
-
-# ④ 回退插件代码到旧版本包
-rm -rf /root/astrbot/data/plugins/astrbot_plugin_only_you
-tar -xzf /path/to/onlyyou_plugin_v2.7.tar.gz -C /root/astrbot/data/plugins/astrbot_plugin_only_you
-
-# ⑤ 重启 / 重新加载插件，确认旧版日志与 Pages 正常
-```
-
-**回滚兼容性说明**：
-- v2.8 每次保存都会同步维护 SQLite `souls` 索引（含 `profile_json`），因此**回退到 v2.7 仍可读取角色数据**；v2.7 不认识的新字段（`revision` / `model_config` / `bound_platforms` / `settings`）会被忽略。
-- v2.8 的 `souls/*.json` 是新增文件，旧版不会读取，保留即可；如确认不再升级回 v2.8，可自行归档删除。
-- 回滚后建议再次备份当前状态，避免后续升级覆盖现场。
-
----
-
-## 9. 幂等 / 失败重试 / 降级语义
-
-### 9.1 一次性迁移 flag 只在全部成功后写入
+### 8.1 一次性 flag 语义
 
 | flag（实际键名） | 负责迁移 | 失败语义 |
 | :--- | :--- | :--- |
-| `legacy_umo_bindings_migrated` | 旧 UMO 绑定 → `bound_platforms` | 任一条失败则不写 flag、log warning「下次启动重试」；重试时已迁移的平台绑定会跳过（幂等） |
-| `model_config_migrated_to_souls` | 旧全局 `model_config` → 各角色 | 任一角色失败则不写 flag；重试时「已有有效配置」的角色跳过（幂等） |
+| `legacy_umo_bindings_migrated` | 旧 UMO 绑定 → `bound_platforms` | 任一条失败则不写 flag，下次启动重试；已迁移项跳过 |
+| `model_config_migrated_to_souls` | 旧全局模型配置 → 各角色 | 任一角色失败则不写 flag；已有有效配置的角色跳过 |
+| `legacy_model_migrated` | 旧 provider id → `(source_id, model)` | 只尝试一次；解析失败也会置位（不回滚、不重试） |
+| `legacy_user_identity_migrated_v2` | 裸用户 ID → 规范账号 | 证据唯一才改写；歧义项保留待 Pages 手工补全 |
+| `user_relations_migrated_v1` | `users` 关系列 → `user_relations` | 失败 / 无角色时不写 flag，下次启动重试 |
 
-> 重试方式：再次热重载 / 重启插件即可；无需手工改库。确认全部成功后 flag 才会变为 `true`。
+> v2.10 无新增 flag、无数据库迁移；v2.11 的 `proactive_enabled` 是幂等 `ALTER TABLE` 纯加法，不依赖 flag，失败时下次启动会自动重试补列。
 
-### 9.2 旧库无 `revision` 列
+### 8.2 旧库缺 `revision`
 
-`db.initialize()` 用 `PRAGMA table_info` + `ALTER TABLE souls ADD COLUMN revision INTEGER NOT NULL DEFAULT 0` 幂等补列；旧角色首次读取时自动升级为 `revision >= 1` 并落盘 JSON。
+`db.initialize()` 用 `PRAGMA table_info` + `ALTER TABLE ... ADD COLUMN revision INTEGER NOT NULL DEFAULT 0` 幂等补列；旧角色首次读取时升级为 `revision >= 1` 并落盘。
 
-### 9.3 `souls/` 目录不可写时的降级（重要）
+### 8.3 `souls/` 不可写时的降级
 
-- **行为**：JSON 写失败重试 1 次后放弃，但**仍写 SQLite 索引**（数据不丢，不会静默丢配置）；同时 `souls/save` API 返回 `data.storage = {file_written: false, degraded: true, error: "..."}`，`message` 带「⚠️ Soul JSON 写入失败，已降级写入 SQLite 索引，重启/读取时会自动重试落盘」。
-- **恢复**：修复目录权限 / 磁盘空间后，**下一次读取或保存会自动回填 JSON**（索引 revision 更高 → 回写文件自愈），无需手工导出。
-- **自检**：
-  ```bash
-  ls -ld /AstrBot/data/plugin_data/astrbot_plugin_only_you/souls
-  # 确认 AstrBot 进程用户可写
-  ```
+- JSON 写失败重试 1 次后放弃，但**仍写 SQLite 索引**（数据不丢）；`souls/save` 返回 `data.storage = {file_written:false, degraded:true, error}` 并在 `message` 追加中文告警。
+- 修复权限 / 磁盘后，下一次读取或保存会自动把 JSON 补回来（索引 revision 更高 → 回写文件自愈）。
+- 自检：`ls -ld <数据目录>/souls`，确认 AstrBot 进程用户可写。
 
-### 9.4 手工编辑 `souls/*.json` 的正确姿势
+### 8.4 手工编辑 `souls/*.json`
 
-1. 先停插件（或至少停止写入：关闭 Dashboard 自动保存操作）；
-2. 编辑 `souls/<soul_id>.json`（保持 JSON 合法、`soul_id` 不变）；
-3. 重启 / 热重载插件，并在 Pages 刷新一次；
-4. 插件将以 **文件为准** 重建 SQLite 索引；若与索引同 revision 但内容不同，会 log warning 后保留文件内容。
+1. 停插件或确保没有自动保存操作；
+2. 编辑文件（保持 JSON 合法、`soul_id` 不变）；
+3. 重启 / 热重载并在 Pages 刷新一次；
+4. 文件优先：同 revision 但内容不同会记 warning 后保留文件内容，并重建索引。
 
-> 不要把 `revision` 手工改小（会被自愈逻辑覆盖），也不要在插件运行中删文件（可能导致索引重建后回写）。
-
----
-
-## 10. 「解绑 / 清空」排障语义表（清理 vs 保留）
-
-| 操作 | 入口 | 清理什么（内存态） | 保留什么（持久化） | 重启后果 |
-| :--- | :--- | :--- | :--- | :--- |
-| **解绑机器人接口** | 会话页 → 「解绑（清理该平台内存滑窗）」；或 `POST sessions/unbind_platform` | 该平台所有 UMO 的会话滑窗 / evicted / 未读；`_known_group_umos` / `_known_l3_umos` 中该平台项；该平台各类冷却时间戳 | 角色 JSON 的 `bound_platforms` 仅移除该平台；`memories / users / surfing_history / group_profiles` **不删** | 需重新绑定；持久化记忆 / 关系仍在；运行态冷却会同步持久层（不会复活） |
-| **清空单个会话内存** | 会话页 → 单会话「清空」；或 `POST sessions/clear_memory {umo}` | 指定 UMO 的滑窗 / evicted / 未读 | 该会话的持久化记忆 / 用户档案 / 群档案 | 该会话上下文从空白开始，关系等级与记忆仍保留 |
-| **清空整个平台内存** | 会话页 → 「清空整个平台」；或 `POST sessions/clear_memory {platform_id}` | 该平台所有 UMO 的滑窗 / evicted / 未读 / 冷却缓存 | 绑定关系与全部持久化数据 | 同上；需要重新积累上下文 |
-| **清空群聊内存** | 关系页 → 群聊详情 → 「清空该群内存滑窗与未读」；或 `users/update action="clear_group_memory"` | 该群 UMO 的滑窗 / 未读 | 群档案（群名 / 备注 / 绑定角色 / 最近活跃）仍在 | 群聊上下文从空白开始，群档案仍可见 |
-| **移除群聊记录** | 关系页 → 群聊详情 → 「移除群聊记录」；或 `users/update action="delete_group"` | 该群内存态 + `plugin_settings["group_profiles"]` 中的档案记录 | `memories / users` **不删**；该群之后若再有发言会重新建档 | 群聊不再出现在关系页「💬 群聊」分区；重新发言后重新出现 |
-
-> **统一原则**：**「清空」只清内存会话态；「删除 / 移除」才动档案索引；持久化记忆、用户关系、冲浪历史默认永远不删。** 若用户反馈「解绑后记忆没了」，先按本表核对是否实际执行了「移除群聊记录」或手工删库。
+不要把 `revision` 手工改小（会被自愈逻辑覆盖），也不要在运行中删文件。
 
 ---
 
-## 11. 重启语义边界（避免把正常行为当 bug）
+## 9. 「解绑 / 清空」语义（清理 vs 保留）
+
+| 操作 | 入口 | 清理（内存态） | 保留（持久化） |
+| :--- | :--- | :--- | :--- |
+| 解绑机器人接口 | 机器人接口页 / `sessions/unbind_platform` | 该平台所有会话滑窗、未读、群/L3 缓存、冷却时间戳、读空气门闸预算 | `bound_platforms` 仅移除该平台；`memories / users / user_relations / surfing_history / group_profiles` 不删 |
+| 清空单会话 | `sessions/clear_memory {umo}` | 指定 UMO 的滑窗 / evicted / 未读 | 记忆、用户档案、群档案 |
+| 清空整个平台 | `sessions/clear_memory {platform_id}` | 该平台所有 UMO 的滑窗 / 未读 / 冷却 | 绑定关系与全部持久化数据 |
+| 清空群聊内存 | 关系页群聊详情 / `users/update action="clear_group_memory"` | 该群滑窗与未读 | 群档案（群名 / 备注 / 绑定角色） |
+| 移除群聊记录 | 关系页群聊详情 / `users/update action="delete_group"` | 内存态 + `group_profiles` 档案 | `memories / users / user_relations` 不删 |
+| 删除用户 | 关系页用户详情 / `users/update action="delete"` | — | 默认只删**当前角色**关系行；所有角色都无关系行时才删全局身份；记忆不删 |
+| 关闭主动回复 | 关系页用户 / 群聊详情开关（`users/update` 的 `proactive_enabled`） | 该目标的主动消息（补回 / 翻群 / 联想 / 分享）；未读不 ACK、不消耗 | 记忆、关系、群档案、开关值；被动回复不受影响 |
+
+> 统一原则：**「清空」只清内存会话态；「删除 / 移除」才动档案索引；持久化记忆、关系与冲浪历史默认永不删除。**
+
+---
+
+## 10. 重启语义
 
 | 状态 | 重启后 | 说明 |
 | :--- | :--- | :--- |
-| **未读消息 backlog** | **清空** | 未读队列本身不持久化，这是既定产品语义：重启后不会补回旧未读 |
-| 主动消息去重（已分享视频 / 已聊繁忙成果） | **保留** | 由 `runtime_state_v1` 恢复，不会重复分享 / 重复聊 |
-| 冲浪分享 / 闲逛 / 翻群 / 私聊补回冷却 | **保留** | 冷却时间戳持久化（仅保留最近 7 天） |
-| ★L3 私聊目标（`known_l3_umos`） | **保留** | 最多 100 个，MRU 淘汰 |
-| 当日动态时间轴 / 繁忙结算 | 保留 | 由 SQLite `daily_schedules` 承载；已结算块不会重复结算 |
-| 每日遗忘 GC | 不重复跑 | `last_forgetting_gc_date` 为今天时只做 T1 实时清理 |
-| 解绑后的平台内存 / 冷却缓存 | 不复活 | `clear_platform_memory_state` 会同步持久层 |
+| 未读消息队列 | **清空** | 未读不持久化，既定产品语义 |
+| 已分享视频去重 / 已聊繁忙成果 | 保留 | `runtime_state_v1` |
+| 冲浪分享、闲逛、翻群、私聊补回冷却 | 保留 | 时间戳持久化，仅保留最近 7 天 |
+| ★L3 私聊目标 | 保留 | 最多 100 个，MRU 淘汰 |
+| 当日时间轴 / 繁忙结算 | 保留 | `daily_schedules`；已结算块不重复结算 |
+| 每日遗忘 GC | 不重复跑 | `last_forgetting_gc_date` |
+| 主动回复开关 | 保留 | `user_relations.proactive_enabled` / `GroupProfile.proactive_enabled` |
+| 读空气概率 / 每小时预算 | 重置 | `_gate_pass_ts` 为内存态，重启后从空开始 |
 
 ---
 
-## 12. 常见问题（FAQ）
+## 11. 版本迁移条目
 
-**Q1：升级后 Pages 打开空白 / 404？**
-A：先确认日志出现 `Registered 31 Web API routes`；再检查插件目录是否被旧 `__pycache__` 覆盖、是否解压到了错误子目录；最后强刷浏览器缓存。
+### 11.1 v2.8.2：普通配置与 Pages 去重
+
+- 删除 `surfing_config.surfing_enabled`、`relationship_config.core_user_ids / important_user_ids` 等重复项。
+- 旧配置值不会被读取；升级后请在 Pages「冲浪」「关系与群聊」页逐角色确认。
+- `enable_tiered_memory=false` 时记忆写入、召回、提炼全部 no-op（含命令与 API）。
+- 仅配置变化，无数据库迁移。
+
+### 11.2 v2.8.3：后台视频源迁移到 Pages
+
+- 后台视频源改存 Soul JSON 的 `settings.surfing_sources`（`bilibili` / `douyin` 子集，缺省两者都启用）；普通配置中的 `enable_bili_surfing` / `enable_douyin_surfing` 旧键一并删除。
+- 旧全局开关不继承；需要在 Pages 逐角色重新选择。
+- 只影响 SURF 心跳自动抓取；手动冲浪仍可临时指定平台。
+- 无数据库迁移。
+
+### 11.3 v2.8.4：用户平台身份规范化
+
+- 新用户直接写入 `platform_id:native_uid`。
+- 旧裸 ID 在收到消息时自动升级；启动时用持久化私聊 UMO 证据做一次性迁移（`legacy_user_identity_migrated_v2`），歧义项保留。
+- Pages 关系页对旧格式显示「⚠️ 旧格式」，可用「补全平台」或在详情中补全；`users/update action="normalize_identity"` 同样可用。
+- 只改 `users.platform_ids_json`，不动记忆与群档案。
+
+### 11.4 v2.9：用户身份全局化 + 关系按角色隔离
+
+- `users` 只保留全局身份；`user_relations(soul_id, global_uid)` 保存 `tier / affinity / interaction_count / nickname / attitude`。
+- 关系页只显示当前角色；同一用户在不同角色下可有不同等级与态度。
+- 合并只能从当前角色关系列表下拉选择；删除默认只删当前角色关系。
+- 迁移按平台归属拆分，裸 ID 先按持久化 UMO 证据推断，再回退默认角色；失败不写 flag，下次启动重试。
+- `users` 旧关系列保留作回退，**不要手工删除**。
+
+### 11.5 v2.9：行动卡与时间轴清理
+
+- 旧行动卡无合法 `action_type` 直接丢弃（日志 warning），不再猜测类型。
+- 卡池按 `SLEEP 2 / BUSY_TASK 3 / SURF 2 / IDLE_ROAM 2` 生成；不足由兜底卡补齐。
+- `reroll` / `cards/ai_generate(auto_save=true)` 只换卡池，今日时间轴冻结不变，新池明日生效。
+- 旧 6 时段 / 过夜回绕 / 非连续日程不满足首块 `0.0`、末块 `24.0` 与首尾相连，会在加载时被重抽。
+- 无需手工清库；若想立即换卡池，执行 `/onlyyou reroll`。
+
+### 11.6 v2.10：记忆时间锚点 + 读空气概率/预算门闸
+
+- **无数据库迁移、无 Web API 路由变化**；替换插件文件并热重载即可。
+- **读空气概率门闸默认开启 80%**：普通（非 @）群消息约 20% 不再进入读空气决策模型。想保持旧行为把 `atmosphere_config.reply_gate_probability` 改为 `100` 或关闭 `reply_gate_enabled`；`reply_gate_hourly_limit`（默认 0 = 不限）可按群限制每小时判定次数。
+- **记忆时间标注**：新增 `core/time_utils.py`；注入行带「形成于 …（星期，N 天前）」+ `MEMORY_TIME_CONTEXT_PROMPT`，提炼 transcript 带窗口范围与逐条时间戳。记忆正文、50 字上限、GC / 去重语义均不变。
+- **Pages**：记忆页展示形成时间 tooltip；无需重建数据。
+
+### 11.7 v2.11：按角色 / 会话的「主动回复」开关
+
+- **纯加法迁移**：`user_relations.proactive_enabled` 与 `users.proactive_enabled` 由 `db.initialize()` 幂等补列（默认 1）；旧 `group_profiles` 缺键按 `true`。
+- **行为变化**：关系页用户 / 群聊详情新增开关；关闭后只停 Bot 主动发起的未读补回、`GROUP_LURK`、`MEMORY_MUSE` 与视频分享。被动回复、@ 与读空气接话不变。
+- **合并语义**：账号合并时 `proactive_enabled` 按「双方都允许才开启」的 AND 语义；删除用户 / 群聊不因开关状态删除记忆或关系。
+- **v2.11.1**：修复群聊开关保存后重新打开又显示开启的前端字段丢失问题（仅 `views/console/page-relations.js` 的 `normalizeGroup` 白名单；后端与落库在 v2.11.0 即正确）。升级仅需覆盖前端静态资源并强刷浏览器缓存。
+
+---
+
+## 12. FAQ
+
+**Q1：升级后 Pages 空白 / 404？**
+确认日志有 `Registered 31 Web API routes`；检查是否解压到错误子目录、是否有旧 `__pycache__`；最后强刷浏览器缓存。
 
 **Q2：`souls/` 目录不存在？**
-A：首次启动 / 首次保存时自动创建（`SoulManager._ensure_souls_dir`）。查看日志是否有 `create souls dir failed`——通常是权限或磁盘问题。目录可稍后自动补建。
+首次启动或首次保存时自动创建。若日志出现 `create souls dir failed`，检查权限或磁盘；目录可稍后自动补建。
 
-**Q3：`legacy_umo_bindings_migrated` 一直是 false？**
-A：说明迁移有失败项（日志有 `migrate legacy umo binding failed`），插件会在下次启动重试；排查权限 / 数据异样后重启。若本来就没有旧绑定，flag 可能不会被写入，属正常。
+**Q3：`user_relations` 为空？**
+确认存在至少一个角色、`user_relations_migrated_v1` 是否已写入；若日志有 `user_relations migration failed`，修复后重启重试。无旧关系数据时为空属正常。
 
-**Q4：升级后角色名 / 模型配置不对？**
-A：检查对应 `souls/<soul_id>.json` 内容与 `revision`；如果之前手工改过文件，文件会胜出；如果怀疑是旧索引覆盖，查看日志是否有 `Restored soul ... from the newer SQLite index`（自愈）或 `keeping the JSON file (manual edit)`。必要时先备份再让插件重新读取。
+**Q4：升级后行动卡变少了？**
+v2.9 会丢弃无 `action_type` 的旧卡，并用兜底卡补齐四类行动。执行 `/onlyyou reroll` 可生成一整池新卡（今日时间轴不变）。
 
-**Q5：解绑机器人接口后用户关系 / 记忆还在吗？**
-A：在。按 §10 语义，解绑只清内存会话态；`memories / users / surfing_history / group_profiles` 不删。
+**Q5：解绑机器人接口后记忆 / 关系还在吗？**
+在。按 §9 语义，解绑只清内存会话态；持久化记忆与关系不删。
 
-**Q6：重启后机器人又分享了昨天分享过的视频？**
-A：确认升级后的运行态持久化是否生效：查 `plugin_settings["runtime_state_v1"]` 中 `shared_video_ids` 是否包含该 `video_id`。只有**分享成功**的才记录；升级前旧版本分享过的视频没有历史记录，不纳入去重（升级后第一次可能重复一次属预期）。
+**Q6：重启后又分享了昨天分享过的视频？**
+检查 `runtime_state_v1.shared_video_ids`。只有**分享成功**的才记录；升级前旧版本分享过的视频没有记录，升级后首次可能重复一次，属预期。
 
 **Q7：什么时候需要完整重启而不是热重载？**
-A：修改了依赖（`requirements.txt`）、升级涉及 AstrBot 配置结构、或热重载后日志异常时，使用 `docker restart astrbot`。
+修改依赖、AstrBot 配置结构变化，或热重载后日志异常时，使用 `docker restart astrbot`。
+
+**Q8：升级后群里突然安静了？**
+v2.10 起非 @ 普通群消息默认只按 80% 概率进入读空气，且可能被每小时预算拦截。检查 `atmosphere_config.reply_gate_enabled` / `reply_gate_probability` / `reply_gate_hourly_limit`；@ 与私聊不受影响。
+
+**Q9：记忆里的「这周末」还是原样？**
+v2.10 只注入「形成时间」供模型解冻相对时间，**不会改写记忆正文**（避免篡改事实）。若模型仍误用过期记忆，可在 Pages 记忆页手动编辑或删除该条。
+
+**Q10：关闭主动回复后对方还会收到回复吗？**
+会。该开关只停 Bot 主动发起（未读补回 / 翻群 / 联想 / 分享）；对方发消息、@ Bot 与被读空气选中的接话都照常。
+
+**Q11：群聊开关保存后又变回开启？**
+这是 v2.11.0 的前端字段白名单问题，v2.11.1 已修复。确认 `page-relations.js` 已更新并强刷浏览器缓存。
 
 ---
 
-## 13. 附录：升级检查速查表
+## 13. 升级速查表
 
 ```text
-[ ] 已备份 only_you.db（sqlite3 .backup 或 cp）与 souls/ / 整数据目录
+[ ] 已备份 only_you.db（.backup 或 cp）与 souls/ / 整个数据目录
 [ ] 已备份旧版插件代码包
-[ ] 新代码已上传并清理 __pycache__ / AppleDouble 文件
+[ ] 新代码已上传，__pycache__ / ._* 已清理
 [ ] 热重载或重启完成
-[ ] 日志：Registered 31 Web API routes for Plugin Pages.
-[ ] 日志：Plugin initialized successfully.
-[ ] 日志：迁移日志（UMO / model_config / SQLite soul 落盘）符合预期；无 Traceback
-[ ] souls/*.json 存在且含 soul_id/card/model_config/bound_platforms/settings/updated_at/revision
-[ ] souls 表含 revision 列，每个角色一行
-[ ] plugin_settings：legacy_umo_bindings_migrated / model_config_migrated_to_souls = true（有旧数据时）
-[ ] Pages 8 页可打开；关系页 / 会话页为 v2.8 新版
-[ ] 旧 UMO 绑定出现在会话页「机器人接口」
-[ ] 某个角色聊天路由 / 模型按角色生效
-[ ] 冲浪总开关、分享门禁、T1 上限、重启去重抽检通过
-[ ] 普通配置项与 Pages 无重复（无全局冲浪开关 / 平台源开关 / 用户等级名单）
-[ ] 后台视频源已按角色确认（v2.8.3：原全局 B站/抖音开关已移除）
+[ ] 日志：Registered 31 Web API routes / Plugin initialized successfully
+[ ] 日志：各迁移项符合预期，无 Traceback
+[ ] souls/*.json 存在，含 card / model_config / bound_platforms / settings / updated_at / revision
+[ ] souls 表含 revision 列；user_relations 每角色有行且含 proactive_enabled
+[ ] plugin_settings 迁移 flag 状态符合预期
+[ ] Pages 8 页可打开，关系 / 机器人接口页按角色工作
+[ ] 记忆页显示形成时间；关系页主动回复开关可保存并刷新保持
+[ ] 非 @ 群消息门闸符合预期（默认 80%，可调 0~100 或关闭）
+[ ] 两个角色各自模型与关系互不影响
+[ ] 重启不重复分享视频 / 不重复聊繁忙成果；未读按语义清空
 [ ] 记录升级时间、版本号、备份路径与回滚步骤
 ```
-
----
-
-## 14. v2.8.2 配置去重（普通配置 ↔ Pages）升级注意
-
-v2.8.2 起，插件「普通配置」（AstrBot 插件配置面板 / `_conf_schema.json`）只保留**运行参数**，用户级 / 角色级开关与名单全部交给 Pages：
-
-1. **角色冲浪总开关**：普通配置中的全局 `surfing_config.surfing_enabled` 已删除；每个角色在 Pages「冲浪」页用 `settings.surfing_enabled` 独立管理（缺省开启）。升级后旧配置中的 `surfing_enabled` 即使残留也不会被读取，AstrBot 也可能按新 schema 丢弃；若之前全局关闭，需要在 Pages 里逐角色确认开关。
-2. **用户等级 / 名单**：普通配置中的 `relationship_config.core_user_ids` / `important_user_ids` 已删除；用户等级存 SQLite `users.tier`，统一在 Pages「关系与群聊」页管理；★L3 仍会由 AstrBot `admins_id` 自动确定。旧名单不再自动 seed，已存在的用户等级不受影响。
-3. **分级记忆开关统一**：`memory_and_context_config.enable_tiered_memory=false` 时，除记忆注入 / 召回 / 提炼外，`add_memory` 也直接 no-op（`/onlyyou memory add`、Pages 新增记忆、繁忙成果写入均不会落库），命令与 Web API 会显式提示。
-4. **配置标题简化**：所有配置项标题缩短，详细说明移入 `hint`；升级后请在 AstrBot 插件配置页确认显示正常（必要时刷新页面）。
-5. **Pages 记忆页引导**：注入预算提示条新增「前往 AstrBot 插件配置修改预算」，预算 / 滑窗 / 提炼阈值等仍在普通配置中修改。
-
-以上均**不涉及数据库迁移**，热重载或重启即可生效。
-
----
-
-## 15. v2.8.3 后台视频源迁移到 Pages
-
-v2.8.3 起，普通配置中的 `surfing_config.enable_bili_surfing` / `enable_douyin_surfing` 已删除，改为按角色保存在 Soul JSON 的 `settings.surfing_sources`（`["bilibili", "douyin"]` 的子集；缺省两者都启用），由 Pages「冲浪」页「后台视频源」开关管理：
-
-1. **自动清键**：热重载/重启后 AstrBot 会按新 schema 移除旧键，日志可见 `Config key removed: surfing_config.enable_bili_surfing` / `enable_douyin_surfing`；
-2. **旧值不继承**：升级后所有角色默认两者都启用；如之前全局关闭过抖音，请到 Pages「冲浪」页逐角色关闭抖音；
-3. **作用范围**：只影响 SURF 心跳的自动抓取；手动冲浪仍可在工具栏「平台筛选」显式指定 B站 / 抖音，该显式选择会覆盖角色偏好；
-4. **至少一个源**：Pages 会拒绝保存空列表（避免后台冲浪彻底失效）；
-5. 无数据库迁移，热重载或重启即可生效。
-
----
-
-## 16. v2.8.4 用户平台身份规范化（`platform_id:native_uid`）
-
-v2.8 起一个角色可绑定多个机器人接口，私聊会话可跨平台合并到同一个用户档案。但早期用户档案只存了裸 `global_uid`（如 QQ 号 `2975066889`），与 v2.8 约定的 `platform_id:native_uid`（如 `qq bot:2975066889`）格式不一致，会出现：
-
-- 关系页的平台标签把裸 ID 当成「平台」显示；
-- 详情弹窗里旧格式 ID 删除后又被后端强制加回（`update_user_details` 曾强制把 `global_uid` 插回 `platform_ids`）；
-- 跨平台同名数字 ID 可能落到同一档案 / 互相覆盖缓存，合并与删除语义混乱。
-
-**v2.8.4 修复（无表结构变更，热重载/重启即生效）**：
-
-1. **新用户**：平台账号直接以 `platform_id:native_uid` 写入 `users.platform_ids`（`global_uid` 也使用该规范值）；
-2. **旧用户自动修复**：
-   - 收到消息时按 UMO 第一段（平台）+ 发送者 ID 自动把裸 ID 升级为 `platform_id:native_uid`，并移除已被合格账号覆盖的裸条目；
-   - 启动时一次性迁移 `legacy_user_identity_migrated_v1`：只使用**持久化的私聊 UMO 证据**（`umo_soul_bindings` 与 `runtime_state_v1.known_l3_umos`）推断平台，证据唯一才改写；有歧义/无证据的保持原样，留给 Pages 手动补全；
-3. **Pages 关系页**：旧格式条目显示「⚠️ 旧格式」标签，可在详情弹窗补全为 `platform_id:uid`（输入框支持已知接口下拉）或直接删除；保存不会再被强制加回；
-4. **API**：`users/list` 每项新增 `platform_accounts`（`{account, platform_id, uid, legacy}`）、`legacy_platform_ids`、`has_legacy_platform_ids`；`users/update` 新增 `action="normalize_identity"`（body `{global_uid, platform_id?}`，按证据或显式平台补全旧 ID）；`platform_ids` 支持字符串数组或 `{platform_id, native_uid}` 对象数组，至少保留一个账号；
-5. **兼容**：`global_uid` 仍是档案主键（历史 `memories.user_id` 不需要迁移）；裸 ID 在找不到平台证据时保留，可在关系页手动处理。
-
-建议升级后：打开 Pages「关系与群聊」页检查带「旧格式」标签的用户；有明确的平台归属时点「补全平台」保存即可。该操作只改 `users.platform_ids_json`，不动记忆与群聊档案。
-
----
-
-## 17. v2.9 用户身份全局化 + 关系状态按角色隔离
-
-v2.9 起用户数据拆成两层：`users` 只保存**全局身份**（`global_uid / display_name / platform_ids`），新增 `user_relations` 保存**每个角色对该用户的关系状态**（`tier / affinity / interaction_count / nickname / attitude`）。
-
-### 17.1 升级后行为变化
-
-1. 关系页（Pages「关系与群聊」）只显示**当前角色**的关系档案；切换顶部「当前角色」会重新加载对应角色的用户与群聊。
-2. 同一用户在不同角色下可以有不同等级 / 好感 / 专属称呼 / 专属态度（互不影响）；`display_name` 与平台账号是全局身份，修改会影响所有角色。
-3. 合并用户时只能从**当前角色已存在的关系档案**中下拉选择，后端会再次校验；合并会按角色逐 Soul 合并关系行，并迁移 `memories.user_id`。
-4. 删除用户默认只移除**当前角色**的关系档案；只有该用户在所有角色都没有关系行时才删除全局身份。**记忆仍然不随用户档案删除**（记忆属于角色，按 `soul_id` 隔离；如需彻底清理请在记忆页按关联用户删除）。
-5. `users/list` / `users/update` 不传 `soul_id` 时仍返回/操作 legacy 全局视图（兼容旧脚本与旧页面）。
-
-### 17.2 升级步骤
-
-1. **备份**：`docker exec astrbot cp /AstrBot/data/plugin_data/astrbot_plugin_only_you/only_you.db /AstrBot/data/plugin_data/astrbot_plugin_only_you/only_you.db.bak_v28`（或整体备份 `plugin_data` 目录）。
-2. 部署新插件文件并热重载/重启容器。
-3. 确认日志出现：
-   - `[OnlyYou] Registered 31 Web API routes for Plugin Pages.`
-   - `[OnlyYou] Plugin initialized successfully.`
-   - `[OnlyYou] Migrated legacy user relationships into per-Soul user_relations: {'users_processed': N, 'relations_created': M, 'skipped': K}`（一次性；幂等 flag 写入后不会重复）
-   - 无 Traceback。
-4. 数据校验（容器内）：
-   ```bash
-   sqlite3 /AstrBot/data/plugin_data/astrbot_plugin_only_you/only_you.db \
-     "select soul_id, count(*) from user_relations group by soul_id;"
-   ```
-   预期每个角色一行计数；`users` 表身份数不变。
-5. Pages 逐角色打开关系页，确认用户/群聊按角色过滤、关系字段正确。
-
-### 17.3 迁移规则与回滚
-
-- 关系拆分：每个 `users` 行按 `platform_ids` 中平台归属的 Soul 生成 `user_relations` 行（复制 legacy 的 tier/affinity/interaction/nickname/attitude）；跨 Soul 的多平台用户在每个角色各一行。
-- 裸旧 ID：优先按持久化私聊 UMO 证据（`umo_soul_bindings` / `runtime_state_v1.known_l3_umos`）推断平台，再回退 `default_soul_id`（若未设置则回退运行时兜底角色，即最近更新的角色）。
-- 迁移失败/无 Soul 时不会写入 flag，下次启动自动重试；可重复执行不产生重复行。
-- `users` 旧关系列保留作回退，**请勿手工删除**；回滚到 v2.8 时旧列仍可读，但 v2.9 期间按角色修改的关系不会回写旧列。
-- 回滚步骤：恢复升级前的 `only_you.db` 备份 + 旧版插件文件，重启；`user_relations` 表可保留（旧版不读取）。
-
----
-
-## 18. v2.10.0 记忆时间标注 + 读空气概率/预算门闸
-
-> 本版本**无数据库结构变更、无 Web API 路由增减、无一次性迁移 flag**；部署方式与 v2.9 → v2.10 一致：备份 → 覆盖插件文件 → 热重载 / 重启容器 → 确认日志无 Traceback。
-
-### 18.1 升级后行为变化
-
-| 变化 | 影响 | 需要做什么 |
-| :--- | :--- | :--- |
-| **读空气概率门闸默认开启 80%** | 普通（非 @）群消息默认约 20% 不再进入读空气决策模型；@ / 唤醒 / 引用 Bot、`BUSY` 特判与私聊不受影响 | 想保持旧行为：把 `atmosphere_config.reply_gate_probability` 改为 `100` 或关闭 `reply_gate_enabled`；想更安静：调到 0~70 或设置 `reply_gate_hourly_limit` |
-| **记忆注入新增 `[记忆时间基准]` 块** | System Prompt 多一小段固定指令（约 190 字），每条记忆前多「形成于 …（星期，N 天前）」标注 | 无需操作；Token 预算仍由 `max_injected_memories` / `max_memory_chars_budget` 控制（预算只统计记忆正文） |
-| **记忆提炼 Prompt 带时间基准** | 提炼模型拿到「当前时间 + 每条消息真实发送时间 + 窗口时间范围」，更会判断消息新鲜度；**记忆正文写法与 50 字上限不变** | 无需操作（无数据库变化） |
-| **Pages 记忆页显示形成时间** | 召回列显示 `形成于 N 天前` + 绝对时间 tooltip | 刷新页面即可（静态资源随插件覆盖） |
-
-### 18.2 部署与校验步骤
-
-1. **备份**（可选但推荐）：`docker exec astrbot cp /AstrBot/data/plugin_data/astrbot_plugin_only_you/only_you.db /AstrBot/data/plugin_data/astrbot_plugin_only_you/only_you.db.bak_v29`。
-2. 覆盖 `data/plugins/astrbot_plugin_only_you/` 下的插件文件（先删除旧 `__pycache__`），热重载或重启容器。
-3. 确认日志出现：
-   - `[OnlyYou] Registered 31 Web API routes for Plugin Pages.`
-   - `[OnlyYou] Plugin initialized successfully.`
-   - 无 Python Traceback。
-4. 行为抽查：
-   - 普通群消息被门闸拦截时出现 `[OnlyYou] Reply gate dropped non-@ group message (...)`；私聊 / @ 消息不会出现该日志。
-   - Pages「记忆」页每行显示「形成于 …」；`/onlyyou memory extract` 后可看到新记忆带形成时间。
-5. 无数据迁移需要校验；`memories` 表结构与 v2.9 完全一致。
-
-### 18.3 回滚
-
-- 回滚到 v2.9：恢复旧插件文件并热重载即可；`plugin_settings` / `souls/*.json` / `memories` 结构未变，v2.9 可正常读取。
-- 唯一「降级差异」：v2.10 期间由门闸拦下的普通群消息不会补回（本来就不算未读）；记忆里的相对时间在 v2.9 下重新失去注入时间锚点，但不影响数据。
-
-## 19. v2.11.0 按角色 / 会话的「主动回复」开关
-
-> 本版本只新增会话级开关与两个数据字段，**无破坏性迁移**；不主动修改任何既有设置（旧数据默认允许主动回复）。
-
-### 19.1 数据变化
-
-| 位置 | 变化 | 旧数据默认 |
-| :--- | :--- | :--- |
-| `user_relations.proactive_enabled` | 新增 `INTEGER NOT NULL DEFAULT 1`（`db.initialize()` 幂等 `ALTER TABLE` 自动补列） | `1` = 允许主动回复 |
-| `users.proactive_enabled` | 同上（无 Soul 的 legacy 回退列） | `1` |
-| `plugin_settings["group_profiles"]` 的每个群档案 | 新增 `proactive_enabled: bool` | 缺失 → `True` |
-
-- **不需要备份 DB**：迁移是纯加法；若想保险仍可 `docker exec astrbot cp /AstrBot/data/plugin_data/astrbot_plugin_only_you/only_you.db .../only_you.db.bak_v210`。
-- 角色 Soul JSON（`souls/*.json`）**不受影响**；23 个字段的群档案结构仍兼容旧版本（旧版本插件会忽略新键）。
-
-### 19.2 部署与校验步骤
-
-1. 覆盖插件文件（先清理旧 `__pycache__`），热重载或重启容器。
-2. 确认日志出现 `[OnlyYou] Registered 31 Web API routes for Plugin Pages.`、`[OnlyYou] Plugin initialized successfully.`，无 Python Traceback（路由数不变，仍为 31）。
-3. Pages「关系与群聊」页：
-   - 打开任一用户详情弹窗 → 看到「允许「当前角色」主动回复 Ta」开关，默认开启；
-   - 打开任一「💬 群聊」详情弹窗 → 看到「允许在当前群主动回复」开关，默认开启；
-   - 关闭保存后列表行出现 `🤐 不主动`，刷新页面保持；`users/list` 的 `users[]` / `groups[]` 均返回 `proactive_enabled`。
-4. 行为抽查（可选）：
-   - 关闭某私聊用户的主动回复后，Bot 在 `IDLE` 时不会主动补回该用户的未读（日志 `UNREAD_PRIVATE_CATCHUP skipped: proactive disabled ...`），未读队列保留；
-   - 关闭某群后，`IDLE_ROAM(GROUP_LURK)` 不会挑选该群（日志 `proactive disabled` 或直接无该群决策调用），其他群不受影响。
-
-### 19.3 回滚
-
-- 回滚到 v2.10：恢复旧插件文件并热重载即可；新列 / 新键被旧版本忽略，旧版本会恢复「所有会话都允许主动回复」的行为（关系 / 记忆数据不丢）。
-- 开关值保留在数据库中，重新升级到 v2.11 后立即恢复。

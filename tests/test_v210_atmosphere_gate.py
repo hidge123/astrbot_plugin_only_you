@@ -1,6 +1,6 @@
 """v2.10 T2 offline tests: probabilistic / budget reply gate for group read-air.
 
-Frozen contract (``docs/TODO.md`` T2):
+Frozen contract (``docs/ARCHITECTURE.md`` §10.2):
 
 1. The gate sits **after** the direct-mention + BUSY fast paths and **before** the
    debounce window / 5D atmosphere decision model.

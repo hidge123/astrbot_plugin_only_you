@@ -33,7 +33,7 @@ class DatabaseManager:
         await self.execute("PRAGMA journal_mode=WAL;")
         await self.execute("PRAGMA synchronous=NORMAL;")
 
-        # 1. Memories table (exact schema from docs/ARCHITECTURE.md Section 4.1)
+        # 1. Memories table (exact schema from docs/ARCHITECTURE.md Section 6.1)
         await self.execute(
             """
             CREATE TABLE IF NOT EXISTS memories (

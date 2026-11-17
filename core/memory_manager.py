@@ -80,7 +80,7 @@ class MemoryItem:
 
 class MemoryManager:
     """
-    精简版分级记忆与定时遗忘管理器 (docs/ARCHITECTURE.md Section 4.1 & 4.2):
+    精简版分级记忆与定时遗忘管理器 (docs/ARCHITECTURE.md Section 6.1):
     - 单张轻量 SQLite `memories` 表
     - 自动按重要度划分为 Tier 1 (EPHEMERAL) / Tier 2 (RECENT) / Tier 3 (CORE)
     - 每日 `run_forgetting_gc()` 物理清理过期或活力归零记忆，并自动晋升高频召回记忆
@@ -107,7 +107,7 @@ class MemoryManager:
     @staticmethod
     def resolve_tier_by_importance(importance: int, user_tier: int = 1) -> int:
         """
-        Enforce automatic tier grading rules (docs/ARCHITECTURE.md Section 4.1):
+        Enforce automatic tier grading rules (docs/ARCHITECTURE.md Section 6.1):
         - importance >= 8 (and L2/L3 user) -> Tier 3 (CORE)
         - 5 <= importance <= 7 -> Tier 2 (RECENT)
         - importance <= 4 -> Tier 1 (EPHEMERAL)
@@ -415,7 +415,7 @@ class MemoryManager:
 
     async def run_forgetting_gc(self, now_override: Optional[int] = None) -> dict[str, int]:
         """
-        每日定时遗忘清理程序 (exact implementation from docs/ARCHITECTURE.md Section 4.2):
+        每日定时遗忘清理程序 (exact implementation from docs/ARCHITECTURE.md Section 6.1):
         1. 清理超过 48 小时 (172800s) 的 Tier 1 (瞬时短时记忆)
         2. 结算所有 Tier 2 (近期记忆) 的每日活力衰减:
            - 用户等级保护系数: L1=0.6, L2=1.2, L3=2.0

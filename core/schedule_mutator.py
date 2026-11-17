@@ -85,7 +85,7 @@ def _clamp(value: float, low: float, high: float) -> float:
 
 class BoundedScheduleMutator:
     """
-    输入驱动的受限日程微调器 (docs/ARCHITECTURE.md Section 3.3):
+    输入驱动的受限日程微调器 (docs/ARCHITECTURE.md Section 5):
     三重防失控硬性限制：
     1. 每日最大微调次数配额 `run.mutations_used < max_mutations_per_day` (默认 2 次)
     2. 微调冷却时间锁 `time.time() - run.last_mutation_ts >= mutation_cooldown_seconds` (默认 120 分钟)
@@ -215,7 +215,7 @@ class BoundedScheduleMutator:
     async def can_mutate(
         self, run: DailyScheduleRun, current_slot: SlotInstance, impact: int
     ) -> bool:
-        """Exact 3-gate hard constraint check from docs/ARCHITECTURE.md Section 3.3."""
+        """Exact 3-gate hard constraint check from docs/ARCHITECTURE.md Section 5."""
         # 限制 1：每日最大微调次数配额（默认每天最多只允许变卦 2 次）
         if int(getattr(run, "mutations_used", 0) or 0) >= self.max_mutations_per_day:
             return False

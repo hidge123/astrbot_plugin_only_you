@@ -1,6 +1,6 @@
 """v2.10 T1 offline tests: memory time annotations & time-stamped extraction windows.
 
-Frozen contract (``docs/TODO.md`` T1):
+Frozen contract (``docs/ARCHITECTURE.md`` §6.3):
 
 1. ``core/time_utils.py`` renders local time / weekday / age / spans defensively
    (invalid or missing timestamps degrade to ``""`` and never raise).

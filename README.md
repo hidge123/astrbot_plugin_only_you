@@ -21,10 +21,10 @@
 | **④ 角色繁忙卡 (`BUSY_TASK`)** | **🔥 `BUSY`** | *“赶商业插画线稿”* / *“在丹房炼制回春丹”* / *“编写渗透脚本”* | **熟人特权过滤**：忽略 L1，仅抽空简短回复 ◆L2 / ★L3 | **极简三要素**：① 注入当前行为记忆 ② 随时间推进 `0%→100%` 进度条 ③ 走完或被中断时随机生成一句今日【完成结果】写入 **Tier 1 瞬时记忆** |
 
 ### ② 24h 动态弹性时间轴 + 角色专属行动卡池（取代旧固定 6 时段 + 奇遇卡）
-- **角色专属卡池（8~12 张）**：导入 / 创建角色卡时，由决策模型一次性生成贴合其职业、爱好与作息的四类行动卡；卡片名称固定在池中，可在控制台随时增删改。
+- **角色专属卡池（重抽固定 9 张；导入种子卡池 8~12 张）**：导入 / 创建角色卡时，由决策模型一次性生成贴合其职业、爱好与作息的四类行动卡；卡片名称固定在池中，可在控制台随时增删改。
 - **每日随机排轴**：每天无需再调大模型造卡，直接按 **角色作息类型（`rhythm.chronotype`：早睡早起 / 规律 / 夜猫子）曲线 × 今日基调卡 × 相邻连携** 从卡池加权抽卡，并在每张卡的 `[min_hours, max_hours]` 内按 `0.5h` 步长随机掷出时长，让游标从 `0.0` 无缝推进到 `24.0`，自然形成 **7~11 个长短不一的弹性时间块**。
 - **每天都不同的繁忙成果**：`BUSY_TASK` 每次走完 100%（或中途被打断）都会由决策模型生成一句**当天专属、带随机小细节的完成结果**（如*“回春丹炼成了但最后一炉差点炸炉”*），直接写入 Tier 1 短时记忆，彻底替代旧版奇遇卡作为聊天谈资。
-- **旧数据平滑迁移**：旧 6 时段 / 过夜日程会被自动重抽；旧事件卡按 `state + title` 自动推导 `action_type` 与合理时长区间，无需手工改库。
+- **旧数据边界（v2.9）**：旧 6 时段 / 过夜 / 非连续日程会被自动重抽；缺少合法 `action_type` 的旧行动卡会被丢弃并由兜底卡补齐四类行动（不再按标题猜测类型）；`reroll` 只重抽卡池，今日时间轴保持不变、次日生效。
 - **未读消息补回**：睡觉 / 繁忙时被门禁拦下的消息会进入独立未读队列（读空气判“不回复”的不算）；醒来或忙完后，**私聊主动补回一句自然回复**，**群聊先读空气决策再决定是否插话**，消费即清空，可 `/onlyyou unread [list|flush|clear]` 调试。**未读队列是内存态，重启会清空（既定产品语义，见 ⑭）**。
 - **读空气概率/预算门闸（v2.10）**：在「BUSY 特判 + @/唤醒/引用快速放行」之后、「防抖等待 + 读空气决策模型」之前，对**非 @ 普通群消息**先按 `reply_gate_probability`（默认 **80%**）抽样、再过 `reply_gate_hourly_limit`（同一群聊每小时判定上限，默认 **0 = 不限**）；未通过直接放弃，**不调用决策模型、不进入防抖、不算未读**。@ / 唤醒 / 引用、`BUSY` 特判与私聊完全不受影响；关闭门闸或概率调 100% 即与旧版一致（见 ⑰）。
 
@@ -77,7 +77,7 @@
 ### ⑩ 机器人接口（platform）绑定与路由优先级
 - **绑定模型**：一个 Soul 可绑定多个机器人接口（如 `aiocqhttp`、`telegram_bot_1`）；**同一接口同一时刻只属于一个 Soul**，冲突时 API 精确返回「该机器人接口已被角色『XX』绑定，请先在角色 XX 下解绑」。`platform_id` 会被校验为非空、不含 `:`、长度 ≤ 64。
 - **路由优先级（v2.8 废除单会话 UMO 绑定主导）**：① UMO 第一段 == `platform_id` 的平台绑定 → ② 旧 `umo_soul_bindings` 精确绑定（兼容迁移）→ ③ `plugin_settings["default_soul_id"]` → ④ 最近更新的角色 → ⑤ 自动创建默认角色。
-- **心跳按 Soul 驱动**：每 15 分钟对「有绑定的 Soul + 默认兜底 Soul」各自独立执行时间轴结算与行动分发；有绑定的 Soul 只处理自身平台范围内的未读 / 群聊，默认兜底 Soul 处理未被任何角色绑定的机器人接口（未设置默认角色时，聊天路由按优先级落到最近更新的角色；心跳层无任何绑定时退化为单角色处理全部会话）。解绑时同步清理该平台的内存滑窗 / 未读 / 冷却缓存（**不删持久化记忆**；「清理 vs 保留」完整语义见 [docs/UPGRADE.md](docs/UPGRADE.md) 第 10 节）。
+- **心跳按 Soul 驱动**：每 15 分钟对「有绑定的 Soul + 默认兜底 Soul」各自独立执行时间轴结算与行动分发；有绑定的 Soul 只处理自身平台范围内的未读 / 群聊，默认兜底 Soul 处理未被任何角色绑定的机器人接口（未设置默认角色时，聊天路由按优先级落到最近更新的角色；心跳层无任何绑定时退化为单角色处理全部会话）。解绑时同步清理该平台的内存滑窗 / 未读 / 冷却缓存（**不删持久化记忆**；「清理 vs 保留」完整语义见 [docs/UPGRADE.md](docs/UPGRADE.md) 第 9 节）。
 
 ### ⑪ 模型四角色按 Soul 独立配置
 - 每个角色一套 `main / decision / vision / tts`，存于 Soul JSON 的 `model_config`；`onlyyou::main::<soul_id>` 实例化与释放按角色进行。
@@ -238,7 +238,7 @@ OnlyYou/
 ├── storage/db.py                # aiosqlite 持久化（含 plugin_settings KV 表；v2.8 souls.revision 迁移）
 ├── prompts/templates.py         # 集中管理 Prompt 模板
 ├── tests/                       # 离线 unittest 测试套件（零网络）
-└── docs/                        # 设计文档（PRD / ARCHITECTURE / PROMPTS_AND_FLOWS / WEBUI_DESIGN / UPGRADE）
+└── docs/                        # 设计文档（ARCHITECTURE 架构设计 / UPGRADE 升级迁移）
 ```
 
 > 生产数据目录（不入 Git）：`data/plugin_data/astrbot_plugin_only_you/{only_you.db, souls/*.json}`，详见 §2。
@@ -249,12 +249,9 @@ OnlyYou/
 
 | 文档路径 | 文档名称 | 核心内容概述 |
 | :--- | :--- | :--- |
-| **[docs/PRD.md](docs/PRD.md)** | **产品需求文档 (PRD v2.8)** | 三态门禁 × 四类可执行行动卡、24h 动态弹性时间轴与繁忙结果短时记忆、输入驱动的块切分微调、分级记忆与定时遗忘、**详细角色卡（10 分区 / 36 字段）**、**插件自治四角色模型**与平台协同边界；v2.8 增补 **Soul 独立 JSON 一致性语义、机器人接口绑定路由、按 Soul 模型、冲浪分享门禁与总开关、T1/MEMORY_MUSE 记忆规则、运行态持久化、31 条 Web API 与解绑清空语义**。 |
-| **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | **技术架构与 AstrBot 实现方案 (v2.8)** | `BotState` 三态门禁 + `ActionType` 四类行动卡、24h 动态时间轴拼接与作息曲线、繁忙半途结算与 IDLE_ROAM 调度、`MemoryManager` 活力衰减与物理清理、`ContextBudgetManager` 裁剪与 **Persona 接管**、**`ProviderFactory` / `ModelHub` / `selected_provider`**、`plugin_settings` 表与最终 `_conf_schema.json`；v2.8 增补 **Soul JSON 持久化层 / revision 冲突裁决 / 运行时快照 / 31 条 API 清单**。 |
-| **[docs/WEBUI_DESIGN.md](docs/WEBUI_DESIGN.md)** | **Plugin Pages 控制台方案 (v2.8)** | 48px 顶栏 + 216px 侧栏布局、灰白+青绿设计令牌、8 个页面设计要点（含 24h 弹性轴 / 四类卡编辑器 / 繁忙成果卡；v2.8 新版 **关系与群聊页 / 机器人接口页**、模型按角色、记忆 T1 倒计时、冲浪总开关）、Bridge 通信封装、**31 条 Web API 契约**。 |
-| **[docs/PROMPTS_AND_FLOWS.md](docs/PROMPTS_AND_FLOWS.md)** | **Prompt 工程与交互时序 (v2.8)** | 角色卡整卡生成 / 分区补全 Prompt、四类专属行动卡池生成、繁忙完成结果与翻群 / 联想主动搭话 Prompt、受限状态微调、读空气、记忆提炼、**Persona 接管与插件 TTS 时序**；v2.8 增补 **按 Soul 模型解析、平台绑定路由、SURF 分享门禁、MEMORY_MUSE 三桶抽样**。 |
-| **[docs/UPGRADE.md](docs/UPGRADE.md)** | **生产升级与迁移验证指南 (v2.8)** | v2.7 → v2.8 升级步骤：备份 `only_you.db` → 部署 / 热重载 → 日志校验（`Registered 31 Web API routes` / `Plugin initialized successfully` / 迁移日志 / 无 Traceback）→ `souls/*.json` 与一次性 flag 数据校验 → Pages 验收 → 回滚；含**解绑 / 清空类操作的「清理 vs 保留」排障语义表**、幂等重试与降级语义。 |
-| **AGENTS.md（本地工程手册，GitHub 不可见）** | **开发、部署与联调规范** | 目录与模块职责、敏感信息安全规范、**AstrBot v4 底层机制与避坑指南**（`selected_provider`、Persona 段替换、`on_decorating_result`、`plugin_settings`、Provider 实例化）、**24h 时间轴不变量与繁忙结算契约**、Docker 部署、SSH 隧道 + OpenAPI 真机联调流程。⚠️ **该文件已在 `.gitignore` 中忽略，仅本地工程维护使用，GitHub 仓库不可见（因此本表不提供 Markdown 链接）**；GitHub 可见文档为 `README.md` + `docs/PRD.md` / `docs/ARCHITECTURE.md` / `docs/PROMPTS_AND_FLOWS.md` / `docs/WEBUI_DESIGN.md` / `docs/UPGRADE.md`。 |
+| **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | **技术架构设计 (v2.11)** | 三态门禁 × 四类行动卡、24h 动态时间轴与作息曲线、输入驱动的受限微调、分级记忆与时间锚点、上下文预算、**Persona 接管**、用户关系双模型（全局身份 + 按角色关系 + 主动回复开关）、Soul JSON 唯一真源与 revision 裁决、四角色模型与 `selected_provider`、读空气概率/预算门闸、冲浪分享门禁、运行态持久化、配置分层、31 条 Web API 与控制台结构。 |
+| **[docs/UPGRADE.md](docs/UPGRADE.md)** | **生产升级与迁移指南 (v2.11)** | 自动迁移清单与幂等 flag → 备份 → 部署 / 热重载 → 日志与数据校验 → Pages / 功能抽检 → 回滚；含**解绑 / 清空类操作的「清理 vs 保留」语义表**、重启语义、v2.8.2~v2.11 版本迁移条目与 FAQ。 |
+| **AGENTS.md（本地工程手册，GitHub 不可见）** | **开发、部署与联调规范** | 目录与模块职责、敏感信息安全规范、**AstrBot v4 底层机制与避坑指南**（`selected_provider`、Persona 段替换、`on_decorating_result`、`plugin_settings`、Provider 实例化）、**24h 时间轴不变量与繁忙结算契约**、Docker 部署、SSH 隧道 + OpenAPI 真机联调流程。⚠️ **该文件已在 `.gitignore` 中忽略，仅本地工程维护使用，GitHub 仓库不可见（因此本表不提供 Markdown 链接）**；GitHub 可见文档为 `README.md` + `docs/ARCHITECTURE.md` / `docs/UPGRADE.md`。 |
 
 ---
 
@@ -265,7 +262,7 @@ OnlyYou/
    - 在 AstrBot 插件配置面板设置 Roguelite / 读空气 / 冲浪接口与分享门槛 / 记忆阈值（`_conf_schema.json` 只含运行参数；角色总开关、后台视频源、用户等级名单均由 Pages / Soul JSON 管理）；
    - 打开插件 Pages 控制台，在「模型」页为**当前角色**配置 **对话（必填）/ 决策 / 视频解析 / TTS**（配置写入该角色 `souls/<soul_id>.json` 的 `model_config`）；
    - 在「角色卡」页手填或 AI 生成角色卡；在「会话 / 机器人接口」页把机器人接口绑定到角色并设置默认角色兜底。
-3. **从 v2.7 升级到 v2.8**：**先备份 `only_you.db`（以及整个插件数据目录），再阅读 [docs/UPGRADE.md](docs/UPGRADE.md) 执行升级与迁移校验**。v2.8 首次启动会自动把旧 SQLite 角色数据落盘为 `souls/*.json`、迁移旧 UMO 绑定与全局模型配置（一次性 flag 全部成功才写入，失败下次启动自动重试）。
+3. **从旧版本升级到 v2.11**：**先备份 `only_you.db`（以及整个插件数据目录），再阅读 [docs/UPGRADE.md](docs/UPGRADE.md) 执行升级与迁移校验**。首次启动会自动把旧 SQLite 角色数据落盘为 `souls/*.json`、迁移旧 UMO 绑定与全局模型配置，并把 `users` 关系列按角色拆分到 `user_relations`；v2.11 另会幂等补充 `proactive_enabled` 列（一次性 flag 全部成功才写入，失败下次启动自动重试）。
 4. **本地离线测试（零网络、无需安装 AstrBot / pytest）**：
 
    ```bash

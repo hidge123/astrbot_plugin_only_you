@@ -559,7 +559,7 @@ class SessionBuffer:
 
 class ContextBudgetManager:
     """
-    简易上下文与预算管理器 (docs/ARCHITECTURE.md Section 4.3):
+    简易上下文与预算管理器 (docs/ARCHITECTURE.md Section 6.2):
     0. 用角色卡渲染出的人格 Prompt 替换 AstrBot 原生 `# Persona Instructions` 段
     1. 完全清空平台原生历史 `req.contexts.clear()`，注入插件维护的高信噪比会话滑窗
     2. 按 `[0.40 * 关键词匹配 + 0.35 * 时间新鲜度 + 0.25 * 重要度]` 对候选记忆打分排序

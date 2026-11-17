@@ -1,6 +1,6 @@
 """v2.9 regression tests: unified action-card titles + "re-roll card pool" semantics.
 
-Covers the three v2.9 changes (see ``docs/IMPLEMENTATION_PLAN.md`` companion plan):
+Covers the three v2.9 changes (see ``docs/ARCHITECTURE.md`` §4.3):
 
 1. **统一行动卡标题格式** — ``ACTION_DECK_GENERATE_PROMPT`` + the code-side
    ``normalize_action_card_title`` sanitizer, so every generated / imported /
