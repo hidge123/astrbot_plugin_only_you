@@ -1,6 +1,6 @@
-# OnlyYou (只有你) —— 技术架构设计 (v2.11)
+# OnlyYou (只有你) —— 技术架构设计 (v2.12)
 
-> 适用版本：插件 **v2.11.1**（`metadata.yaml` / `main.py @register` 为版本真源）。
+> 适用版本：插件 **v2.12.0**（`metadata.yaml` / `main.py @register` 为版本真源）。
 > 本文只描述**当前实现**的架构、数据契约与运行机制；代码是最终真源，文档与代码冲突时以代码为准。
 > 生产升级、迁移校验、回滚与「清理 vs 保留」语义见 [`UPGRADE.md`](UPGRADE.md)。
 
@@ -14,7 +14,7 @@ OnlyYou 是一个 AstrBot `Star` 插件：在**不接管平台底层**的前提�
 | :--- | :--- | :--- |
 | 接入层 | `main.py` 的 `@filter` 钩子、`core/platform_bridge.py` | 接收消息、命令分流、群聊读空气、与 AstrBot 原生管线协同（唤醒 / 分段 / 流式 / TTS） |
 | 决策与状态层 | `state_machine.py`、`roguelite_deck.py`、`schedule_mutator.py`、`atmosphere_reader.py` | 三态门禁、24h 时间轴、输入驱动微调、是否接话 |
-| 能力层 | `memory_manager.py`、`context_budget.py`、`soul_manager.py`、`model_hub.py`、`provider_factory.py`、`user_relation.py`、`surfing/` | 记忆、上下文、角色配置、四角色模型、用户关系、赛博冲浪 |
+| 能力层 | `memory_manager.py`、`context_budget.py`、`soul_manager.py`、`model_hub.py`、`provider_factory.py`、`user_relation.py`、`surfing/` | 记忆（RAG）、上下文、角色配置、多角色模型（含 Embedding / Rerank）、用户关系、赛博冲浪 |
 | 持久化层 | `storage/db.py`、`core/runtime_state.py`、`souls/*.json` | SQLite 业务表 + 角色 JSON 唯一真源 + 运行态快照 |
 | 控制台 | `core/web_api.py` + `views/console/` | 31 条 Web API 与 8 页无构建 Plugin Pages |
 
@@ -80,7 +80,7 @@ OnlyYou/
 │   ├── memory_manager.py        # 分级记忆、T1 去重/上限/清理、MEMORY_MUSE 抽样、Forgetting GC、形成时间字段
 │   ├── context_budget.py        # SessionBuffer、Persona 接管、记忆预算、关系上下文、时间戳提炼窗口
 │   ├── time_utils.py            # 本地时间格式化：星期 / 形成时间锚点 / 窗口跨度 / 时间戳，非法值安全降级
-│   ├── model_hub.py             # 四角色模型网关（按 Soul 读写、可选继承）
+│   ├── model_hub.py             # 多角色模型网关（四对话角色 + Embedding/Rerank，按 Soul 读写）
 │   ├── provider_factory.py      # 唯一触碰 AstrBot Provider 内部结构的封装
 │   ├── platform_bridge.py       # 唤醒决策、平台实例枚举、分段回复、主动消息 / 语音
 │   ├── runtime_state.py         # runtime_state_v1 快照（去重 / 冷却 / ★L3 目标）
@@ -93,7 +93,7 @@ OnlyYou/
 │   └── adapters/                # bilibili.py / douyin.py / base.py
 ├── storage/db.py                # aiosqlite（stdlib sqlite3 自动回退）持久化
 ├── prompts/templates.py         # 全部 Prompt 模板
-├── tests/                       # 745 条离线 unittest（零网络）
+├── tests/                       # 812 条离线 unittest（零网络）
 └── docs/                        # ARCHITECTURE.md / UPGRADE.md
 ```
 
@@ -216,52 +216,65 @@ class UserTier(int, Enum):   L1_NORMAL=1 | L2_IMPORTANT=2 | L3_CORE=3
 
 ## 六、 记忆与上下文工程
 
-### 6.1 三级记忆
+### 6.1 记忆分类与三级生命周期（v2.12）
+
+每条记忆同时带两个维度：
+
+| 维度 | 取值 | 说明 |
+| :--- | :--- | :--- |
+| `memory_type` | `profile` 人物画像 / `relationship` 关系共识 / `state` 近期状态 / `episode` 短期情节 | 决定能否晋升 T3；旧行默认 `episode` |
+| `memory_tier` | T1 瞬时 / T2 近期 / T3 核心 | 决定 GC 与注入优先级 |
 
 | 层级 | 划分规则 | 生命周期 | 典型来源 |
 | :--- | :--- | :--- | :--- |
-| Tier 1 瞬时 | `importance <= 4` | 48h；每角色上限 30 条 | 繁忙成果、看片见闻、翻群吃瓜 |
-| Tier 2 近期 | `5 <= importance <= 7` | 按活力值每日衰减，归零删除 | 日常对话提炼 |
-| Tier 3 核心 | `importance >= 8` 且用户等级 >= L2 | 永久；`access_count >= 4` 且重要度 >= 6 时 T2 自动晋升 | 重要事实、约定、偏好 |
+| Tier 1 瞬时 | `importance <= 4` | 48h（自创建或**降级为 T1** 起算）；每角色上限 30 条 | 繁忙成果、看片见闻、翻群吃瓜 |
+| Tier 2 近期 | `5 <= importance <= 7` | 按活力值每日衰减，归零删除；可晋升 T3 | 日常对话提炼 |
+| Tier 3 核心 | 直出仅限 `profile` / `relationship` 且 `importance >= 9`；或 T2 满足严苛条件后晋升 | 永久 | 真实身份、严重忌口 / 雷点、长期承诺 |
 
-L1 普通用户的消息即使重要度 8 也只能进 T2（不允许直接创建核心记忆）。
+L1 普通用户即使重要度 8 也只能进 T2；`episode` / `state` 永远不会晋升 T3。
 
-**写入规则**：`add_memory()` 统一入口，内容截断 60 字；T1 相同内容按 `(soul_id, content)` 去重并刷新 `last_accessed_at`，插入后按 `created_at ASC, id ASC` FIFO 淘汰超限项；`enable_tiered_memory=false` 时所有写入与召回均为 no-op。
+**写入规则（`add_memory`）**：
+
+1. 内容截断 60 字；`memory_type` / `event_at` / 向量随行落库；
+2. **语义去重（全层级）**：与同 Soul、同用户（或公共记忆）的未归档记忆比较——有向量时余弦 `>= 0.85`，无向量时字符 Bigram Jaccard `>= 0.65` 判定重复；重复只刷新 `last_accessed_at`、合并 `keywords`、取更高 `importance`，**绝不重复插入**；
+3. **版本替代（Supersede）**：显式 `supersedes_id`，或同为 `state` 且相似度在 `[0.72, 0.85)`，插入新记忆后把旧记忆 `superseded_by = 新 id`（归档备查，不再参与召回 / 主动联想）；
+4. T1 保留期锚点为 `tier1_since`：新建 T1 取 `created_at`，从 T2/T3 **降级**为 T1 时重置为降级时刻（旧行 `tier1_since=0` 回退 `created_at`）；超限项按 `COALESCE(NULLIF(tier1_since,0), created_at) ASC, id ASC` FIFO 淘汰；`enable_tiered_memory=false` 时全部写入与召回为 no-op。
 
 **每日遗忘 GC**（`run_forgetting_gc`，`last_forgetting_gc_date` 保证跨重启每天一次）：
 
-- 删除创建超过 48h 的 T1；
-- T2 每日衰减：`daily_decay = 35 / (importance × tier_factor × (1 + 0.5·ln(1+access_count)))`，`tier_factor` 为 L1=0.6 / L2=1.2 / L3=2.0；活力 <= 0 物理删除；
-- T2 中 `access_count >= 4` 且 `importance >= 6` 晋升 T3；
-- 另有 `cleanup_tier1()` 在启动与每次心跳做实时清理。
+- 删除 `tier1_since + 48h` 已过的 T1；`cleanup_tier1()` 在启动、每次心跳与记忆列表读取前做实时清理（过期项最迟 15 分钟内回收；降级为 T1 时锚点重置为降级时刻）；
+- T2 每日衰减：`daily_decay = 35 / (importance × tier_factor × (1 + 0.5·ln(1+access_count)))`，`tier_factor` L1=0.6 / L2=1.2 / L3=2.0；活力 <= 0 物理删除；
+- **T3 晋升硬门闸**：`memory_type IN (profile, relationship)`、`importance >= 8`、`access_count >= 8` 才晋升；其余 T2 继续自然代谢。
 
-### 6.2 检索与注入
+### 6.2 RAG 多路混合召回与注入（v2.12）
 
 `ContextBudgetManager.apply_context_and_memory_budget()` 的执行顺序固定：
 
 1. **Persona 接管**：用角色卡渲染结果替换 `req.system_prompt` 中的 `# Persona Instructions` 段（精确替换 → 正则兜底 → 前置三分支）；头像与原生人设原文永不注入。
 2. **清空原生历史**：`req.contexts.clear()`，注入插件 `SessionBuffer` 滑窗（默认 15 条，剔除与当前 prompt 重复的最新用户消息）。
-3. **召回打分**：候选记忆按 `0.40 × 关键词命中 + 0.35 × 时间新鲜度(exp(-0.15·天)) + 0.25 × 重要度` 排序。
-4. **硬预算**：最多注入 6 条、总内容不超过 400 字；命中记忆累加 `access_count` 并刷新访问时间。每条注入行附 `形成于 YYYY-MM-DD（星期，N 天前）` 锚点，并在记忆块前注入 `MEMORY_TIME_CONTEXT_PROMPT`（锚点是形成时间而非当前时间，相对表述按锚点解冻）。
-5. **状态注入**：繁忙时注入当前事项 + 实时进度 + 时间范围；空闲时注入行动类型、今日已完成繁忙成果（最多 3 条）与最近看片内容；变卦时注入第一人称心理独白。
-6. **关系注入**：`USER_RELATION_CONTEXT_PROMPT` 注入三级重要度法则 + 当前对话人档案（等级 / 亲密度 / 专属称呼 / 专属态度 / 主动回复开关）+ 群聊其他活跃对话者摘要（≤4 条）。整段异常静默降级为空。
+3. **上下文感知 Query**：当前消息 + 滑窗内该用户最近 2 条发言；有 `embedding` 角色时同时取 Query 向量。
+4. **三路粗排候选池（Top-24）**：仅 `superseded_by IS NULL`；Dense（向量余弦）+ Sparse（`content + keywords` BM25）+ T3/T2/T1 分桶保底，防止高 tier 吃满候选名额。
+5. **Rerank 精排**：有 `rerank` 角色时调用 `rerank(query, docs)` 得到 `sem_score`；否则用向量余弦，两个角色都关闭时用「内容 N-gram + 关键词命中」的词法相似度。综合分 `total = 0.55×sem + 0.25×recency(event_at) + 0.20×importance`。
+6. **最低相关性门闸**：`total < 0.38` 或 `sem < 0.25` 的记忆直接丢弃（默认值可在插件配置调整），绝不 0 分硬凑。
+7. **滑窗去重 + 预算裁剪**：跳过 10 分钟内刚提炼且内容仍在当前滑窗内的记忆；最多 6 条、总字符 <= 400，**字符预算计入时间标签**，超长项 `continue` 而不是 `break`，让后面更短的相关记忆仍能注入。
+8. **True-Hit 强化**：仅 `sem >= 0.55` 且距上次强化超过 6 小时才 `access_count += 1`；T3 晋升见 6.1。
+9. **状态 / 关系注入**：繁忙进度、空闲繁忙成果与看片、变卦独白；`USER_RELATION_CONTEXT_PROMPT` 注入三级法则 + 当前对话人档案 + **身份归一说明** + 群聊其他活跃对话者摘要（≤4 条）。整段异常静默降级为空。
 
-### 6.3 记忆时间锚点（v2.10）
+### 6.3 记忆时间锚点（v2.10 / v2.12）
 
-目标：让相对时间（「这周末 / 明天 / 昨天」）在长期记忆中可解冻，并让跨天滑窗的提炼模型知道「今天」是哪天。**只做时间标注，不改写记忆正文、不改数据库结构、不改 GC 语义。**
+- **统一格式化**：`core/time_utils.py` 提供 `format_local_datetime` / `describe_time_anchor` / `current_datetime_text` / `describe_time_span`，固定中文星期，非法 / 未来时间戳安全降级。
+- **事件时间 `event_at`（v2.12）**：提炼时优先使用模型返回的 `event_at`；否则按 transcript 中该发言人的**最后一条真实消息时间**推断，再否则用窗口最新时间。注入锚点使用 `event_at`（为 0 时回退 `created_at`），解决冷群跨天提炼的时间偏移。
+- **注入格式**：`- [核心记忆 · 人物画像 · 形成于 2026-11-05（星期四，10 天前）] 正文`；块前注入 `MEMORY_TIME_CONTEXT_PROMPT`。正文保持原样。
+- **预算语义（v2.12）**：时间标签计入 `max_memory_chars_budget`，`injected_chars` 也统计标签长度。
 
-- **统一格式化**：`core/time_utils.py` 提供 `format_local_datetime` / `describe_time_anchor` / `current_datetime_text` / `describe_time_span` 等纯函数，使用固定中文星期表（不依赖 locale），非法 / 缺失 / 未来时间戳安全降级。
-- **存储与 API**：`memories.created_at` 仍是唯一权威形成时间；`MemoryItem.to_dict()` 增 `created_at_text` / `last_accessed_at_text`，Pages 记忆页展示「形成于 …」绝对时间。
-- **提炼窗口**：`SessionBuffer.format_extraction_transcript()` 生成带范围头的 transcript：
+### 6.4 Embedding / Rerank 角色（v2.12）
 
-  ```text
-  【窗口时间范围】2026-11-09 21:30 ~ 2026-11-15 21:30（跨度 6 天），共 15 条消息
-  [2026-11-10 09:12] [L1 阿一(ID:u-1)]: 这周末去考试吗
-  ```
-
-  提炼 Prompt 同时注入 `{current_datetime}`；同批记忆共享传入的形成锚点，正文与 50 字上限不变。
-- **注入侧**：记忆块逐条附加形成时间；`IDLE_ROAM(MEMORY_MUSE)` 素材与 `/onlyyou memory list` 同样展示形成时间。`injected_chars` 仍只统计正文，保持硬预算语义。
-- **兼容边界**：`format_for_transcript()` 默认 `with_time=False`，读空气、未读补回等既有 Prompt 字节不变；无数据库迁移。
+- **配置真源**：与四角色一样存 Soul JSON 的 `model_config.embedding / .rerank`，结构为 `{mode, provider_id, source_id, model}`。
+- **来源模式**：`off`（默认，自动降级） / `provider`（复用 AstrBot 已启用实例） / `source`（按 `(source_id, model)` 复用或自建插件实例）。
+- **Provider 封装**：`ProviderFactory` 新增 `list_embedding_providers` / `list_rerank_providers` / `get_embedding_provider` / `get_rerank_provider`；`ModelHub` 新增 `get_embeddings` / `get_embedding` / `rerank_documents` 与 `test_role` 的 RAG 分支。
+- **优雅降级**：Embedding + Rerank 全开 → 向量 + BM25 粗排 + Rerank 精排；仅 Embedding → 向量 + 词法融合；两者皆关 → 纯词法检索；任何实例创建 / 调用失败都只降级，不抛异常。
+- **向量存储**：`memories.embedding_json` 缓存归一化浮点向量，纯 Python 内积（单 Soul 百条量级耗时 < 2ms），不引入 FAISS 等外部向量库。旧记忆不强制启动回填；被真实召回后由后台任务惰性补算（不阻塞回复），编辑内容时同步重算。
+- **控制台**：模型页新增「向量模型 / 重排模型」两张卡片（三档来源模式 + 提供商列表 + 测试），记忆页展示分类标签、已归档状态、向量缓存数量。
 
 ---
 
@@ -269,19 +282,24 @@ L1 普通用户的消息即使重要度 8 也只能进 T2（不允许直接创�
 
 ### 7.1 v2.9 两层数据模型
 
-- `users`：**全局身份**——`global_uid`（主键，规范形如 `platform_id:native_uid`）、`display_name`、`platform_ids`。
+- `users`：**全局身份**——`global_uid`（主键，规范形如 `platform_id:native_uid`）、`display_name`、`platform_ids`、`aliases`（v2.12 曾用名 / 多端昵称）。
 - `user_relations`：**按角色隔离的关系状态**——`(soul_id, global_uid)` → `tier / interaction_count / affinity / nickname / attitude / proactive_enabled`。
 - 读取时优先 `user_relations`，首次访问从 `users` 旧关系列种值（legacy 回退）；所有关系 API 都接受可选 `soul_id`，不传时保持 v2.8 全局视图。
 - `proactive_enabled` 在 v2.11 加入：`user_relations` 为权威值，`users` 同名列作为无 Soul 调用的 legacy 回退；合并账号时按**双方都允许才开启**的 AND 语义。
 - 合并用户只能从**当前角色**的关系列表下拉选择；删除默认只删当前角色关系，全部角色都无关系行时才删全局身份；记忆不随用户档案删除。
+- **身份归一（v2.12）**：用户改名时旧 `display_name` 自动收入 `aliases`（上限 10 条、单条 <= 40 字、过滤平台账号）；`canonical_name` 优先取角色专属 `nickname`，其次主 `display_name`，最后 `global_uid`。滑窗 transcript、记忆提炼与关系上下文统一使用规范称呼。
+- **孤立记忆归并**：关系页修改 `platform_ids` 或合并用户时，`users` / `user_relations` 主键不变，`memories.user_id` 指向旧账号 / 曾用名的孤儿记忆自动改写到主 `global_uid`。
+- **历史裸 ID 迁移**：启动时一次性把 `memories.user_id` 中的裸平台 uid（如 `"42"`）与曾用名归并到唯一确定的 `global_uid`（`legacy_memory_user_ids_migrated_v1` 幂等 flag）；Native uid 同时属于多个用户的歧义行不自动改写。
 
 ### 7.2 三级关系
 
 | 等级 | 产生方式 | 行为差异 |
 | :--- | :--- | :--- |
 | L1 普通 | 默认 | 仅 `IDLE` 可互动，`BUSY` 直接忽略 |
-| ◆L2 重要 | 管理员设置 / 好感度自动晋升（`enable_auto_promotion_l2`） | `BUSY` 可被放行；`IDLE` 可被主动 @ 分享 |
+| ◆L2 重要 | 管理员设置 / 有效互动自动晋升（`enable_auto_promotion_l2` + `auto_promote_l2_min_interactions` AND `auto_promote_l2_min_affinity`） | `BUSY` 可被放行；`IDLE` 可被主动 @ 分享 |
 | ★L3 核心 | AstrBot `admins_id` 自动确定，或关系页 / `/onlyyou tier <uid> 3` 显式设置 | 唯一能通过私聊强呼叫唤醒睡眠、最易击穿繁忙护甲；**不参与好感度与自动晋升** |
+
+**好感度曲线（v2.12）**：只有 Bot **真正生成回复**的回合才结算（`on_llm_response_hook` → `record_effective_interaction`）。同用户 180s 冷却只计一次；普通群聊接话 `+0.4`、直接 @ / 引用 / 私聊 `+0.6`；好感 `>= 60` 后增速减半；每人每日 `+5.0` 封顶。L1 → L2 必须**同时**满足互动次数（默认 40）与好感度（默认 30.0）。`resolve_user()` 只解析身份，不再因消息到达加好感。
 
 ### 7.3 群聊档案
 
@@ -353,14 +371,18 @@ SQLite `souls` 表（`soul_id / persona_hash / profile_json / updated_at / revis
 | `mused_memory_ids` | `{soul_id: [memory_id]}`，每角色 ≤30（MUSE 轮转） |
 | `last_surf_share_ts` / `last_idle_roam_ts` / `last_group_lurk_ts` / `last_private_catchup_ts` | 冷却时间戳，仅保留最近 7 天 |
 | `known_l3_umos` | `{global_uid: umo}`，≤100，MRU |
+| `recent_proactive_messages` | `{soul_id: [主动消息文本]}`，每角色最近 5 条（v2.12 反反复读） |
+| `idle_roam_daily_counts` | `{soul_id: {"date": "YYYY-MM-DD", "count": n}}`（v2.12 每日主动上限） |
 
 非法数据类型、未知键、超限项全部在归一化时降级或裁剪，存储异常只记 warning。
 
 ---
 
-## 九、 四角色模型、TTS 与平台协同
+## 九、 多角色模型（四对话角色 + Embedding / Rerank）、TTS 与平台协同
 
 ### 9.1 角色与继承
+
+v2.12 起共 **6 个角色**：`main` / `decision` / `vision` / `tts` / `embedding` / `rerank`。前四个语义不变；`embedding` / `rerank` 为 RAG 记忆角色，三档 `mode`（off / provider / source），不参与继承，任一关闭或失败都自动降级。
 
 | 角色 | 用途 | 继承规则 |
 | :--- | :--- | :--- |
@@ -412,14 +434,23 @@ SQLite `souls` 表（`soul_id / persona_hash / profile_json / updated_at / revis
 
 门闸预算 `_gate_pass_ts` 为内存态，重启或 `clear_gate_budget()`（按 UMO / 平台）清空；平台解绑时同步清理。
 
-### 10.3 空闲闲逛（`IDLE_ROAM`）
+### 10.3 空闲闲逛（`IDLE_ROAM`，v2.12 重设计）
 
-心跳先做**私聊未读补回**（每会话冷却，单次最多 2 个会话，失败保留），再按优先级尝试：
+心跳先做**私聊未读补回**（每会话冷却，单次最多 2 个会话，失败保留），然后：
 
-- **`GROUP_LURK` 翻群吃瓜**：按未读数选群 → 读空气决策 `REPLY` 才生成并发送，`IGNORE` 也 ack 消费；受群冷却与 §7.4 主动回复开关约束。发送成功即结束本轮。
-- **`MEMORY_MUSE` 记忆联想**：没有可翻的群、或翻群被判 `IGNORE` 后继续执行；优先单次消费今日已结算、尚未聊过的繁忙成果（最多 2 条），用完后从 T1/T2/T3 三桶分别抽样（最久未访问优先，≤2 条），发送成功才刷新 `last_accessed_at` 并写入轮转环。素材同样带记忆形成时间。
+1. **冷却**：`idle_roam_cooldown_minutes` 默认 **120**；
+2. **每日上限**：`idle_roam_daily_max_count` 默认 **3**（0 = 不限），按角色按本地自然日计数；
+3. **`GROUP_LURK` 翻群吃瓜**：按未读数选群 → 读空气决策 `REPLY` 才生成并发送，`IGNORE` 也 ack 消费；受群冷却与 §7.4 主动回复开关约束。发送成功即结束本轮；
+4. **触发概率门闸**：`idle_roam_trigger_probability` 默认 **35%**，冷却到点也不再机械必发；
+5. **话题模式**：`PERSONA_TOPIC` : `MEMORY_MUSE` = `idle_roam_persona_topic_ratio`（默认 **70**）: 其余。
+   - **`PERSONA_TOPIC`（新增主力）**：不读旧记忆，从 6 个灵感切面随机选 1 个（当下行动 / 兴趣癖好 / 居所氛围 / 主业吐槽 / 好奇提问 / 世界观日常），结合角色卡与当前时间块生成全新日常话题；今日繁忙成果每项只能用一次；
+   - **`MEMORY_MUSE`**：只抽 **1 条**记忆，且 72 小时内被聊过（召回 / 联想）的记忆跳过；抽不到时**无缝切到 `PERSONA_TOPIC`**，绝不回退 `list_memories()` 全量硬抽（旧版复读 bug 根因）；
+6. **反反复读**：`runtime_state_v1.recent_proactive_messages[soul_id]` 保存最近 5 条主动消息，Prompt 中注入「禁止重复话题 / 禁止使用这些句首字 / 句尾字」；发送成功后才写入。
 
-两者都受 `idle_roam_cooldown_minutes`（默认 45）限制。
+### 10.3b 运行态与提炼重试
+
+- `runtime_state_v1` 新增 `recent_proactive_messages`（每角色 5 条）与 `idle_roam_daily_counts`（`{date, count}`），随原有冷却 / 去重快照一起持久化，重启不重置每日上限与反反复读环。
+- `SessionBuffer` 保存提炼后台任务强引用；回调返回 `False`（LLM 失败 / JSON 解析失败）时把该批消息放入**单批重试缓冲**，下一次提炼自动前置重合并，不再永久丢失。
 
 ### 10.4 未读消息
 
@@ -452,7 +483,7 @@ SQLite `souls` 表（`soul_id / persona_hash / profile_json / updated_at / revis
 | :--- | :--- | :--- |
 | AstrBot 配置 | `_conf_schema.json` | 只放**运行参数**（日程、读空气、冲浪接口与门槛、记忆/上下文阈值） |
 | 插件自治设置 | SQLite `plugin_settings` | `default_soul_id`、迁移 flag、`runtime_state_v1`、`group_profiles`、旧全局 `model_config` |
-| 角色配置 | `souls/<soul_id>.json` | 角色卡、行动卡池、四角色模型、平台绑定、冲浪开关与视频源 |
+| 角色配置 | `souls/<soul_id>.json` | 角色卡、行动卡池、多角色模型（含 Embedding / Rerank）、平台绑定、冲浪开关与视频源 |
 
 配置项**不得**跨层重复：用户等级/名单、角色冲浪开关、后台视频源、模型配置都不在普通配置里。
 
@@ -460,20 +491,20 @@ SQLite `souls` 表（`soul_id / persona_hash / profile_json / updated_at / revis
 
 | 分组 | 键（默认值） |
 | :--- | :--- |
-| `roguelite_schedule_config` | `enable_roguelite_schedule`(true)、`max_mutations_per_day`(2)、`mutation_cooldown_minutes`(120)、`idle_roam_cooldown_minutes`(45)、`allow_l3_wake_from_resting`(true)、`unread_private_reply_enabled`(true)、`unread_group_ttl_minutes`(120)、`unread_private_ttl_minutes`(720)、`unread_max_per_chat`(20)、`unread_group_cooldown_minutes`(60)、`unread_private_cooldown_minutes`(60) |
-| `relationship_config` | `enable_auto_promotion_l2`(true) |
+| `roguelite_schedule_config` | `enable_roguelite_schedule`(true)、`max_mutations_per_day`(2)、`mutation_cooldown_minutes`(120)、`idle_roam_cooldown_minutes`(120)、`idle_roam_trigger_probability`(35)、`idle_roam_daily_max_count`(3)、`idle_roam_persona_topic_ratio`(70)、`allow_l3_wake_from_resting`(true)、`unread_private_reply_enabled`(true)、`unread_group_ttl_minutes`(120)、`unread_private_ttl_minutes`(720)、`unread_max_per_chat`(20)、`unread_group_cooldown_minutes`(60)、`unread_private_cooldown_minutes`(60) |
+| `relationship_config` | `enable_auto_promotion_l2`(true)、`auto_promote_l2_min_interactions`(40)、`auto_promote_l2_min_affinity`(30.0)、`affinity_cooldown_seconds`(180)、`affinity_daily_cap`(5.0) |
 | `atmosphere_config` | `takeover_group_chat`(true)、`debounce_seconds`(4.0)、`reply_gate_enabled`(true)、`reply_gate_probability`(80)、`reply_gate_hourly_limit`(0) |
 | `surfing_config` | `bili_cookie`("")、`douyin_api_base`、`send_raw_video`(true)、`surf_share_min_score`(80)、`surf_share_cooldown_minutes`(90) |
-| `memory_and_context_config` | `enable_tiered_memory`(true)、`sliding_window_size`(15)、`extract_every_n_messages`(15)、`max_injected_memories`(6)、`max_memory_chars_budget`(400)、`max_tier1_memories`(30) |
+| `memory_and_context_config` | `enable_tiered_memory`(true)、`sliding_window_size`(15)、`extract_every_n_messages`(15)、`max_injected_memories`(6)、`max_memory_chars_budget`(400)、`max_tier1_memories`(30)、`max_recall_candidates`(24)、`min_recall_score`(0.38)、`min_semantic_score`(0.25) |
 
 ### 11.3 SQLite 表
 
 | 表 | 主键 | 用途 |
 | :--- | :--- | :--- |
-| `memories` | `id` | 分级记忆（含活力、访问次数、时间戳） |
+| `memories` | `id` | 分级记忆（活力 / 访问次数 / 时间戳 + v2.12 `memory_type` / `event_at` / `embedding_json` / `superseded_by` / `last_reinforced_at` + v2.12 `tier1_since`） |
 | `souls` | `soul_id` | 角色索引（`profile_json` + `revision`） |
 | `daily_schedules` | `(soul_id, date_str)` | 当日 24h 时间轴快照 |
-| `users` | `global_uid` | 全局用户身份（旧关系列 + `proactive_enabled` legacy 回退列保留） |
+| `users` | `global_uid` | 全局用户身份（`aliases_json` 曾用名 v2.12；旧关系列 + `proactive_enabled` legacy 回退列保留） |
 | `user_relations` | `(soul_id, global_uid)` | 按角色的关系状态（含 `proactive_enabled`） |
 | `umo_soul_bindings` | `umo` | 旧版单会话绑定（仅兼容） |
 | `plugin_settings` | `key` | JSON KV：自治设置 / flag / 运行态 |
@@ -509,7 +540,7 @@ SQLite `souls` 表（`soul_id / persona_hash / profile_json / updated_at / revis
 ## 十三、 测试与验证
 
 ```bash
-python3 -m unittest discover -s tests -v      # 745 条，全部离线、零网络
+python3 -m unittest discover -s tests -v      # 812 条，全部离线、零网络
 python3 -m compileall -q core storage surfing prompts main.py
 node --check views/console/*.js
 ```
@@ -522,17 +553,21 @@ node --check views/console/*.js
 | `test_v29_*` | 全局身份 + 按 Soul 关系、关系 API、行动卡标题与卡池重抽 |
 | `test_v210_*` | 时间工具边界、滑窗时间戳、提炼与注入时间基准、读空气概率/预算门闸 |
 | `test_v211_*` | 主动回复开关的 schema/迁移、按角色持久化、API、GROUP_LURK/MUSE/分享跳过 |
+| `test_v212_rag_memory.py` | 表迁移、Embedding/Rerank 提供商与 ModelHub、全层级语义去重、Supersede、混合召回分桶、强化 / T3 晋升门闸、提炼上限与身份归一、召回门槛与预算 `continue` |
+| `test_v212_identity_relation.py` | 曾用名 / 规范称呼、孤儿记忆归并、合并用户、好感冷却 / 上限 / 减速 / AND 晋升、身份归一 Prompt |
+| `test_v212_proactive.py` | 冷却 / 概率 / 每日上限、PERSONA_TOPIC 与繁忙成果单次消费、MEMORY_MUSE 不回退全量列表、最近 5 条反反复读、运行态新键、提炼单批重试 |
+| `test_v212_api.py` | `models/sources` 的 RAG 提供商、`models/config` 六角色读写与状态、`models/test`、记忆分类 / 归档 / 过滤统计 |
 | `test_web_api.py` / `test_v26_api.py` | 31 路由信封与 payload |
 | `test_js_syntax.py` | 控制台脚本语法与 `index.html` 清单 |
 
-改动以下契约时必须同步测试：时间轴不变量、`ActionType` 固定护甲、`settle_busy_block` 单次结算、未读定义、Soul JSON 真源与 revision 裁决、记忆时间锚点、读空气概率/预算门闸、主动回复开关、31 条路由形状。
+改动以下契约时必须同步测试：时间轴不变量、`ActionType` 固定护甲、`settle_busy_block` 单次结算、未读定义、Soul JSON 真源与 revision 裁决、记忆时间 / 事件时间锚点、记忆分类与去重 / Supersede、召回门槛与 T3 晋升门闸、身份归一与好感曲线、主动对话节奏与反反复读、读空气概率/预算门闸、主动回复开关、31 条路由形状。
 
 ---
 
 ## 十四、 设计边界与已知取舍
 
 1. **不接管平台**：插件不修改 AstrBot 黑白名单、平台适配器与原生 TTS 配置，只通过公开 extra / 钩子协同。
-2. **不做向量检索**：记忆召回使用关键词 + 时间 + 重要度打分，不引入 Embedding / Rerank，零额外模型成本。
+2. **向量检索为可选增强**：默认不配置 Embedding / Rerank（自动降级为词法检索，零额外模型成本）；配置后走「向量 + BM25 粗排 → Rerank 精排」，向量缓存在本地 SQLite，不引入 FAISS 等外部向量库，也不做跨 Soul 全局索引。
 3. **不主动删用户数据**：解绑、清空会话、移除群档案、关闭主动回复都不删除持久化记忆与用户关系；唯一自动删除的是过期 T1 与活力归零的 T2。
 4. **未读队列不持久化**：重启后不补回旧未读；主动消息去重与冷却则通过 `runtime_state_v1` 跨重启保留。
 5. **门闸预算不持久化**：读空气概率/每小时预算的 `_gate_pass_ts` 为内存态，重启或平台解绑后清零。

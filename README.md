@@ -2,6 +2,8 @@
 
 > **“在各个群聊里，我是能和大家接梗互损、会顺手往群里丢沙雕视频的鲜活 AI 网友；我每天按自己的作息曲线（早睡早起 / 规律 / 夜猫子）排出一整条 24 小时动态时间轴——睡觉卡完全静默、繁忙卡带着 0%→100% 进度条闷头干活并在结束时随机结算一句今日成果、冲浪卡真的去刷 B站/抖音、空闲游荡卡则翻群吃瓜或发呆想起旧事；我还会根据你的消息或刷到的视频实时切分 / 延展时间块。”**
 >
+> **v2.12 是「记忆与主动对话质量」版本**：长期记忆升级为 **RAG 三段式**——写入侧四类 `memory_type`（人物画像 / 关系共识 / 近期状态 / 短期情节）+ Embedding 语义去重 + `superseded_by` 版本替代 + 真实事件时间 `event_at`；读取侧「上下文感知 Query → 向量 + BM25 + 分层保底的 Top-24 粗排 → Rerank 精排 → 最低相关性门闸（不相关绝不硬塞）→ 计入时间标签的预算裁剪 → True-Hit 强化」；T2→T3 只允许 `profile` / `relationship` 且重要度 ≥ 8、跨天有效命中 ≥ 8 次。用户身份新增**曾用名 / 多昵称归一**（`canonical_name` + `aliases` + 平台账号自动归并记忆），**只有真实回复才结算好感**（180s 冷却 / 每日 +5 上限 / L1→L2 双门槛 AND）。主动对话改为**低频 + 概率 + 每日上限 + 70% 全新人设话题**，并用「最近 5 条主动消息」做反反复读约束，彻底告别「草…想起你那天聊骚」式循环复读。
+>
 > **v2.8 是「配置与运行态可信化」版本**：每个角色的完整配置（角色卡 / 行动卡池 / 四角色模型 / 机器人接口绑定 / 冲浪开关）落盘为 `<数据目录>/souls/<soul_id>.json` **独立 JSON（唯一真源，SQLite 仅作索引）**，配合 `revision` 单调版本号 + 内容哈希冲突裁决 + 原子写与自愈、写失败显式告警；一个角色可绑定多个**机器人接口（platform）**、同一接口严格互斥，聊天按「平台绑定 → 旧 UMO 兼容 → 默认角色 → 最近更新角色」路由，心跳按角色独立驱动；冲浪分享新增五道门禁（非兜底 + 未分享过 + 评分门槛 + 分享冷却 + 闲逛冷却，且须存在 ★L3 私聊目标）与按角色总开关；记忆新增 T1 去重 / 每角色上限 / 48h 实时清理、`MEMORY_MUSE` 三桶轮转与繁忙成果单次消费；`_shared_video_ids`、冷却时间戳、忙碌成果消费记录、★L3 私聊目标等运行态持久化到 `plugin_settings["runtime_state_v1"]`，**重启不再重复分享同一视频 / 重复聊同一条繁忙成果，冷却不会重置**。同时保留 **10 分区 × 36 字段的详细角色卡** 与 **灰白 + 青绿配色的 8 页可视化控制台（v2.8 新版关系页 / 会话页）**。
 
 ---
@@ -40,11 +42,13 @@
 - **L2 重要用户（群聊熟人，支持好感度自动晋升）**：即便 Bot 处于 `繁忙中` 也会抽空回复；在 `空闲中` 刷到对口视频会在群里主动 `@` 他。
 - **★ L3 核心用户（管理员 / OnlyYou）**：最高优先级，消息最容易击穿 `繁忙` 护甲让它停下手头事陪你；独享高频私聊陪伴与“群聊吃瓜，私聊耳语”。**★L3 为管理员级：不参与好感度计算、不会被自动晋升产生**，可由 AstrBot `admins_id` 自动确定，也可在关系页详情弹窗中显式设置（用户等级与名单由 Pages 管理，插件普通配置不再维护）。
 - **群聊档案（v2.8）**：`GroupProfile` 记录群名、备注、所属平台、绑定角色、最近活跃时间与滑窗 / 未读计数，存于 `plugin_settings["group_profiles"]`；关系页「💬 群聊」分区可查看并维护群备注、清空该群内存滑窗与未读、移除群聊记录。
+- **长期记忆 RAG（v2.12）**：四类 `memory_type` + Embedding 语义去重 + `superseded_by` 版本替代 + 真实事件时间；读取侧向量 / BM25 / 分层保底粗排 → Rerank 精排 → 最低相关性门闸（默认 0.38 / 0.25）；T3 晋升只认 `profile`/`relationship` 跨天 8 次有效命中；模型页新增向量 / 重排角色，均可关闭并自动降级（详见 ⑲）。
+- **身份归一与主动对话重设计（v2.12）**：曾用名 / 多昵称归一 + 孤儿记忆自动归并；只有真实回复才结算好感（180s 冷却、每日 +5、L1→L2 AND 门槛）；`IDLE_ROAM` 改为 2h 冷却 + 35% 概率 + 每日 3 条 + 70% 全新人设话题 + 最近 5 条反反复读（详见 ⑳）。
 - **按会话主动回复开关（v2.11）**：用户 / 群聊详情弹窗可单独关闭「主动回复」——只停 Bot 主动发起的未读补回、翻群冒泡、发呆联想与视频分享，被动回复不受影响；按角色隔离、默认开启，列表行标记 `🤐 不主动`，详见 ⑱。
 
 ### ⑤ 精简版分级记忆、定时自动遗忘与上下文预算管理
 - **参考并精简自 `livingmemory`**：剔除笨重的 2D/3D 图谱看板与高延迟的 Agent Tool 调用，采用轻量化单表 SQLite + 「关键词 + 时间新鲜度 + 重要度」混合打分召回（不使用 Embedding / Rerank）。
-- **三级记忆与定时遗忘（Forgetting GC）**：**Tier 3 核心记忆**（永久保留重要事实与约定）、**Tier 2 近期记忆**（按重要度与访问次数动态衰减）、**Tier 1 瞬时记忆**（今日繁忙卡的随机完成结果、刚看的视频与翻群吃瓜见闻，活 48h）。v2.8 起 T1 增加「同角色内容去重 + 每角色上限（默认 30）+ 启动 / 心跳实时清理 + 跨重启每日 GC 只跑一次」。
+- **三级记忆与定时遗忘（Forgetting GC）**：**Tier 3 核心记忆**（永久保留重要事实与约定）、**Tier 2 近期记忆**（按重要度与访问次数动态衰减）、**Tier 1 瞬时记忆**（今日繁忙卡的随机完成结果、刚看的视频与翻群吃瓜见闻，活 48h）。v2.8 起 T1 增加「同角色内容去重 + 每角色上限（默认 30）+ 启动 / 心跳实时清理 + 跨重启每日 GC 只跑一次」；v2.12 起保留期由 `tier1_since` 锚定，从 T2/T3 **降级**为 T1 时重新计算 48h，过期的 T1 也会在列表读取前即时回收。
 - **记忆时间锚点（v2.10）**：每条记忆的注入行都带「形成于 2026-11-05（星期四，10 天前）」时间锚点，并附 `MEMORY_TIME_CONTEXT_PROMPT` 教模型把正文里的「这周末 / 明天 / 昨天」按形成时间解冻、判断是否已过期；记忆提炼的滑窗也带「当前真实时间 + 窗口首尾时间范围 + 每条消息发送时间」，冷群跨天窗口不再无法定位。**记忆正文不被改写、无数据库结构变更**（见 ⑯）。
 - **上下文预算管理器**：完全接管平台原生历史（`req.contexts.clear()` + 插件滑窗），并严格限制单次注入记忆的最大条数（默认 `<= 6 条`）与总字数预算（默认 `<= 400 字`），杜绝上下文窗口超载与 Token 费用失控。
 
@@ -54,8 +58,8 @@
 - **AI 造卡**：支持整卡生成与单分区补全（主模型），结果作为草稿预览、采用后才保存；旧的 4 字段扁平档案会自动迁移。
 - **渲染预算**：`render_persona_prompt(card, max_chars=2000)` 只渲染非空字段，优先保留身份 / 说话方式 / 性格 / 社交，超预算时按优先级丢弃低价值分区，硬保证不超预算；图片头像（Data URL 等）**绝不注入** Persona / System Prompt。
 
-### ⑦ 插件自治四角色模型（v2.8：按 Soul 独立配置）
-- **四角色**：**对话（`main`，必填）**、**决策（`decision`，读空气 / 记忆提炼 / 日程微调 / 造卡）**、**视频解析（`vision`）**、**语音（`tts`）**；`decision` / `vision` 支持「独立配置」或显式继承（`main` / `decision`），关闭继承且留空即停用该角色（不回退 `main`）；`tts` 不继承，`mode="off"` 即关闭。
+### ⑦ 插件自治多角色模型（v2.8：按 Soul 独立配置；v2.12 扩为 6 角色）
+- **四角色**：**对话（`main`，必填）**、**决策（`decision`，读空气 / 记忆提炼 / 日程微调 / 造卡）**、**视频解析（`vision`）**、**语音（`tts`）**；v2.12 另增 **向量（`embedding`）** 与 **重排（`rerank`）** 两个 RAG 角色（`off | provider | source` 三档，不参与继承，关闭即自动降级）；`decision` / `vision` 支持「独立配置」或显式继承（`main` / `decision`），关闭继承且留空即停用该角色（不回退 `main`）；`tts` 不继承，`mode="off"` 即关闭。
 - **按角色而不是按平台**：v2.8 起四角色配置存放在**每个 Soul 自己的 JSON** 的 `model_config` 字段中；`ModelHub` 在 `main.py` 接线 `attach_soul_manager()` 后，读写 / 解析 / 测试 / TTS 接口全部支持可选 `soul_id`（缺省 = 默认角色，传 `umo` 时先按 UMO 路由出角色）。
 - **不重复配置密钥**：`core/provider_factory.py` 从 AstrBot 提供商源 + 模型名构建实例；平台已有同源同模型且启用的实例则直接复用。
 - **主模型仍走原生管线**：门禁放行后执行 `event.set_extra("selected_provider", main_provider_id)`，AstrBot `_select_provider()` 会解析该 extra（`provider_manager.inst_map`），分段回复、流式输出、工具调用全部保留；插件自建主模型注册为 **`onlyyou::main::<soul_id>`**（旧全局路径 `onlyyou::main` 保留兼容），不出现在平台模型列表，换模型 / 卸载时注销对应实例。
@@ -79,7 +83,7 @@
 - **路由优先级（v2.8 废除单会话 UMO 绑定主导）**：① UMO 第一段 == `platform_id` 的平台绑定 → ② 旧 `umo_soul_bindings` 精确绑定（兼容迁移）→ ③ `plugin_settings["default_soul_id"]` → ④ 最近更新的角色 → ⑤ 自动创建默认角色。
 - **心跳按 Soul 驱动**：每 15 分钟对「有绑定的 Soul + 默认兜底 Soul」各自独立执行时间轴结算与行动分发；有绑定的 Soul 只处理自身平台范围内的未读 / 群聊，默认兜底 Soul 处理未被任何角色绑定的机器人接口（未设置默认角色时，聊天路由按优先级落到最近更新的角色；心跳层无任何绑定时退化为单角色处理全部会话）。解绑时同步清理该平台的内存滑窗 / 未读 / 冷却缓存（**不删持久化记忆**；「清理 vs 保留」完整语义见 [docs/UPGRADE.md](docs/UPGRADE.md) 第 9 节）。
 
-### ⑪ 模型四角色按 Soul 独立配置
+### ⑪ 模型多角色按 Soul 独立配置
 - 每个角色一套 `main / decision / vision / tts`，存于 Soul JSON 的 `model_config`；`onlyyou::main::<soul_id>` 实例化与释放按角色进行。
 - 旧版全局 `plugin_settings["model_config"]` 保留兼容：首次启动一次性迁移到「主模型为空」的角色（flag `model_config_migrated_to_souls`，不删旧键）；`ModelHub` 未接线 SoulManager 时保持旧全局行为。
 - Pages「模型」页顶部展示当前角色，读取 / 保存均带 `?soul_id=` / `{soul_id, model_config}`，切换角色即重新加载该角色的模型状态。
@@ -95,8 +99,8 @@
 
 ### ⑬ 记忆工程化：T1 去重 / 上限 / 清理 + MEMORY_MUSE 三层分桶
 - **T1 去重**：同一角色 + 完全相同内容已存在时刷新其 `last_accessed_at` 并返回原 id，不新增；
-- **T1 上限**：每角色默认最多 30 条（`memory_and_context_config.max_tier1_memories`），插入后超限按 `created_at ASC, id ASC` 淘汰最旧；T2/T3 行为不变；
-- **实时清理**：`cleanup_tier1()` 删除 >48h 的 T1 与超上限 T1，启动与每次心跳调用；每日 `run_forgetting_gc()` 由 `plugin_settings["last_forgetting_gc_date"]` 保证**跨重启每天只跑一次**；
+- **T1 上限**：每角色默认最多 30 条（`memory_and_context_config.max_tier1_memories`），插入后超限按 `COALESCE(NULLIF(tier1_since,0), created_at) ASC, id ASC` 淘汰最旧；T2/T3 行为不变；
+- **实时清理**：`cleanup_tier1()` 删除 `tier1_since + 48h` 已过的 T1 与超上限 T1，启动、每次心跳与记忆列表读取前调用；降级为 T1 时 `tier1_since` 重置，旧数据回退 `created_at`；每日 `run_forgetting_gc()` 由 `plugin_settings["last_forgetting_gc_date"]` 保证**跨重启每天只跑一次**；
 - **MEMORY_MUSE 三层分桶**：`sample_muse_memories()` 对 T1/T2/T3 各自独立查询（最久未访问优先），过滤最近用过的 id 后按层级 / 重要度加权抽 ≤2 条；发送成功才更新 `last_accessed_at`（不加 `access_count`、不改活力 / 层级），并写入每角色 30 条的轮转环形表；
 - **繁忙成果单次消费**：`IDLE_ROAM` 发呆联想优先消费 `run.settled_busy_results()` 中**本角色还没聊过**的繁忙成果（`_mused_busy_keys[soul_id]`），同一成果最多主动聊 1 次，发送成功才记录；用完才轮到三桶记忆抽样。
 - Pages 记忆页 T1 行显示 `⏳ 剩余 Xh 清除` 与「上限 N 条」，T1 不再展示活力条。
@@ -130,6 +134,18 @@
 - **只控 Bot 主动发起的消息**：私聊未读补回、`IDLE_ROAM(GROUP_LURK)` 翻群冒泡、`IDLE_ROAM(MEMORY_MUSE)` 发呆联想私聊、`SURF` 视频分享。用户/群友主动发来的私聊、@ 与读空气接话等**被动回复完全不受影响**。
 - **按角色隔离**：用户开关存在 `user_relations(soul_id, global_uid).proactive_enabled`（旧 `users` 表列作无 Soul 回退），群聊开关存在 `GroupProfile.proactive_enabled`（`plugin_settings["group_profiles"]`）；默认 **开启**，旧数据升级后行为不变。
 - **失败保留重试**：关闭的私聊用户不会消耗未读（不 ACK、不调决策模型）；关闭的群聊会被 `GROUP_LURK` 候选列表直接跳过，不会挤占其他群；冲浪分享会自动跳过关闭的 ★L3 目标，改投下一位允许的 ★L3。
+
+### ⑲ 记忆 RAG：四类分类 + 语义去重 / 版本替代 + 混合召回（v2.12）
+- **写入侧**：每条记忆带 `memory_type`（`profile` / `relationship` / `state` / `episode`）与真实事件时间 `event_at`；`add_memory` 对 **T1/T2/T3 全层级**做语义去重（有向量：余弦 ≥ 0.85；无向量：字符 Bigram Jaccard ≥ 0.65），重复只合并关键词 / 刷新时间，不新增行；同 `state` 的旧状态或显式 `supersedes_id` 会被新记忆 `superseded_by` 归档，不再参与召回与主动联想。
+- **读取侧**：Query = 当前消息 + 该用户最近 2 条发言；候选池仅取未归档记忆，按「向量余弦 + `content`/`keywords` BM25 + T3/T2/T1 分桶保底」粗排 Top-24；有 Rerank 角色时精排，综合分 `0.55×语义 + 0.25×新鲜度(event_at) + 0.20×重要度`；**低于 0.38 / 语义低于 0.25 直接丢弃**；预算计入时间标签，超长项 `continue` 让后面更短的相关记忆仍能注入；10 分钟内刚提炼且仍在滑窗内的记忆不重复注入。
+- **强化与晋升**：只有本次语义 ≥ 0.55 且距上次强化 > 6h 才 `access_count + 1`；T3 晋升硬性要求 `memory_type IN (profile, relationship)`、`importance ≥ 8`、`access_count ≥ 8` 且记忆至少 1 天，日常情节与阶段状态留在 T2 自然代谢。
+- **提炼**：单批最多 3 条；Prompt 注入【参与者身份归一表】与同角色已有 T2/T3 记忆（含 ID），要求高抽象度、去台词化、拒绝临时口头支票，并可返回 `supersedes_id`；直出 T3 仅限 `profile` / `relationship` 且 `importance ≥ 9`。提炼失败时该批消息进入单批重试缓冲，不再永久丢失。
+- **模型**：模型页新增「向量模型 (Embedding) / 重排模型 (Rerank)」两张卡片，支持 `关闭 / 提供商源 / AstrBot 提供商` 三种模式与一键测试；两者皆关闭时自动降级为增强版词法检索（零报错）。
+
+### ⑳ 身份归一与主动对话重设计（v2.12）
+- **身份归一**：`users.aliases_json` 记录曾用名 / 多端昵称；`canonical_name` 优先角色专属称呼 → 主显示名 → `global_uid`。滑窗、记忆提炼与关系上下文统一使用规范称呼，并在 Prompt 注入「所有名称均指代同一人」说明；修改 `platform_ids` 或合并用户时，旧账号 / 曾用名下的孤儿记忆自动归并到主身份；启动时还会把历史 `memories.user_id` 里的裸平台 uid 一次性折入规范 `global_uid`（歧义行保持原样）。
+- **好感曲线**：`on_any_message` 只解析身份（`resolve_user` 默认不加分）；只有 `on_llm_response_hook` 真正生成回复后才 `record_effective_interaction`——180s 冷却、普通群聊 +0.4 / 直接或私聊 +0.6、好感 ≥ 60 减速、每日 +5.0 封顶；L1→◆L2 必须同时满足互动次数与好感度（默认 40 / 30，均可配）。
+- **主动对话节奏**：`IDLE_ROAM` 冷却默认 120 分钟、触发概率 35%、每日上限 3 条；话题模式 70% 走全新 `PERSONA_TOPIC`（6 个灵感切面：当下行动 / 兴趣癖好 / 居所氛围 / 主业吐槽 / 好奇提问 / 世界观日常），30% 走 `MEMORY_MUSE`（只抽 1 条、72h 内聊过跳过；抽不到就无缝切人设话题，**绝不再回退全量记忆列表硬抽**）；最近 5 条主动消息写入运行态并作为负面约束注入 Prompt，禁止重复话题与相同句首 / 句尾用字。
 
 ---
 
@@ -173,7 +189,7 @@
 ```
 
 - 文件名规则：非法字符 `\ / : * ? " < > |` 与控制字符替换为 `_`；发生替换时追加 `__<sha1 前 8 位>` 防撞。正常 `soul_id`（如 `default_soul` / `酒狐`）直接即 `<soul_id>.json`。
-- `card` 由 `normalize_card()` 归一化后写入；`model_config` 为四角色归一化结构；`settings` 至少含 `surfing_enabled`，未知键原样保留。
+- `card` 由 `normalize_card()` 归一化后写入；`model_config` 为多角色归一化结构（含 Embedding / Rerank）；`settings` 至少含 `surfing_enabled`，未知键原样保留。
 
 ### 2.3 一致性规则（文件真源 + 索引自愈）
 
@@ -210,8 +226,8 @@
 
 ```text
 OnlyYou/
-├── metadata.yaml                # 插件元数据（version: 2.11.1）
-├── _conf_schema.json            # AstrBot WebUI 配置 Schema（仅运行参数；无模型绑定）
+├── metadata.yaml                # 插件元数据（version: 2.12.0）
+├── _conf_schema.json            # AstrBot WebUI 配置 Schema（仅运行参数；含 v2.12 主动对话节奏 / L1→L2 门槛 / RAG 门槛）
 ├── requirements.txt             # Python 依赖
 ├── main.py                      # 插件入口：三态门禁 / selected_provider / LLM 钩子 / on_decorating_result TTS / 后台任务 / 指令
 ├── core/                        # 核心逻辑
@@ -221,11 +237,11 @@ OnlyYou/
 │   ├── character_card.py        # 详细角色卡（CARD_SCHEMA 10 分区 / 36 字段 + Prompt 渲染）
 │   ├── soul_manager.py          # Soul 独立 JSON 真源 / 索引自愈 / 平台绑定路由 / AI 造卡 / Persona 导入
 │   ├── runtime_state.py         # v2.8 运行态持久化（去重 / 冷却 / ★L3 目标 → plugin_settings）
-│   ├── user_relation.py         # 三级用户关系 + 用户专属态度 + 群聊档案（group_profiles）
-│   ├── memory_manager.py        # 分级记忆 + T1 去重/上限/清理 + MEMORY_MUSE 三桶抽样 + Forgetting GC + v2.10 记忆时间基准
-│   ├── context_budget.py        # 上下文/记忆预算 + Persona 接管
-│   ├── provider_factory.py      # AstrBot Provider 内部结构封装（复用/自建实例、TTS）
-│   ├── model_hub.py             # 插件自治四角色模型网关（v2.8 支持按 Soul 读写）
+│   ├── user_relation.py         # 三级用户关系 + 单用户态度 + 曾用名/规范称呼 + 好感曲线 + 群聊档案
+│   ├── memory_manager.py        # RAG 分级记忆：四类 memory_type + 语义去重 / Supersede + 混合召回 + 强化门闸 + Forgetting GC
+│   ├── context_budget.py        # 上下文滑窗 + 混合召回 / Rerank / 相关性门闸 + 身份归一注入 + Persona 接管
+│   ├── provider_factory.py      # AstrBot Provider 封装（复用/自建、TTS、Embedding、Rerank）
+│   ├── model_hub.py             # 插件自治多角色模型网关（四对话角色 + Embedding/Rerank，按 Soul 读写）
 │   ├── platform_bridge.py       # 平台协同桥（唤醒 / 分段 / 主动语音消息 / 机器人接口探测）
 │   ├── web_api.py               # 31 条 Plugin Pages Web API
 │   ├── time_utils.py            # v2.10 共享本地时间格式化（星期 / 形成时间锚点 / 窗口跨度）
@@ -249,8 +265,8 @@ OnlyYou/
 
 | 文档路径 | 文档名称 | 核心内容概述 |
 | :--- | :--- | :--- |
-| **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | **技术架构设计 (v2.11)** | 三态门禁 × 四类行动卡、24h 动态时间轴与作息曲线、输入驱动的受限微调、分级记忆与时间锚点、上下文预算、**Persona 接管**、用户关系双模型（全局身份 + 按角色关系 + 主动回复开关）、Soul JSON 唯一真源与 revision 裁决、四角色模型与 `selected_provider`、读空气概率/预算门闸、冲浪分享门禁、运行态持久化、配置分层、31 条 Web API 与控制台结构。 |
-| **[docs/UPGRADE.md](docs/UPGRADE.md)** | **生产升级与迁移指南 (v2.11)** | 自动迁移清单与幂等 flag → 备份 → 部署 / 热重载 → 日志与数据校验 → Pages / 功能抽检 → 回滚；含**解绑 / 清空类操作的「清理 vs 保留」语义表**、重启语义、v2.8.2~v2.11 版本迁移条目与 FAQ。 |
+| **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | **技术架构设计 (v2.12)** | 三态门禁 × 四类行动卡、24h 动态时间轴与作息曲线、输入驱动的受限微调、**RAG 分级记忆（四类 memory_type / 语义去重 / Supersede / 混合召回 / 最低相关性门闸）**、身份归一（曾用名 / 规范称呼）、好感曲线、主动对话节奏（概率 / 每日上限 / 人设话题 / 反反复读）、上下文预算、**Persona 接管**、Soul JSON 唯一真源与 revision 裁决、多角色模型（含 Embedding / Rerank）与 `selected_provider`、读空气概率/预算门闸、冲浪分享门禁、运行态持久化、配置分层、31 条 Web API 与控制台结构。 |
+| **[docs/UPGRADE.md](docs/UPGRADE.md)** | **生产升级与迁移指南 (v2.12)** | 自动迁移清单与幂等 flag → 备份 → 部署 / 热重载 → 日志与数据校验 → Pages / 功能抽检 → 回滚；含**解绑 / 清空类操作的「清理 vs 保留」语义表**、重启语义、v2.8.2~v2.11 版本迁移条目与 FAQ。 |
 | **AGENTS.md（本地工程手册，GitHub 不可见）** | **开发、部署与联调规范** | 目录与模块职责、敏感信息安全规范、**AstrBot v4 底层机制与避坑指南**（`selected_provider`、Persona 段替换、`on_decorating_result`、`plugin_settings`、Provider 实例化）、**24h 时间轴不变量与繁忙结算契约**、Docker 部署、SSH 隧道 + OpenAPI 真机联调流程。⚠️ **该文件已在 `.gitignore` 中忽略，仅本地工程维护使用，GitHub 仓库不可见（因此本表不提供 Markdown 链接）**；GitHub 可见文档为 `README.md` + `docs/ARCHITECTURE.md` / `docs/UPGRADE.md`。 |
 
 ---
@@ -262,7 +278,7 @@ OnlyYou/
    - 在 AstrBot 插件配置面板设置 Roguelite / 读空气 / 冲浪接口与分享门槛 / 记忆阈值（`_conf_schema.json` 只含运行参数；角色总开关、后台视频源、用户等级名单均由 Pages / Soul JSON 管理）；
    - 打开插件 Pages 控制台，在「模型」页为**当前角色**配置 **对话（必填）/ 决策 / 视频解析 / TTS**（配置写入该角色 `souls/<soul_id>.json` 的 `model_config`）；
    - 在「角色卡」页手填或 AI 生成角色卡；在「会话 / 机器人接口」页把机器人接口绑定到角色并设置默认角色兜底。
-3. **从旧版本升级到 v2.11**：**先备份 `only_you.db`（以及整个插件数据目录），再阅读 [docs/UPGRADE.md](docs/UPGRADE.md) 执行升级与迁移校验**。首次启动会自动把旧 SQLite 角色数据落盘为 `souls/*.json`、迁移旧 UMO 绑定与全局模型配置，并把 `users` 关系列按角色拆分到 `user_relations`；v2.11 另会幂等补充 `proactive_enabled` 列（一次性 flag 全部成功才写入，失败下次启动自动重试）。
+3. **从旧版本升级到 v2.12**：**先备份 `only_you.db`（以及整个插件数据目录），再阅读 [docs/UPGRADE.md](docs/UPGRADE.md) 执行升级与迁移校验**。首次启动会自动把旧 SQLite 角色数据落盘为 `souls/*.json`、迁移旧 UMO 绑定与全局模型配置，并把 `users` 关系列按角色拆分到 `user_relations`；v2.11 另会幂等补充 `proactive_enabled` 列（一次性 flag 全部成功才写入，失败下次启动自动重试）。
 4. **本地离线测试（零网络、无需安装 AstrBot / pytest）**：
 
    ```bash

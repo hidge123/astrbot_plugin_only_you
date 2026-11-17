@@ -48,7 +48,13 @@ class DatabaseManager:
                 vitality REAL DEFAULT 100.0,
                 access_count INTEGER DEFAULT 0,
                 created_at INTEGER NOT NULL,
-                last_accessed_at INTEGER
+                last_accessed_at INTEGER,
+                memory_type TEXT NOT NULL DEFAULT 'episode',
+                event_at INTEGER NOT NULL DEFAULT 0,
+                embedding_json TEXT NOT NULL DEFAULT '',
+                superseded_by INTEGER DEFAULT NULL,
+                last_reinforced_at INTEGER NOT NULL DEFAULT 0,
+                tier1_since INTEGER NOT NULL DEFAULT 0
             );
             """
         )
@@ -58,6 +64,13 @@ class DatabaseManager:
         await self.execute(
             "CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories(memory_tier);"
         )
+        # v2.12: RAG / 动态演进的长期记忆字段（幂等迁移，旧库自动补齐）。
+        #   memory_type       profile / relationship / state / episode 四类分类
+        #   event_at          事件真实发生时间（0 = 未知，回退 created_at 锚点）
+        #   embedding_json    SQLite 本地缓存的归一化向量（纯 Python 内积，无外部向量库）
+        #   superseded_by     版本替代：旧事实被新记忆取代后指向新记忆 id（归档停用召回）
+        #   last_reinforced_at 上次有效召回强化的时间戳（强化冷却防刷）
+        await self._ensure_memory_columns()
 
         # 2. Souls table (caches expanded Persona / custom Roguelite card pools)
         await self.execute(
@@ -110,6 +123,7 @@ class DatabaseManager:
                 platform_ids_json TEXT NOT NULL DEFAULT '[]',
                 attitude TEXT NOT NULL DEFAULT '',
                 proactive_enabled INTEGER NOT NULL DEFAULT 1,
+                aliases_json TEXT NOT NULL DEFAULT '[]',
                 updated_at INTEGER NOT NULL
             );
             """
@@ -138,6 +152,9 @@ class DatabaseManager:
                 )
         except Exception:
             pass
+
+        # v2.12: 跨平台 / 多昵称身份归一（曾用名列表），幂等补齐旧库。
+        await self._ensure_user_columns()
 
         # 4b. v2.9: per-Soul relationship state (identity stays in `users`).
         #     One row per (soul_id, global_uid); the legacy users relation columns
@@ -224,6 +241,76 @@ class DatabaseManager:
                 watched_at INTEGER NOT NULL
             );
             """
+        )
+
+    async def _table_columns(self, table: str) -> set[str]:
+        """Return the existing column names of ``table`` (empty set on failure)."""
+        try:
+            rows = await self.fetchall(f"PRAGMA table_info({table});")
+        except Exception:
+            return set()
+        return {str(row.get("name") or "") for row in rows or []}
+
+    async def _ensure_column(
+        self, table: str, column: str, ddl: str, columns: Optional[set[str]] = None
+    ) -> bool:
+        """Idempotently ``ALTER TABLE`` one column; returns whether it was added."""
+        existing = columns if columns is not None else await self._table_columns(table)
+        if column in existing:
+            return False
+        try:
+            await self.execute(f"ALTER TABLE {table} ADD COLUMN {ddl};")
+        except Exception:
+            # Concurrent ALTER / racing initialisation: a second attempt is a no-op.
+            return False
+        if columns is not None:
+            columns.add(column)
+        return True
+
+    async def _ensure_memory_columns(self) -> None:
+        """v2.12 幂等迁移 ``memories`` 表的 RAG / 动态演进字段。"""
+        columns = await self._table_columns("memories")
+        if not columns:
+            return
+        await self._ensure_column(
+            "memories", "memory_type", "memory_type TEXT NOT NULL DEFAULT 'episode'", columns
+        )
+        await self._ensure_column(
+            "memories", "event_at", "event_at INTEGER NOT NULL DEFAULT 0", columns
+        )
+        await self._ensure_column(
+            "memories", "embedding_json", "embedding_json TEXT NOT NULL DEFAULT ''", columns
+        )
+        await self._ensure_column(
+            "memories", "superseded_by", "superseded_by INTEGER DEFAULT NULL", columns
+        )
+        await self._ensure_column(
+            "memories",
+            "last_reinforced_at",
+            "last_reinforced_at INTEGER NOT NULL DEFAULT 0",
+            columns,
+        )
+        # v2.12: Tier 1 retention start. Set when a memory is created as T1 or
+        # downgraded to T1, so a 12-day-old T2 does not become "expired" the moment
+        # it is switched to T1. 0 = legacy row -> fall back to created_at.
+        await self._ensure_column(
+            "memories", "tier1_since", "tier1_since INTEGER NOT NULL DEFAULT 0", columns
+        )
+        await self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memories_active "
+            "ON memories(soul_id, superseded_by);"
+        )
+        await self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);"
+        )
+
+    async def _ensure_user_columns(self) -> None:
+        """v2.12 幂等迁移 ``users`` 表的曾用名列表字段。"""
+        columns = await self._table_columns("users")
+        if not columns:
+            return
+        await self._ensure_column(
+            "users", "aliases_json", "aliases_json TEXT NOT NULL DEFAULT '[]'", columns
         )
 
     async def get_setting(self, key: str, default: Any = None) -> Any:

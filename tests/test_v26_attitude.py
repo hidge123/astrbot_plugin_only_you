@@ -571,7 +571,7 @@ class TestUserRelationPromptInjection(UserRelationInjectionTestBase):
         assert sp.index("[记忆时间基准]") < sp.index("[脑海中的相关记忆")
         # v2.10: recalled memories are annotated with their formation-time anchor
         # (the relative-time anchor), content itself stays untouched.
-        assert "- [近期记忆 · 形成于 " in sp
+        assert "- [近期记忆 · 短期情节 · 形成于 " in sp
         assert "] 用户喜欢猫" in sp
 
 

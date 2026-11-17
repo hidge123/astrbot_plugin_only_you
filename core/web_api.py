@@ -2540,10 +2540,24 @@ class OnlyYouWebAPI:
         try:
             await self.plugin._ensure_initialized()
             soul_id = self._get_query_param("soul_id") or None
+            # v2.12: reclaim any overdue T1 rows before listing, so the page can
+            # never show a "remaining 0" row that GC would delete moments later.
+            cleaner = getattr(self.plugin.memory_manager, "cleanup_tier1", None)
+            if callable(cleaner):
+                try:
+                    await cleaner()
+                except Exception as exc:  # noqa: BLE001 - listing must not fail
+                    logger.debug(f"[OnlyYou] list-time T1 cleanup failed: {exc}")
             tier_str = self._get_query_param("memory_tier")
             memory_tier = int(tier_str) if tier_str in ("1", "2", "3") else None
             user_id = self._get_query_param("user_id") or None
             keyword = self._get_query_param("keyword") or None
+            # v2.12: four-value classification filter ("profile"/"relationship"/...).
+            memory_type = self._get_query_param("memory_type") or None
+            include_archived_raw = str(
+                self._get_query_param("include_superseded") or ""
+            ).strip().lower()
+            include_superseded = include_archived_raw not in ("0", "false", "no", "off")
 
             items = await self.plugin.memory_manager.list_memories(
                 soul_id=soul_id,
@@ -2551,10 +2565,18 @@ class OnlyYouWebAPI:
                 user_id=user_id,
                 keyword=keyword,
                 limit=120,
+                memory_type=memory_type,
+                include_superseded=include_superseded,
             )
             all_for_soul = await self.plugin.memory_manager.list_memories(
                 soul_id=soul_id, limit=500
             )
+            from .memory_manager import MEMORY_TYPES
+
+            type_counts = {
+                mem_type: sum(1 for m in all_for_soul if m.memory_type == mem_type)
+                for mem_type in MEMORY_TYPES
+            }
             stats = {
                 "tier3_count": sum(1 for m in all_for_soul if m.memory_tier == MemoryTier.CORE),
                 "tier2_count": sum(1 for m in all_for_soul if m.memory_tier == MemoryTier.RECENT),
@@ -2562,9 +2584,18 @@ class OnlyYouWebAPI:
                     1 for m in all_for_soul if m.memory_tier == MemoryTier.EPHEMERAL
                 ),
                 "total": len(all_for_soul),
+                # v2.12: classification / archive diagnostics for the memory page.
+                "memory_type_counts": type_counts,
+                "superseded_count": sum(1 for m in all_for_soul if m.is_superseded),
+                "active_total": sum(1 for m in all_for_soul if not m.is_superseded),
+                "embedding_count": sum(1 for m in all_for_soul if m.embedding),
                 "sliding_window_size": self.plugin.session_buffer.sliding_window_size,
                 "max_injected_memories": self.plugin.context_budget.max_injected_memories,
                 "max_memory_chars_budget": self.plugin.context_budget.max_memory_chars_budget,
+                # v2.12: RAG recall gates (0 when the embedding/rerank roles are off).
+                "max_recall_candidates": self.plugin.context_budget.max_recall_candidates,
+                "min_recall_score": self.plugin.context_budget.min_recall_score,
+                "min_semantic_score": self.plugin.context_budget.min_semantic_score,
             }
             return ok_response(
                 {
@@ -2632,6 +2663,8 @@ class OnlyYouWebAPI:
                     memory_tier=body.get("memory_tier"),
                     vitality=body.get("vitality"),
                     user_id=body.get("user_id"),
+                    memory_type=body.get("memory_type"),
+                    event_at=body.get("event_at"),
                 )
                 if not updated:
                     return err_response("未找到要修改的记忆条目")
@@ -2696,6 +2729,9 @@ class OnlyYouWebAPI:
                 user_id=user_id,
                 user_tier=user_tier,
                 memory_tier=mtier,
+                # v2.12: classification / real event time are editable from the API.
+                memory_type=body.get("memory_type"),
+                event_at=body.get("event_at"),
             )
             mems = await self.plugin.memory_manager.list_memories(soul_id=soul_id)
             return ok_response(
@@ -2841,6 +2877,9 @@ class OnlyYouWebAPI:
                         text=share_text,
                         session_buffer=self.plugin.session_buffer,
                         soul_name=soul.name,
+                        on_overflow_callback=getattr(
+                            self.plugin, "_on_window_overflow", None
+                        ),
                     )
                 else:
                     # Record into default session buffer window even when no live platform UMO is active yet
@@ -2849,6 +2888,9 @@ class OnlyYouWebAPI:
                         content=share_text,
                         is_proactive=True,
                         soul_name=soul.name,
+                        on_overflow_callback=getattr(
+                            self.plugin, "_on_window_overflow", None
+                        ),
                     )
                     sent = True
 
@@ -3123,14 +3165,23 @@ class OnlyYouWebAPI:
             factory = self._provider_factory()
             sources = factory.list_sources()
             tts_providers = factory.list_tts_providers()
+            embedding_providers = factory.list_embedding_providers()
+            rerank_providers = factory.list_rerank_providers()
             if inspect.isawaitable(sources):
                 sources = await sources
             if inspect.isawaitable(tts_providers):
                 tts_providers = await tts_providers
+            if inspect.isawaitable(embedding_providers):
+                embedding_providers = await embedding_providers
+            if inspect.isawaitable(rerank_providers):
+                rerank_providers = await rerank_providers
             return ok_response(
                 {
                     "sources": list(sources or []),
                     "tts_providers": list(tts_providers or []),
+                    # v2.12: RAG roles can reuse AstrBot embedding / rerank providers.
+                    "embedding_providers": list(embedding_providers or []),
+                    "rerank_providers": list(rerank_providers or []),
                 }
             )
         except Exception as e:
@@ -3173,10 +3224,13 @@ class OnlyYouWebAPI:
                 raw_cfg = body.get("model_config")
                 if not isinstance(raw_cfg, dict):
                     # Tolerate raw config bodies: {"main": {...}, "decision": {...}, ...}
-                    if any(key in body for key in ("main", "decision", "vision", "tts")):
+                    role_keys = (
+                        "main", "decision", "vision", "tts", "embedding", "rerank",
+                    )
+                    if any(key in body for key in role_keys):
                         raw_cfg = {
                             key: body.get(key)
-                            for key in ("main", "decision", "vision", "tts")
+                            for key in role_keys
                             if key in body
                         }
                 if not isinstance(raw_cfg, dict):
@@ -3221,7 +3275,9 @@ class OnlyYouWebAPI:
             allowed = {str(item).strip().lower() for item in roles}
             allowed.add("small")  # legacy alias of `decision`
             if role not in allowed:
-                return err_response(f"未知模型角色: {role}（可选 main/decision/vision/tts）")
+                return err_response(
+                    f"未知模型角色: {role}（可选 main/decision/vision/tts/embedding/rerank）"
+                )
 
             tester = getattr(hub, "test_role", None)
             if not callable(tester):

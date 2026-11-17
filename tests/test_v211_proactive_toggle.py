@@ -552,6 +552,9 @@ class TestMainProactiveGating(DatabaseAsyncTestCase):
                 {"target": "GROUP", "message": "这瓜保熟吗"},
             ]
         )
+        # v2.12: the probability gate is closed so only branch A runs (the group
+        # is skipped, and the tick stops instead of falling through to a persona topic).
+        fake.config["roguelite_schedule_config"]["idle_roam_trigger_probability"] = 0
         sent = await fake._run_idle_roam_action(
             self.soul, self.run, self.current_slot
         )

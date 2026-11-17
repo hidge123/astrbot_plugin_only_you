@@ -425,7 +425,7 @@ class TestModelHubPerSoul(SoulStoreTestBase):
         )
         status_a = await self.hub.get_status(soul_a.soul_id)
         status_b = await self.hub.get_status("soul_b")
-        assert set(status_a) == {"main", "decision", "vision", "tts"}
+        assert set(status_a) == {"main", "decision", "vision", "tts", "embedding", "rerank"}
         assert status_a["main"]["configured"] is True
         assert status_a["main"]["provider_id"] == f"onlyyou::main::{soul_a.soul_id}"
         assert status_b["main"]["configured"] is False
@@ -706,8 +706,8 @@ class TestMainRuntimeHelpers(DatabaseAsyncTestCase):
         )
         now = int(time.time())
         await self.db.execute(
-            "UPDATE memories SET created_at = ? WHERE content = ?",
-            (now - 172801, "48 小时前的瞬时记忆"),
+            "UPDATE memories SET created_at = ?, tier1_since = ? WHERE content = ?",
+            (now - 172801, now - 172801, "48 小时前的瞬时记忆"),
         )
         fake = SimpleNamespace(db=self.db, memory_manager=self.memory_manager)
         from OnlyYou.main import OnlyYouPlugin
@@ -821,7 +821,8 @@ class _RecordingBridge:
         self.ok = True
 
     async def send_proactive_message(
-        self, umo="", text="", session_buffer=None, soul_name="Bot", audio_path=None
+        self, umo="", text="", session_buffer=None, soul_name="Bot", audio_path=None,
+        on_overflow_callback=None
     ):
         if not self.ok:
             return False

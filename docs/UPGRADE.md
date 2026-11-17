@@ -1,8 +1,9 @@
-# OnlyYou 生产升级与迁移指南 (v2.11)
+# OnlyYou 生产升级与迁移指南 (v2.12)
 
-> 适用对象：从 **v2.6.x ~ v2.10.x** 升级到 **v2.11.1** 的 AstrBot 部署（更早版本按同一流程升级，但旧行动卡 / 日程会在 v2.9 清理规则下被重抽或丢弃）。
+> 适用对象：从 **v2.6.x ~ v2.11.x** 升级到 **v2.12.0** 的 AstrBot 部署（更早版本按同一流程升级，但旧行动卡 / 日程会在 v2.9 清理规则下被重抽或丢弃）。
 > 本文只写升级、迁移、校验、回滚与排障语义，不含真实服务器地址或密钥；命令中的 `$SERVER_IP`、`<数据目录>`、`/path/to/OnlyYou` 均为占位符。
-> 版本口径：插件 `v2.11.1`；Web API **31 条**；控制台 **8 页**；角色卡 **10 分区 / 36 字段**。
+> 版本口径：插件 `v2.12.0`；Web API **31 条**（字段扩展、路由未变）；控制台 **8 页**；角色卡 **10 分区 / 36 字段**。
+> **本批修复**：T2/T3 降级为 T1 时不再沿用旧 `created_at`、界面也不会再显示「剩余 0h」；T1 保留期由 `tier1_since` 锚定（降级时重置 48h），列表读取前会先回收过期项。
 
 ---
 
@@ -21,6 +22,10 @@
 | 7 | `users` 关系列 → 按角色 `user_relations` | 首次启动且存在角色 | `user_relations_migrated_v1` |
 | 8 | 运行态快照初始化 | 首次读取 | 无（缺省空快照） |
 | 9 | `user_relations` / `users` 补 `proactive_enabled` 列（v2.11，纯加法） | 旧库缺列 | 无（幂等 `ALTER TABLE`，默认 1） |
+| 10 | `memories` 补 `memory_type / event_at / embedding_json / superseded_by / last_reinforced_at`（v2.12，纯加法） | 旧库缺列 | 无（幂等 `ALTER TABLE`；旧行 `memory_type='episode'`、`event_at=0`、无向量、未归档） |
+| 11 | `users` 补 `aliases_json`（v2.12，纯加法） | 旧库缺列 | 无（幂等 `ALTER TABLE`，默认 `[]`） |
+| 12 | 旧 `memories.user_id` 裸平台 uid / 曾用名归并到 `global_uid`（v2.12） | 存在可唯一归属的裸 ID | `legacy_memory_user_ids_migrated_v1`（全部成功才写入；歧义行保持原样） |
+| 13 | `memories` 补 `tier1_since`（v2.12，纯加法） | 旧库缺列 | 无（幂等 `ALTER TABLE`，默认 `0`；旧 T1 回退 `created_at`） |
 
 **关键原则**：一次性 flag 只有在**全部条目迁移成功**后才写入；失败保留未写入状态并记 warning「下次启动重试」，迁移逻辑本身幂等（已迁移项跳过，不会重复插入）。
 
@@ -33,6 +38,7 @@ v2.10 与 v2.11 另有**非迁移**的行为变化：
 
 - **v2.10**：非 @ 普通群消息默认先过读空气概率门闸（`reply_gate_probability=80`）；记忆注入与提炼新增时间锚点。无数据库结构变更、无 Web API 路由变化。
 - **v2.11**：用户 / 群聊新增「主动回复」开关（旧数据默认开启）；`user_relations` / `users` 幂等补 `proactive_enabled` 列，群档案缺键按 `true` 处理。无破坏性迁移。
+- **v2.12**：记忆系统升级为 RAG + 动态演进；主动对话默认更安静；L1→L2 与 T2→T3 门槛大幅提高。**纯加法迁移**，旧记忆 / 用户 / 关系全部保留；但以下行为变化需要知晓（详见 §11.8）。
 
 ---
 
@@ -147,6 +153,8 @@ sqlite3 <数据目录>/only_you.db <<'SQL'
 .tables
 PRAGMA table_info(souls);
 PRAGMA table_info(user_relations);
+PRAGMA table_info(memories);
+PRAGMA table_info(users);
 SELECT soul_id, revision FROM souls;
 SELECT soul_id, COUNT(*), SUM(proactive_enabled) FROM user_relations GROUP BY soul_id;
 SELECT COUNT(*), SUM(proactive_enabled) FROM users;
@@ -157,6 +165,7 @@ SQL
 
 - `souls` 含 `revision` 列，且每个角色一行；
 - `user_relations` 含 `proactive_enabled` 列（默认 1），每个角色一组计数；`users` 身份数与升级前一致；
+- v2.12：`memories` 含 `memory_type / event_at / embedding_json / superseded_by / last_reinforced_at`，`users` 含 `aliases_json`；旧记忆 `memory_type='episode'`、`event_at=0`（升级后第一次召回按 `created_at` 锚点）；
 - `daily_schedules` 的旧日程会在访问时自动重抽，无需手工删。
 
 ### 5.3 迁移 flag
@@ -200,6 +209,10 @@ sqlite3 <数据目录>/only_you.db \
 | 11 | 把 `reply_gate_probability` 临时设为 0，在 `IDLE` 群聊发普通消息 | 不出现读空气决策调用，日志出现 `Reply gate dropped non-@ group message (...)`；@ Bot / 私聊仍正常回复 |
 | 12 | 查看 System Prompt 或 Pages 记忆页 | 每条回忆记忆带「形成于 YYYY-MM-DD（星期，N 天前）」；记忆页展示绝对时间；记忆正文未被改写 |
 | 13 | 关系页关闭某用户 / 群聊的「主动回复」后等待心跳 | 该目标不再收到未读补回 / 翻群 / 联想 / 视频分享；被动消息与 @ 不受影响；重新开启后恢复 |
+| 14 | 模型页把「向量模型 / 重排模型」设为 AstrBot 已启用实例并点测试 | 向量返回维度、重排返回打分；关闭时 `/onlyyou status` 与聊天仍正常（自动降级词法检索） |
+| 15 | 给同一用户连续改两次群名片再聊几句触发提炼 | 记忆只按一个规范称呼记录；提炼 Prompt 含「参与者身份归一表」，不会出现「A 对 B 还在啃数电」式身份分裂 |
+| 16 | 连续发 20 条普通群消息（Bot 只回复几条） | 好感只按真实回复结算，同用户 180s 内只加一次；不会再「随便聊几句就升 L2」 |
+| 17 | 在 `IDLE_ROAM` 心跳观察 1~2 小时 | 默认 2h 冷却 + 35% 概率 + 每日 3 条上限；`PERSONA_TOPIC` 与 `MEMORY_MUSE` 按 7:3 出现，不会连续复读同一条旧记忆 |
 
 ---
 
@@ -346,6 +359,29 @@ docker start astrbot
 - **行为变化**：关系页用户 / 群聊详情新增开关；关闭后只停 Bot 主动发起的未读补回、`GROUP_LURK`、`MEMORY_MUSE` 与视频分享。被动回复、@ 与读空气接话不变。
 - **合并语义**：账号合并时 `proactive_enabled` 按「双方都允许才开启」的 AND 语义；删除用户 / 群聊不因开关状态删除记忆或关系。
 - **v2.11.1**：修复群聊开关保存后重新打开又显示开启的前端字段丢失问题（仅 `views/console/page-relations.js` 的 `normalizeGroup` 白名单；后端与落库在 v2.11.0 即正确）。升级仅需覆盖前端静态资源并强刷浏览器缓存。
+
+### 11.8 v2.12：RAG 记忆、身份归一与主动对话节奏
+
+- **纯加法数据库迁移**：见 §0 表 #10 / #11；无需手工改库、无需清空记忆。旧记忆不会自动补向量，首次被召回 / 编辑时按需补算。
+- **行为变化（非破坏性，但可感知）**：
+  - **主动消息更少**：`idle_roam_cooldown_minutes` 45 → **120**，新增 35% 触发概率 / 每日 3 条上限 / 70% 人设新话题占比。想恢复高频可把冷却调回 45、概率调 100、上限调 0。
+  - **好感曲线更慢**：只在 Bot 真正回复后结算，180s 冷却、+0.4/+0.6、每日 +5.0 封顶；L1→L2 改为互动 ≥ 40 **且** 好感 ≥ 30 的 AND 门槛（可在 `relationship_config` 调整）。已存在的 L2/L3 不受影响。
+  - **T3 更难产生**：只有 `profile` / `relationship` 且 importance ≥ 8、有效命中 ≥ 8 次并跨天，才从 T2 晋升；`episode` / `state` 留在 T2。已存在的 T3 原样保留。
+  - **语义去重对所有层级生效**：重复事实只刷新旧记忆、不再新增；旧库中已有的重复行不会自动删除，可在记忆页手工清理。
+  - **提炼单批最多 3 条**：需要 decision 模型可用；失败时该批消息进入单批重试缓冲，下次提炼自动重试一次，不会永久丢失。
+- **历史裸 ID 归并**：`memories.user_id` 里旧的裸平台 uid（如 `"42"`）或曾用名会在启动时一次性改写到 `webchat:42` 这类规范 `global_uid`；同一 native uid 属于多个用户的歧义行保持原样，可在关系页手工合并。旧记忆不强制补向量，被召回后后台惰性补算。
+- **Embedding / Rerank 为可选**：不配置时自动降级为「content + keywords」词法检索，零报错；推荐在模型页绑定 AstrBot 已启用的 `BAAI/bge-m3` 与 `BAAI/bge-reranker-v2-m3`。
+- **回滚**：回退到 v2.11 时，新增列会被旧版忽略（旧版 SQL 不读它们），记忆 / 用户 / 关系数据不丢；已 `superseded_by` 归档的行在旧版里会重新参与召回，但不会造成数据损坏。回滚后建议把 `idle_roam_*` 新配置从 `_conf_schema.json` 之外的手工配置中移除（旧版不识别，会被 schema 完整性检查忽略）。
+
+### 11.9 v2.12：T1 保留期与回收修复
+
+- **问题**：一条形成于 12 天前的 T2 被手动降级为 T1 后，前端仍按 `created_at` 计算 48h 倒计时，于是立刻显示「剩余 0h」；服务端要等下一次心跳（≤15 分钟）的 `cleanup_tier1()` 才真正删除，造成「已过期却还在列表里」的观感。
+- **修复**：
+  - 新增 `memories.tier1_since`：新建 T1 取创建时刻；**从 T2/T3 降级为 T1 时重置为降级时刻**，保留期重新计算 48h。旧 T1（`tier1_since=0`）继续回退 `created_at`，不改变既有过期节奏。
+  - `cleanup_tier1()` / `run_forgetting_gc()` / T1 FIFO 上限统一按 `COALESCE(NULLIF(tier1_since,0), created_at)` 判断与排序，降级来的新 T1 不会先被裁掉。
+  - `memories/list` 与 `/onlyyou memory list` 在读取前先跑一次 `cleanup_tier1()`，过期项不必再等心跳；前端对真正过期的行显示「待回收（≤15 分钟）」而不是「剩余 0h」。
+- **验证**：降级后 47h 仍保留、49h 删除；旧库 T1 过期即删；重复编辑已是 T1 的记忆不重置 48h；上限淘汰按新的保留期起点排序。离线回归 812 tests 全绿。
+- **回滚**：回退到不含该修复的旧版插件时 `tier1_since` 被忽略，T1 又按 `created_at` 计时；不丢数据，但降级项会重新表现为「已过期」，属预期。
 
 ---
 

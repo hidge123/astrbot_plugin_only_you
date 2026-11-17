@@ -5251,3 +5251,35 @@ html[data-theme="dark"] .rel-chip.is-active .rel-chip-count {
     display: none;
   }
 }
+
+/* ==================== v2.12 memory type / superseded ==================== */
+.memory-row.is-archived {
+  opacity: 0.62;
+}
+
+.memory-row.is-archived .memory-row-content {
+  text-decoration: line-through;
+  text-decoration-color: var(--border-strong);
+}
+
+.memory-type-chip {
+  border-color: var(--primary-soft);
+  color: var(--primary);
+  background: var(--primary-soft);
+}
+
+.memory-archived-chip {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: transparent;
+}
+
+.warn-text {
+  color: var(--danger);
+}
+
+/* v2.12: overdue Tier 1 rows waiting for the next heartbeat GC */
+.memory-vitality.is-expired {
+  color: var(--danger);
+  font-weight: 600;
+}

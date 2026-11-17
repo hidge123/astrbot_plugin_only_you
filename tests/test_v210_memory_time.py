@@ -345,9 +345,9 @@ class TestMemoryInjectionTimeAnchor(DatabaseAsyncTestCase):
         return budget, buffer, manager
 
     async def _apply(self, budget):
-        req = FakeRequest(prompt="还记得周末的事吗", system_prompt="BASE")
+        req = FakeRequest(prompt="考科目二的事还记得吗", system_prompt="BASE")
         await budget.apply_context_and_memory_budget(
-            event=FakeEvent(message_str="还记得周末的事吗", umo="umo-1"),
+            event=FakeEvent(message_str="考科目二的事还记得吗", umo="umo-1"),
             req=req,
             soul=self.soul,
             user=self.user,
@@ -379,7 +379,7 @@ class TestMemoryInjectionTimeAnchor(DatabaseAsyncTestCase):
         anchor = time_utils.describe_time_anchor(created_ts, NOW_TS)
         assert "[记忆时间基准]" in prompt
         assert f"今天是 {time_utils.current_datetime_text(NOW_TS)}" in prompt
-        assert f"- [核心记忆 · 形成于 {anchor}] 阿泽说这周末要去考科目二" in prompt
+        assert f"- [核心记忆 · 短期情节 · 形成于 {anchor}] 阿泽说这周末要去考科目二" in prompt
         # Relative wording is preserved; the model resolves it from the anchor.
         assert "这周末" in prompt
         assert "历史信息" in prompt and "未来安排" in prompt
@@ -391,6 +391,7 @@ class TestMemoryInjectionTimeAnchor(DatabaseAsyncTestCase):
             id=2,
             soul_id=self.soul.soul_id,
             content="一二三四五六七八九十",
+            keywords="科目二",
             importance=8,
             memory_tier=MemoryTier.RECENT,
             created_at=_ts(days=-3),
@@ -400,14 +401,15 @@ class TestMemoryInjectionTimeAnchor(DatabaseAsyncTestCase):
             "OnlyYou.core.context_budget.time.time", return_value=float(NOW_TS)
         ):
             result = await budget.apply_context_and_memory_budget(
-                event=FakeEvent(message_str="随便聊聊", umo="umo-1"),
-                req=FakeRequest(prompt="随便聊聊", system_prompt="BASE"),
+                event=FakeEvent(message_str="科目二的事", umo="umo-1"),
+                req=FakeRequest(prompt="科目二的事", system_prompt="BASE"),
                 soul=self.soul,
                 user=self.user,
                 run=make_run(),
                 current_slot=make_slot(state=BotState.IDLE),
             )
-        assert result["injected_chars"] == len("一二三四五六七八九十")
+        # v2.12: injected_chars counts the memory line INCLUDING its time label.
+        assert result["injected_chars"] > len("一二三四五六七八九十")
 
     async def test_no_memory_means_no_time_block(self):
         budget, _buffer, _manager = self._build_budget([])

@@ -780,6 +780,13 @@
         { id: "edge_tts_default", model: "zh-CN-XiaoxiaoNeural", type: "edge_tts", enable: true },
         { id: "openai_tts_demo", model: "tts-1", type: "openai_tts_api", enable: false }
       ],
+      /* v2.12：RAG 角色可复用的 AstrBot 提供商（Mock 预览用） */
+      embeddingProviders: [
+        { id: "bge_m3_demo", model: "BAAI/bge-m3", type: "openai_embedding", enable: true }
+      ],
+      rerankProviders: [
+        { id: "bge_reranker_demo", model: "BAAI/bge-reranker-v2-m3", type: "openai_rerank", enable: true }
+      ],
       modelLists: {
         deepseek: [
           { model: "deepseek-chat", id: "deepseek/deepseek-chat", enable: true, modalities: ["text"], source: "config" },
@@ -1239,12 +1246,28 @@
     var tier1 = 0;
     var tier2 = 0;
     var tier3 = 0;
+    var typeCounts = { profile: 0, relationship: 0, state: 0, episode: 0 };
+    var superseded = 0;
+    var embedded = 0;
     db.memories.forEach(function (memory) {
       if (memory.memory_tier === 3) tier3 += 1;
       else if (memory.memory_tier === 2) tier2 += 1;
       else tier1 += 1;
+      var memType = memory.memory_type || "episode";
+      if (typeCounts[memType] == null) typeCounts[memType] = 0;
+      typeCounts[memType] += 1;
+      if (memory.superseded) superseded += 1;
+      if (memory.has_embedding) embedded += 1;
     });
-    return { tier1: tier1, tier2: tier2, tier3: tier3, total: db.memories.length };
+    return {
+      tier1: tier1,
+      tier2: tier2,
+      tier3: tier3,
+      total: db.memories.length,
+      memory_type_counts: typeCounts,
+      superseded_count: superseded,
+      embedding_count: embedded
+    };
   }
 
   function knownUmos() {
@@ -1556,6 +1579,39 @@
         item.label += inheritFrom === "decision" ? " · 继承轻量决策模型" : " · 继承主模型";
       }
       status[role] = item;
+    });
+    ["embedding", "rerank"].forEach(function (role) {
+      var entry = cfg[role] || {};
+      var vectorMode = entry.mode || "off";
+      var configured =
+        vectorMode === "provider"
+          ? !!entry.provider_id
+          : vectorMode === "source"
+          ? !!(entry.source_id && entry.model)
+          : false;
+      status[role] = {
+        role: role,
+        configured: configured,
+        inherited: false,
+        inherit: false,
+        inherit_from: "",
+        mode: vectorMode,
+        provider_id:
+          vectorMode === "provider"
+            ? entry.provider_id || ""
+            : configured
+            ? "onlyyou::" + role + "::" + entry.source_id + "::" + entry.model
+            : "",
+        source_id: entry.source_id || "",
+        model: entry.model || "",
+        label:
+          vectorMode === "off"
+            ? "已关闭（降级为词法检索）"
+            : configured
+            ? (vectorMode === "provider" ? "AstrBot 提供商 · " : "") + (entry.provider_id || entry.source_id + " / " + entry.model)
+            : "未配置完整",
+        ok: configured
+      };
     });
     var ttsCfg = cfg.tts || {};
     var ttsMode = ttsCfg.mode || "off";
@@ -1905,6 +1961,17 @@
       out[role] = {
         inherit: !!inheritFrom,
         inherit_from: inheritFrom,
+        source_id: String(roleRaw.source_id == null ? "" : roleRaw.source_id).trim(),
+        model: String(roleRaw.model == null ? "" : roleRaw.model).trim()
+      };
+    });
+    ["embedding", "rerank"].forEach(function (role) {
+      var roleRaw = raw[role] && typeof raw[role] === "object" ? raw[role] : {};
+      var roleMode = String(roleRaw.mode == null ? "off" : roleRaw.mode).trim().toLowerCase();
+      if (["off", "source", "provider"].indexOf(roleMode) < 0) roleMode = "off";
+      out[role] = {
+        mode: roleMode,
+        provider_id: String(roleRaw.provider_id == null ? "" : roleRaw.provider_id).trim(),
         source_id: String(roleRaw.source_id == null ? "" : roleRaw.source_id).trim(),
         model: String(roleRaw.model == null ? "" : roleRaw.model).trim()
       };
@@ -2683,10 +2750,53 @@
       tier2_count: counts.tier2,
       tier1_count: counts.tier1,
       total: counts.total,
+      /* v2.12：分类 / 归档 / 向量缓存诊断 */
+      memory_type_counts: counts.memory_type_counts,
+      superseded_count: counts.superseded_count,
+      embedding_count: counts.embedding_count,
       sliding_window_size: 12,
       max_injected_memories: 5,
-      max_memory_chars_budget: 400
+      max_memory_chars_budget: 400,
+      max_recall_candidates: 24,
+      min_recall_score: 0.38,
+      min_semantic_score: 0.25
     };
+  }
+
+  var MEMORY_TYPE_LABELS_MOCK = {
+    profile: "人物画像",
+    relationship: "关系共识",
+    state: "近期状态",
+    episode: "短期情节"
+  };
+
+  function normalizeMockMemory(memory) {
+    var memType = memory.memory_type || "episode";
+    if (!MEMORY_TYPE_LABELS_MOCK[memType]) memType = "episode";
+    var out = clone(memory);
+    out.memory_type = memType;
+    out.memory_type_label = MEMORY_TYPE_LABELS_MOCK[memType];
+    out.has_embedding = !!memory.has_embedding;
+    out.superseded_by = memory.superseded_by == null ? null : memory.superseded_by;
+    out.superseded = !!memory.superseded || out.superseded_by != null;
+    /* v2.12：T1 保留期锚点与过期时间（Mock 预览同构返回） */
+    if (out.memory_tier === 1) {
+      var tier1Since = num(memory.tier1_since, 0) || num(memory.created_at, 0);
+      out.tier1_since = tier1Since;
+      out.tier1_expires_at =
+        num(memory.tier1_expires_at, 0) || (tier1Since ? tier1Since + 172800 : 0);
+      out.tier1_remaining_seconds = Math.max(
+        0,
+        out.tier1_expires_at - Math.floor(Date.now() / 1000)
+      );
+      out.tier1_expired = !!out.tier1_expires_at && out.tier1_remaining_seconds <= 0;
+    } else {
+      out.tier1_since = 0;
+      out.tier1_expires_at = 0;
+      out.tier1_remaining_seconds = 0;
+      out.tier1_expired = false;
+    }
+    return out;
   }
 
   function listMemories(payload) {
@@ -2694,15 +2804,20 @@
     var tier = payload.memory_tier != null && payload.memory_tier !== "" ? Number(payload.memory_tier) : null;
     var userId = payload.user_id || "";
     var keyword = String(payload.keyword || "").toLowerCase();
+    var memoryType = String(payload.memory_type || "");
+    var includeArchived = String(payload.include_superseded || "").toLowerCase();
+    includeArchived = ["0", "false", "no", "off"].indexOf(includeArchived) < 0;
     var memories = db.memories.filter(function (memory) {
       if (soulId && memory.soul_id !== soulId) return false;
       if (tier != null && memory.memory_tier !== tier) return false;
       if (userId && memory.user_id !== userId) return false;
+      if (memoryType && (memory.memory_type || "episode") !== memoryType) return false;
+      if (!includeArchived && (memory.superseded || memory.superseded_by != null)) return false;
       if (keyword && (memory.content + " " + memory.keywords).toLowerCase().indexOf(keyword) < 0) return false;
       return true;
     });
     return {
-      memories: clone(memories),
+      memories: memories.map(normalizeMockMemory),
       stats: memoryStats(),
       /* v2.8：T1 上限提示（契约 §5.6 / §6.2） */
       tier1_limit: 30
@@ -2713,9 +2828,11 @@
     var action = String(body.action || "add").toLowerCase();
     var soulId = String(body.soul_id || db.souls[0].soul_id);
     function memoriesForSoul() {
-      return clone(db.memories.filter(function (memory) {
-        return memory.soul_id === soulId;
-      }));
+      return db.memories
+        .filter(function (memory) {
+          return memory.soul_id === soulId;
+        })
+        .map(normalizeMockMemory);
     }
     if (action === "gc") {
       var removed = db.memories.filter(function (memory) {
@@ -2737,6 +2854,7 @@
         user_id: "core_tester",
         user_tier: 3,
         memory_tier: 2,
+        memory_type: "episode",
         content: "最近阿泽提到周末想去新开的咖啡店坐坐。",
         keywords: "咖啡店,周末,阿泽",
         importance: 6,
@@ -2773,6 +2891,10 @@
         if (body.keywords != null) memory.keywords = String(body.keywords);
         if (body.importance != null) memory.importance = clamp(body.importance, 1, 10);
         if (body.memory_tier != null) memory.memory_tier = clamp(body.memory_tier, 1, 3);
+        if (body.memory_type != null && MEMORY_TYPE_LABELS_MOCK[String(body.memory_type)]) {
+          memory.memory_type = String(body.memory_type);
+        }
+        if (body.event_at != null) memory.event_at = Number(body.event_at) || 0;
         if (body.vitality != null) memory.vitality = clamp(body.vitality, 0, 100);
         if (body.user_id != null) memory.user_id = String(body.user_id);
         updated = memory;
@@ -2789,6 +2911,10 @@
       user_id: String(body.user_id || ""),
       user_tier: Number(body.user_tier || 2),
       memory_tier: Number(body.memory_tier || 3),
+      memory_type: MEMORY_TYPE_LABELS_MOCK[String(body.memory_type || "")]
+        ? String(body.memory_type)
+        : "episode",
+      event_at: Number(body.event_at) || 0,
       content: content,
       keywords: String(body.keywords || ""),
       importance: clamp(body.importance || 8, 1, 10),
@@ -2797,7 +2923,7 @@
       created_at: nowSeconds(),
       last_accessed_at: nowSeconds()
     });
-    return { new_id: mid, memories: clone(db.memories.filter(function (memory) { return memory.soul_id === soulId; })) };
+    return { new_id: mid, memories: memoriesForSoul() };
   }
 
   function videosForSoul(soulId) {
@@ -2985,7 +3111,9 @@
       case "models/sources":
         return {
           sources: clone(db.sources),
-          tts_providers: clone(db.ttsProviders)
+          tts_providers: clone(db.ttsProviders),
+          embedding_providers: clone(db.embeddingProviders || []),
+          rerank_providers: clone(db.rerankProviders || [])
         };
       case "models/list": {
         var sourceId = String(payload.source_id || "");

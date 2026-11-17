@@ -786,7 +786,7 @@ class TestModelsPerSoul(WebApiV28TestBase):
         assert get_a["soul_id"] == first.soul_id
         assert get_a["model_config"]["main"]["model"] == "deepseek-chat"
         assert get_b["model_config"]["main"]["model"] == "deepseek-reasoner"
-        assert set(get_a["status"]) == {"main", "decision", "vision", "tts"}
+        assert set(get_a["status"]) == {"main", "decision", "vision", "tts", "embedding", "rerank"}
 
         # each Soul persisted its own config in its JSON file
         assert (await self.read_soul_file(first.soul_id))["model_config"]["main"][

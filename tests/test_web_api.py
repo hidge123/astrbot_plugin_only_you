@@ -183,7 +183,7 @@ class TestInitSummary(WebApiTestBase):
             "IDLE_ROAM",
             "BUSY_TASK",
         }
-        assert set(data["model_status"]) == {"main", "decision", "vision", "tts"}
+        assert set(data["model_status"]) == {"main", "decision", "vision", "tts", "embedding", "rerank"}
         assert data["model_status"]["main"]["mode"] == "unconfigured"
         assert data["model_status"]["tts"]["mode"] == "off"
         assert isinstance(data["native_personas"], list)
@@ -264,7 +264,7 @@ class TestDashboardOverview(WebApiTestBase):
         assert set(counts["relations"]) == {"l1", "l2", "l3", "total"}
         assert set(counts["memories"]) == {"tier1", "tier2", "tier3", "total"}
         assert isinstance(counts["videos"], int)
-        assert set(data["models"]) == {"main", "decision", "vision", "tts"}
+        assert set(data["models"]) == {"main", "decision", "vision", "tts", "embedding", "rerank"}
 
     async def test_dashboard_counts_reflect_data(self):
         soul = await self.first_soul()
@@ -529,8 +529,8 @@ class TestModelRoutes(WebApiTestBase):
 
     async def test_models_config_get_defaults(self):
         data = self.assert_ok(await self.call("GET", self.api.api_models_config))
-        assert set(data["model_config"]) == {"main", "decision", "vision", "tts"}
-        assert set(data["status"]) == {"main", "decision", "vision", "tts"}
+        assert set(data["model_config"]) == {"main", "decision", "vision", "tts", "embedding", "rerank"}
+        assert set(data["status"]) == {"main", "decision", "vision", "tts", "embedding", "rerank"}
         assert data["model_config"]["tts"]["mode"] == "off"
 
     async def test_models_config_post_persists_and_hot_rebuilds(self):

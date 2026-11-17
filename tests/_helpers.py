@@ -52,6 +52,7 @@ def load_plugin_modules():
     import OnlyYou.core.platform_bridge as platform_bridge
     import OnlyYou.core.provider_factory as provider_factory
     import OnlyYou.core.roguelite_deck as roguelite_deck
+    import OnlyYou.core.runtime_state as runtime_state
     import OnlyYou.core.schedule_mutator as schedule_mutator
     import OnlyYou.core.soul_manager as soul_manager
     import OnlyYou.core.state_machine as state_machine
@@ -71,6 +72,7 @@ def load_plugin_modules():
         platform_bridge=platform_bridge,
         provider_factory=provider_factory,
         roguelite_deck=roguelite_deck,
+        runtime_state=runtime_state,
         schedule_mutator=schedule_mutator,
         soul_manager=soul_manager,
         state_machine=state_machine,
@@ -156,6 +158,11 @@ def make_plugin_config(**overrides):
             "mutation_cooldown_minutes": 120,
             "idle_roam_cooldown_minutes": 45,
             "allow_l3_wake_from_resting": True,
+            # v2.12: deterministic proactive pace for offline tests (production
+            # defaults are 35% probability / 3 per day / 70% persona topics).
+            "idle_roam_trigger_probability": 100,
+            "idle_roam_daily_max_count": 0,
+            "idle_roam_persona_topic_ratio": 0,
         },
         "relationship_config": {
             # v2.8.2: user ID lists removed from the general config (Pages owns tiers).
@@ -164,6 +171,18 @@ def make_plugin_config(**overrides):
         "surfing_config": {},
         "model_and_tts_config": {},
     }
+    # Deep-merge the dict sections so a test can override one key without losing
+    # the deterministic defaults above.
+    for section in (
+        "memory_and_context_config",
+        "roguelite_schedule_config",
+        "relationship_config",
+    ):
+        patch = overrides.get(section)
+        if isinstance(patch, dict):
+            merged = dict(config[section])
+            merged.update(patch)
+            overrides[section] = merged
     config.update(overrides)
     return config
 

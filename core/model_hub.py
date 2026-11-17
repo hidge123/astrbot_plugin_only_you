@@ -25,6 +25,7 @@ All AstrBot provider internals are reached through ``core/provider_factory.py``.
 
 import base64
 import copy
+import inspect
 import json
 import re
 import time
@@ -62,11 +63,31 @@ DEFAULT_MODEL_CONFIG: Dict[str, dict] = {
         "scope": "private",
         "dual_output": False,
     },
+    # v2.12: RAG roles (off / provider / source); off = 纯词法降级检索。
+    "embedding": {
+        "mode": "off",
+        "provider_id": "",
+        "source_id": "",
+        "model": "",
+    },
+    "rerank": {
+        "mode": "off",
+        "provider_id": "",
+        "source_id": "",
+        "model": "",
+    },
 }
 
 TTS_MODES = ("off", "source", "provider")
 TTS_SCOPES = ("private", "l3", "all")
 CHAT_ROLES = ("main", "decision", "vision")
+#: v2.12: RAG 角色（向量检索 / 重排）——三档来源模式，`off` 表示停用。
+VECTOR_ROLES = ("embedding", "rerank")
+VECTOR_MODES = ("off", "provider", "source")
+VECTOR_ROLE_LABELS = {
+    "embedding": "向量模型 (Embedding)",
+    "rerank": "重排模型 (Rerank)",
+}
 
 #: Legal ``inherit_from`` values for the two inheritable chat roles (v2.6).
 INHERIT_FROM_OPTIONS: Dict[str, tuple] = {
@@ -163,13 +184,24 @@ def normalize_model_config(raw: Any) -> Dict[str, dict]:
         "scope": scope,
         "dual_output": _to_bool(tts_raw.get("dual_output"), default=False),
     }
+    for role in VECTOR_ROLES:
+        role_raw = raw.get(role) if isinstance(raw.get(role), dict) else {}
+        role_mode = _clean(role_raw.get("mode")).lower() or "off"
+        if role_mode not in VECTOR_MODES:
+            role_mode = "off"
+        normalized[role] = {
+            "mode": role_mode,
+            "provider_id": _clean(role_raw.get("provider_id")),
+            "source_id": _clean(role_raw.get("source_id")),
+            "model": _clean(role_raw.get("model")),
+        }
     return normalized
 
 
 class ModelHub:
     """Four-role model scheduling gateway (main / decision / vision / tts)."""
 
-    ROLES = ("main", "decision", "vision", "tts")
+    ROLES = ("main", "decision", "vision", "tts", "embedding", "rerank")
     CONFIG_SETTING_KEY = "model_config"
     MIGRATION_FLAG_KEY = "legacy_model_migrated"
     MAIN_PROVIDER_ID = "onlyyou::main"
@@ -344,7 +376,13 @@ class ModelHub:
             if _clean(entry.get("source_id")) and _clean(entry.get("model")):
                 return True
         tts = cfg.get("tts") or {}
-        return _clean(tts.get("mode")).lower() not in ("", "off")
+        if _clean(tts.get("mode")).lower() not in ("", "off"):
+            return True
+        for role in VECTOR_ROLES:
+            entry = cfg.get(role) or {}
+            if _clean(entry.get("mode")).lower() not in ("", "off"):
+                return True
+        return False
 
     async def _migrate_config_to_souls_once(self) -> None:
         """One-shot migration of the legacy global config into every existing Soul.
@@ -654,6 +692,30 @@ class ModelHub:
         # >2 hops / self-cycle / unknown parent role -> disabled (no main fallback).
         return None
 
+    def _resolve_vector_role(
+        self, role: str, cfg: Optional[Dict[str, dict]] = None
+    ) -> Optional[Dict[str, str]]:
+        """Resolve ``embedding`` / ``rerank`` into a provider selection dict.
+
+        ``off`` (or an incomplete ``provider`` / ``source`` config) returns ``None``
+        — the memory engine then degrades to lexical retrieval, never to ``main``.
+        """
+        active = cfg if isinstance(cfg, dict) else self._config
+        entry = active.get(role) or {}
+        mode = _clean(entry.get("mode")).lower() or "off"
+        if mode == "provider":
+            provider_id = _clean(entry.get("provider_id"))
+            if not provider_id:
+                return None
+            return {"mode": "provider", "provider_id": provider_id}
+        if mode == "source":
+            source_id = _clean(entry.get("source_id"))
+            model = _clean(entry.get("model"))
+            if not source_id or not model:
+                return None
+            return {"mode": "source", "source_id": source_id, "model": model}
+        return None
+
     async def resolve_role(
         self, role: str, soul_id: Optional[str] = None
     ) -> Optional[dict]:
@@ -673,6 +735,10 @@ class ModelHub:
 
         if name in ("decision", "vision"):
             return self._resolve_chat_role(name, cfg=cfg)
+
+        # v2.12: embedding / rerank never inherit; ``off`` disables the role.
+        if name in VECTOR_ROLES:
+            return self._resolve_vector_role(name, cfg=cfg)
 
         # tts never inherits
         tts = cfg.get("tts") or {}
@@ -717,6 +783,23 @@ class ModelHub:
 
         resolved_soul_id = await self._resolve_soul_id(soul_id, umo=umo)
         try:
+            if name in VECTOR_ROLES:
+                resolved = await self.resolve_role(
+                    name, soul_id=resolved_soul_id or soul_id
+                )
+                if resolved is None:
+                    return None
+                getter = getattr(
+                    factory,
+                    "get_embedding_provider"
+                    if name == "embedding"
+                    else "get_rerank_provider",
+                    None,
+                )
+                if not callable(getter):
+                    return None
+                return await getter(resolved)
+
             if name == "tts":
                 resolved = await self.resolve_role("tts", soul_id=resolved_soul_id or soul_id)
                 if resolved is None:
@@ -736,6 +819,197 @@ class ModelHub:
         except Exception as exc:
             logger.warning(f"[OnlyYou] get_provider(role={name}) failed: {exc}")
             return None
+
+    # ------------------------------------------------------------------
+    # v2.12: Embedding / Rerank calls (RAG memory retrieval)
+    # ------------------------------------------------------------------
+    def get_embedding_config(self, soul_id: Optional[str] = None) -> dict:
+        """Return a copy of a Soul's normalized embedding role config."""
+        cfg = self._sync_active_config(soul_id)
+        return copy.deepcopy(cfg.get("embedding") or DEFAULT_MODEL_CONFIG["embedding"])
+
+    def get_rerank_config(self, soul_id: Optional[str] = None) -> dict:
+        """Return a copy of a Soul's normalized rerank role config."""
+        cfg = self._sync_active_config(soul_id)
+        return copy.deepcopy(cfg.get("rerank") or DEFAULT_MODEL_CONFIG["rerank"])
+
+    @staticmethod
+    def _normalize_vector(raw: Any) -> List[float]:
+        """Coerce one embedding payload into a list of finite floats."""
+        if isinstance(raw, dict):
+            raw = raw.get("embedding") or raw.get("vector") or raw.get("data")
+        if not isinstance(raw, (list, tuple)):
+            return []
+        vector: List[float] = []
+        for value in raw:
+            if isinstance(value, bool):
+                return []
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return []
+            if number != number or number in (float("inf"), float("-inf")):
+                return []
+            vector.append(number)
+        return vector
+
+    @classmethod
+    def _normalize_vectors(cls, raw: Any, expected: int) -> List[List[float]]:
+        """Coerce a batch embedding payload into ``expected`` aligned vectors."""
+        if raw is None:
+            return []
+        payload = raw
+        if isinstance(payload, dict):
+            payload = payload.get("data") or payload.get("embeddings") or payload
+        if not isinstance(payload, (list, tuple)):
+            return []
+        vectors: List[List[float]] = []
+        for item in payload:
+            vector = cls._normalize_vector(item)
+            if not vector:
+                return []
+            vectors.append(vector)
+        if expected > 0 and len(vectors) != expected:
+            # Some adapters wrap a single vector in an extra list.
+            if expected == 1 and len(vectors) == 1:
+                return vectors
+            return []
+        return vectors
+
+    @staticmethod
+    async def _maybe_await(value: Any) -> Any:
+        if inspect.isawaitable(value):
+            return await value
+        return value
+
+    async def get_embeddings(
+        self,
+        texts: List[str],
+        soul_id: Optional[str] = None,
+        umo: Optional[str] = None,
+    ) -> List[List[float]]:
+        """Batch-embed ``texts`` via the configured embedding role.
+
+        Returns ``[]`` whenever the role is off / unconfigured / failed, so every
+        caller can degrade to lexical retrieval without exception handling.
+        """
+        clean_texts = [str(text or "").strip() for text in (texts or [])]
+        clean_texts = [text for text in clean_texts if text]
+        if not clean_texts:
+            return []
+        try:
+            provider = await self.get_provider(
+                "embedding", umo=umo, soul_id=soul_id
+            )
+        except Exception as exc:  # noqa: BLE001 - degrade to lexical
+            logger.debug(f"[OnlyYou] embedding provider unavailable: {exc}")
+            return []
+        if provider is None:
+            return []
+
+        batch_fn = getattr(provider, "get_embeddings", None)
+        if callable(batch_fn):
+            try:
+                raw = await self._maybe_await(batch_fn(clean_texts))
+                vectors = self._normalize_vectors(raw, len(clean_texts))
+                if vectors:
+                    return vectors
+            except Exception as exc:  # noqa: BLE001 - fall back to single calls
+                logger.debug(f"[OnlyYou] get_embeddings failed, falling back: {exc}")
+        single_fn = getattr(provider, "get_embedding", None)
+        if not callable(single_fn):
+            return []
+        vectors: List[List[float]] = []
+        for text in clean_texts:
+            try:
+                raw = await self._maybe_await(single_fn(text))
+            except Exception as exc:  # noqa: BLE001 - degrade to lexical
+                logger.debug(f"[OnlyYou] get_embedding failed: {exc}")
+                return []
+            vector = self._normalize_vector(raw)
+            if not vector:
+                return []
+            vectors.append(vector)
+        return vectors
+
+    async def get_embedding(
+        self,
+        text: str,
+        soul_id: Optional[str] = None,
+        umo: Optional[str] = None,
+    ) -> List[float]:
+        """Embed one text (``[]`` when the embedding role is disabled/failed)."""
+        vectors = await self.get_embeddings([text], soul_id=soul_id, umo=umo)
+        return vectors[0] if vectors else []
+
+    async def rerank_documents(
+        self,
+        query: str,
+        documents: List[str],
+        top_n: Optional[int] = None,
+        soul_id: Optional[str] = None,
+        umo: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Rerank ``documents`` against ``query`` via the rerank role.
+
+        Returns ``[{"index": int, "score": float}, ...]`` sorted by score (desc) or
+        ``[]`` when the role is off / unconfigured / failed.
+        """
+        docs = [str(doc or "") for doc in (documents or [])]
+        if not docs or not str(query or "").strip():
+            return []
+        try:
+            provider = await self.get_provider("rerank", umo=umo, soul_id=soul_id)
+        except Exception as exc:  # noqa: BLE001 - degrade to dense/lexical
+            logger.debug(f"[OnlyYou] rerank provider unavailable: {exc}")
+            return []
+        if provider is None:
+            return []
+        rerank_fn = getattr(provider, "rerank", None)
+        if not callable(rerank_fn):
+            return []
+        limit = top_n if isinstance(top_n, int) and top_n > 0 else len(docs)
+        raw: Any = None
+        for kwargs in (
+            {"query": query, "documents": docs, "top_n": limit},
+            {"query": query, "documents": docs},
+        ):
+            try:
+                raw = await self._maybe_await(rerank_fn(**kwargs))
+                break
+            except TypeError:
+                continue
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[OnlyYou] rerank failed: {exc}")
+                return []
+        if raw is None:
+            try:
+                raw = await self._maybe_await(rerank_fn(query, docs, limit))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[OnlyYou] rerank failed: {exc}")
+                return []
+        if not isinstance(raw, (list, tuple)):
+            return []
+        results: List[Dict[str, Any]] = []
+        for position, item in enumerate(raw):
+            if isinstance(item, dict):
+                index = item.get("index", item.get("idx", position))
+                score = item.get("relevance_score", item.get("score", item.get("relevance")))
+            else:
+                index = getattr(item, "index", position)
+                score = getattr(
+                    item, "relevance_score", getattr(item, "score", None)
+                )
+            try:
+                index_value = int(index)
+                score_value = float(score)
+            except (TypeError, ValueError):
+                continue
+            if index_value < 0 or index_value >= len(docs):
+                continue
+            results.append({"index": index_value, "score": score_value})
+        results.sort(key=lambda entry: entry["score"], reverse=True)
+        return results[:limit]
 
     @staticmethod
     def _provider_meta(instance: Any) -> tuple:
@@ -927,6 +1201,8 @@ class ModelHub:
             return {"status": "error", "role": _clean(role), "error": "未知模型角色"}
         if name == "tts":
             return await self._test_tts(soul_id=soul_id)
+        if name in VECTOR_ROLES:
+            return await self._test_vector_role(name, soul_id=soul_id)
 
         started = time.time()
         try:
@@ -960,6 +1236,75 @@ class ModelHub:
             }
         except Exception as exc:
             return {"status": "error", "role": name, "error": str(exc)}
+
+    async def _test_vector_role(
+        self, role: str, soul_id: Optional[str] = None
+    ) -> dict:
+        """Connectivity test for ``embedding`` / ``rerank`` (v2.12)."""
+        started = time.time()
+        config = (
+            self.get_embedding_config(soul_id)
+            if role == "embedding"
+            else self.get_rerank_config(soul_id)
+        )
+        if _clean(config.get("mode")) in ("", "off"):
+            return {
+                "status": "error",
+                "role": role,
+                "error": f"{VECTOR_ROLE_LABELS.get(role, role)}未启用",
+            }
+        provider = await self.get_provider(role, soul_id=soul_id)
+        if provider is None:
+            return {
+                "status": "error",
+                "role": role,
+                "error": "未配置模型或提供商实例创建失败",
+            }
+        provider_id, model = self._provider_meta(provider)
+
+        def _elapsed_ms() -> int:
+            return int((time.time() - started) * 1000)
+        if role == "embedding":
+            vectors = await self.get_embeddings(
+                ["OnlyYou 记忆检索连通性测试"], soul_id=soul_id
+            )
+            if not vectors:
+                return {
+                    "status": "error",
+                    "role": role,
+                    "error": "向量模型未返回有效向量",
+                }
+            return {
+                "status": "ok",
+                "role": role,
+                "provider_id": provider_id,
+                "model": model,
+                "dimension": len(vectors[0]),
+                "latency_ms": _elapsed_ms(),
+            }
+        results = await self.rerank_documents(
+            "火锅", ["阿泽最爱川渝火锅", "今天天气不错"], top_n=2, soul_id=soul_id
+        )
+        if not results:
+            return {
+                "status": "error",
+                "role": role,
+                "error": "重排模型未返回有效结果",
+            }
+        return {
+            "status": "ok",
+            "role": role,
+            "provider_id": provider_id,
+            "model": model,
+            "results": [
+                {
+                    "index": entry["index"],
+                    "score": round(float(entry["score"]), 4),
+                }
+                for entry in results
+            ],
+            "latency_ms": _elapsed_ms(),
+        }
 
     async def _test_tts(self, soul_id: Optional[str] = None) -> dict:
         started = time.time()
@@ -1148,6 +1493,52 @@ class ModelHub:
             status["ok"] = configured
         return status
 
+    def _vector_role_status(
+        self, role: str, cfg: Optional[Dict[str, Any]] = None
+    ) -> dict:
+        """Status entry for ``embedding`` / ``rerank`` (v2.12)."""
+        active = cfg if isinstance(cfg, dict) else self._sync_active_config()
+        section = active.get(role) if isinstance(active.get(role), dict) else {}
+        mode = _clean(section.get("mode")).lower() or "off"
+        status: Dict[str, Any] = {
+            "role": role,
+            "name": VECTOR_ROLE_LABELS.get(role, role),
+            "configured": False,
+            "inherited": False,
+            "inherit": False,
+            "inherit_from": "",
+            "mode": mode,
+            "provider_id": _clean(section.get("provider_id")),
+            "source_id": _clean(section.get("source_id")),
+            "model": _clean(section.get("model")),
+            "label": "已关闭（降级为词法检索）",
+            "ok": False,
+        }
+        if mode == "provider":
+            configured = bool(status["provider_id"])
+            status["configured"] = configured
+            status["label"] = (
+                f"AstrBot {VECTOR_ROLE_LABELS.get(role, role)}：{status['provider_id']}"
+                if configured
+                else "未选择 AstrBot 提供商"
+            )
+            status["ok"] = configured
+        elif mode == "source":
+            configured = bool(status["source_id"] and status["model"])
+            status["configured"] = configured
+            status["provider_id"] = (
+                f"onlyyou::{role}::{status['source_id']}::{status['model']}"
+                if configured
+                else ""
+            )
+            status["label"] = (
+                f"{status['source_id']} / {status['model']}"
+                if configured
+                else "提供商源未配置完整"
+            )
+            status["ok"] = configured
+        return status
+
     async def get_status(self, soul_id: Optional[str] = None) -> Dict[str, dict]:
         """Return the four-role status of one Soul (default Soul when empty)."""
         if not self._soul_manager_ready() and not self._loaded:
@@ -1195,6 +1586,21 @@ class ModelHub:
                 "ok": False,
                 "error": str(exc),
             }
+        for role in VECTOR_ROLES:
+            try:
+                status[role] = self._vector_role_status(role, active_cfg)
+            except Exception as exc:  # noqa: BLE001 - status must never raise
+                status[role] = {
+                    "role": role,
+                    "configured": False,
+                    "inherited": False,
+                    "inherit": False,
+                    "inherit_from": "",
+                    "mode": "off",
+                    "label": "已关闭（降级为词法检索）",
+                    "ok": False,
+                    "error": str(exc),
+                }
         return status
 
     # ------------------------------------------------------------------

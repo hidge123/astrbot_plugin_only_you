@@ -48,8 +48,27 @@
       desc: "语音合成 / 主动分享语音",
       icon: "volume",
       help: "插件自主 TTS：提供商源模式自建 openai_tts_api 实例；AstrBot TTS 模式复用平台已有 TTS 提供商。"
+    },
+    embedding: {
+      name: "向量模型 (Embedding)",
+      desc: "记忆语义检索 / 去重",
+      icon: "search",
+      help: "用于记忆写入时的语义去重与召回时的向量粗排；可复用 AstrBot 已启用的嵌入提供商（如 BAAI/bge-m3），也可按提供商源自建实例。关闭后自动降级为「content + keywords」词法检索。"
+    },
+    rerank: {
+      name: "重排模型 (Rerank)",
+      desc: "召回结果精排",
+      icon: "filter",
+      help: "对粗排候选做精确相关性重排（综合分 0.55×语义 + 0.25×新鲜度 + 0.20×重要度）；可复用 AstrBot 已启用的重排提供商（如 BAAI/bge-reranker-v2-m3）。关闭后只用向量 / 词法相关性。"
     }
   };
+  /* v2.12: RAG 两个角色（三档来源模式：关闭 / 提供商源 / AstrBot 提供商） */
+  var VECTOR_ROLES = ["embedding", "rerank"];
+  var VECTOR_MODES = [
+    { value: "off", label: "关闭" },
+    { value: "source", label: "提供商源" },
+    { value: "provider", label: "AstrBot 提供商" }
+  ];
   var TTS_MODES = [
     { value: "off", label: "关闭" },
     { value: "source", label: "提供商源" },
@@ -79,6 +98,8 @@
     destroyed: false,
     sources: [],
     ttsProviders: [],
+    embeddingProviders: [],
+    rerankProviders: [],
     soulId: "",
     cfg: null,
     savedCfg: null,
@@ -201,6 +222,18 @@
     };
   }
 
+  function normalizeVectorRole(raw) {
+    raw = raw && typeof raw === "object" ? raw : {};
+    var mode = str(raw.mode) || "off";
+    if (["off", "source", "provider"].indexOf(mode) < 0) mode = "off";
+    return {
+      mode: mode,
+      provider_id: str(raw.provider_id),
+      source_id: str(raw.source_id),
+      model: str(raw.model)
+    };
+  }
+
   function normalizeConfig(raw) {
     raw = raw && typeof raw === "object" ? raw : {};
     var main = raw.main && typeof raw.main === "object" ? raw.main : {};
@@ -213,6 +246,8 @@
       main: { source_id: str(main.source_id), model: str(main.model) },
       decision: normalizeChatRole("decision", raw.decision),
       vision: normalizeChatRole("vision", raw.vision),
+      embedding: normalizeVectorRole(raw.embedding),
+      rerank: normalizeVectorRole(raw.rerank),
       tts: {
         mode: ttsMode,
         source_id: str(tts.source_id),
@@ -256,6 +291,24 @@
 
   function statusInfo(role) {
     var info = statusOf(role);
+    if (VECTOR_ROLES.indexOf(role) >= 0) {
+      if (!info.mode || info.mode === "off") {
+        return {
+          cls: "light-off",
+          text: "已关闭",
+          tip: info.label || (role === "embedding" ? "未启用向量检索，降级为词法检索" : "未启用精排")
+        };
+      }
+      if (info.configured === false || info.ok === false) {
+        return { cls: "light-err", text: "未配置完整", tip: info.label || "请补全提供商源 / 模型" };
+      }
+      return {
+        cls: "light-ok",
+        text: info.mode === "provider" ? "复用 AstrBot 实例" : "插件自建实例",
+        tip: info.label || "",
+        wrap: true
+      };
+    }
     if (role === "tts") {
       if (!info.mode || info.mode === "off") {
         return { cls: "light-off", text: "已关闭", tip: info.label || "TTS 已关闭" };
@@ -296,9 +349,14 @@
     });
   }
 
-  function sourceOptionsHtml(selectedId, withEmpty, includeAll) {
+  function sourceOptionsHtml(selectedId, withEmpty, includeAll, providerType) {
     var html = withEmpty ? '<option value="">— 选择提供商源 —</option>' : "";
     var list = includeAll ? S.sources : chatSources();
+    if (providerType) {
+      list = S.sources.filter(function (source) {
+        return str(source.provider_type) === str(providerType);
+      });
+    }
     var matched = false;
     list.forEach(function (source) {
       var label = (source.provider || source.id) + " · " + source.id;
@@ -576,6 +634,176 @@
   }
 
   /* ------------------------------------------------------------------ *
+   * v2.12 向量 / 重排模型卡片（RAG 记忆检索）
+   * ------------------------------------------------------------------ */
+  function vectorProviders(role) {
+    return role === "embedding" ? S.embeddingProviders : S.rerankProviders;
+  }
+
+  function vectorMeta(role) {
+    return (S.cfg && S.cfg[role]) || { mode: "off", provider_id: "", source_id: "", model: "" };
+  }
+
+  function vectorDetailHtml(role) {
+    var cfg = vectorMeta(role);
+    var mode = str(cfg.mode) || "off";
+    var isEmbedding = role === "embedding";
+    var roleName = isEmbedding ? "向量模型" : "重排模型";
+    if (mode === "off") {
+      return (
+        '<div class="card" style="background:var(--surface-2);border:0"><div class="card-body tight">' +
+        '<div class="text-sm text-2">' +
+        (isEmbedding
+          ? "向量模型已关闭：记忆召回自动降级为「content + keywords」词法检索，功能可用但语义理解较弱。"
+          : "重排模型已关闭：召回只按向量 / 词法相关性粗排，不调用精排。") +
+        "</div></div></div>"
+      );
+    }
+    if (mode === "source") {
+      return (
+        '<div class="field"><span class="field-label">提供商源（' +
+        esc(roleName) +
+        '）</span><select class="select" data-vector-role="' +
+        esc(role) +
+        '" data-vector-field="source_id">' +
+        sourceOptionsHtml(cfg.source_id, true, false, role) +
+        "</select>" +
+        (S.sources.filter(function (source) {
+          return str(source.provider_type) === role;
+        }).length === 0
+          ? '<div class="field-help warn-text">还没有 ' +
+            (isEmbedding ? "嵌入 (Embedding)" : "重排 (Rerank)") +
+            " 类型的提供商源：请先在 AstrBot WebUI → 服务提供商里添加。</div>"
+          : "") +
+        "</div>" +
+        '<div class="field mt-12"><span class="field-label">模型名</span>' +
+        '<div class="row"><input class="input grow" type="text" data-vector-role="' +
+        esc(role) +
+        '" data-vector-field="model" value="' +
+        esc(cfg.model) +
+        '" placeholder="' +
+        (isEmbedding ? "例如：BAAI/bge-m3" : "例如：BAAI/bge-reranker-v2-m3") +
+        '" />' +
+        '<button class="btn btn-outline btn-sm" type="button" data-action="pull-models" data-role-key="' +
+        esc(role) +
+        '">' +
+        icon("refresh", 13) +
+        "拉取</button></div>" +
+        '<div class="row wrap mt-4" data-role="candidates-' +
+        esc(role) +
+        '">' +
+        candidatesHtml(role) +
+        "</div>" +
+        '<div class="field-help">插件会按 (提供商源, 模型) 复用已加载实例，否则自建 ' +
+        esc(role) +
+        " 实例；修改后自动保存并即时生效。</div></div>"
+      );
+    }
+    var options = '<option value="">— 选择 AstrBot ' + esc(roleName) + " —</option>";
+    var matched = false;
+    vectorProviders(role).forEach(function (item) {
+      var label =
+        (item.id || "") +
+        (item.model ? " · " + item.model : "") +
+        (item.type ? " · " + item.type : "");
+      if (item.enable === false) label += "（未启用）";
+      if (String(cfg.provider_id) === String(item.id)) matched = true;
+      options +=
+        '<option value="' +
+        esc(item.id) +
+        '"' +
+        (String(cfg.provider_id) === String(item.id) ? " selected" : "") +
+        ">" +
+        esc(label) +
+        "</option>";
+    });
+    if (cfg.provider_id && !matched) {
+      options +=
+        '<option value="' +
+        esc(cfg.provider_id) +
+        '" selected>' +
+        esc(cfg.provider_id) +
+        "（提供商不存在）</option>";
+    }
+    return (
+      '<div class="field"><span class="field-label">AstrBot ' +
+      esc(roleName) +
+      ' 提供商</span><select class="select" data-vector-role="' +
+      esc(role) +
+      '" data-vector-field="provider_id">' +
+      options +
+      "</select>" +
+      '<div class="field-help">复用 AstrBot WebUI → 服务提供商里已启用的' +
+      (isEmbedding ? "嵌入" : "重排") +
+      "实例；关闭卡片即停用该角色。</div></div>"
+    );
+  }
+
+  function vectorCardHtml(role) {
+    var meta = roleMeta(role);
+    var info = statusInfo(role);
+    var cfg = vectorMeta(role);
+    var mode = str(cfg.mode) || "off";
+    return (
+      '<section class="card model-card" data-role-card="' +
+      role +
+      '"><div class="card-head">' +
+      '<div class="model-role"><span class="model-role-icon">' +
+      icon(meta.icon, 15) +
+      "</span>" +
+      '<div class="model-role-text"><span class="model-role-name">' +
+      esc(meta.name) +
+      '</span><span class="model-role-desc">' +
+      esc(meta.desc) +
+      "</span></div></div>" +
+      '<div class="model-status" data-tip="' +
+      esc(info.tip) +
+      '"><span class="status-light ' +
+      info.cls +
+      '"></span><span>' +
+      esc(info.text) +
+      "</span></div></div>" +
+      '<div class="card-body"><div class="field"><span class="field-label">模型来源模式</span>' +
+      '<div class="segmented" data-role="vector-mode-seg-' +
+      esc(role) +
+      '">' +
+      VECTOR_MODES.map(function (item) {
+        return (
+          '<button type="button" class="seg-btn' +
+          (mode === item.value ? " active" : "") +
+          '" data-action="set-vector-mode" data-vector-role="' +
+          esc(role) +
+          '" data-mode="' +
+          esc(item.value) +
+          '">' +
+          esc(item.label) +
+          "</button>"
+        );
+      }).join("") +
+      '</div><div class="field-help">关闭：降级 / 不调用；提供商源：按 (源, 模型) 自建或复用；AstrBot 提供商：直接复用平台已启用实例。</div></div>' +
+      '<div data-role="vector-detail-' +
+      esc(role) +
+      '" class="mt-12">' +
+      vectorDetailHtml(role) +
+      "</div>" +
+      '<div class="row mt-12"><button class="btn btn-outline btn-sm" type="button" data-action="test-role" data-role-key="' +
+      esc(role) +
+      '">' +
+      icon("zap", 13) +
+      "测试连接</button>" +
+      '<span class="hint">向量模型返回维度 / 重排模型返回打分，验证 RAG 链路。</span></div>' +
+      '<div data-role="test-wrap-' +
+      esc(role) +
+      '">' +
+      testResultHtml(role) +
+      "</div>" +
+      '<div class="field-help mt-8">' +
+      esc(meta.help) +
+      "</div></div></section>"
+    );
+  }
+
+  /* ------------------------------------------------------------------ *
    * TTS 卡片
    * ------------------------------------------------------------------ */
   function ttsDetailHtml() {
@@ -782,6 +1010,9 @@
       '<div class="model-grid">' +
       CHAT_ROLES.map(chatCardHtml).join("") +
       "</div>" +
+      '<div class="model-grid mt-12">' +
+      VECTOR_ROLES.map(vectorCardHtml).join("") +
+      "</div>" +
       ttsCardHtml()
     );
   }
@@ -804,7 +1035,7 @@
   /** 只刷新四张卡片右上角的状态灯，不重绘表单，避免打断输入。 */
   function refreshStatusBadges() {
     if (!S.container) return;
-    ["main", "decision", "vision", "tts"].forEach(function (role) {
+    ["main", "decision", "vision", "tts"].concat(VECTOR_ROLES).forEach(function (role) {
       var card = S.container.querySelector('[data-role-card="' + role + '"]');
       if (!card) return;
       var el = card.querySelector(".model-status");
@@ -886,6 +1117,19 @@
     });
   }
 
+  function refreshVectorDetail(role) {
+    if (!S.container) return;
+    var detail = S.container.querySelector('[data-role="vector-detail-' + role + '"]');
+    if (detail) detail.innerHTML = vectorDetailHtml(role);
+    var seg = S.container.querySelector('[data-role="vector-mode-seg-' + role + '"]');
+    if (seg) {
+      var mode = str(vectorMeta(role).mode) || "off";
+      seg.querySelectorAll(".seg-btn").forEach(function (btn) {
+        btn.classList.toggle("active", btn.getAttribute("data-mode") === mode);
+      });
+    }
+  }
+
   function refreshTtsDetail() {
     if (!S.container) return;
     var detail = S.container.querySelector('[data-role="tts-detail"]');
@@ -922,6 +1166,12 @@
     var configData = results[1] || {};
     S.sources = Array.isArray(sourcesData.sources) ? sourcesData.sources : [];
     S.ttsProviders = Array.isArray(sourcesData.tts_providers) ? sourcesData.tts_providers : [];
+    S.embeddingProviders = Array.isArray(sourcesData.embedding_providers)
+      ? sourcesData.embedding_providers
+      : [];
+    S.rerankProviders = Array.isArray(sourcesData.rerank_providers)
+      ? sourcesData.rerank_providers
+      : [];
     S.soulId = configData.soul_id != null && configData.soul_id !== "" ? String(configData.soul_id) : sid;
     S.cfg = normalizeConfig(configData.model_config);
     S.savedCfg = clone(S.cfg);
@@ -981,6 +1231,35 @@
         icon("alert", 13) +
         " 测试失败：" +
         esc((data && data.error) || "未知错误") +
+        "</div>";
+    } else if (role === "embedding") {
+      html =
+        '<div class="model-test-result is-ok">' +
+        icon("check", 13) +
+        " 向量连通 · 延迟 " +
+        esc(num(data.latency_ms, 0)) +
+        " ms · 维度 " +
+        esc(num(data.dimension, 0)) +
+        (data.provider_id ? " · " + esc(str(data.provider_id)) : "") +
+        (data.model ? " / " + esc(str(data.model)) : "") +
+        "</div>";
+    } else if (role === "rerank") {
+      var rerankRows = Array.isArray(data.results) ? data.results : [];
+      html =
+        '<div class="model-test-result is-ok">' +
+        icon("check", 13) +
+        " 重排连通 · 延迟 " +
+        esc(num(data.latency_ms, 0)) +
+        " ms" +
+        (rerankRows.length
+          ? '<div class="text-xs mt-4">' +
+            rerankRows
+              .map(function (row) {
+                return "#" + esc(num(row.index, 0)) + " → " + esc(num(row.score, 0).toFixed(4));
+              })
+              .join(" · ") +
+            "</div>"
+          : "") +
         "</div>";
     } else if (role === "tts") {
       var audio = str(data.audio_base64);
@@ -1106,6 +1385,14 @@
       if (wrap) wrap.innerHTML = candidatesHtml(role);
       refreshInheritPreviews();
       scheduleAutoSave();
+    } else if (action === "set-vector-mode") {
+      var vectorRole = actionEl.getAttribute("data-vector-role");
+      var vectorMode = actionEl.getAttribute("data-mode") || "off";
+      if (!vectorRole || !S.cfg[vectorRole]) return;
+      if (["off", "source", "provider"].indexOf(vectorMode) < 0) vectorMode = "off";
+      S.cfg[vectorRole].mode = vectorMode;
+      refreshVectorDetail(vectorRole);
+      scheduleAutoSave();
     } else if (action === "set-tts-mode") {
       var mode = actionEl.getAttribute("data-mode") || "off";
       if (!S.cfg.tts) S.cfg.tts = normalizeConfig({}).tts;
@@ -1152,6 +1439,20 @@
       scheduleAutoSave();
       return;
     }
+    var vectorRole = el.getAttribute("data-vector-role");
+    var vectorField = el.getAttribute("data-vector-field");
+    if (vectorRole && vectorField && S.cfg[vectorRole]) {
+      S.cfg[vectorRole][vectorField] = String(el.value == null ? "" : el.value);
+      if (vectorField === "source_id") {
+        S.candidates[vectorRole] = null;
+        var vectorCandidates = S.container
+          ? S.container.querySelector('[data-role="candidates-' + vectorRole + '"]')
+          : null;
+        if (vectorCandidates) vectorCandidates.innerHTML = candidatesHtml(vectorRole);
+      }
+      scheduleAutoSave();
+      return;
+    }
     var ttsField = el.getAttribute("data-tts-field");
     if (ttsField) {
       if (!S.cfg.tts) S.cfg.tts = normalizeConfig({}).tts;
@@ -1194,6 +1495,8 @@
     S.destroyed = false;
     S.sources = [];
     S.ttsProviders = [];
+    S.embeddingProviders = [];
+    S.rerankProviders = [];
     S.soulId = String((app && app.state && app.state.currentSoulId) || "");
     S.cfg = null;
     S.savedCfg = null;
@@ -1244,6 +1547,8 @@
     S.container = null;
     S.sources = [];
     S.ttsProviders = [];
+    S.embeddingProviders = [];
+    S.rerankProviders = [];
     S.soulId = "";
     S.cfg = null;
     S.savedCfg = null;

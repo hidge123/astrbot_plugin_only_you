@@ -167,6 +167,8 @@ from .prompts.templates import (
     ATMOSPHERE_EVAL_PROMPT,
     BUSY_TASK_COMPLETION_PROMPT,
     IDLE_ROAM_PROACTIVE_PROMPT,
+    PERSONA_RANDOM_TOPIC_PROMPT,
+    PERSONA_TOPIC_FACETS,
     PROACTIVE_CHAT_PROMPT,
     UNREAD_PRIVATE_CATCHUP_PROMPT,
 )
@@ -339,7 +341,7 @@ def _umo_in_platform_scope(
     "astrbot_plugin_only_you",
     "hidge123",
     "OnlyYou (只有你) —— 具备生命节律、三级记忆与赛博冲浪能力的高自治 AI 伴侣与数字网友插件",
-    "2.11.1",
+    "2.12.0",
     "https://github.com/hidge123/astrbot_plugin_only_you",
 )
 class OnlyYouPlugin(Star):
@@ -409,6 +411,14 @@ class OnlyYouPlugin(Star):
         self.memory_manager = MemoryManager(
             db=self.db, model_hub=self.model_hub, plugin_config=self.config
         )
+        # v2.12: the extraction prompt needs canonical names / aliases to keep one
+        # person as one memory subject (identity normalisation).
+        attach_relation = getattr(self.memory_manager, "attach_user_relation", None)
+        if callable(attach_relation):
+            try:
+                attach_relation(self.user_relation)
+            except Exception as exc:  # noqa: BLE001 - identity block is optional
+                logger.debug(f"[OnlyYou] attach user_relation failed: {exc}")
         self.session_buffer = SessionBuffer(plugin_config=self.config)
         self.context_budget = ContextBudgetManager(
             memory_manager=self.memory_manager,
@@ -466,6 +476,10 @@ class OnlyYouPlugin(Star):
         # recently mused memory ids per Soul (ring buffer, keeps the buckets rotating).
         self._mused_busy_keys: dict[str, set[str]] = {}
         self._mused_memory_ids: dict[str, list[int]] = {}
+        # v2.12 anti-repetition guard: the last 5 proactive messages per Soul, plus
+        # the per-Soul daily IDLE_ROAM counter ({"date": "YYYY-MM-DD", "count": n}).
+        self._recent_proactive_messages: dict[str, list[str]] = {}
+        self._idle_roam_daily_counts: dict[str, dict[str, Any]] = {}
 
     async def _ensure_initialized(self) -> None:
         if self._initialized:
@@ -527,6 +541,26 @@ class OnlyYouPlugin(Star):
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[OnlyYou] legacy user identity migration failed: {exc}")
+        # v2.12: fold legacy bare ``memories.user_id`` values (bare platform uid /
+        # old display name) into the canonical global identity. Only unambiguous
+        # owners are rewritten; ambiguous ones stay for manual repair.
+        memory_identity_migrator = (
+            getattr(identity_manager, "migrate_legacy_memory_user_ids", None)
+            if identity_manager is not None
+            else None
+        )
+        if callable(memory_identity_migrator):
+            try:
+                memory_identity_stats = await memory_identity_migrator()
+                if isinstance(memory_identity_stats, dict) and memory_identity_stats.get(
+                    "updated"
+                ):
+                    logger.info(
+                        "[OnlyYou] Folded %s legacy memory row(s) into canonical users.",
+                        memory_identity_stats.get("updated"),
+                    )
+            except Exception as exc:  # noqa: BLE001 - migration must not block startup
+                logger.warning(f"[OnlyYou] legacy memory user-id migration failed: {exc}")
         # v2.9: split the legacy global relationship columns into per-Soul
         # ``user_relations`` rows (identity stays in ``users``). Idempotent flag;
         # failure leaves the flag unset so the next startup retries.
@@ -721,6 +755,52 @@ class OnlyYouPlugin(Star):
                         ring + cleaned
                     )[-MAX_MUSED_MEMORY_IDS_PER_SOUL:]
 
+        def _recent_proactive() -> None:
+            mapping = getattr(self, "_recent_proactive_messages", None)
+            if not isinstance(mapping, dict):
+                mapping = {}
+                try:
+                    self._recent_proactive_messages = mapping
+                except Exception:  # pragma: no cover - defensive
+                    return
+            raw = snapshot.get("recent_proactive_messages")
+            if not isinstance(raw, dict):
+                return
+            for soul_key, values in raw.items():
+                if not isinstance(soul_key, str) or not soul_key:
+                    continue
+                if not isinstance(values, (list, tuple)):
+                    continue
+                cleaned = [
+                    str(item).strip() for item in values if isinstance(item, str) and item.strip()
+                ]
+                if cleaned:
+                    mapping[soul_key] = cleaned[-5:]
+
+        def _idle_roam_daily() -> None:
+            mapping = getattr(self, "_idle_roam_daily_counts", None)
+            if not isinstance(mapping, dict):
+                mapping = {}
+                try:
+                    self._idle_roam_daily_counts = mapping
+                except Exception:  # pragma: no cover - defensive
+                    return
+            raw = snapshot.get("idle_roam_daily_counts")
+            if not isinstance(raw, dict):
+                return
+            for soul_key, payload in raw.items():
+                if not isinstance(soul_key, str) or not soul_key:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                date_text = str(payload.get("date") or "").strip()
+                try:
+                    count_value = int(payload.get("count") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if date_text and count_value > 0:
+                    mapping[soul_key] = {"date": date_text, "count": count_value}
+
         def _known_l3() -> None:
             mapping = getattr(self, "_known_l3_umos", None)
             if not isinstance(mapping, dict):
@@ -757,6 +837,8 @@ class OnlyYouPlugin(Star):
             ):
                 _dict_of_float(attr, key)
             _known_l3()
+            _recent_proactive()
+            _idle_roam_daily()
         except Exception as exc:  # noqa: BLE001 - a dirty snapshot must not block boot
             logger.warning(f"[OnlyYou] restore runtime state failed: {exc}")
 
@@ -836,6 +918,42 @@ class OnlyYouPlugin(Star):
                     result[map_key] = value
             return result
 
+        def _recent_proactive_map() -> dict[str, list[str]]:
+            raw = getattr(self, "_recent_proactive_messages", None)
+            result: dict[str, list[str]] = {}
+            if not isinstance(raw, dict):
+                return result
+            for soul_key, values in raw.items():
+                if not isinstance(soul_key, str) or not soul_key:
+                    continue
+                if not isinstance(values, (list, tuple)):
+                    continue
+                cleaned = [
+                    str(item).strip() for item in values if isinstance(item, str) and item.strip()
+                ]
+                if cleaned:
+                    result[soul_key] = cleaned[-5:]
+            return result
+
+        def _idle_roam_daily_map() -> dict[str, dict[str, Any]]:
+            raw = getattr(self, "_idle_roam_daily_counts", None)
+            result: dict[str, dict[str, Any]] = {}
+            if not isinstance(raw, dict):
+                return result
+            for soul_key, payload in raw.items():
+                if not isinstance(soul_key, str) or not soul_key:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                date_text = str(payload.get("date") or "").strip()
+                try:
+                    count_value = int(payload.get("count") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if date_text and count_value > 0:
+                    result[soul_key] = {"date": date_text, "count": count_value}
+            return result
+
         store = getattr(self, "runtime_state_store", None)
         if store is None:
             return
@@ -850,6 +968,8 @@ class OnlyYouPlugin(Star):
                 "last_group_lurk_ts": _float_map("_last_group_lurk_ts"),
                 "last_private_catchup_ts": _float_map("_last_private_catchup_ts"),
                 "known_l3_umos": _string_map("_known_l3_umos"),
+                "recent_proactive_messages": _recent_proactive_map(),
+                "idle_roam_daily_counts": _idle_roam_daily_map(),
             }
             await store.save(snapshot)
         except Exception as exc:  # noqa: BLE001 - persistence is best-effort only
@@ -1114,11 +1234,11 @@ class OnlyYouPlugin(Star):
         try:
             minutes = int(
                 (self.config.get("roguelite_schedule_config") or {}).get(
-                    "idle_roam_cooldown_minutes", 45
+                    "idle_roam_cooldown_minutes", 120
                 )
             )
         except (TypeError, ValueError, AttributeError):
-            minutes = 45
+            minutes = 120
         return max(0, minutes) * 60
 
     def _roguelite_setting(self, key: str, default: Any) -> Any:
@@ -1483,6 +1603,191 @@ class OnlyYouPlugin(Star):
         count = 1 if len(pool) <= 1 else 2
         return random.sample(pool, k=count)
 
+    # ==================================================================
+    # v2.12 IDLE_ROAM 主动对话节奏 (冷却 / 概率 / 每日上限 / 人设话题)
+    # ==================================================================
+    def _idle_roam_trigger_probability(self) -> int:
+        """Chance (%) that a cooled-down IDLE_ROAM tick actually speaks."""
+        try:
+            value = int(self._roguelite_setting("idle_roam_trigger_probability", 35))
+        except (TypeError, ValueError):
+            value = 35
+        return max(0, min(100, value))
+
+    def _idle_roam_daily_max(self) -> int:
+        """Max proactive IDLE_ROAM messages per Soul per day (0 = unlimited)."""
+        try:
+            value = int(self._roguelite_setting("idle_roam_daily_max_count", 3))
+        except (TypeError, ValueError):
+            value = 3
+        return max(0, value)
+
+    def _idle_roam_persona_ratio(self) -> int:
+        """Share (%) of new-topic (PERSONA_TOPIC) vs memory-muse messages."""
+        try:
+            value = int(self._roguelite_setting("idle_roam_persona_topic_ratio", 70))
+        except (TypeError, ValueError):
+            value = 70
+        return max(0, min(100, value))
+
+    @staticmethod
+    def _idle_roam_day_key() -> str:
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def _idle_roam_daily_count(self, soul_id: str) -> int:
+        """Today's proactive IDLE_ROAM count of one Soul (reset at midnight)."""
+        mapping = getattr(self, "_idle_roam_daily_counts", None)
+        if not isinstance(mapping, dict):
+            return 0
+        entry = mapping.get(str(soul_id or ""))
+        if not isinstance(entry, dict):
+            return 0
+        if str(entry.get("date") or "") != self._idle_roam_day_key():
+            return 0
+        try:
+            return max(0, int(entry.get("count") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _record_idle_roam_sent(self, soul_id: str, message: str) -> None:
+        """Bookkeeping after a successful proactive send (cooldown/day/anti-repeat)."""
+        sid = str(soul_id or "")
+        if not sid:
+            return
+        try:
+            self._last_idle_roam_ts[sid] = time.time()
+        except Exception:  # noqa: BLE001 - bookkeeping must never break a send
+            pass
+        day = self._idle_roam_day_key()
+        counts = getattr(self, "_idle_roam_daily_counts", None)
+        if not isinstance(counts, dict):
+            counts = {}
+            try:
+                self._idle_roam_daily_counts = counts
+            except Exception:  # noqa: BLE001
+                counts = {}
+        entry = counts.get(sid)
+        if not isinstance(entry, dict) or str(entry.get("date") or "") != day:
+            entry = {"date": day, "count": 0}
+        try:
+            count = int(entry.get("count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        entry["count"] = count + 1
+        counts[sid] = entry
+        recent = getattr(self, "_recent_proactive_messages", None)
+        if not isinstance(recent, dict):
+            recent = {}
+            try:
+                self._recent_proactive_messages = recent
+            except Exception:  # noqa: BLE001
+                recent = {}
+        text = str(message or "").strip()
+        if text:
+            ring = list(recent.get(sid, []))
+            ring.append(text)
+            recent[sid] = ring[-5:]
+
+    def _anti_repeat_block(self, soul_id: str) -> str:
+        """Negative prompt block built from the last 5 proactive messages."""
+        sid = str(soul_id or "")
+        recent = getattr(self, "_recent_proactive_messages", None)
+        if not isinstance(recent, dict):
+            return (
+                "（暂无近期主动消息记录；仍不要用「在干嘛 / 干嘛呢 / 睡了吗」"
+                "这类烂大街开场。）"
+            )
+        messages = list(recent.get(sid, []))[-5:]
+        if not messages:
+            return (
+                "（暂无近期主动消息记录；仍不要用「在干嘛 / 干嘛呢 / 睡了吗」"
+                "这类烂大街开场。）"
+            )
+        lines = [
+            "你最近 5 条主动消息如下（**严禁**重复它们聊过的话题，**严禁**写近似的句式）："
+        ]
+        lines.extend(f"- {text}" for text in messages)
+        starters = sorted({text[0] for text in messages if text})
+        enders = sorted({text[-1] for text in messages if text})
+        if starters:
+            lines.append("本次**严禁**用这些字开头：" + "、".join(starters))
+        if enders:
+            lines.append("本次**严禁**用这些字结尾：" + "、".join(enders))
+        return "\n".join(lines)
+
+    def _unused_busy_results(self, soul_id: str, run: Any) -> tuple[list[str], list[str]]:
+        """Settled BUSY_TASK results not mused yet (each may be used exactly once)."""
+        mused = getattr(self, "_mused_busy_keys", None)
+        if not isinstance(mused, dict):
+            mused = {}
+            try:
+                self._mused_busy_keys = mused
+            except Exception:  # pragma: no cover - defensive
+                pass
+        used = mused.setdefault(str(soul_id or ""), set())
+        texts: list[str] = []
+        keys: list[str] = []
+        try:
+            slots = run.settled_busy_results()
+        except Exception:
+            slots = []
+        for slot in slots:
+            text = str(getattr(slot, "completion_result", "") or "").strip()
+            slot_key = str(getattr(slot, "slot_key", "") or "")
+            if not text or not slot_key or slot_key in used:
+                continue
+            texts.append(text)
+            keys.append(slot_key)
+            if len(texts) >= 2:
+                break
+        return texts, keys
+
+    async def _sample_muse_memory(self, soul_id: str) -> list[Any]:
+        """Pick exactly one memory that has not been mused for 72h (no fallback)."""
+        sampler = getattr(self.memory_manager, "sample_muse_memories", None)
+        if not callable(sampler):
+            return []
+        recent_ids = list((getattr(self, "_mused_memory_ids", None) or {}).get(soul_id, []))
+        try:
+            sampled = await sampler(soul_id=soul_id, exclude_ids=recent_ids, pick=3)
+        except TypeError:
+            try:
+                sampled = await sampler(soul_id)
+            except Exception as exc:  # noqa: BLE001 - never break the heartbeat
+                logger.warning(f"[OnlyYou] sample_muse_memories failed: {exc}")
+                return []
+        except Exception as exc:  # noqa: BLE001 - never break the heartbeat
+            logger.warning(f"[OnlyYou] sample_muse_memories failed: {exc}")
+            return []
+        # ``exclude_ids`` is the persisted rotation ring; additionally a memory that
+        # was actually talked about (recalled or mused) within 72h is skipped, while
+        # a brand-new memory (created moments ago, never recalled) is still eligible.
+        now = time.time()
+        excluded = set()
+        for value in recent_ids or []:
+            try:
+                excluded.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        for item in sampled or []:
+            try:
+                memory_id = int(getattr(item, "id", 0) or 0)
+                created_at = int(getattr(item, "created_at", 0) or 0)
+                last_accessed = int(getattr(item, "last_accessed_at", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if memory_id and memory_id in excluded:
+                continue
+            # A later access than creation means it was recalled/mused -> 72h cooldown.
+            if (
+                created_at
+                and last_accessed > created_at + 60
+                and (now - last_accessed) < 72 * 3600
+            ):
+                continue
+            return [item]
+        return []
+
     async def _run_idle_roam_action(
         self,
         soul: Any,
@@ -1491,27 +1796,44 @@ class OnlyYouPlugin(Star):
         allowed_platforms: Any = None,
         blocked_platforms: Any = None,
     ) -> bool:
-        """Execute one ``IDLE_ROAM`` proactive action (GROUP_LURK or MEMORY_MUSE).
+        """Execute one ``IDLE_ROAM`` proactive action (v2.12).
 
-        Branch A lurk: pick a known group with recent user messages, feed its sliding
-        window to ``IDLE_ROAM_PROACTIVE_PROMPT`` and bubble up there or DM ★L3.
-        Branch B muse (v2.8): consume today's settled BUSY_TASK results **once**; when
-        exhausted, rotate memories sampled independently across the T1/T2/T3 buckets
-        and refresh only their ``last_accessed_at`` after a successful send.
+        Order of gates (contract §4):
+
+        1. cooldown (default 120min) and per-day cap (default 3);
+        2. branch A ``GROUP_LURK`` — reply to a group unread backlog when the
+           atmosphere decision says REPLY (consumed even on IGNORE);
+        3. trigger probability gate (default 35%) — a cooled-down tick no longer
+           speaks mechanically every time;
+        4. weighted mode pick (default 70% ``PERSONA_TOPIC`` / 30% ``MEMORY_MUSE``);
+           an empty memory pool **falls through to PERSONA_TOPIC**, it never falls
+           back to the full memory list (the old re-reading bug);
+        5. anti-repetition guard built from the last 5 proactive messages.
+
         Returns True only when a proactive message was actually sent.
         """
         try:
             now = time.time()
+            soul_id = str(getattr(soul, "soul_id", "") or "")
             cooldown = self._idle_roam_cooldown_seconds()
             if (
                 cooldown > 0
-                and (now - self._last_idle_roam_ts.get(soul.soul_id, 0.0)) < cooldown
+                and (now - self._last_idle_roam_ts.get(soul_id, 0.0)) < cooldown
             ):
                 return False
 
-            soul_id = str(getattr(soul, "soul_id", "") or "")
+            daily_max = self._idle_roam_daily_max()
+            sent_today = self._idle_roam_daily_count(soul_id)
+            if daily_max > 0 and sent_today >= daily_max:
+                logger.info(
+                    "[OnlyYou] IDLE_ROAM skipped: daily proactive limit reached "
+                    f"({sent_today}/{daily_max}) for soul={soul_id}"
+                )
+                return False
+
             slot_title = str(getattr(current_slot, "title", "") or "发呆闲逛")
             current_time = datetime.now().strftime("%H:%M")
+            anti_repeat = self._anti_repeat_block(soul_id)
 
             # ---- 分支 A：翻群记录吃瓜 (GROUP_LURK，先决策后回复) ----
             lurked = await self._pick_group_unread_candidate(
@@ -1537,6 +1859,7 @@ class OnlyYouPlugin(Star):
                             f"最近群聊上下文：\n{transcript}"
                         ),
                         current_time=current_time,
+                        anti_repeat_block=anti_repeat,
                     )
                     data = await _hub_call_json(
                         self.model_hub,
@@ -1566,18 +1889,17 @@ class OnlyYouPlugin(Star):
                             session_buffer=self.session_buffer,
                             soul_name=soul.name,
                             audio_path=audio_path,
+                            on_overflow_callback=getattr(self, "_on_window_overflow", None),
                         )
                         if sent:
-                            self._last_idle_roam_ts[soul.soul_id] = now
                             self._last_group_lurk_ts[umo] = now
+                            self._record_idle_roam_sent(soul_id, message)
                             self.session_buffer.ack_unread(umo, seqs)
                             logger.info(
                                 "[OnlyYou] IDLE_ROAM(GROUP_LURK) proactive message sent "
                                 f"to {target_umo} (consumed {len(batch)} unread)"
                             )
-                            persister = getattr(
-                                self, "_persist_runtime_state", None
-                            )
+                            persister = getattr(self, "_persist_runtime_state", None)
                             if callable(persister):
                                 try:
                                     await persister()
@@ -1619,77 +1941,69 @@ class OnlyYouPlugin(Star):
                                 f"[OnlyYou] persist runtime state failed: {exc}"
                             )
 
-            # ---- 分支 B：发呆记忆联想 (MEMORY_MUSE) ----
-            # v2.8: each settled BUSY_TASK result is mused at most once per Soul.
-            mused_busy = getattr(self, "_mused_busy_keys", None)
-            if not isinstance(mused_busy, dict):
-                mused_busy = {}
-                try:
-                    self._mused_busy_keys = mused_busy
-                except Exception:
-                    pass
-            used_keys = mused_busy.setdefault(soul.soul_id, set())
-            busy_picks: list[tuple[str, str]] = []
-            try:
-                for settled_slot in run.settled_busy_results():
-                    text = str(getattr(settled_slot, "completion_result", "") or "").strip()
-                    slot_key = str(getattr(settled_slot, "slot_key", "") or "")
-                    if not text or not slot_key or slot_key in used_keys:
-                        continue
-                    busy_picks.append((slot_key, text))
-            except Exception:
-                busy_picks = []
-            busy_picks = busy_picks[:2]
-
-            picked_memories: list[Any] = []
-            use_busy = bool(busy_picks)
-            if use_busy:
-                context_material = "\n".join(
-                    f"- 【今日繁忙成果】{text}" for _key, text in busy_picks
+            # ---- 概率门闸：冷却到点也不再机械必发 ----
+            probability = self._idle_roam_trigger_probability()
+            if probability <= 0 or random.randint(1, 100) > probability:
+                logger.info(
+                    "[OnlyYou] IDLE_ROAM skipped: trigger probability not hit "
+                    f"({probability}%)"
                 )
-            else:
-                sampler = getattr(self.memory_manager, "sample_muse_memories", None)
-                if callable(sampler):
-                    recent_ids = list(
-                        (getattr(self, "_mused_memory_ids", None) or {}).get(soul.soul_id, [])
-                    )
-                    try:
-                        picked_memories = await sampler(
-                            soul_id=soul.soul_id, exclude_ids=recent_ids, pick=2
-                        )
-                    except TypeError:
-                        picked_memories = await sampler(soul.soul_id)
-                    except Exception as exc:  # noqa: BLE001 - never break the heartbeat
-                        logger.warning(f"[OnlyYou] sample_muse_memories failed: {exc}")
-                        picked_memories = []
+                return False
+
+            # ---- 按权重选择话题模式（人设新话题 vs 旧记忆联想） ----
+            persona_ratio = self._idle_roam_persona_ratio()
+            use_persona = random.randint(1, 100) <= persona_ratio
+            picked_memories: list[Any] = []
+            if not use_persona:
+                picked_memories = await self._sample_muse_memory(soul_id)
                 if not picked_memories:
-                    try:
-                        fallback_pool = await self.memory_manager.list_memories(
-                            soul_id=soul.soul_id, limit=10
-                        )
-                    except Exception:
-                        fallback_pool = []
-                    picked_memories = self._pick_memory_muse_material(run, fallback_pool)
-                if not picked_memories:
+                    # 绝不回退到 list_memories() 全量硬抽（旧版复读 bug 的根因）。
                     logger.info(
-                        "[OnlyYou] IDLE_ROAM skipped: no active group, no busy result "
-                        "and no memory"
+                        "[OnlyYou] IDLE_ROAM: no cooled-down memory, "
+                        "falling back to PERSONA_TOPIC"
                     )
-                    return False
+                    use_persona = True
+
+            busy_texts: list[str] = []
+            busy_keys: list[str] = []
+            if use_persona:
+                inspire = random.choice(PERSONA_TOPIC_FACETS).format(
+                    current_slot_title=slot_title
+                )
+                busy_texts, busy_keys = self._unused_busy_results(soul_id, run)
+                prompt = PERSONA_RANDOM_TOPIC_PROMPT.format(
+                    soul_name=soul.name,
+                    soul_archetype=soul.archetype or "有生活气息的普通网友",
+                    speaking_style=soul.speaking_style or "自然口语短句",
+                    current_time=current_time,
+                    current_slot_title=slot_title,
+                    soul_summary=self._render_soul_summary(soul) or "（角色卡暂无摘要）",
+                    busy_results_text=(
+                        "\n".join(f"- {text}" for text in busy_texts)
+                        or "今天暂时还没忙完什么"
+                    ),
+                    inspiration_facet=inspire,
+                    anti_repeat_block=anti_repeat,
+                )
+                roam_mode = "PERSONA_TOPIC"
+            else:
                 context_material = "\n".join(
-                    f"- 【记忆 · {describe_time_anchor(getattr(item, 'created_at', 0), now) or '时间未知'}】"
+                    f"- 【记忆 · "
+                    f"{describe_time_anchor(getattr(item, 'created_at', 0), now) or '时间未知'}】"
                     f"{getattr(item, 'content', '')}"
                     for item in picked_memories
                 )
+                prompt = IDLE_ROAM_PROACTIVE_PROMPT.format(
+                    soul_name=soul.name,
+                    speaking_style=soul.speaking_style or "自然口语短句",
+                    current_slot_title=slot_title,
+                    roam_mode="MEMORY_MUSE",
+                    context_material=context_material,
+                    current_time=current_time,
+                    anti_repeat_block=anti_repeat,
+                )
+                roam_mode = "MEMORY_MUSE"
 
-            prompt = IDLE_ROAM_PROACTIVE_PROMPT.format(
-                soul_name=soul.name,
-                speaking_style=soul.speaking_style or "自然口语短句",
-                current_slot_title=slot_title,
-                roam_mode="MEMORY_MUSE",
-                context_material=context_material,
-                current_time=current_time,
-            )
             data = await _hub_call_json(
                 self.model_hub, prompt, role="decision", default=None, soul=soul
             )
@@ -1701,63 +2015,70 @@ class OnlyYouPlugin(Star):
                 soul, target_umo
             ):
                 logger.info(
-                    "[OnlyYou] IDLE_ROAM(MEMORY_MUSE) skipped: proactive disabled for "
+                    f"[OnlyYou] IDLE_ROAM({roam_mode}) skipped: proactive disabled for "
                     f"target {target_umo}"
                 )
                 target_umo = ""
-            if target_umo and message:
-                audio_path = await self._maybe_synthesize_proactive(message, soul)
-                sent = await self.platform_bridge.send_proactive_message(
-                    umo=target_umo,
-                    text=message,
-                    session_buffer=self.session_buffer,
-                    soul_name=soul.name,
-                    audio_path=audio_path,
+            if not (target_umo and message):
+                logger.info(
+                    f"[OnlyYou] IDLE_ROAM({roam_mode}) skipped: no target or empty message"
                 )
-                if sent:
-                    self._last_idle_roam_ts[soul.soul_id] = now
-                    if use_busy:
-                        for slot_key, _text in busy_picks:
-                            used_keys.add(slot_key)
-                    else:
-                        memory_ids = [
-                            int(getattr(item, "id", 0) or 0) for item in picked_memories
-                        ]
-                        memory_ids = [mid for mid in memory_ids if mid > 0]
-                        toucher = getattr(
-                            self.memory_manager, "touch_memories_for_muse", None
-                        )
-                        if memory_ids and callable(toucher):
-                            try:
-                                await toucher(memory_ids)
-                            except Exception as exc:  # noqa: BLE001
-                                logger.debug(f"[OnlyYou] touch muse memories failed: {exc}")
-                        muse_ids = getattr(self, "_mused_memory_ids", None)
-                        if not isinstance(muse_ids, dict):
-                            muse_ids = {}
-                            try:
-                                self._mused_memory_ids = muse_ids
-                            except Exception:
-                                pass
-                        ring = list(muse_ids.get(soul.soul_id, [])) + memory_ids
-                        muse_ids[soul.soul_id] = ring[-30:]
-                    logger.info(
-                        "[OnlyYou] IDLE_ROAM(MEMORY_MUSE) proactive message sent "
-                        f"to {target_umo} (source={'BUSY_RESULT' if use_busy else 'MEMORY'})"
-                    )
-                    persister = getattr(self, "_persist_runtime_state", None)
-                    if callable(persister):
-                        try:
-                            await persister()
-                        except Exception as exc:  # noqa: BLE001 - best-effort
-                            logger.debug(
-                                f"[OnlyYou] persist runtime state failed: {exc}"
-                            )
-                    return True
-            logger.info(
-                "[OnlyYou] IDLE_ROAM(MEMORY_MUSE) skipped: no target or empty message"
+                return False
+
+            audio_path = await self._maybe_synthesize_proactive(message, soul)
+            sent = await self.platform_bridge.send_proactive_message(
+                umo=target_umo,
+                text=message,
+                session_buffer=self.session_buffer,
+                soul_name=soul.name,
+                audio_path=audio_path,
+                on_overflow_callback=getattr(self, "_on_window_overflow", None),
             )
-            return False
+            if not sent:
+                logger.info(
+                    f"[OnlyYou] IDLE_ROAM({roam_mode}) send failed; nothing consumed"
+                )
+                return False
+
+            self._record_idle_roam_sent(soul_id, message)
+            if busy_keys:
+                mused = getattr(self, "_mused_busy_keys", None)
+                if isinstance(mused, dict):
+                    mused.setdefault(soul_id, set()).update(busy_keys)
+            if picked_memories:
+                memory_ids = [
+                    int(getattr(item, "id", 0) or 0) for item in picked_memories
+                ]
+                memory_ids = [mid for mid in memory_ids if mid > 0]
+                toucher = getattr(self.memory_manager, "touch_memories_for_muse", None)
+                if memory_ids and callable(toucher):
+                    try:
+                        await toucher(memory_ids)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug(f"[OnlyYou] touch muse memories failed: {exc}")
+                muse_ids = getattr(self, "_mused_memory_ids", None)
+                if not isinstance(muse_ids, dict):
+                    muse_ids = {}
+                    try:
+                        self._mused_memory_ids = muse_ids
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+                ring = list(muse_ids.get(soul_id, [])) + memory_ids
+                muse_ids[soul_id] = ring[-30:]
+
+            logger.info(
+                f"[OnlyYou] IDLE_ROAM({roam_mode}) proactive message sent to "
+                f"{target_umo} (day {sent_today + 1}"
+                + (f"/{daily_max}" if daily_max > 0 else "")
+                + ")"
+            )
+            persister = getattr(self, "_persist_runtime_state", None)
+            if callable(persister):
+                try:
+                    await persister()
+                except Exception as exc:  # noqa: BLE001 - best-effort
+                    logger.debug(f"[OnlyYou] persist runtime state failed: {exc}")
+            return True
         except Exception as exc:  # noqa: BLE001 - never break the heartbeat loop
             logger.warning(f"[OnlyYou] _run_idle_roam_action failed: {exc}")
             return False
@@ -1877,6 +2198,7 @@ class OnlyYouPlugin(Star):
                     session_buffer=self.session_buffer,
                     soul_name=getattr(soul, "name", "Bot") or "Bot",
                     audio_path=audio_path,
+                    on_overflow_callback=getattr(self, "_on_window_overflow", None),
                 )
             except Exception as exc:  # noqa: BLE001 - keep unread for a later retry
                 logger.warning(f"[OnlyYou] private unread catch-up send failed: {exc}")
@@ -2148,6 +2470,7 @@ class OnlyYouPlugin(Star):
                 session_buffer=self.session_buffer,
                 soul_name=soul.name,
                 audio_path=audio_path,
+                on_overflow_callback=getattr(self, "_on_window_overflow", None),
             )
             if sent:
                 shared_ids.add(video_id)
@@ -2214,8 +2537,13 @@ class OnlyYouPlugin(Star):
             except Exception as e:
                 logger.warning(f"[OnlyYou] Daily Forgetting GC error: {e}")
 
-    async def _on_window_overflow(self, umo: str, transcript: str) -> None:
-        """Callback triggered when `SessionBuffer` evicts `extract_every_n_messages` messages."""
+    async def _on_window_overflow(self, umo: str, transcript: str) -> bool:
+        """Callback triggered when `SessionBuffer` evicts `extract_every_n_messages` messages.
+
+        v2.12: returns ``False`` when the extraction LLM call / JSON parse failed so
+        ``SessionBuffer`` can keep exactly one retry batch instead of silently losing
+        the evicted messages.
+        """
         soul = await self.soul_manager.resolve_soul(umo=umo, allow_llm_seed=False)
         await self.memory_manager.extract_memories_from_transcript(
             soul_id=soul.soul_id,
@@ -2223,6 +2551,7 @@ class OnlyYouPlugin(Star):
             transcript_text=transcript,
             umo=umo,
         )
+        return not bool(getattr(self.memory_manager, "last_extraction_failed", False))
 
     @staticmethod
     def _render_soul_summary(soul: Any) -> str:
@@ -2405,7 +2734,7 @@ class OnlyYouPlugin(Star):
         _, is_direct_mention, buffered_message = self.atmosphere_reader.record_message(
             event=event,
             user=user,
-            on_overflow_callback=self._on_window_overflow,
+            on_overflow_callback=getattr(self, "_on_window_overflow", None),
         )
 
         is_private = self.atmosphere_reader.is_private_event(event)
@@ -2542,8 +2871,47 @@ class OnlyYouPlugin(Star):
             content=reply_text,
             is_proactive=False,
             soul_name=soul.name,
-            on_overflow_callback=self._on_window_overflow,
+            on_overflow_callback=getattr(self, "_on_window_overflow", None),
         )
+
+        # v2.12: affinity is settled **only** for a turn the bot really answered
+        # (cooldown + daily cap + AND promotion inside the relation manager).
+        try:
+            reply_user = await self.user_relation.resolve_user(
+                event, soul_id=soul.soul_id
+            )
+            is_private = self.atmosphere_reader.is_private_event(event)
+            is_direct = bool(getattr(event, "is_at_or_wake_command", False)) or is_private
+            settle = getattr(
+                self.user_relation, "record_effective_interaction", None
+            )
+            if callable(settle):
+                before = (
+                    int(getattr(reply_user, "interaction_count", 0) or 0),
+                    round(float(getattr(reply_user, "affinity", 0.0) or 0.0), 2),
+                )
+                await settle(
+                    soul.soul_id,
+                    reply_user,
+                    is_direct_mention=is_direct,
+                    is_private=is_private,
+                )
+                after = (
+                    int(getattr(reply_user, "interaction_count", 0) or 0),
+                    round(float(getattr(reply_user, "affinity", 0.0) or 0.0), 2),
+                )
+                if after != before:
+                    logger.info(
+                        "[OnlyYou] Effective interaction settled for %s: "
+                        "interactions %s -> %s, affinity %s -> %s",
+                        getattr(reply_user, "global_uid", "?"),
+                        before[0],
+                        after[0],
+                        before[1],
+                        after[1],
+                    )
+        except Exception as exc:  # noqa: BLE001 - settlement must never break replies
+            logger.warning(f"[OnlyYou] settle effective interaction failed: {exc}")
 
         # Consume the one-shot mutation monologue after the first post-mutation reply.
         run, current_slot, _ = await self.deck_engine.get_current_and_next_slot(
@@ -3015,6 +3383,13 @@ class OnlyYouPlugin(Star):
                 yield event.plain_result(f"✅ 已写入记忆 ID={mid} (Tier={mtier}, 重要度={imp})：{content[:50]}")
                 return
 
+            # v2.12: reclaim overdue T1 rows before showing the list.
+            cleaner = getattr(self.memory_manager, "cleanup_tier1", None)
+            if callable(cleaner):
+                try:
+                    await cleaner()
+                except Exception as exc:  # noqa: BLE001 - list must still render
+                    logger.debug(f"[OnlyYou] list-time T1 cleanup failed: {exc}")
             mems = await self.memory_manager.retrieve_candidates(
                 soul_id=soul.soul_id, user_id=user.global_uid, limit=15
             )
@@ -3027,10 +3402,13 @@ class OnlyYouPlugin(Star):
                 # v2.10: show the memory formation time (its relative-time anchor).
                 formed = describe_time_anchor(m.created_at)
                 formed_text = f"|形成:{formed}" if formed else ""
+                # v2.12: four-value classification (and archive marker).
+                type_text = f"|{m.to_dict().get('memory_type_label') or '短期情节'}"
+                archived_text = "|已归档" if m.is_superseded else ""
                 lines.append(
-                    f"- #{m.id} [{t_label}|重要度:{m.importance}|活力:{m.vitality:.0f}"
-                    f"|召回:{m.access_count}{formed_text}] "
-                    f"{m.content} (关键词:{m.keywords})"
+                    f"- #{m.id} [{t_label}{type_text}|重要度:{m.importance}"
+                    f"|活力:{m.vitality:.0f}|召回:{m.access_count}"
+                    f"{formed_text}{archived_text}] {m.content} (关键词:{m.keywords})"
                 )
             yield event.plain_result("\n".join(lines))
             return

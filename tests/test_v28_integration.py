@@ -190,7 +190,7 @@ class TestSoulJsonFileLifecycle(V28IntegrationBase):
         assert isinstance(data["updated_at"], int) and data["updated_at"] > 0
         assert data["card"]["identity"]["name"] == "酒狐"
         # the model config is always stored in its normalized four-role shape
-        assert set(data["model_config"]) == {"main", "decision", "vision", "tts"}
+        assert set(data["model_config"]) == {"main", "decision", "vision", "tts", "embedding", "rerank"}
 
         # SQLite keeps the index row in sync
         rows = await self.soul_rows()
@@ -622,7 +622,7 @@ class TestModelHubPerSoul(V28IntegrationBase):
 
         status_a = await self.hub.get_status("soul_a")
         status_b = await self.hub.get_status("soul_b")
-        assert set(status_a) >= {"main", "decision", "vision", "tts"}
+        assert set(status_a) >= {"main", "decision", "vision", "tts", "embedding", "rerank"}
         assert status_a["main"]["configured"] is True
         assert status_b["main"]["configured"] is False
 
@@ -640,7 +640,7 @@ class TestModelHubPerSoul(V28IntegrationBase):
         await legacy_hub.save_model_config(MAIN_A)
         stored = await self.db.get_setting("model_config", None)
         assert stored is not None and stored["main"] == MAIN_A["main"]
-        assert set(stored) == {"main", "decision", "vision", "tts"}
+        assert set(stored) == {"main", "decision", "vision", "tts", "embedding", "rerank"}
 
         main_id = await legacy_hub.get_main_provider_id()
         assert main_id == "onlyyou::main"
@@ -945,7 +945,8 @@ class RecordingProactiveBridge:
         self.ok = True
 
     async def send_proactive_message(
-        self, umo, text, session_buffer=None, soul_name="Bot", audio_path=None
+        self, umo, text, session_buffer=None, soul_name="Bot", audio_path=None,
+        on_overflow_callback=None
     ):
         self.sent.append(
             {

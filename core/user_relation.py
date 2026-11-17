@@ -39,6 +39,9 @@ _GROUP_NOTES_MAX_CHARS = 500
 #: One-shot migration flag for legacy bare ``global_uid`` platform ids (v2.8.4).
 LEGACY_USER_IDENTITY_MIGRATED_KEY = "legacy_user_identity_migrated_v2"
 
+#: v2.12: one-shot flag folding legacy bare ``memories.user_id`` values.
+LEGACY_MEMORY_USER_IDS_KEY = "legacy_memory_user_ids_migrated_v1"
+
 
 def split_platform_account(value: Any) -> Optional[tuple[str, str]]:
     """Parse ``"platform_id:native_uid"`` -> ``(platform_id, native_uid)``.
@@ -165,6 +168,39 @@ def _dedupe_keep_order(values: Any) -> list[str]:
     return result
 
 
+#: v2.12: 曾用名列表上限（防止群名片频繁改名把身份行撑爆）。
+MAX_ALIASES = 10
+MAX_ALIAS_CHARS = 40
+
+
+def _clean_alias(value: Any) -> str:
+    """Validate one alias: trimmed, <=40 chars, not a platform-account string."""
+    text = str(value or "").strip()
+    if not text or len(text) > MAX_ALIAS_CHARS:
+        return ""
+    # Platform accounts ("qq bot:123") are handled by ``platform_ids``, not aliases.
+    if ":" in text:
+        return ""
+    if text.lower() in ("anonymous", "群友", "null", "none", "bot"):
+        return ""
+    return text
+
+
+def _normalize_aliases(
+    values: Any, *, canonical: str = "", exclude: Any = ()
+) -> list[str]:
+    """Dedupe / cap / filter an alias list (newest last, FIFO capped)."""
+    blocked = {str(item or "").strip() for item in (exclude or []) if str(item or "").strip()}
+    blocked.add(str(canonical or "").strip())
+    aliases: list[str] = []
+    for value in list(values or []):
+        text = _clean_alias(value)
+        if not text or text in aliases or text in blocked:
+            continue
+        aliases.append(text)
+    return aliases[-MAX_ALIASES:]
+
+
 @dataclass
 class UserProfile:
     """User relationship profile across platforms."""
@@ -185,6 +221,13 @@ class UserProfile:
     # fields (tier/affinity/interaction/nickname/attitude/proactive_enabled) belong to
     # this Soul.
     soul_id: str = ""
+    # v2.12: 曾用名 / 多端昵称（同一用户在不同群名片、不同平台的历史名字）。
+    aliases: list[str] = field(default_factory=list)
+
+    @property
+    def canonical_name(self) -> str:
+        """Stable display name: character nickname -> display name -> uid."""
+        return (self.nickname or self.display_name or self.global_uid or "").strip()
 
     def to_dict(self) -> dict[str, Any]:
         accounts: list[dict[str, Any]] = []
@@ -229,6 +272,9 @@ class UserProfile:
             "platform_accounts": accounts,
             "legacy_platform_ids": legacy_ids,
             "has_legacy_platform_ids": bool(legacy_ids),
+            # v2.12: 身份归一（同一用户的多昵称 / 多账号）。
+            "aliases": list(self.aliases),
+            "canonical_name": self.canonical_name,
             "soul_id": self.soul_id,
         }
 
@@ -297,8 +343,14 @@ class UserRelationManager:
     - ○ L1_NORMAL (1): 普通用户（群友）
     """
 
-    AUTO_PROMOTE_INTERACTION_THRESHOLD = 12
-    AUTO_PROMOTE_AFFINITY_THRESHOLD = 15.0
+    AUTO_PROMOTE_INTERACTION_THRESHOLD = 40
+    AUTO_PROMOTE_AFFINITY_THRESHOLD = 30.0
+    #: v2.12 affinity curve: one settlement per user per cooldown window.
+    AFFINITY_COOLDOWN_SECONDS = 180
+    AFFINITY_GAIN_GROUP = 0.4
+    AFFINITY_GAIN_DIRECT = 0.6
+    AFFINITY_DAILY_CAP = 5.0
+    AFFINITY_SLOWDOWN_THRESHOLD = 60.0
 
     def __init__(
         self,
@@ -315,10 +367,159 @@ class UserRelationManager:
         # ---- v2.8 group profiles (plugin_settings["group_profiles"]) ----
         self._groups_cache: Optional[dict[str, GroupProfile]] = None
         self._group_persist_ts: dict[str, float] = {}
+        # ---- v2.12 affinity settlement bookkeeping (in-memory, per process) ----
+        self._last_affinity_ts: dict[tuple[str, str], float] = {}
+        self._daily_affinity: dict[tuple[str, str, str], float] = {}
 
     @property
     def cfg(self) -> dict[str, Any]:
         return self.plugin_config.get("relationship_config", {}) or {}
+
+    # ------------------------------------------------------------------
+    # v2.12: slower, effective-reply-only affinity curve
+    # ------------------------------------------------------------------
+    @property
+    def auto_promote_min_interactions(self) -> int:
+        """L1 -> L2 minimum effective interactions (default 40)."""
+        try:
+            return max(
+                1,
+                int(
+                    self.cfg.get(
+                        "auto_promote_l2_min_interactions",
+                        self.AUTO_PROMOTE_INTERACTION_THRESHOLD,
+                    )
+                ),
+            )
+        except (TypeError, ValueError):
+            return self.AUTO_PROMOTE_INTERACTION_THRESHOLD
+
+    @property
+    def auto_promote_min_affinity(self) -> float:
+        """L1 -> L2 minimum affinity (default 30.0)."""
+        try:
+            return max(
+                0.0,
+                float(
+                    self.cfg.get(
+                        "auto_promote_l2_min_affinity",
+                        self.AUTO_PROMOTE_AFFINITY_THRESHOLD,
+                    )
+                ),
+            )
+        except (TypeError, ValueError):
+            return self.AUTO_PROMOTE_AFFINITY_THRESHOLD
+
+    @property
+    def affinity_cooldown_seconds(self) -> float:
+        """Per-user settlement cooldown (default 180s; 0 disables it)."""
+        try:
+            return max(
+                0.0,
+                float(self.cfg.get("affinity_cooldown_seconds", self.AFFINITY_COOLDOWN_SECONDS)),
+            )
+        except (TypeError, ValueError):
+            return float(self.AFFINITY_COOLDOWN_SECONDS)
+
+    @property
+    def affinity_daily_cap(self) -> float:
+        """Per-user daily affinity gain cap (default +5.0; 0 disables it)."""
+        try:
+            return max(
+                0.0,
+                float(self.cfg.get("affinity_daily_cap", self.AFFINITY_DAILY_CAP)),
+            )
+        except (TypeError, ValueError):
+            return float(self.AFFINITY_DAILY_CAP)
+
+    def _should_auto_promote(self, profile: UserProfile) -> bool:
+        """L1 -> L2 requires **both** thresholds (AND, never OR) — v2.12."""
+        if profile is None or profile.tier != UserTier.L1_NORMAL:
+            return False
+        if not bool(self.cfg.get("enable_auto_promotion_l2", True)):
+            return False
+        try:
+            interactions = int(profile.interaction_count)
+            affinity = float(profile.affinity)
+        except (TypeError, ValueError):
+            return False
+        return (
+            interactions >= self.auto_promote_min_interactions
+            and affinity >= self.auto_promote_min_affinity
+        )
+
+    async def record_effective_interaction(
+        self,
+        soul_id: Optional[str],
+        user: Optional[UserProfile],
+        is_direct_mention: bool = False,
+        is_private: bool = False,
+        now: Optional[float] = None,
+    ) -> Optional[UserProfile]:
+        """Settle affinity **only for a turn the bot really answered** (v2.12).
+
+        Called from ``on_llm_response_hook`` after a reply was generated. Rules:
+
+        * per-user cooldown (default 180s): burst messages count once;
+        * small gains (``+0.4`` group / ``+0.6`` direct / private), halved above
+          ``AFFINITY_SLOWDOWN_THRESHOLD`` (60);
+        * hard daily cap (``+5.0``) so one afternoon of spam cannot max affinity;
+        * L1 -> L2 promotion requires interactions **AND** affinity thresholds.
+        """
+        if user is None:
+            return None
+        uid = str(getattr(user, "global_uid", "") or "").strip()
+        if not uid:
+            return None
+        soul = self._soul_key(soul_id)
+        now_ts = float(now if now is not None else time.time())
+        key = (soul, uid)
+
+        cooldown = self.affinity_cooldown_seconds
+        last_settled = float(self._last_affinity_ts.get(key, 0.0) or 0.0)
+        if cooldown > 0 and last_settled and (now_ts - last_settled) < cooldown:
+            return user
+
+        day = time.strftime("%Y-%m-%d", time.localtime(now_ts))
+        daily_key = (soul, uid, day)
+        used_today = float(self._daily_affinity.get(daily_key, 0.0) or 0.0)
+        cap = self.affinity_daily_cap
+        if cap > 0 and used_today >= cap:
+            return user
+
+        gain = (
+            self.AFFINITY_GAIN_DIRECT
+            if (is_direct_mention or is_private)
+            else self.AFFINITY_GAIN_GROUP
+        )
+        try:
+            current_affinity = float(user.affinity)
+        except (TypeError, ValueError):
+            current_affinity = 0.0
+        if current_affinity >= self.AFFINITY_SLOWDOWN_THRESHOLD:
+            gain *= 0.5
+        if cap > 0:
+            gain = min(gain, max(0.0, cap - used_today))
+        if gain <= 0:
+            return user
+
+        user.interaction_count = int(user.interaction_count or 0) + 1
+        user.affinity = min(100.0, current_affinity + gain)
+        self._last_affinity_ts[key] = now_ts
+        self._daily_affinity[daily_key] = used_today + gain
+        self._prune_daily_affinity(day)
+        if self._should_auto_promote(user):
+            user.tier = UserTier.L2_IMPORTANT
+        await self.save_user(user)
+        return user
+
+    def _prune_daily_affinity(self, today: str) -> None:
+        """Drop yesterday's counters once the map grows (bounded memory)."""
+        if len(self._daily_affinity) <= 512:
+            return
+        for key in list(self._daily_affinity.keys()):
+            if key[2] != today:
+                self._daily_affinity.pop(key, None)
 
     def _get_configured_tier(
         self, sender_id: str, umo: Optional[str] = None, is_event_admin: bool = False
@@ -344,12 +545,18 @@ class UserRelationManager:
         return None
 
     async def resolve_user(
-        self, event: Any, soul_id: Optional[str] = None
+        self,
+        event: Any,
+        soul_id: Optional[str] = None,
+        bump_interaction: bool = False,
     ) -> UserProfile:
-        """Resolve UserProfile from an incoming AstrMessageEvent and record interaction.
+        """Resolve UserProfile from an incoming AstrMessageEvent.
 
         v2.9: pass ``soul_id`` so tier/affinity/nickname/attitude are read & updated in
         the per-Soul ``user_relations`` row (identity stays global).
+        v2.12: **does not bump affinity by default** — mere message arrival is not a
+        conversation. ``on_llm_response_hook`` settles a real reply turn through
+        :meth:`record_effective_interaction` instead.
         """
         sender_id = ""
         sender_name = "群友"
@@ -377,7 +584,7 @@ class UserRelationManager:
             display_name=sender_name,
             umo=umo,
             is_event_admin=is_admin,
-            bump_interaction=True,
+            bump_interaction=bump_interaction,
             platform_id=_platform_id_from_umo(umo),
             soul_id=soul_id,
         )
@@ -410,17 +617,56 @@ class UserRelationManager:
         pids = _dedupe_keep_order(self._pids_from_row(row))
         if not pids:
             pids = [global_uid]
+        try:
+            raw_aliases = json.loads(row.get("aliases_json") or "[]")
+        except Exception:
+            raw_aliases = []
+        if not isinstance(raw_aliases, list):
+            raw_aliases = []
+        nickname = str(row.get("nickname") or "")
+        display_name = str(row.get("display_name") or global_uid)
+        aliases = _normalize_aliases(
+            raw_aliases,
+            canonical=nickname or display_name,
+            exclude=[global_uid, display_name, nickname],
+        )
         return UserProfile(
             global_uid=global_uid,
-            display_name=str(row.get("display_name") or global_uid),
+            display_name=display_name,
             tier=tier,
             interaction_count=int(row.get("interaction_count", 0)),
             affinity=float(row.get("affinity", 0.0)),
             platform_ids=pids,
-            nickname=str(row.get("nickname") or ""),
+            nickname=nickname,
             attitude=str(row.get("attitude") or ""),
             proactive_enabled=_as_enabled(row.get("proactive_enabled"), True),
+            aliases=aliases,
         )
+
+    @staticmethod
+    def _remember_alias(profile: UserProfile, name: Any) -> bool:
+        """Append a previous display name to ``profile.aliases`` (bounded/deduped).
+
+        The old *display name* is exactly what we are about to replace, so it must
+        not be filtered out as "the current canonical name"; only the character
+        nickname (the stable canonical name) is excluded.
+        """
+        if profile is None:
+            return False
+        candidate = _clean_alias(name)
+        if not candidate:
+            return False
+        canonical = str(profile.nickname or "").strip()
+        if candidate == profile.global_uid or (canonical and candidate == canonical):
+            return False
+        if candidate in profile.aliases:
+            return False
+        profile.aliases = _normalize_aliases(
+            list(profile.aliases) + [candidate],
+            canonical=canonical,
+            exclude=[profile.global_uid],
+        )
+        return candidate in profile.aliases
 
     @staticmethod
     def _heal_profile_identity(
@@ -528,6 +774,7 @@ class UserRelationManager:
             attitude=profile.attitude,
             proactive_enabled=profile.proactive_enabled,
             soul_id="",
+            aliases=list(profile.aliases),
         )
 
     @staticmethod
@@ -721,6 +968,14 @@ class UserRelationManager:
 
         requested_name = (display_name or "").strip()
         if requested_name and requested_name != profile.global_uid:
+            # v2.12: a renamed user keeps their previous display name as an alias so
+            # the same person is never split into two memory subjects.
+            if (
+                profile.display_name
+                and requested_name != profile.display_name
+                and profile.display_name != profile.global_uid
+            ):
+                self._remember_alias(profile, profile.display_name)
             profile.display_name = requested_name
 
         if soul:
@@ -734,18 +989,12 @@ class UserRelationManager:
             profile.tier = cfg_tier
 
         if bump_interaction:
+            # Legacy path (kept for pre-v2.12 callers / tests): a fixed +1.5 gain
+            # with the **AND** promotion gate. Production settles affinity through
+            # ``record_effective_interaction`` on real replies only.
             profile.interaction_count += 1
-            profile.affinity += 1.5
-            # L1 -> L2 automatic promotion is scoped per Soul (never to L3).
-            enable_auto = bool(self.cfg.get("enable_auto_promotion_l2", True))
-            if (
-                enable_auto
-                and profile.tier == UserTier.L1_NORMAL
-                and (
-                    profile.interaction_count >= self.AUTO_PROMOTE_INTERACTION_THRESHOLD
-                    or profile.affinity >= self.AUTO_PROMOTE_AFFINITY_THRESHOLD
-                )
-            ):
+            profile.affinity = min(100.0, float(profile.affinity) + 1.5)
+            if self._should_auto_promote(profile):
                 profile.tier = UserTier.L2_IMPORTANT
 
         await self.save_user(profile)
@@ -871,6 +1120,89 @@ class UserRelationManager:
             logger.debug(f"[OnlyYou] read runtime_state for identity migration failed: {exc}")
         return evidence
 
+    async def migrate_legacy_memory_user_ids(self) -> dict[str, int]:
+        """Fold legacy bare / aliased ``memories.user_id`` values into the identity.
+
+        Old versions could store a bare platform uid (``"42"``) or a previous
+        display name instead of the canonical ``global_uid``. Those rows become
+        invisible to ``retrieve_*`` once identity normalisation lands, so this
+        one-shot migration re-points **unambiguous** matches to the owner
+        ``global_uid``; ambiguous bare ids (two users share the native uid) are
+        left untouched for manual repair. Idempotent via
+        ``plugin_settings["legacy_memory_user_ids_migrated_v1"]``.
+        """
+        stats = {"updated": 0, "ambiguous": 0}
+        try:
+            already = bool(await self.db.get_setting(LEGACY_MEMORY_USER_IDS_KEY, False))
+        except Exception:
+            already = False
+        if already:
+            return stats
+
+        try:
+            rows = await self.db.fetchall(
+                "SELECT global_uid, platform_ids_json, aliases_json FROM users"
+            )
+        except Exception as exc:  # noqa: BLE001 - migration must never block startup
+            logger.warning(f"[OnlyYou] legacy memory user-id migration read users failed: {exc}")
+            return stats
+
+        # bare key (native uid / alias) -> set of owning global_uid values
+        candidates: dict[str, set[str]] = {}
+        for row in rows:
+            owner = str(row.get("global_uid") or "").strip()
+            if not owner:
+                continue
+            keys: set[str] = set()
+            try:
+                platform_ids = json.loads(row.get("platform_ids_json") or "[]")
+            except Exception:
+                platform_ids = []
+            for value in platform_ids if isinstance(platform_ids, list) else []:
+                parsed = split_platform_account(value)
+                if parsed is not None:
+                    keys.add(parsed[1].strip())
+            try:
+                aliases = json.loads(row.get("aliases_json") or "[]")
+            except Exception:
+                aliases = []
+            for value in aliases if isinstance(aliases, list) else []:
+                cleaned = _clean_alias(value)
+                if cleaned:
+                    keys.add(cleaned)
+            for key in keys:
+                if key and key != owner:
+                    candidates.setdefault(key, set()).add(owner)
+
+        for bare, owners in candidates.items():
+            if len(owners) != 1:
+                stats["ambiguous"] += 1
+                continue
+            owner = next(iter(owners))
+            try:
+                pending = await self.db.fetchall(
+                    "SELECT id FROM memories WHERE user_id = ?", (bare,)
+                )
+            except Exception:  # noqa: BLE001 - best effort
+                continue
+            if not pending:
+                continue
+            try:
+                await self.db.execute(
+                    "UPDATE memories SET user_id = ? WHERE user_id = ?", (owner, bare)
+                )
+                stats["updated"] += len(pending)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"[OnlyYou] legacy memory user-id migrate {bare} failed: {exc}")
+
+        try:
+            await self.db.set_setting(LEGACY_MEMORY_USER_IDS_KEY, True)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[OnlyYou] persist memory user-id migration flag failed: {exc}")
+        if stats["updated"] or stats["ambiguous"]:
+            logger.info("[OnlyYou] Legacy memory user-id migration: %s", stats)
+        return stats
+
     async def migrate_legacy_user_identities(self) -> dict[str, int]:
         """Upgrade legacy bare ``platform_ids`` to ``platform_id:native_uid`` form.
 
@@ -958,18 +1290,20 @@ class UserRelationManager:
             """
             INSERT INTO users (
                 global_uid, display_name, nickname, tier, interaction_count,
-                affinity, platform_ids_json, attitude, updated_at
+                affinity, platform_ids_json, attitude, aliases_json, updated_at
             )
-            VALUES (?, ?, '', 1, 0, 0.0, ?, '', ?)
+            VALUES (?, ?, '', 1, 0, 0.0, ?, '', ?, ?)
             ON CONFLICT(global_uid) DO UPDATE SET
                 display_name = excluded.display_name,
                 platform_ids_json = excluded.platform_ids_json,
+                aliases_json = excluded.aliases_json,
                 updated_at = excluded.updated_at
             """,
             (
                 profile.global_uid,
                 profile.display_name,
                 json.dumps(profile.platform_ids, ensure_ascii=False),
+                json.dumps(_normalize_aliases(profile.aliases, canonical=profile.canonical_name), ensure_ascii=False),
                 int(time.time()),
             ),
         )
@@ -1028,9 +1362,9 @@ class UserRelationManager:
             """
             INSERT INTO users (
                 global_uid, display_name, nickname, tier, interaction_count, affinity,
-                platform_ids_json, attitude, proactive_enabled, updated_at
+                platform_ids_json, attitude, proactive_enabled, aliases_json, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(global_uid) DO UPDATE SET
                 display_name = excluded.display_name,
                 nickname = excluded.nickname,
@@ -1040,6 +1374,7 @@ class UserRelationManager:
                 platform_ids_json = excluded.platform_ids_json,
                 attitude = excluded.attitude,
                 proactive_enabled = excluded.proactive_enabled,
+                aliases_json = excluded.aliases_json,
                 updated_at = excluded.updated_at
             """,
             (
@@ -1052,6 +1387,7 @@ class UserRelationManager:
                 json.dumps(profile.platform_ids, ensure_ascii=False),
                 profile.attitude,
                 1 if profile.proactive_enabled else 0,
+                json.dumps(_normalize_aliases(profile.aliases, canonical=profile.canonical_name), ensure_ascii=False),
                 int(time.time()),
             ),
         )
@@ -1078,6 +1414,7 @@ class UserRelationManager:
                 SELECT u.global_uid AS identity_uid,
                        u.display_name AS display_name,
                        u.platform_ids_json AS platform_ids_json,
+                       u.aliases_json AS aliases_json,
                        r.tier AS rel_tier,
                        r.interaction_count AS rel_interaction_count,
                        r.affinity AS rel_affinity,
@@ -1099,6 +1436,7 @@ class UserRelationManager:
                             "global_uid": row.get("identity_uid"),
                             "display_name": row.get("display_name"),
                             "platform_ids_json": row.get("platform_ids_json"),
+                            "aliases_json": row.get("aliases_json"),
                         }
                     )
                     relation = {
@@ -1157,13 +1495,30 @@ class UserRelationManager:
         identity fields. Without ``soul_id`` the legacy users columns are updated.
         """
         soul = self._soul_key(soul_id)
+        previous_accounts: list[str] = []
+        if platform_ids is not None:
+            try:
+                existing_profile = await self.get_user(global_uid, soul_id=soul or None)
+            except Exception:  # noqa: BLE001 - identity merge is best effort
+                existing_profile = None
+            if existing_profile is not None:
+                previous_accounts = list(existing_profile.platform_ids) + list(
+                    existing_profile.aliases
+                )
         profile = await self.get_or_create_user(
             user_id=global_uid,
             display_name=display_name or "",
             soul_id=soul or None,
         )
         if display_name is not None and display_name.strip():
-            profile.display_name = display_name.strip()
+            new_name = display_name.strip()
+            if (
+                profile.display_name
+                and new_name != profile.display_name
+                and profile.display_name != profile.global_uid
+            ):
+                self._remember_alias(profile, profile.display_name)
+            profile.display_name = new_name
         if nickname is not None:
             profile.nickname = nickname.strip()
         if attitude is not None:
@@ -1184,7 +1539,47 @@ class UserRelationManager:
                 )
             profile.platform_ids = cleaned
         await self.save_user(profile)
+        if previous_accounts:
+            # v2.12: binding extra platform accounts folds orphaned memories of those
+            # accounts into the primary identity (contract §3.1).
+            await self._reconcile_user_memories(profile, previous_accounts)
         return profile
+
+    async def _reconcile_user_memories(
+        self, profile: UserProfile, extra_keys: Any = None
+    ) -> dict[str, int]:
+        """Re-point memories owned by aliases / platform accounts to ``global_uid``."""
+        stats = {"memories": 0}
+        if profile is None:
+            return stats
+        primary = str(profile.global_uid or "").strip()
+        if not primary:
+            return stats
+        keys: set[str] = set()
+        for value in list(extra_keys or []) + list(profile.platform_ids or []) + list(
+            profile.aliases or []
+        ):
+            text = str(value or "").strip()
+            if text and text != primary:
+                keys.add(text)
+        for key in keys:
+            try:
+                rows = await self.db.fetchall(
+                    "SELECT id FROM memories WHERE user_id = ?", (key,)
+                )
+            except Exception:  # noqa: BLE001 - memory reconcile is best effort
+                continue
+            if not rows:
+                continue
+            try:
+                await self.db.execute(
+                    "UPDATE memories SET user_id = ? WHERE user_id = ?",
+                    (primary, key),
+                )
+                stats["memories"] += len(rows)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"[OnlyYou] reconcile memories for {key} failed: {exc}")
+        return stats
 
     async def merge_users(
         self,
@@ -1223,6 +1618,15 @@ class UserRelationManager:
             + list(secondary.platform_ids)
         )
         primary.platform_ids = merged_pids
+        # v2.12: both sides' previous names become aliases of the merged identity.
+        primary.aliases = _normalize_aliases(
+            list(primary.aliases)
+            + list(secondary.aliases)
+            + [secondary.display_name, secondary_uid_value]
+            + [p_id, s_id],
+            canonical=primary.canonical_name,
+            exclude=[primary_uid_value],
+        )
         primary.soul_id = ""
         await self._upsert_identity(primary)
         # Legacy columns (pre-v2.9 fallback) keep the historical merge semantics.
@@ -1347,6 +1751,14 @@ class UserRelationManager:
         await self.db.execute(
             "UPDATE memories SET user_id = ? WHERE user_id IN (?, ?)",
             (primary_uid_value, secondary_uid_value, s_id),
+        )
+        # v2.12: fold memories stored under either side's aliases / platform accounts.
+        await self._reconcile_user_memories(
+            primary,
+            list(primary.aliases)
+            + list(secondary.aliases)
+            + list(primary.platform_ids)
+            + list(secondary.platform_ids),
         )
         await self.db.execute(
             "DELETE FROM user_relations WHERE global_uid = ?", (secondary_uid_value,)

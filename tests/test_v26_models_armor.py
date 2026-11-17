@@ -299,7 +299,7 @@ class TestModelHubStatus(unittest.IsolatedAsyncioTestCase):
     async def test_default_status_reports_inheritance_fields(self):
         hub = make_hub(MAIN_CFG)
         status = await hub.get_status()
-        assert set(status) == {"main", "decision", "vision", "tts"}
+        assert set(status) == {"main", "decision", "vision", "tts", "embedding", "rerank"}
         required = {
             "role",
             "configured",

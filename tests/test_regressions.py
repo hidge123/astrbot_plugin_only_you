@@ -68,6 +68,15 @@ _PLUGIN_METHOD_NAMES = (
     "_settle_finished_busy_blocks",
     "_run_idle_roam_action",
     "_idle_roam_cooldown_seconds",
+    "_idle_roam_trigger_probability",
+    "_idle_roam_daily_max",
+    "_idle_roam_persona_ratio",
+    "_idle_roam_day_key",
+    "_idle_roam_daily_count",
+    "_record_idle_roam_sent",
+    "_anti_repeat_block",
+    "_unused_busy_results",
+    "_sample_muse_memory",
     "_roguelite_setting",
     "_group_lurk_cooldown_seconds",
     "_private_catchup_cooldown_seconds",
@@ -124,7 +133,8 @@ class RecordingProactiveBridge:
         self.decisions.append(bool(should_reply))
 
     async def send_proactive_message(
-        self, umo, text, session_buffer=None, soul_name="Bot", audio_path=None
+        self, umo, text, session_buffer=None, soul_name="Bot", audio_path=None,
+        on_overflow_callback=None
     ):
         self.sent.append((umo, text, audio_path))
         return self.ok
@@ -888,15 +898,18 @@ class TestMemoryForgettingGC(unittest.IsolatedAsyncioTestCase):
         assert await self.db.fetchone("SELECT id FROM memories WHERE id = ?", (memory_id,)) is None
 
     async def test_tier2_promoted_to_tier3_after_frequent_access(self):
+        # v2.12 hard gate: only profile/relationship + importance >= 8 + 8 hits.
         memory_id = await self.manager.add_memory(
             soul_id="s1",
             content="被反复提起的记忆",
-            importance=6,
+            importance=8,
             user_tier=2,
             memory_tier=MemoryTier.RECENT,
+            memory_type="profile",
+            created_at=self.now - 3 * 86400,
         )
         await self.db.execute(
-            "UPDATE memories SET access_count = 4 WHERE id = ?", (memory_id,)
+            "UPDATE memories SET access_count = 8 WHERE id = ?", (memory_id,)
         )
         stats = await self.manager.run_forgetting_gc(now_override=self.now)
         assert stats["promoted_to_tier3"] == 1
@@ -928,22 +941,56 @@ class TestMemoryForgettingGC(unittest.IsolatedAsyncioTestCase):
         memory_id = await self.manager.add_memory(
             soul_id="s1",
             content="高频召回记忆",
-            importance=6,
+            importance=8,
             user_tier=2,
             memory_tier=MemoryTier.RECENT,
-            vitality=100.0,
+            memory_type="profile",
+            created_at=self.now - 3 * 86400,
+            vitality=90.0,
         )
         await self.db.execute(
-            "UPDATE memories SET access_count = 3 WHERE id = ?", (memory_id,)
+            "UPDATE memories SET access_count = 7 WHERE id = ?", (memory_id,)
         )
-        await self.manager.reinforce_memories([memory_id])
+        reinforced = await self.manager.reinforce_memories(
+            [memory_id], sem_scores={memory_id: 0.9}, now_override=self.now
+        )
         row = await self.db.fetchone(
             "SELECT memory_tier, access_count, vitality FROM memories WHERE id = ?",
             (memory_id,),
         )
-        assert row["access_count"] == 4
+        assert reinforced == 1
+        assert row["access_count"] == 8
         assert row["memory_tier"] == MemoryTier.CORE
-        assert row["vitality"] == 100.0
+        assert row["vitality"] == 98.0
+
+    async def test_reinforce_skips_low_semantic_hits_and_cooldown(self):
+        memory_id = await self.manager.add_memory(
+            soul_id="s1",
+            content="不相关召回",
+            importance=8,
+            user_tier=2,
+            memory_tier=MemoryTier.RECENT,
+            memory_type="profile",
+        )
+        assert (
+            await self.manager.reinforce_memories(
+                [memory_id], sem_scores={memory_id: 0.2}, now_override=self.now
+            )
+            == 0
+        )
+        assert (
+            await self.manager.reinforce_memories(
+                [memory_id], sem_scores={memory_id: 0.9}, now_override=self.now
+            )
+            == 1
+        )
+        # same 6h window -> the second burst never counts again
+        assert (
+            await self.manager.reinforce_memories(
+                [memory_id], sem_scores={memory_id: 0.9}, now_override=self.now + 60
+            )
+            == 0
+        )
 
 
 # ===========================================================================
@@ -1052,9 +1099,11 @@ class TestContextBudget(ContextBudgetTestBase):
                 keywords="记忆",
                 importance=9 - index,
             )
-        req = FakeRequest(prompt="还记得吗", system_prompt="BASE")
+        req = FakeRequest(prompt="还记得这些记忆吗", system_prompt="BASE")
         result = await self.apply(
-            req, FakeEvent(message_str="还记得吗", umo="umo-1"), make_slot(state=BotState.IDLE)
+            req,
+            FakeEvent(message_str="还记得这些记忆吗", umo="umo-1"),
+            make_slot(state=BotState.IDLE),
         )
         assert len(result["recalled_ids"]) == 2
         assert req.system_prompt.count("- [") == 2
@@ -1094,14 +1143,23 @@ class TestContextBudget(ContextBudgetTestBase):
                 "sliding_window_size": 5,
                 "extract_every_n_messages": 5,
                 "max_injected_memories": 6,
-                "max_memory_chars_budget": 50,  # property floor is max(50, cfg)
+                # v2.12: the per-memory label ("近期记忆 · 短期情节 · 形成于 …") counts
+                # against the budget: 2 lines fit in 160, a third one does not.
+                "max_memory_chars_budget": 160,
             }
         )
         budget, manager, _buffer = self.build_budget(config)
-        for index in range(4):
+        # Four distinct 20-char memories (identical content would now be deduped).
+        contents = [
+            "甲" * 20,
+            "乙" * 20,
+            "丙" * 20,
+            "丁" * 20,
+        ]
+        for index, content in enumerate(contents):
             await manager.add_memory(
                 soul_id=self.soul.soul_id,
-                content="一二三四五六七八九十一二三四五六七八九十",  # 20 chars each
+                content=content,  # 20 chars each
                 keywords="测试",
                 importance=8 - index,
             )
@@ -1110,7 +1168,7 @@ class TestContextBudget(ContextBudgetTestBase):
             req, FakeEvent(message_str="测试", umo="umo-1"), make_slot(state=BotState.IDLE)
         )
         assert len(result["recalled_ids"]) == 2
-        assert result["injected_chars"] == 40
+        assert result["injected_chars"] > 40
         assert result["injected_chars"] <= budget.max_memory_chars_budget
 
     async def test_keyword_match_boosts_ranking(self):
@@ -1972,7 +2030,11 @@ class TestProjectSanity(unittest.TestCase):
         roguelite = schema.get("roguelite_schedule_config", {}).get("items", {})
         assert "daily_encounter_count" not in roguelite
         assert "idle_roam_cooldown_minutes" in roguelite
-        assert roguelite["idle_roam_cooldown_minutes"]["default"] == 45
+        # v2.12: proactive pace is slower and fully configurable.
+        assert roguelite["idle_roam_cooldown_minutes"]["default"] == 120
+        assert roguelite["idle_roam_trigger_probability"]["default"] == 35
+        assert roguelite["idle_roam_daily_max_count"]["default"] == 3
+        assert roguelite["idle_roam_persona_topic_ratio"]["default"] == 70
 
     def test_compileall_passes_without_repo_artifacts(self):
         pycache_prefix = tempfile.mkdtemp(prefix="onlyyou-pyc-")

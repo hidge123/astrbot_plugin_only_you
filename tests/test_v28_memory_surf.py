@@ -69,6 +69,21 @@ def _config_with_tier1_limit(limit):
 # 1. sample_muse_memories — per-bucket query, exclude, weighted sampling
 # ===========================================================================
 class MemoryTestBase(DatabaseAsyncTestCase):
+    #: Distinct Chinese characters used to build fixture contents that must NOT be
+    #: collapsed by the v2.12 semantic dedupe (near-identical templates are now
+    #: intentionally treated as the same memory).
+    _ALPHABET = "甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥天地玄黄宇宙洪荒日月盈昃辰宿列张"
+
+    @classmethod
+    def _distinct(cls, prefix, index):
+        size = len(cls._ALPHABET)
+        return "%s%s%s%s" % (
+            prefix,
+            cls._ALPHABET[(index * 5) % size],
+            cls._ALPHABET[(index * 11 + 3) % size],
+            index,
+        )
+
     async def asyncSetUp(self):
         await super().asyncSetUp()
         self.config = make_plugin_config()
@@ -201,7 +216,7 @@ class TestSampleMuseMemories(MemoryTestBase):
     async def test_weighted_draw_prefers_high_importance(self):
         high = await self._add("高重要度记忆", MemoryTier.RECENT, importance=10)
         for index in range(5):
-            await self._add("低重要度记忆%d" % index, MemoryTier.RECENT, importance=1)
+            await self._add(self._distinct("低重要度", index), MemoryTier.RECENT, importance=1)
         await self._add("T1 低层级", MemoryTier.EPHEMERAL, importance=1)
 
         random.seed(2024)
@@ -241,7 +256,7 @@ class TestSampleMuseMemories(MemoryTestBase):
 
     async def test_per_bucket_limit_defaults_to_15(self):
         for index in range(20):
-            await self._add("批量记忆%d" % index, MemoryTier.RECENT, importance=5)
+            await self._add(self._distinct("批量", index), MemoryTier.RECENT, importance=5)
         picked = await self._pick(pick=20)
         assert len(picked) == 15
 
@@ -326,9 +341,10 @@ class TestTier1DedupeAndCap(MemoryTestBase):
         )
         assert len(rows) == 1
         assert rows[0]["last_accessed_at"] >= before
-        # refresh only: original keywords / importance are kept as-is.
-        assert rows[0]["keywords"] == "火锅"
-        assert rows[0]["importance"] == 3
+        # v2.12: the duplicate refreshes the row and MERGES keywords / importance
+        # instead of inserting another copy.
+        assert set(str(rows[0]["keywords"]).split(",")) == {"火锅", "另一个关键词"}
+        assert rows[0]["importance"] == 9
 
     async def test_dedupe_is_scoped_per_soul(self):
         first = await self._add("同名记忆", MemoryTier.EPHEMERAL, soul_id="soul-a")
@@ -337,13 +353,17 @@ class TestTier1DedupeAndCap(MemoryTestBase):
         count = await self.db.fetchone("SELECT COUNT(*) AS n FROM memories")
         assert count["n"] == 2
 
-    async def test_dedupe_only_applies_to_tier1(self):
+    async def test_dedupe_applies_to_every_tier(self):
+        """v2.12: T1/T2/T3 are all immune to duplicate insertion."""
         first = await self._add("跨层级内容", MemoryTier.EPHEMERAL)
         second = await self._add("跨层级内容", MemoryTier.RECENT, importance=6)
         third = await self._add(
             "跨层级内容", MemoryTier.CORE, importance=9, user_tier=3
         )
-        assert len({first, second, third}) == 3
+        assert second == first
+        assert third == first
+        rows = await self.db.fetchall("SELECT id FROM memories")
+        assert len(rows) == 1
 
     async def test_default_cap_is_30_fifo(self):
         ids = []
@@ -351,7 +371,7 @@ class TestTier1DedupeAndCap(MemoryTestBase):
         for index in range(31):
             ids.append(
                 await self._add(
-                    "默认上限记忆%d" % index,
+                    self._distinct("上限", index),
                     MemoryTier.EPHEMERAL,
                     importance=2,
                     created_at=base + index,
@@ -372,7 +392,7 @@ class TestTier1DedupeAndCap(MemoryTestBase):
         base = int(time.time()) - 500
         ids = [
             await self._add(
-                "小上限记忆%d" % index,
+                self._distinct("小上限", index),
                 MemoryTier.EPHEMERAL,
                 importance=2,
                 created_at=base + index,
@@ -392,7 +412,7 @@ class TestTier1DedupeAndCap(MemoryTestBase):
         for soul_id in ("soul-a", "soul-b"):
             for index in range(3):
                 await self._add(
-                    "%s 记忆%d" % (soul_id, index),
+                    self._distinct("%s " % soul_id, index),
                     MemoryTier.EPHEMERAL,
                     importance=2,
                     soul_id=soul_id,
@@ -507,7 +527,7 @@ class TestCleanupTier1(MemoryTestBase):
         for soul_id in ("soul-a", "soul-b"):
             for index in range(3):
                 await self._add(
-                    "%s 记忆%d" % (soul_id, index),
+                    self._distinct("%s " % soul_id, index),
                     MemoryTier.EPHEMERAL,
                     soul_id=soul_id,
                     created_at=self.now - 1000 + index,

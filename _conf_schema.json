@@ -24,8 +24,26 @@
       "idle_roam_cooldown_minutes": {
         "description": "闲逛搭话冷却（分钟）",
         "type": "int",
-        "default": 45,
-        "hint": "空闲游荡（翻群吃瓜 / 记忆联想）主动搭话的冷却时间，避免频繁骚扰，默认 45。"
+        "default": 120,
+        "hint": "空闲游荡（翻群吃瓜 / 人设话题 / 记忆联想）主动搭话的冷却时间，默认 120（2 小时），避免频繁骚扰。"
+      },
+      "idle_roam_trigger_probability": {
+        "description": "闲逛触发概率(%)",
+        "type": "int",
+        "default": 35,
+        "hint": "0~100：冷却结束后按该概率决定是否真的主动搭话（默认 35），不再机械卡点必发；0 = 不主动搭话。"
+      },
+      "idle_roam_daily_max_count": {
+        "description": "每日搭话上限",
+        "type": "int",
+        "default": 3,
+        "hint": "每个角色每天最多主动搭话几次（默认 3），防止一整天反复刷屏；0 = 不限制（仍受冷却与概率约束）。"
+      },
+      "idle_roam_persona_topic_ratio": {
+        "description": "人设话题占比(%)",
+        "type": "int",
+        "default": 70,
+        "hint": "0~100：主动搭话时「人设随机日常话题 PERSONA_TOPIC」的占比（默认 70），其余走旧记忆联想 MEMORY_MUSE；记忆不足时自动全部走人设话题。"
       },
       "allow_l3_wake_from_resting": {
         "description": "允许 ★L3 唤醒",
@@ -79,7 +97,31 @@
         "description": "L1 自动晋升 L2",
         "type": "bool",
         "default": true,
-        "hint": "允许普通用户通过群聊良性互动自动晋升为重要用户（仅晋升到 L2；★L3 仅由平台管理员身份或 Pages「关系与群聊」页手动确定）。用户等级与名单统一在 Pages「关系与群聊」页管理，本配置不再提供用户 ID 名单。"
+        "hint": "允许普通用户自动晋升为 ◆L2 重要熟人（仅到 L2；★L3 仅由平台管理员身份或 Pages 显式设置）。只有 Bot 真正回复过的对话回合才计数，并需同时满足「晋升互动阈值」与「晋升好感阈值」。用户等级与名单统一在 Pages「关系与群聊」页管理。"
+      },
+      "auto_promote_l2_min_interactions": {
+        "description": "晋升互动阈值",
+        "type": "int",
+        "default": 40,
+        "hint": "L1 普通用户自动晋升 ◆L2 重要熟人所需要的有效互动次数。只有 Bot 真正回复过的对话回合才计数（默认 40）。"
+      },
+      "auto_promote_l2_min_affinity": {
+        "description": "晋升好感阈值",
+        "type": "float",
+        "default": 30.0,
+        "hint": "L1 自动晋升 ◆L2 所需要的好感度。与「晋升互动阈值」同时满足（AND）才会晋升，默认 30。"
+      },
+      "affinity_cooldown_seconds": {
+        "description": "好感冷却（秒）",
+        "type": "int",
+        "default": 180,
+        "hint": "同一用户连续发多条消息时只结算一次好感的最小间隔，默认 180 秒；0 = 关闭冷却。"
+      },
+      "affinity_daily_cap": {
+        "description": "每日好感上限",
+        "type": "float",
+        "default": 5.0,
+        "hint": "每个用户每天最多获得的好感度，防止单日刷屏刷满，默认 5.0；0 = 不限制。"
       }
     }
   },
@@ -195,6 +237,24 @@
         "type": "int",
         "default": 30,
         "hint": "每个角色的 Tier1 瞬时记忆数量上限，超出后按创建时间 FIFO 淘汰最旧，默认 30。"
+      },
+      "max_recall_candidates": {
+        "description": "粗排候选数",
+        "type": "int",
+        "default": 24,
+        "hint": "混合召回（向量 / 词法 / 分层保底）进入重排阶段的候选记忆条数，默认 24。"
+      },
+      "min_recall_score": {
+        "description": "最低相关性",
+        "type": "float",
+        "default": 0.38,
+        "hint": "综合得分（0.55 语义 + 0.25 新鲜度 + 0.20 重要度）低于该值的记忆不会注入，默认 0.38。"
+      },
+      "min_semantic_score": {
+        "description": "最低语义相关",
+        "type": "float",
+        "default": 0.25,
+        "hint": "语义相关性（重排 / 向量 / 词法）低于该值的记忆不会注入，默认 0.25。"
       }
     }
   }

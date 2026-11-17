@@ -45,8 +45,17 @@ class TestPluginConfigSchema(unittest.TestCase):
 
     def test_auto_promotion_switch_remains_behavior_only(self):
         items = self.schema["relationship_config"]["items"]
-        assert set(items) == {"enable_auto_promotion_l2"}
+        # v2.12: the L1 -> L2 curve is tunable, but never as a user ID list.
+        assert set(items) == {
+            "enable_auto_promotion_l2",
+            "auto_promote_l2_min_interactions",
+            "auto_promote_l2_min_affinity",
+            "affinity_cooldown_seconds",
+            "affinity_daily_cap",
+        }
         assert items["enable_auto_promotion_l2"]["type"] == "bool"
+        assert items["auto_promote_l2_min_interactions"]["default"] == 40
+        assert items["auto_promote_l2_min_affinity"]["default"] == 30.0
 
     def test_every_item_has_short_description_and_hint(self):
         for section, section_cfg in self.schema.items():

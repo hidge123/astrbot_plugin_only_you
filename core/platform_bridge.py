@@ -319,6 +319,7 @@ class PlatformBridge:
         session_buffer: Any = None,
         soul_name: str = "Bot",
         audio_path: Optional[str] = None,
+        on_overflow_callback: Any = None,
     ) -> bool:
         """
         Send a proactive message to `umo` reusing AstrBot's `segmented_reply` config,
@@ -327,6 +328,11 @@ class PlatformBridge:
 
         When `audio_path` is given (plugin TTS), a `Record` voice message is sent after
         the text segments.
+
+        v2.12: ``on_overflow_callback`` is forwarded to
+        ``SessionBuffer.record_assistant_message`` so a proactive message that
+        triggers the 15-message eviction still hands the evicted batch to the memory
+        extractor instead of silently dropping it (``记忆提炼.md`` §1 boundary bug).
         """
         if not umo or not text or self.context is None:
             return False
@@ -361,6 +367,7 @@ class PlatformBridge:
                 content=text,
                 is_proactive=True,
                 soul_name=soul_name,
+                on_overflow_callback=on_overflow_callback,
             )
 
         return sent_any

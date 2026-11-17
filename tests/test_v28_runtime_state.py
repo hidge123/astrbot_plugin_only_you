@@ -99,6 +99,15 @@ _RUNTIME_METHODS = (
     "_render_soul_summary",
     "_maybe_share_surfed_video",
     "_pick_memory_muse_material",
+    "_idle_roam_trigger_probability",
+    "_idle_roam_daily_max",
+    "_idle_roam_persona_ratio",
+    "_idle_roam_day_key",
+    "_idle_roam_daily_count",
+    "_record_idle_roam_sent",
+    "_anti_repeat_block",
+    "_unused_busy_results",
+    "_sample_muse_memory",
     "clear_platform_memory_state",
     "terminate",
 )
@@ -141,7 +150,8 @@ class _RecordingBridge:
         self.ok = True
 
     async def send_proactive_message(
-        self, umo="", text="", session_buffer=None, soul_name="Bot", audio_path=None
+        self, umo="", text="", session_buffer=None, soul_name="Bot", audio_path=None,
+        on_overflow_callback=None
     ):
         if not self.ok:
             return False
@@ -581,9 +591,13 @@ class TestRestartProactiveDedupe(DatabaseAsyncTestCase):
         plugin2 = await self._new_plugin(hub=hub2, bridge=bridge2)
         await plugin2._load_runtime_state()
         assert plugin2._mused_busy_keys[soul.soul_id] == {busy_slot.slot_key}
-        assert await plugin2._run_idle_roam_action(soul, run, current_slot) is False
-        assert hub2.json_calls == []
-        assert bridge2.sent == []
+        sent2 = await plugin2._run_idle_roam_action(soul, run, current_slot)
+        # v2.12: the mused busy result is never repeated; the tick falls back to a
+        # fresh PERSONA_TOPIC message that must not mention the old busy result.
+        assert sent2 is True
+        assert "回春丹" not in hub2.json_calls[0]["prompt"]
+        assert plugin2._mused_busy_keys[soul.soul_id] == {busy_slot.slot_key}
+        assert len(bridge2.sent) == 1
 
 
 # ==========================================================================

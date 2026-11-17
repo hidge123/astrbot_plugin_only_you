@@ -316,7 +316,11 @@
       injectionBudgetHint() +
       "</div>" +
       "</div>" +
-      '<div class="row-between mt-8"><span class="text-xs muted" data-tip="Tier 1 瞬时记忆创建 48 小时后过期且每角色最多保留 ' +
+      '<div class="row-between mt-8"><span class="text-xs muted" data-tip="v2.12：记忆分人物画像 / 关系共识 / 近期状态 / 短期情节四类；被新记忆取代的旧记忆显示「已归档」且不再参与召回。">分类：人物画像 · 关系共识 · 近期状态 · 短期情节 · 已归档 ' +
+      esc(num(S.stats && S.stats.superseded_count, 0)) +
+      " 条 · 已缓存向量 " +
+      esc(num(S.stats && S.stats.embedding_count, 0)) +
+      ' 条</span><span class="text-xs muted" data-tip="Tier 1 瞬时记忆创建或从 T2/T3 降级后 48 小时过期，且每角色最多保留 ' +
       esc(num(S.tier1Limit, 30)) +
       ' 条；Tier 2 近期记忆活力值随时间衰减；Tier 3 核心记忆永久保留并优先注入。">T1 48h 过期 · 上限 ' +
       esc(num(S.tier1Limit, 30)) +
@@ -347,26 +351,54 @@
   }
 
   /**
-   * T1 瞬时记忆不再展示活力条：按 created_at 计算 48h 过期倒计时（契约 §5.6）。
-   * 服务端在遗忘 GC 中删除创建超过 48h 的 T1，这里展示「⏳ 剩余 Xh 清除」。
+   * T1 瞬时记忆倒计时。
+   * v2.12：保留期锚点是服务端 `tier1_since`（创建为 T1 或从 T2/T3 降级为 T1 时
+   * 重新计时），旧数据回退 `created_at`；真正过期后显示「待回收（≤15 分钟）」，
+   * 不再显示误导性的「剩余 0h」。
    */
   function tier1CountdownHtml(memory) {
-    var created = num(memory && memory.created_at, 0);
-    if (!created) {
+    var nowSec = Math.floor(Date.now() / 1000);
+    var expires = num(memory && memory.tier1_expires_at, 0);
+    if (!expires) {
+      var startFallback =
+        num(memory && memory.tier1_since, 0) || num(memory && memory.created_at, 0);
+      expires = startFallback ? startFallback + 172800 : 0;
+    }
+    if (!expires) {
       return (
-        '<span class="memory-vitality" data-tip="Tier 1 瞬时记忆创建后 48 小时过期，由遗忘清理 GC 删除">⏳ 48h 内清除</span>'
+        '<span class="memory-vitality" data-tip="Tier 1 瞬时记忆创建 / 降级后 48 小时过期，由遗忘清理 GC 删除">⏳ 48h 内清除</span>'
       );
     }
-    var elapsed = Date.now() / 1000 - created;
-    if (elapsed < 0) elapsed = 0;
-    var remain = Math.max(0, 48 - elapsed / 3600);
-    var text = remain >= 10 ? String(Math.round(remain)) : remain.toFixed(1);
+    var created = num(memory && memory.created_at, 0);
+    var since = num(memory && memory.tier1_since, 0);
+    var resetNote = since && created && since > created + 60 ? "（自降级为 T1 起重新计时）" : "";
+    var remain = expires - nowSec;
+    if (remain <= 0) {
+      return (
+        '<span class="memory-vitality is-expired" data-tip="' +
+        esc("已超过 48 小时保留期，等待下一次心跳 GC 回收（通常 ≤15 分钟）" + resetNote) +
+        '">⏳ 待回收（≤15 分钟）</span>'
+      );
+    }
+    var hours = remain / 3600;
+    var label;
+    if (hours < 1) {
+      label = "⏳ " + Math.max(1, Math.ceil(remain / 60)) + " 分钟后清除";
+    } else {
+      var text = hours >= 10 ? String(Math.round(hours)) : hours.toFixed(1);
+      label = "⏳ 剩余 " + text + "h 清除";
+    }
     return (
       '<span class="memory-vitality" data-tip="' +
-      esc("Tier 1 瞬时记忆创建后 48 小时过期，剩余约 " + text + " 小时由遗忘清理 GC 删除") +
-      '">⏳ 剩余 ' +
-      esc(text) +
-      "h 清除</span>"
+      esc(
+        "Tier 1 瞬时记忆保留 48 小时，剩余约 " +
+          (hours >= 10 ? Math.round(hours) : hours.toFixed(1)) +
+          " 小时由遗忘清理 GC 删除" +
+          resetNote
+      ) +
+      '">' +
+      esc(label) +
+      "</span>"
     );
   }
 
@@ -441,12 +473,34 @@
     var lastText =
       String(memory.last_accessed_at_text || "") || fmtDateTime(num(memory.last_accessed_at, 0));
     var when = fmtAgo(createdTs);
+    var typeLabel = String(memory.memory_type_label || "");
+    var typeKey = String(memory.memory_type || "episode");
+    var archived = !!memory.superseded;
     var recallText = "召回 " + recall + " 次" + (when ? " · 形成于 " + when : "");
+    if (archived) recallText += " · 已归档";
+    var typeHtml = typeLabel
+      ? '<span class="kw memory-type-chip" data-tip="记忆分类：' +
+        esc(typeKey) +
+        (memory.has_embedding ? " · 已缓存向量" : "") +
+        '">' +
+        esc(typeLabel) +
+        "</span>" +
+        (archived
+          ? '<span class="kw memory-archived-chip" data-tip="已被新记忆取代（superseded_by #' +
+            esc(memory.superseded_by) +
+            '），不再参与召回">已归档</span>'
+          : "")
+      : "";
+    var archivedTip = archived
+      ? " · 已被新记忆 #" + esc(memory.superseded_by) + " 取代"
+      : "";
     var recallTip = createdText
       ? "形成于 " + createdText + (lastText ? " · 最近提及 " + lastText : "")
       : "记忆形成时间未知";
     return (
-      '<div class="memory-row" data-memory-id="' +
+      '<div class="memory-row' +
+      (archived ? " is-archived" : "") +
+      '" data-memory-id="' +
       esc(memory.id) +
       '" data-tier="' +
       esc(tier) +
@@ -468,8 +522,8 @@
       '">' +
       esc(content) +
       "</p>" +
-      (keywordHtml
-        ? '<div class="memory-row-keywords">' + keywordHtml + "</div>"
+      (typeHtml || keywordHtml
+        ? '<div class="memory-row-keywords">' + typeHtml + keywordHtml + "</div>"
         : "") +
       "</div>" +
       /* 列3：关联用户 + 活力 + 召回 */
@@ -477,7 +531,7 @@
       userLabelHtml(memory) +
       vitalityHtml(memory, tier) +
       '<span class="memory-recall" data-tip="' +
-      esc(recallTip) +
+      esc(recallTip + archivedTip) +
       '">' +
       esc(recallText) +
       "</span></div>" +
@@ -705,12 +759,20 @@
   /* ------------------------------------------------------------------ *
    * 表单：新增 / 编辑
    * ------------------------------------------------------------------ */
+  var MEMORY_TYPE_OPTIONS = [
+    { value: "profile", label: "人物画像", desc: "身份 / 长期喜好 / 雷点" },
+    { value: "relationship", label: "关系共识", desc: "约定 / 专属称呼 / 相处方式" },
+    { value: "state", label: "近期状态", desc: "当前阶段，可被新状态取代" },
+    { value: "episode", label: "短期情节", desc: "一次互动 / 梗 / 临时小事" }
+  ];
+
   function formHtml(memory) {
     var isEdit = !!memory;
     var content = isEdit ? memory.content || "" : "";
     var keywords = isEdit ? memory.keywords || "" : "";
     var importance = isEdit ? num(memory.importance, 8) : 8;
     var tier = isEdit ? Number(memory.memory_tier) || 3 : 3;
+    var memoryType = isEdit ? String(memory.memory_type || "episode") : "episode";
     return (
       '<div class="field"><span class="field-label">记忆内容 <span class="req">*</span></span>' +
       '<textarea class="textarea" rows="4" data-role="content" placeholder="例如：阿泽严重海鲜过敏，聚餐千万别点海鲜">' +
@@ -745,7 +807,22 @@
           );
         })
         .join("") +
-      "</select></div></div>"
+      "</select></div></div>" +
+      '<div class="field"><span class="field-label">记忆分类</span>' +
+      '<select class="select" data-role="memory-type">' +
+      MEMORY_TYPE_OPTIONS.map(function (item) {
+        return (
+          '<option value="' +
+          esc(item.value) +
+          '"' +
+          (item.value === memoryType ? " selected" : "") +
+          ">" +
+          esc(item.label + " · " + item.desc) +
+          "</option>"
+        );
+      }).join("") +
+      "</select>" +
+      '<div class="field-help">只有「人物画像 / 关系共识」且重要度 ≥ 8 的记忆，才可能在长期有效命中后晋升为 T3 永久记忆。</div></div>'
     );
   }
 
@@ -754,12 +831,14 @@
     var keywordsEl = bodyEl.querySelector('[data-role="keywords"]');
     var importanceEl = bodyEl.querySelector('[data-role="importance"]');
     var tierEl = bodyEl.querySelector('[data-role="memory-tier"]');
+    var typeEl = bodyEl.querySelector('[data-role="memory-type"]');
     var content = contentEl ? String(contentEl.value || "").trim() : "";
     return {
       content: content,
       keywords: keywordsEl ? String(keywordsEl.value || "").trim() : "",
       importance: importanceEl ? Number(importanceEl.value) : 8,
-      memory_tier: tierEl ? Number(tierEl.value) : 3
+      memory_tier: tierEl ? Number(tierEl.value) : 3,
+      memory_type: typeEl ? String(typeEl.value || "episode") : "episode"
     };
   }
 
@@ -797,7 +876,8 @@
               content: form.content,
               keywords: form.keywords,
               importance: form.importance,
-              memory_tier: form.memory_tier
+              memory_tier: form.memory_tier,
+              memory_type: form.memory_type
             });
             if (data && data.new_id != null) {
               modalApp.toast("已新增记忆 #" + data.new_id);
@@ -848,7 +928,8 @@
               content: form.content,
               keywords: form.keywords,
               importance: form.importance,
-              memory_tier: form.memory_tier
+              memory_tier: form.memory_tier,
+              memory_type: form.memory_type
             });
             modalApp.toast("已保存记忆 #" + memory.id);
             await reloadMemories(false);

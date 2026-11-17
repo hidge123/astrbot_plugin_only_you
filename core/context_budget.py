@@ -1,6 +1,7 @@
 """Session sliding window buffer and Context & Token Budget Manager (core/context_budget.py)."""
 
 import asyncio
+import inspect
 import math
 import re
 import time
@@ -8,7 +9,14 @@ from dataclasses import dataclass
 from typing import Any, Callable, Coroutine, Optional
 
 from .character_card import render_persona_prompt
-from .memory_manager import MemoryManager, MemoryTier
+from .memory_manager import (
+    MemoryManager,
+    MemoryTier,
+    cosine_similarity,
+    normalize_memory_type,
+    retrieval_similarity,
+    MEMORY_TYPE_LABELS,
+)
 from .roguelite_deck import DailyScheduleRun, SlotInstance
 from .soul_manager import SoulProfile
 from .state_machine import ActionType, BotState
@@ -32,6 +40,21 @@ try:
 except ImportError:
     import logging
     logger = logging.getLogger("onlyyou.context_budget")
+
+# ==============================================================================
+# v2.12: RAG 混合召回排序权重与最低相关性门闸（contract §2.4）
+# ==============================================================================
+#: 综合得分 = 0.55 * 语义相关 + 0.25 * 时间新鲜度 + 0.20 * 重要度
+SEMANTIC_WEIGHT = 0.55
+RECENCY_WEIGHT = 0.25
+IMPORTANCE_WEIGHT = 0.20
+#: 低于相关性门槛的记忆绝不注入（0 分硬凑是旧版的病根）。
+MIN_RECALL_SCORE = 0.38
+MIN_SEMANTIC_SCORE = 0.25
+#: 刚提炼且内容仍在当前滑窗里的记忆，避免与滑窗重复注入。
+RECENT_DUPLICATE_WINDOW_SECONDS = 10 * 60
+#: 上下文感知 Query 取该用户最近几条发言（解决“那它呢/然后呢”无关键词）。
+QUERY_CONTEXT_USER_MESSAGES = 2
 
 
 def _clean_text(value: Any) -> str:
@@ -108,6 +131,11 @@ class SessionBuffer:
         self._unread: dict[str, list[BufferedMessage]] = {}
         self._unread_kind: dict[str, bool] = {}
         self._seq_counter: int = 0
+        # v2.12: strong references to the background extraction tasks (a bare
+        # ``loop.create_task`` result may be garbage-collected) + one retry batch
+        # per session kept when the extraction LLM call / JSON parse failed.
+        self._overflow_tasks: set = set()
+        self._retry_batches: dict[str, list[BufferedMessage]] = {}
 
     @property
     def cfg(self) -> dict[str, Any]:
@@ -172,7 +200,11 @@ class SessionBuffer:
         msg = BufferedMessage(
             role="user",
             sender_id=user.global_uid,
-            sender_name=user.display_name,
+            # v2.12: use the stable canonical name (nickname -> display name) so one
+            # user cannot appear under several nicknames inside the transcript.
+            sender_name=str(
+                getattr(user, "canonical_name", "") or user.display_name
+            ),
             user_tier=int(user.tier.value),
             user_tier_label=user.tier.label,
             content=content.strip(),
@@ -423,13 +455,42 @@ class SessionBuffer:
         if len(evicted) >= self.extract_every_n_messages:
             batch = list(evicted)
             evicted.clear()
+            # v2.12: prepend a previously failed batch so its messages are retried
+            # (at most one retained batch per session).
+            retry_batch = self._retry_batches.pop(umo, None)
+            if retry_batch:
+                batch = list(retry_batch) + batch
             transcript = self.format_extraction_transcript(batch)
             if on_overflow_callback is not None:
                 try:
                     loop = asyncio.get_running_loop()
-                    loop.create_task(on_overflow_callback(umo, transcript))
+                    task = loop.create_task(
+                        self._run_overflow_extraction(
+                            on_overflow_callback, umo, batch, transcript
+                        )
+                    )
+                    self._overflow_tasks.add(task)
+                    task.add_done_callback(self._overflow_tasks.discard)
                 except RuntimeError:
                     pass
+
+    async def _run_overflow_extraction(
+        self,
+        callback: Callable[[str, str], Coroutine[Any, Any, Any]],
+        umo: str,
+        batch: list[BufferedMessage],
+        transcript: str,
+    ) -> None:
+        """Run one extraction callback; retain the batch once when it fails."""
+        try:
+            result = await callback(umo, transcript)
+            failed = result is False
+        except Exception as exc:  # noqa: BLE001 - a background task must not raise
+            logger.warning(f"[OnlyYou] memory extraction task failed: {exc}")
+            failed = True
+        if failed and batch:
+            # Keep only the latest failed batch (bounded retry memory).
+            self._retry_batches[umo] = list(batch)
 
     def get_formatted_window(
         self,
@@ -496,6 +557,44 @@ class SessionBuffer:
         """
         win = self._windows.get(umo, [])[-max_turns:]
         return self.format_extraction_transcript(win)
+
+    def get_recent_user_texts(
+        self, umo: str, sender_id: str = "", limit: int = 2
+    ) -> list[str]:
+        """Return the last ``limit`` user message texts of ``umo`` (oldest first).
+
+        v2.12: used to build the context-aware recall query
+        (``当前消息 + 该用户最近 2 条发言``) so follow-up questions such as
+        "那它呢 / 然后呢 / 你还记得吗" still retrieve the right memories.
+        """
+        try:
+            count = max(0, int(limit))
+        except (TypeError, ValueError):
+            count = 2
+        if count <= 0:
+            return []
+        wanted = str(sender_id or "").strip()
+        texts: list[str] = []
+        for message in reversed(self._windows.get(umo, []) or []):
+            if message.role != "user":
+                continue
+            if wanted and str(message.sender_id or "").strip() != wanted:
+                continue
+            content = str(message.content or "").strip()
+            if content:
+                texts.append(content)
+            if len(texts) >= count:
+                break
+        texts.reverse()
+        return texts
+
+    def get_window_contents(self, umo: str) -> list[str]:
+        """All non-empty message contents of ``umo``'s window (for dedupe checks)."""
+        return [
+            str(message.content or "").strip()
+            for message in self._windows.get(umo, []) or []
+            if str(message.content or "").strip()
+        ]
 
     def get_window_sender_ids(self, umo: str) -> list[str]:
         """Return distinct user ``sender_id`` values of ``umo``'s window (newest first).
@@ -595,6 +694,212 @@ class ContextBudgetManager:
     @property
     def max_memory_chars_budget(self) -> int:
         return max(50, int(self.cfg.get("max_memory_chars_budget", 400)))
+
+    @property
+    def max_recall_candidates(self) -> int:
+        """Coarse-recall pool size entering the rerank stage (default 24)."""
+        try:
+            return max(4, int(self.cfg.get("max_recall_candidates", 24)))
+        except (TypeError, ValueError):
+            return 24
+
+    @property
+    def min_recall_score(self) -> float:
+        """Minimum fused relevance for a memory to be injected (default 0.38)."""
+        try:
+            return max(
+                0.0, min(1.0, float(self.cfg.get("min_recall_score", MIN_RECALL_SCORE)))
+            )
+        except (TypeError, ValueError):
+            return MIN_RECALL_SCORE
+
+    @property
+    def min_semantic_score(self) -> float:
+        """Minimum semantic relevance for a memory to be injected (default 0.25)."""
+        try:
+            return max(
+                0.0,
+                min(1.0, float(self.cfg.get("min_semantic_score", MIN_SEMANTIC_SCORE))),
+            )
+        except (TypeError, ValueError):
+            return MIN_SEMANTIC_SCORE
+
+    # ------------------------------------------------------------------
+    # v2.12: RAG recall helpers (context-aware query / hybrid pool / rerank)
+    # ------------------------------------------------------------------
+    def _build_recall_query(
+        self, umo: str, user: UserProfile, query_text: str
+    ) -> str:
+        """Build the context-aware query: current message + recent same-user turns."""
+        current = str(query_text or "").strip()
+        recent: list[str] = []
+        getter = getattr(self.session_buffer, "get_recent_user_texts", None)
+        if callable(getter):
+            try:
+                recent = getter(
+                    umo,
+                    sender_id=str(getattr(user, "global_uid", "") or ""),
+                    limit=QUERY_CONTEXT_USER_MESSAGES,
+                )
+            except Exception as exc:  # noqa: BLE001 - query enrichment is best effort
+                logger.debug(f"[OnlyYou] build recall query failed: {exc}")
+                recent = []
+        parts = [text for text in recent if text and text != current]
+        if current:
+            parts.append(current)
+        return " ".join(parts).strip() or current
+
+    async def _embed_query(self, query_text: str, soul: SoulProfile) -> list[float]:
+        """Embed the recall query (``[]`` when the embedding role is off)."""
+        hub = getattr(self.memory_manager, "model_hub", None)
+        getter = getattr(hub, "get_embedding", None) if hub is not None else None
+        if not callable(getter):
+            return []
+        soul_id = str(getattr(soul, "soul_id", "") or "")
+        try:
+            vector = getter(query_text, soul_id=soul_id) if soul_id else getter(query_text)
+            if inspect.isawaitable(vector):
+                vector = await vector
+        except TypeError:
+            try:
+                vector = getter(query_text)
+                if inspect.isawaitable(vector):
+                    vector = await vector
+            except Exception:  # noqa: BLE001 - degrade to lexical
+                return []
+        except Exception as exc:  # noqa: BLE001 - degrade to lexical
+            logger.debug(f"[OnlyYou] query embedding failed: {exc}")
+            return []
+        if not isinstance(vector, (list, tuple)):
+            return []
+        return [float(value) for value in vector if isinstance(value, (int, float))]
+
+    async def _retrieve_candidates(
+        self,
+        soul: SoulProfile,
+        user: UserProfile,
+        query_text: str,
+        query_vector: list[float],
+    ) -> list[Any]:
+        """Three-route hybrid pool when available, legacy SQL list otherwise."""
+        manager = self.memory_manager
+        retriever = getattr(manager, "retrieve_hybrid_candidates", None)
+        if callable(retriever):
+            try:
+                return await retriever(
+                    soul_id=soul.soul_id,
+                    user_id=user.global_uid,
+                    query_text=query_text,
+                    query_embedding=query_vector or None,
+                    limit=self.max_recall_candidates,
+                )
+            except Exception as exc:  # noqa: BLE001 - fall through to the legacy pool
+                logger.warning(f"[OnlyYou] hybrid recall failed: {exc}")
+        fallback = getattr(manager, "retrieve_candidates", None)
+        if not callable(fallback):
+            return []
+        try:
+            return await fallback(soul_id=soul.soul_id, user_id=user.global_uid)
+        except Exception as exc:  # noqa: BLE001 - memory is best effort
+            logger.warning(f"[OnlyYou] retrieve_candidates failed: {exc}")
+            return []
+
+    async def _semantic_scores(
+        self,
+        query_text: str,
+        candidates: list[Any],
+        query_vector: list[float],
+        soul: SoulProfile,
+    ) -> dict[int, float]:
+        """Semantic relevance of every candidate (rerank > dense > lexical)."""
+        scores: dict[int, float] = {}
+        if not candidates:
+            return scores
+        hub = getattr(self.memory_manager, "model_hub", None)
+        rerank = getattr(hub, "rerank_documents", None) if hub is not None else None
+        if callable(rerank):
+            documents = [
+                f"{getattr(item, 'content', '')} {getattr(item, 'keywords', '')}".strip()
+                for item in candidates
+            ]
+            rows: list[Any] = []
+            soul_id = str(getattr(soul, "soul_id", "") or "")
+            try:
+                kwargs: dict[str, Any] = {"top_n": len(documents)}
+                if soul_id:
+                    kwargs["soul_id"] = soul_id
+                rows = await rerank(query_text, documents, **kwargs)
+            except TypeError:
+                rows = []
+            except Exception as exc:  # noqa: BLE001 - degrade to dense / lexical
+                logger.debug(f"[OnlyYou] rerank failed: {exc}")
+                rows = []
+            for row in rows or []:
+                if isinstance(row, dict):
+                    raw_index = row.get("index")
+                    raw_score = row.get("score")
+                else:
+                    raw_index = getattr(row, "index", None)
+                    raw_score = getattr(
+                        row, "score", getattr(row, "relevance_score", None)
+                    )
+                try:
+                    index = int(raw_index)
+                    score = float(raw_score)
+                except (TypeError, ValueError):
+                    continue
+                if index < 0 or index >= len(candidates):
+                    continue
+                scores[candidates[index].id] = max(0.0, min(1.0, score))
+            if scores:
+                # A provider that only returns its top-N must not silently gate out
+                # the remaining candidates: fill them with the local fallback.
+                for mem in candidates:
+                    if mem.id in scores:
+                        continue
+                    scores[mem.id] = self._local_semantic_score(
+                        query_text, mem, query_vector
+                    )
+                return scores
+
+        for mem in candidates:
+            scores[mem.id] = self._local_semantic_score(query_text, mem, query_vector)
+        return scores
+
+    @staticmethod
+    def _local_semantic_score(
+        query_text: str, mem: Any, query_vector: list[float]
+    ) -> float:
+        """Dense cosine when both vectors exist, else keyword-aware lexical score."""
+        embedding = getattr(mem, "embedding", None) or []
+        if query_vector and embedding:
+            return max(0.0, min(1.0, cosine_similarity(query_vector, embedding)))
+        return max(
+            0.0,
+            min(
+                1.0,
+                retrieval_similarity(
+                    query_text,
+                    getattr(mem, "content", ""),
+                    getattr(mem, "keywords", ""),
+                ),
+            ),
+        )
+
+    def _is_recent_window_duplicate(self, umo: str, mem: Any, now: float) -> bool:
+        """Whether a just-extracted memory is still fully present in the window."""
+        try:
+            created_at = int(getattr(mem, "created_at", 0) or 0)
+        except (TypeError, ValueError):
+            created_at = 0
+        if not created_at or (now - created_at) > RECENT_DUPLICATE_WINDOW_SECONDS:
+            return False
+        content = str(getattr(mem, "content", "") or "").strip()
+        if not content:
+            return False
+        getter = getattr(self.session_buffer, "get_window_contents", None)
+        contents = getter(umo) if callable(getter) else []
+        return any(content in text for text in contents or [])
 
     async def _takeover_persona(self, req: Any, soul: SoulProfile) -> None:
         """Replace AstrBot's native Persona block with the rendered character card.
@@ -773,6 +1078,22 @@ class ContextBudgetManager:
         )
         # ``relation_notes`` is not a DB column yet (v2.6 freeze): getattr fallback.
         notes_text = _clean_text(getattr(user, "relation_notes", "")) or "无"
+        # v2.12: 身份归一 —— 标准称呼 + 曾用名 + 绑定账号，避免模型把同一人当两个人。
+        canonical_name = (
+            _clean_text(getattr(user, "canonical_name", "")) or display_name or global_uid
+        )
+        aliases = [
+            _clean_text(alias)
+            for alias in (getattr(user, "aliases", None) or [])
+            if _clean_text(alias)
+        ]
+        platforms = [
+            _clean_text(account)
+            for account in (getattr(user, "platform_ids", None) or [])
+            if _clean_text(account)
+        ]
+        aliases_text = "、".join(aliases) or "无"
+        platforms_text = "、".join(platforms) or "无"
         try:
             window_peers_block = await self._render_window_peers_block(
                 umo, user, soul_id=soul_id
@@ -788,6 +1109,9 @@ class ContextBudgetManager:
             nickname_text=nickname_text,
             attitude_text=attitude_text,
             notes_text=notes_text,
+            canonical_name=canonical_name,
+            aliases_text=aliases_text,
+            platforms_text=platforms_text,
             window_peers_block=window_peers_block,
         )
 
@@ -831,50 +1155,70 @@ class ContextBudgetManager:
 
         # Annotate current user prompt with relationship tier & sender identity
         if hasattr(req, "prompt") and req.prompt and not req.prompt.startswith("["):
-            req.prompt = f"[{user.tier.label} {user.display_name}(ID:{user.global_uid})]: {req.prompt}"
+            # v2.12: always use the stable canonical name (identity normalisation).
+            speaker_name = (
+                _clean_text(getattr(user, "canonical_name", ""))
+                or user.display_name
+                or user.global_uid
+            )
+            req.prompt = (
+                f"[{user.tier.label} {speaker_name}(ID:{user.global_uid})]: {req.prompt}"
+            )
 
         # =====================================================================
-        # 第二步：按 [关键词匹配 + 时间新鲜度 + 重要度] 检索候选记忆
+        # 第二步：上下文感知 Query + 三路混合召回 (Top-24) + Rerank 精排 + 门闸
         # =====================================================================
-        candidates = await self.memory_manager.retrieve_candidates(
-            soul_id=soul.soul_id, user_id=user.global_uid
+        now = time.time()
+        recall_query = self._build_recall_query(umo, user, query_text)
+        query_vector = await self._embed_query(recall_query, soul)
+        candidates = await self._retrieve_candidates(
+            soul=soul,
+            user=user,
+            query_text=recall_query,
+            query_vector=query_vector,
+        )
+        candidates = [
+            mem
+            for mem in candidates
+            if not self._is_recent_window_duplicate(umo, mem, now)
+        ]
+        sem_scores = await self._semantic_scores(
+            recall_query, candidates, query_vector, soul
         )
 
-        now = time.time()
-        scored_memories = []
+        scored_memories: list[tuple[float, float, Any]] = []
         for mem in candidates:
-            # 1. 关键词命中分 (0.0 ~ 1.0)
-            kw_list = [k.strip() for k in mem.keywords.split(",") if k.strip()]
-            kw_hits = sum(1 for k in kw_list if k in query_text)
-            # Also check substring overlap with content if no keyword hit directly
-            if kw_hits == 0 and any( tok in query_text for tok in kw_list ):
-                kw_hits = 1
-            kw_score = min(1.0, kw_hits * 0.5) if kw_list else 0.0
-
-            # 2. 时间新鲜度分 Recency (越近越容易被想起，指数衰减)
-            days_old = max(0.0, (now - mem.created_at) / 86400.0)
+            sem_score = float(sem_scores.get(mem.id, 0.0))
+            event_ts = int(
+                getattr(mem, "effective_event_at", 0) or mem.created_at or now
+            )
+            days_old = max(0.0, (now - max(0, event_ts)) / 86400.0)
             recency_score = math.exp(-0.15 * days_old)
+            imp_score = max(1, min(10, int(mem.importance))) / 10.0
+            total_score = (
+                SEMANTIC_WEIGHT * sem_score
+                + RECENCY_WEIGHT * recency_score
+                + IMPORTANCE_WEIGHT * imp_score
+            )
+            # v2.12 最低相关性门闸：不相关的记忆绝不硬凑注入（旧版 0 分也会塞 6 条）。
+            if total_score < self.min_recall_score:
+                continue
+            if sem_score < self.min_semantic_score:
+                continue
+            scored_memories.append((total_score, sem_score, mem))
 
-            # 3. 重要度分 Importance (0.1 ~ 1.0)
-            imp_score = mem.importance / 10.0
-
-            # 综合得分
-            total_score = 0.40 * kw_score + 0.35 * recency_score + 0.25 * imp_score
-            scored_memories.append((total_score, mem))
-
-        scored_memories.sort(key=lambda x: x[0], reverse=True)
+        scored_memories.sort(key=lambda item: item[0], reverse=True)
 
         # =====================================================================
-        # 第三步：硬性预算裁剪 (Hard Budget Gate：限制最大条数与最大字符数)
+        # 第三步：硬性预算裁剪 (预算计入时间标签开销，超长项 continue 而不是 break)
         # =====================================================================
         selected_lines: list[str] = []
         current_chars = 0
         recalled_ids: list[int] = []
+        recall_sem_scores: dict[int, float] = {}
 
-        for score, mem in scored_memories:
+        for _total_score, sem_score, mem in scored_memories:
             if len(selected_lines) >= self.max_injected_memories:
-                break
-            if current_chars + len(mem.content) > self.max_memory_chars_budget:
                 break
 
             if mem.memory_tier == MemoryTier.CORE:
@@ -883,20 +1227,45 @@ class ContextBudgetManager:
                 tag = "近期记忆"
             else:
                 tag = "瞬时记忆"
+            type_label = MEMORY_TYPE_LABELS.get(
+                normalize_memory_type(getattr(mem, "memory_type", "episode")), ""
+            )
+            header = f"[{tag}"
+            if type_label:
+                header += f" · {type_label}"
 
-            # v2.10: every recalled memory carries its formation-time anchor so the
-            # model can resolve relative expressions ("这周末 / 明天") and judge
-            # whether the memory is already stale. Content itself stays untouched.
-            anchor = describe_time_anchor(mem.created_at, now)
+            # v2.10: every recalled memory carries its event-time anchor so the model
+            # can resolve relative expressions ("这周末 / 明天"). Content stays raw.
+            anchor = describe_time_anchor(
+                int(getattr(mem, "effective_event_at", 0) or mem.created_at), now
+            )
             if anchor:
-                selected_lines.append(f"- [{tag} · 形成于 {anchor}] {mem.content}")
-            else:
-                selected_lines.append(f"- [{tag}] {mem.content}")
-            current_chars += len(mem.content)
+                header += f" · 形成于 {anchor}"
+            header += "] "
+            line = f"- {header}{mem.content}"
+            # v2.12: the time label counts against the character budget too.
+            cost = len(line) + 1
+            if current_chars + cost > self.max_memory_chars_budget:
+                # Skip this too-long memory but keep scanning shorter relevant ones.
+                continue
+            selected_lines.append(line)
+            current_chars += cost
             recalled_ids.append(mem.id)
+            recall_sem_scores[mem.id] = sem_score
 
         if recalled_ids:
-            await self.memory_manager.reinforce_memories(recalled_ids)
+            reinforce = getattr(self.memory_manager, "reinforce_memories", None)
+            if callable(reinforce):
+                try:
+                    result = reinforce(recalled_ids, sem_scores=recall_sem_scores)
+                    if inspect.isawaitable(result):
+                        await result
+                except TypeError:
+                    result = reinforce(recalled_ids)
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception as exc:  # noqa: BLE001 - reinforcement is best effort
+                    logger.debug(f"[OnlyYou] reinforce_memories failed: {exc}")
 
         # =====================================================================
         # 第四步：注入当前行动卡约束（BUSY_TASK 实时进度 / IDLE 繁忙成果与视频）
@@ -994,4 +1363,8 @@ class ContextBudgetManager:
             "injected_chars": current_chars,
             "progress_pct": progress_pct,
             "action_type": action_type.value if action_type is not None else "",
+            # v2.12 diagnostics: context-aware query / coarse pool / relevance scores.
+            "recall_query": recall_query,
+            "candidate_count": len(candidates),
+            "semantic_scores": dict(recall_sem_scores),
         }

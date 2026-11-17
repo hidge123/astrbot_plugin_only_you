@@ -47,7 +47,9 @@ EXPECTED_USER_RELATION_CONTEXT_PROMPT = """[用户关系等级与重要度法则
 - 对话人：{display_name} (ID: {global_uid}) | 关系等级：{tier_label} (亲密度 {intimacy})
 - 专属称呼：{nickname_text}
 - 你对 Ta 的专属态度：{attitude_text}
-- 关系备注：{notes_text}{window_peers_block}"""
+- 关系备注：{notes_text}
+- 身份归一：标准称呼「{canonical_name}」；曾用名 / 多端昵称：{aliases_text}；绑定账号：{platforms_text}。
+  （以上所有名称均指代同一个人，记忆与回复中请统一认作同一人，切勿拆分为两个人！）{window_peers_block}"""
 
 EXPECTED_AVATAR = (
     "data:image/png;base64,"
@@ -81,6 +83,9 @@ class TestV26Templates(unittest.TestCase):
             "nickname_text",
             "attitude_text",
             "notes_text",
+            "canonical_name",
+            "aliases_text",
+            "platforms_text",
             "window_peers_block",
         }
         import string
@@ -100,12 +105,17 @@ class TestV26Templates(unittest.TestCase):
             nickname_text="损友",
             attitude_text="嘴上嫌弃但每次都秒回帮他兜底",
             notes_text="旧同学",
+            canonical_name="阿泽",
+            aliases_text="胡翔宇、胡翔宇（考研版）",
+            platforms_text="qq bot:10001",
             window_peers_block="\n\n[当前群聊其他活跃对话者档案]:\n- 老王 (ID: u-2) | 关系等级：L1普通群友",
         )
         assert "对话人：阿泽 (ID: u-1)" in rendered
         assert "亲密度 88.5" in rendered
         assert "你对 Ta 的专属态度：嘴上嫌弃但每次都秒回帮他兜底" in rendered
-        assert "关系备注：旧同学\n\n[当前群聊其他活跃对话者档案]:" in rendered
+        assert "关系备注：旧同学" in rendered
+        assert "身份归一：标准称呼「阿泽」" in rendered
+        assert "[当前群聊其他活跃对话者档案]:" in rendered
         assert "★L3 核心用户" in rendered
         assert "◆L2 重要熟人" in rendered
         assert "L1 普通群友" in rendered

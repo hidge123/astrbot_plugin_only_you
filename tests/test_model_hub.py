@@ -104,7 +104,7 @@ class ModelHubTestBase(DatabaseAsyncTestCase):
 class TestNormalizeModelConfig(unittest.TestCase):
     def test_defaults_are_complete(self):
         cfg = normalize_model_config(None)
-        assert set(cfg) == {"main", "decision", "vision", "tts"}
+        assert set(cfg) == {"main", "decision", "vision", "tts", "embedding", "rerank"}
         assert cfg["main"] == {"source_id": "", "model": ""}
         assert cfg["decision"]["inherit"] is True
         assert cfg["vision"]["inherit"] is True
@@ -301,7 +301,7 @@ class TestPersistenceAndHotRebuild(ModelHubTestBase):
         stored = await self.db.get_setting("model_config", None)
         assert stored is not None
         assert stored["main"] == {"source_id": "deepseek", "model": "deepseek-reasoner"}
-        assert set(stored) == {"main", "decision", "vision", "tts"}
+        assert set(stored) == {"main", "decision", "vision", "tts", "embedding", "rerank"}
 
         # a brand-new hub instance reading the same DB sees the persisted config
         hub2 = ModelHub(
@@ -376,7 +376,7 @@ class TestStatusAndDiagnostics(ModelHubTestBase):
     async def test_get_status_four_roles(self):
         hub, _ctx, _factory = await self.make_hub(model_config=MAIN_CONFIG)
         status = await hub.get_status()
-        assert set(status) == {"main", "decision", "vision", "tts"}
+        assert set(status) == {"main", "decision", "vision", "tts", "embedding", "rerank"}
         assert status["main"]["configured"] is True
         assert status["main"]["mode"] in ("reuse", "plugin")
         assert status["main"]["ok"] is True

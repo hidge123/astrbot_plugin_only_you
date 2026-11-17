@@ -43,6 +43,13 @@ MAIN_PROVIDER_ID = "onlyyou::main"
 TTS_PROVIDER_ID = "onlyyou::tts"
 PLUGIN_ID_PREFIX = "onlyyou::"
 
+#: v2.12: RAG 角色（向量 / 重排）自建实例的 id 前缀。
+EMBEDDING_ID_PREFIX = "onlyyou::embedding::"
+RERANK_ID_PREFIX = "onlyyou::rerank::"
+
+#: AstrBot ``provider_type`` values for the two RAG roles.
+VECTOR_PROVIDER_TYPES = ("embedding", "rerank")
+
 
 def _getattr_safe(obj: Any, name: str, default: Any = None) -> Any:
     """``getattr`` that never raises (properties may explode)."""
@@ -77,6 +84,8 @@ class ProviderFactory:
     MAIN_PROVIDER_ID = MAIN_PROVIDER_ID
     TTS_PROVIDER_ID = TTS_PROVIDER_ID
     CHAT_ID_PREFIX = "onlyyou::chat::"
+    EMBEDDING_ID_PREFIX = EMBEDDING_ID_PREFIX
+    RERANK_ID_PREFIX = RERANK_ID_PREFIX
 
     def __init__(self, context: Any) -> None:
         self.context = context
@@ -85,6 +94,8 @@ class ProviderFactory:
         self._chat_cache: Dict[Tuple[str, str], Any] = {}
         # misc key -> TTS provider instance
         self._tts_cache: Dict[str, Any] = {}
+        # v2.12: (kind, cache_key) -> embedding / rerank provider instance.
+        self._vector_cache: Dict[Tuple[str, str], Any] = {}
         # Strong references to plugin-built instances (so ``id()`` bookkeeping stays
         # valid and dispose can terminate them deterministically).
         self._owned_instances: List[Any] = []
@@ -263,7 +274,13 @@ class ProviderFactory:
             return True
         try:
             pm = self.provider_manager
-            for attr in ("provider_insts", "tts_provider_insts", "inst_map"):
+            for attr in (
+                "provider_insts",
+                "tts_provider_insts",
+                "embedding_provider_insts",
+                "rerank_provider_insts",
+                "inst_map",
+            ):
                 container = _getattr_safe(pm, attr, None)
                 if isinstance(container, dict):
                     if any(value is instance for value in container.values()):
@@ -464,6 +481,300 @@ class ProviderFactory:
         except Exception as exc:
             logger.warning(f"[OnlyYou] list_tts_providers(config) failed: {exc}")
         return providers
+
+    # ------------------------------------------------------------------
+    # v2.12: Embedding / Rerank providers (RAG memory retrieval)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _provider_type_of(instance: Any) -> str:
+        """Best-effort ``provider_type`` (``embedding`` / ``rerank`` / ...)."""
+        meta = ProviderFactory._safe_meta(instance)
+        provider_type = _clean(meta.get("provider_type")).lower()
+        if provider_type:
+            return provider_type
+        config = _as_dict(_getattr_safe(instance, "provider_config", {}))
+        return _clean(config.get("provider_type")).lower()
+
+    @staticmethod
+    def _looks_like_vector(instance: Any, kind: str) -> bool:
+        """Whether ``instance`` can serve the requested vector role.
+
+        Type metadata wins when present; otherwise the capability is probed
+        (``get_embedding`` / ``get_embeddings`` for embedding, ``rerank`` for
+        rerank). Every access is defensive so an AstrBot internal change only
+        degrades the RAG path instead of breaking the plugin.
+        """
+        if instance is None:
+            return False
+        provider_type = ProviderFactory._provider_type_of(instance)
+        if provider_type:
+            return provider_type == kind
+        try:
+            if kind == "embedding":
+                return callable(
+                    _getattr_safe(instance, "get_embedding", None)
+                ) or callable(_getattr_safe(instance, "get_embeddings", None))
+            if kind == "rerank":
+                return callable(_getattr_safe(instance, "rerank", None))
+        except Exception:
+            return False
+        return False
+
+    def _vector_instances(self, kind: str) -> List[Any]:
+        """Every already-loaded AstrBot instance that can serve ``kind``."""
+        instances: List[Any] = []
+        seen: set = set()
+
+        def _add(candidate: Any) -> None:
+            if candidate is None or id(candidate) in seen:
+                return
+            if not self._looks_like_vector(candidate, kind):
+                return
+            seen.add(id(candidate))
+            instances.append(candidate)
+
+        getter_name = (
+            "get_all_embedding_providers"
+            if kind == "embedding"
+            else "get_all_rerank_providers"
+        )
+        for owner in (self.context, self.provider_manager):
+            getter = _getattr_safe(owner, getter_name, None)
+            if not callable(getter):
+                continue
+            try:
+                for instance in _as_list(getter()):
+                    _add(instance)
+            except Exception as exc:  # noqa: BLE001 - degrade silently
+                logger.debug(f"[OnlyYou] {getter_name} failed: {exc}")
+
+        container_attr = (
+            "embedding_provider_insts" if kind == "embedding" else "rerank_provider_insts"
+        )
+        container = _getattr_safe(self.provider_manager, container_attr, None)
+        for instance in _as_list(container):
+            _add(instance)
+        for instance in list(self._inst_map().values()):
+            _add(instance)
+        return instances
+
+    def list_vector_providers(self, kind: str) -> List[dict]:
+        """List enabled instances + configured entries of one vector role."""
+        role = _clean(kind).lower()
+        if role not in VECTOR_PROVIDER_TYPES:
+            return []
+        providers: List[dict] = []
+        seen: set = set()
+        for instance in self._vector_instances(role):
+            meta = self._safe_meta(instance)
+            pid = meta.get("id") or _clean(
+                _as_dict(_getattr_safe(instance, "provider_config", {})).get("id")
+            )
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            providers.append(
+                {
+                    "id": pid,
+                    "model": meta.get("model", ""),
+                    "type": meta.get("type", ""),
+                    "provider_type": role,
+                    "enable": True,
+                    "source": "instance",
+                }
+            )
+        try:
+            for entry in self._providers_config():
+                if not isinstance(entry, dict):
+                    continue
+                if _clean(entry.get("provider_type")).lower() != role:
+                    continue
+                pid = _clean(entry.get("id"))
+                if not pid or pid in seen:
+                    continue
+                seen.add(pid)
+                providers.append(
+                    {
+                        "id": pid,
+                        "model": _clean(entry.get("model")),
+                        "type": _clean(entry.get("type")),
+                        "provider_type": role,
+                        "enable": bool(entry.get("enable", False)),
+                        "source": "config",
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001 - list must never raise
+            logger.warning(f"[OnlyYou] list_vector_providers({role}) failed: {exc}")
+        return providers
+
+    def list_embedding_providers(self) -> List[dict]:
+        """AstrBot embedding providers (``provider_type == "embedding"``)."""
+        return self.list_vector_providers("embedding")
+
+    def list_rerank_providers(self) -> List[dict]:
+        """AstrBot rerank providers (``provider_type == "rerank"``)."""
+        return self.list_vector_providers("rerank")
+
+    def _find_reusable_vector(self, kind: str, source_id: str, model: str) -> Any:
+        """Return an already loaded vector instance for ``(source_id, model)``."""
+        source_id = _clean(source_id)
+        model = _clean(model)
+        if not source_id or not model:
+            return None
+        for instance in self._vector_instances(kind):
+            config = _as_dict(_getattr_safe(instance, "provider_config", {}))
+            if _clean(config.get("provider_source_id")) != source_id:
+                continue
+            meta = self._safe_meta(instance)
+            if model in (_clean(config.get("model")), meta.get("model", "")):
+                pid = meta.get("id") or _clean(config.get("id"))
+                if pid and self._find_provider_entry(pid) is not None:
+                    if not self._instance_is_enabled(pid):
+                        continue
+                return instance
+        return None
+
+    async def _instantiate_source_provider(
+        self, source_id: str, model: str, kind: str
+    ) -> Any:
+        """Build a plugin-owned embedding / rerank instance from a provider source."""
+        source_id = _clean(source_id)
+        model = _clean(model)
+        if not source_id:
+            return None
+        source = self._find_source(source_id)
+        if source is None:
+            logger.warning(f"[OnlyYou] {source_id} provider source not found")
+            return None
+        id_prefix = (
+            EMBEDDING_ID_PREFIX if kind == "embedding" else RERANK_ID_PREFIX
+        )
+        try:
+            entry = {
+                "id": f"{id_prefix}{source_id}::{model}",
+                "enable": True,
+                "provider_source_id": source_id,
+                "provider_type": kind,
+                "model": model,
+                "modalities": [],
+                "custom_extra_body": {},
+                "max_context_tokens": 0,
+            }
+            config = self._merge_provider_config(entry)
+            config = self._resolve_env_keys(config)
+            config["model"] = model
+            config.setdefault("provider_type", kind)
+            provider_type = _clean(config.get("type"))
+            if not provider_type:
+                logger.warning(
+                    f"[OnlyYou] {source_id} has no adapter type for {kind}"
+                )
+                return None
+            pm = self.provider_manager
+            if pm is None:
+                return None
+            dynamic_import = getattr(pm, "dynamic_import_provider", None)
+            if callable(dynamic_import):
+                dynamic_import(provider_type)
+            else:
+                self._fallback_import_provider(provider_type)
+            meta_data = self._provider_cls_map().get(provider_type)
+            provider_cls = _getattr_safe(meta_data, "cls_type", None)
+            if provider_cls is None:
+                logger.warning(
+                    f"[OnlyYou] provider adapter not registered: {provider_type}"
+                )
+                return None
+            instance = provider_cls(config, self._provider_settings())
+            initialize = getattr(instance, "initialize", None)
+            if callable(initialize):
+                result = initialize()
+                if hasattr(result, "__await__"):
+                    await result
+            return instance
+        except Exception as exc:  # noqa: BLE001 - RAG must degrade, not crash
+            logger.warning(
+                f"[OnlyYou] build {kind} provider {source_id}/{model} failed: {exc}"
+            )
+            return None
+
+    async def get_vector_provider(self, kind: str, cfg: Any) -> Any:
+        """Resolve an ``embedding`` / ``rerank`` provider from a role config.
+
+        ``cfg`` supports two modes (v2.12 contract):
+
+        * ``{"mode": "provider", "provider_id": "..."}`` — reuse an AstrBot instance;
+        * ``{"mode": "source", "source_id": "...", "model": "..."}`` — reuse a matching
+          loaded instance or build a plugin-owned one.
+
+        Every failure returns ``None`` so the memory system degrades to lexical
+        retrieval instead of raising.
+        """
+        role = _clean(kind).lower()
+        if role not in VECTOR_PROVIDER_TYPES:
+            return None
+        options = _as_dict(cfg)
+        mode = _clean(options.get("mode")).lower() or "off"
+        if mode == "off":
+            return None
+
+        if mode == "provider":
+            provider_id = _clean(options.get("provider_id"))
+            if not provider_id:
+                return None
+            cache_key = ("provider", provider_id)
+            cached = self._vector_cache.get((role, cache_key))
+            if cached is not None and self._is_loaded_instance(cached):
+                return cached
+            instance = None
+            try:
+                get_by_id = _getattr_safe(self.context, "get_provider_by_id", None)
+                if callable(get_by_id):
+                    instance = get_by_id(provider_id)
+                    if inspect.isawaitable(instance):
+                        instance = await instance
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[OnlyYou] get_provider_by_id({provider_id}) failed: {exc}")
+            if instance is None:
+                instance = self._inst_map().get(provider_id)
+            if instance is None or not self._looks_like_vector(instance, role):
+                logger.warning(
+                    f"[OnlyYou] {role} provider not found or invalid: {provider_id}"
+                )
+                return None
+            self._vector_cache[(role, cache_key)] = instance
+            return instance
+
+        if mode == "source":
+            source_id = _clean(options.get("source_id"))
+            model = _clean(options.get("model"))
+            if not source_id or not model:
+                return None
+            cache_key = ("source", f"{source_id}::{model}")
+            cached = self._vector_cache.get((role, cache_key))
+            if cached is not None and self._is_loaded_instance(cached):
+                return cached
+            reused = self._find_reusable_vector(role, source_id, model)
+            if reused is not None:
+                self._vector_cache[(role, cache_key)] = reused
+                return reused
+            instance = await self._instantiate_source_provider(source_id, model, role)
+            if instance is None:
+                return None
+            self._track_owned(instance)
+            self._vector_cache[(role, cache_key)] = instance
+            return instance
+
+        logger.warning(f"[OnlyYou] unknown {role} provider mode: {mode}")
+        return None
+
+    async def get_embedding_provider(self, cfg: Any) -> Any:
+        """Return an embedding provider instance (``None`` when disabled/failed)."""
+        return await self.get_vector_provider("embedding", cfg)
+
+    async def get_rerank_provider(self, cfg: Any) -> Any:
+        """Return a rerank provider instance (``None`` when disabled/failed)."""
+        return await self.get_vector_provider("rerank", cfg)
 
     async def find_source_model_by_provider_id(
         self, provider_id: str
@@ -903,5 +1214,6 @@ class ProviderFactory:
         self._owned_ids.clear()
         self._chat_cache.clear()
         self._tts_cache.clear()
+        self._vector_cache.clear()
         self._registered_main_ids.clear()
         self._main_instance = None

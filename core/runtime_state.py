@@ -47,6 +47,8 @@ RUNTIME_STATE_VERSION = 1
 MAX_SHARED_VIDEO_IDS_PER_SOUL = 200
 MAX_MUSED_BUSY_KEYS_PER_SOUL = 100
 MAX_MUSED_MEMORY_IDS_PER_SOUL = 30
+#: v2.12: anti-repetition ring of the last proactive messages sent per Soul.
+MAX_RECENT_PROACTIVE_MESSAGES_PER_SOUL = 5
 
 #: ``known_l3_umos`` is capped MRU-style (oldest insertion evicted first).
 MAX_KNOWN_L3_UMOS = 100
@@ -78,6 +80,9 @@ def default_snapshot() -> dict[str, Any]:
         "last_group_lurk_ts": {},
         "last_private_catchup_ts": {},
         "known_l3_umos": {},
+        # v2.12: anti-repetition guard + daily proactive budget.
+        "recent_proactive_messages": {},
+        "idle_roam_daily_counts": {},
     }
 
 
@@ -248,6 +253,37 @@ def normalize_snapshot(
     result["known_l3_umos"] = _normalize_string_map(
         snapshot.get("known_l3_umos"), MAX_KNOWN_L3_UMOS
     )
+
+    # ---- v2.12: recent proactive messages per Soul (anti-repetition ring) ----
+    raw_recent = snapshot.get("recent_proactive_messages")
+    if isinstance(raw_recent, dict):
+        recent: dict[str, list[str]] = {}
+        for soul_id, values in raw_recent.items():
+            clean_soul = _clean_key(soul_id)
+            if not clean_soul:
+                continue
+            # Stored oldest-first; keep only the newest N entries.
+            items = _normalize_string_list(values, MAX_RECENT_PROACTIVE_MESSAGES_PER_SOUL)
+            if items:
+                recent[clean_soul] = items
+        result["recent_proactive_messages"] = recent
+
+    # ---- v2.12: per-Soul daily proactive counter {soul_id: {date, count}} ----
+    raw_counts = snapshot.get("idle_roam_daily_counts")
+    if isinstance(raw_counts, dict):
+        counts: dict[str, dict[str, Any]] = {}
+        for soul_id, payload in raw_counts.items():
+            clean_soul = _clean_key(soul_id)
+            if not clean_soul or not isinstance(payload, dict):
+                continue
+            date_text = str(payload.get("date") or "").strip()
+            try:
+                count_value = int(payload.get("count") or 0)
+            except (TypeError, ValueError):
+                continue
+            if date_text and count_value > 0:
+                counts[clean_soul] = {"date": date_text, "count": count_value}
+        result["idle_roam_daily_counts"] = counts
 
     # Version is owned by the schema, not by the stored payload.
     result["version"] = RUNTIME_STATE_VERSION
