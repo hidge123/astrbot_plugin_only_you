@@ -702,7 +702,7 @@
     html +=
       '<div class="field-help">绑定状态：<span class="tag" data-role="action-state-hint">' +
       esc(STATE_LABELS[String(currentState).toUpperCase()] || "空闲") +
-      "</span> · 该行动类型自带固定护甲档位（由后端自动应用）</div></div>";
+      "</span> · 绑定状态决定该时间块对 L1 / ◆L2 / ★L3 消息的放行与转未读规则</div></div>";
     html +=
       '<div class="field"><span class="field-label">正在做的事（活动标题）</span>' +
       '<input class="input" data-role="activity-input" maxlength="120" placeholder="如：埋头赶稿 / 躺沙发刷 B 站" value="' +

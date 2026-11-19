@@ -1232,6 +1232,12 @@
       S.savedCfg = clone(saved);
       /* 保存期间用户若继续编辑，保留其新改动继续下一轮自动保存 */
       if (JSON.stringify(S.cfg) === payloadJson) S.cfg = saved;
+      /* 已成功落盘的文本编辑不再显示「待应用」 */
+      Object.keys(S.pendingRoles || {}).forEach(function (role) {
+        if (JSON.stringify(S.cfg[role]) === JSON.stringify(S.savedCfg[role])) {
+          delete S.pendingRoles[role];
+        }
+      });
       if (data && data.soul_id) S.soulId = String(data.soul_id);
       S.status =
         data && data.status && typeof data.status === "object" ? data.status : S.status;

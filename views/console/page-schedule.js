@@ -527,7 +527,7 @@
     return html;
   }
 
-  function bindSlotForm(body) {
+  function bindSlotForm(body, isCurrent) {
     var seg = body.querySelector('[data-role="slot-action-seg"]');
     var hint = body.querySelector('[data-role="slot-state-hint"]');
     var gateNote = body.querySelector('[data-role="slot-gate-note"]');
@@ -549,7 +549,8 @@
         }
         if (gateNote) gateNote.textContent = gateDescription(type);
         if (sleepWarning) {
-          sleepWarning.style.display = type === "SLEEP" ? "block" : "none";
+          sleepWarning.style.display =
+            isCurrent && type === "SLEEP" ? "block" : "none";
         }
       });
     }
@@ -589,12 +590,9 @@
     var body = document.createElement("div");
     body.innerHTML = slotFormHtml(app, slot, cards, isCurrent);
     pageData.drawerDirty = false;
-    bindSlotForm(body);
+    bindSlotForm(body, isCurrent);
     var sleepWarning = body.querySelector('[data-role="slot-sleep-warning"]');
-    if (sleepWarning) {
-      sleepWarning.style.display =
-        isCurrent && originalType === "SLEEP" ? "block" : "none";
-    }
+    if (sleepWarning) sleepWarning.style.display = "none";
     app.drawer({
       title:
         "编辑时间块 · " +

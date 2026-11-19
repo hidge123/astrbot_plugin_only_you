@@ -358,7 +358,7 @@
       esc(S.manualPlatform) +
       '" placeholder="例如 aiocqhttp / telegram_bot_1" />' +
       '<button class="btn btn-primary btn-sm" type="button" data-action="bind-manual"' +
-      (current ? "" : ' disabled data-tip="请先选择当前角色"') +
+      (current ? "" : " disabled") +
       ">" +
       icon("link", 13) +
       "绑定到当前角色</button></div>" +
