@@ -66,7 +66,7 @@
 - **TTS 插件自治**：三种来源（关闭 / 提供商源自建 / AstrBot TTS）、触发概率、生效范围（私聊 / L3 / 全部）、语音 + 文字双发；`on_decorating_result` 钩子**先于原生分段回复与原生 TTS** 执行，不会重复播报。
 - **不重造轮子、不与平台配置打架**：黑白名单 100% 遵循平台；被动消息通过 `event.should_call_llm(True/False)` 协同原生管线；后台主动消息复用平台 `segmented_reply` 参数；用户发图走平台原生多模态/识图管线。
 
-### ⑧ 灰白 + 青绿的可视化控制台（AstrBot Plugin Pages，8 页）
+### ⑧ 灰白 + 青绿的可视化控制台（AstrBot Plugin Pages，9 页）
 - **布局**：48px 精简顶栏（品牌 / 当前角色 / 刷新 / 主题）+ 216px 侧栏（运行：概览、日程；角色：角色卡；关系；记忆；冲浪；系统：模型、会话）+ 主工作区。
 - **页面（v2.8 新版）**：**概览**（状态环形表 + 24h 弹性日程轴 + 实时繁忙进度条 + 今日繁忙成果/配额/关系/记忆/模型小卡）、**日程**（24h 动态时间轴 + 四类行动卡网格与编辑器）、**角色卡**（10 分区动态表单 + AI 造卡 + 图片头像；未保存修改离开/切角色前会弹窗确认）、**关系与群聊**（筛选 chips + 即时搜索 + ★L3→◆L2→L1 分组横向列表 + 居中宽幅详情弹窗；群聊分区卡片与详情弹窗）、**记忆**（T3/T2/T1 分层列表 + T1 48h 倒计时与上限提示 + 提炼/GC）、**冲浪**（视频卡片墙 + 顶部按角色的赛博冲浪总开关与后台视频源 B站/抖音选择）、**模型**（**按当前角色**配置四角色 + 测试 + TTS 试听，修改 0.7s 防抖自动保存）、**会话 / 机器人接口**（当前角色绑定列表 + 手动绑定 + 默认角色兜底开关 + 管辖会话内存概览）。页面级未保存修改守卫（`isDirty`）与深/浅色主题保留。
 - **视觉**：灰白底 + 青绿主色（浅色 `#fafafa` / 深色 `#0f1115`，主色 `#0d9488` / `#2dd4bf`）；三态色 `IDLE #10b981` / `BUSY #f59e0b` / `RESTING #6366f1`；内联 SVG 图标替代 emoji，长说明改为悬浮提示；无构建 classic script，支持浅/深色。
@@ -111,6 +111,12 @@
 - `initialize()` 加载、状态变更点（分享成功 / 联想发送成功 / 冷却更新 / ★L3 私聊 / 解绑清空后）best-effort 落盘、`terminate()` 关闭 DB 前再保存；存储层异常只记 warning，绝不影响聊天主流程。
 - **语义边界**：重启后未读 backlog 仍会清空（未读队列本身不持久化，属于既定产品语义）；但**主动消息去重、冷却、★L3 私聊目标不会丢**，因此不会出现「重启后重复分享同一视频 / 重复聊同一条繁忙成果」。
 
+### ⑯ 设置页（v2.13，配置统一入口）
+
+- **设置页**（`page-settings.js`）：6 大分组 Tab（运行节奏 / 主动搭话 / 读空气 / 记忆与 RAG / 关系成长 / 冲浪抓取），每组「常规配置」默认展开、「高级参数」默认折叠；支持搜索过滤、修改对比、恢复本组 / 全部默认。
+- **热更新**：保存后写入 SQLite `plugin_settings["runtime_config"]` 并原地刷新共享配置字典，触发心跳唤醒与模块 `reload_config`，**不需要重载插件**；心跳 / GC 周期修改会立即按新节拍运行。
+- **旧配置迁移**：首次启动自动把旧 AstrBotConfig 中改过的非默认值迁入新配置中心；`_conf_schema.json` 已删除，原生插件配置面板不再出现 OnlyYou 配置。
+
 ### ⑮ 控制台 v2.8 新版关系页与会话页
 - **关系与群聊页**（`page-relations.js` 重写）：顶部筛选 chips（全部 / ★L3 / ◆L2 / L1 / 💬 群聊）+ 即时搜索 + 按 `★L3 → ◆L2 → L1` 分组的 `.relation-row` 横向列表；点行打开**居中宽幅弹窗**编辑显示名 / 专属称呼 / 等级 / 好感度 / 专属态度 / 平台账号 / 合并账号 / 删除；群聊分区卡片 + 群聊详情弹窗（群名、备注、清空该群内存、移除记录）。旧三列看板 / 拖拽 / 「⋯」菜单已移除。
 - **会话 / 机器人接口页**（`page-sessions.js` 重写）：当前角色绑定列表（已绑定 → 解绑并清理该平台内存；被其他角色占用 → 禁绑提示；未绑定 → 绑定到当前角色）、手动输入 `platform_id` 绑定、默认角色兜底开关（`sessions/default_soul`）、当前角色管辖活跃会话内存概览（单会话 / 整平台清空）。旧「默认角色 + UMO 绑定表」UI 已移除（后端 UMO 绑定 API 仅为兼容保留）。
@@ -127,7 +133,7 @@
 - **位置**：`AtmosphereReader.evaluate_should_reply` 中「BUSY 特判 + @/唤醒/引用快速放行」之后、「防抖等待 + 读空气决策模型」之前。
 - **只作用于非 @ 普通群消息**：先按 `reply_gate_probability`（默认 **80%**）抽样，再按 `reply_gate_hourly_limit`（同一群聊滚动 1 小时判定上限，默认 **0 = 不限**）限流；未通过则直接放弃——**不调用决策模型、不进入防抖、不进入未读队列**，日志输出 `[OnlyYou] Reply gate dropped non-@ group message (...)`。
 - **旁路完全不受影响**：私聊、@ / 唤醒 / 引用 Bot、`BUSY` 的 L2/L3 特判、`takeover_group_chat=false`；心跳「群未读回放决策」走独立冷却，不经过门闸。
-- **兼容**：`reply_gate_enabled=false` 或概率 `100%` 时行为与旧版一致；概率 `0%` 时普通群消息完全不读空气（@ 仍会回复）。三项配置均在 AstrBot 插件配置面板「🌬️ 群聊读空气」中可见、可调、可关闭。
+- **兼容**：`reply_gate_enabled=false` 或概率 `100%` 时行为与旧版一致；概率 `0%` 时普通群消息完全不读空气（@ 仍会回复）。三项配置均在 Pages 控制台「设置 → 群聊读空气」中可见、可调、可关闭。
 
 ### ⑱ 按角色 / 会话的「主动回复」开关（v2.11）
 - **位置**：控制台「关系与群聊」页——打开任一**用户**或**群聊**的详情弹窗，即可看到「允许「当前角色」主动回复 Ta / 允许在当前群主动回复」开关；列表行对关闭项显示 `🤐 不主动` 标记。
@@ -226,11 +232,11 @@
 
 ```text
 OnlyYou/
-├── metadata.yaml                # 插件元数据（version: 2.12.0）
-├── _conf_schema.json            # AstrBot WebUI 配置 Schema（仅运行参数；含 v2.12 主动对话节奏 / L1→L2 门槛 / RAG 门槛）
+├── metadata.yaml                # 插件元数据（version: 2.13.0）
 ├── requirements.txt             # Python 依赖
 ├── main.py                      # 插件入口：三态门禁 / selected_provider / LLM 钩子 / on_decorating_result TTS / 后台任务 / 指令
 ├── core/                        # 核心逻辑
+│   ├── config_manager.py        # 运行配置中心（6 大分组 / 常规+高级 / 热更新 / 旧配置迁移）
 │   ├── state_machine.py         # 三态门禁控制器 + 四类行动卡枚举 (ActionType，含固定护甲)
 │   ├── roguelite_deck.py        # 24h 动态积木时间轴引擎（专属卡池 / 作息曲线 / 弹性块拼接）
 │   ├── schedule_mutator.py      # 输入驱动的受限微调（繁忙半途结算 / 睡眠唤醒 / 加钟延展）
@@ -243,13 +249,13 @@ OnlyYou/
 │   ├── provider_factory.py      # AstrBot Provider 封装（复用/自建、TTS、Embedding、Rerank）
 │   ├── model_hub.py             # 插件自治多角色模型网关（四对话角色 + Embedding/Rerank，按 Soul 读写）
 │   ├── platform_bridge.py       # 平台协同桥（唤醒 / 分段 / 主动语音消息 / 机器人接口探测）
-│   ├── web_api.py               # 31 条 Plugin Pages Web API
+│   ├── web_api.py               # 34 条 Plugin Pages Web API
 │   ├── time_utils.py            # v2.10 共享本地时间格式化（星期 / 形成时间锚点 / 窗口跨度）
 │   └── atmosphere_reader.py     # 群聊读空气 / 解线团 / v2.10 概率与每小时预算门闸
 ├── views/console/               # 控制台前端（无构建 classic script）
 │   ├── index.html / style.css   # 外壳 + 设计令牌（浅色 / 深色）
 │   ├── app.js / icons.js / charts.js / mock.js
-│   └── page-*.js                # 概览 / 日程 / 角色卡 / 关系与群聊 / 记忆 / 冲浪 / 模型 / 会话 共 8 页
+│   └── page-*.js                # 概览 / 日程 / 角色卡 / 关系与群聊 / 记忆 / 冲浪 / 模型 / 机器人接口 / 设置 共 9 页
 ├── surfing/                     # B站 / 抖音冲浪管线与适配器（含 is_fallback 兜底标记）
 ├── storage/db.py                # aiosqlite 持久化（含 plugin_settings KV 表；v2.8 souls.revision 迁移）
 ├── prompts/templates.py         # 集中管理 Prompt 模板
@@ -265,7 +271,7 @@ OnlyYou/
 
 | 文档路径 | 文档名称 | 核心内容概述 |
 | :--- | :--- | :--- |
-| **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | **技术架构设计 (v2.12)** | 三态门禁 × 四类行动卡、24h 动态时间轴与作息曲线、输入驱动的受限微调、**RAG 分级记忆（四类 memory_type / 语义去重 / Supersede / 混合召回 / 最低相关性门闸）**、身份归一（曾用名 / 规范称呼）、好感曲线、主动对话节奏（概率 / 每日上限 / 人设话题 / 反反复读）、上下文预算、**Persona 接管**、Soul JSON 唯一真源与 revision 裁决、多角色模型（含 Embedding / Rerank）与 `selected_provider`、读空气概率/预算门闸、冲浪分享门禁、运行态持久化、配置分层、31 条 Web API 与控制台结构。 |
+| **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | **技术架构设计 (v2.12)** | 三态门禁 × 四类行动卡、24h 动态时间轴与作息曲线、输入驱动的受限微调、**RAG 分级记忆（四类 memory_type / 语义去重 / Supersede / 混合召回 / 最低相关性门闸）**、身份归一（曾用名 / 规范称呼）、好感曲线、主动对话节奏（概率 / 每日上限 / 人设话题 / 反反复读）、上下文预算、**Persona 接管**、Soul JSON 唯一真源与 revision 裁决、多角色模型（含 Embedding / Rerank）与 `selected_provider`、读空气概率/预算门闸、冲浪分享门禁、运行态持久化、配置分层、34 条 Web API 与控制台结构。 |
 | **[docs/UPGRADE.md](docs/UPGRADE.md)** | **生产升级与迁移指南 (v2.12)** | 自动迁移清单与幂等 flag → 备份 → 部署 / 热重载 → 日志与数据校验 → Pages / 功能抽检 → 回滚；含**解绑 / 清空类操作的「清理 vs 保留」语义表**、重启语义、v2.8.2~v2.11 版本迁移条目与 FAQ。 |
 | **AGENTS.md（本地工程手册，GitHub 不可见）** | **开发、部署与联调规范** | 目录与模块职责、敏感信息安全规范、**AstrBot v4 底层机制与避坑指南**（`selected_provider`、Persona 段替换、`on_decorating_result`、`plugin_settings`、Provider 实例化）、**24h 时间轴不变量与繁忙结算契约**、Docker 部署、SSH 隧道 + OpenAPI 真机联调流程。⚠️ **该文件已在 `.gitignore` 中忽略，仅本地工程维护使用，GitHub 仓库不可见（因此本表不提供 Markdown 链接）**；GitHub 可见文档为 `README.md` + `docs/ARCHITECTURE.md` / `docs/UPGRADE.md`。 |
 
@@ -275,7 +281,7 @@ OnlyYou/
 
 1. **安装**：将插件目录放入 AstrBot 的 `data/plugins/astrbot_plugin_only_you`，安装 `requirements.txt` 依赖，重启 / 热重载插件（要求 AstrBot `>= v4.5.7`）。
 2. **配置**：
-   - 在 AstrBot 插件配置面板设置 Roguelite / 读空气 / 冲浪接口与分享门槛 / 记忆阈值（`_conf_schema.json` 只含运行参数；角色总开关、后台视频源、用户等级名单均由 Pages / Soul JSON 管理）；
+   - 在 Pages「设置」页统一调整 Roguelite / 主动搭话 / 读空气 / 记忆与 RAG / 关系成长 / 冲浪抓取（保存后热更新即时生效；角色总开关、后台视频源、用户等级名单仍由各业务页 / Soul JSON 管理）；
    - 打开插件 Pages 控制台，在「模型」页为**当前角色**配置 **对话（必填）/ 决策 / 视频解析 / TTS**（配置写入该角色 `souls/<soul_id>.json` 的 `model_config`）；
    - 在「角色卡」页手填或 AI 生成角色卡；在「会话 / 机器人接口」页把机器人接口绑定到角色并设置默认角色兜底。
 3. **从旧版本升级到 v2.12**：**先备份 `only_you.db`（以及整个插件数据目录），再阅读 [docs/UPGRADE.md](docs/UPGRADE.md) 执行升级与迁移校验**。首次启动会自动把旧 SQLite 角色数据落盘为 `souls/*.json`、迁移旧 UMO 绑定与全局模型配置，并把 `users` 关系列按角色拆分到 `user_relations`；v2.11 另会幂等补充 `proactive_enabled` 列（一次性 flag 全部成功才写入，失败下次启动自动重试）。

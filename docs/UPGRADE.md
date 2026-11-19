@@ -1,8 +1,8 @@
-# OnlyYou 生产升级与迁移指南 (v2.12)
+# OnlyYou 生产升级与迁移指南 (v2.13)
 
-> 适用对象：从 **v2.6.x ~ v2.11.x** 升级到 **v2.12.0** 的 AstrBot 部署（更早版本按同一流程升级，但旧行动卡 / 日程会在 v2.9 清理规则下被重抽或丢弃）。
+> 适用对象：从 **v2.6.x ~ v2.12.x** 升级到 **v2.13.0** 的 AstrBot 部署（更早版本按同一流程升级，但旧行动卡 / 日程会在 v2.9 清理规则下被重抽或丢弃）。
 > 本文只写升级、迁移、校验、回滚与排障语义，不含真实服务器地址或密钥；命令中的 `$SERVER_IP`、`<数据目录>`、`/path/to/OnlyYou` 均为占位符。
-> 版本口径：插件 `v2.12.0`；Web API **31 条**（字段扩展、路由未变）；控制台 **8 页**；角色卡 **10 分区 / 36 字段**。
+> 版本口径：插件 `v2.13.0`；Web API **34 条**（新增 `settings/*` 三条）；控制台 **9 页**（新增「设置」）；角色卡 **10 分区 / 36 字段**。
 > **本批修复**：T2/T3 降级为 T1 时不再沿用旧 `created_at`、界面也不会再显示「剩余 0h」；T1 保留期由 `tier1_since` 锚定（降级时重置 48h），列表读取前会先回收过期项。
 
 ---
@@ -26,8 +26,21 @@
 | 11 | `users` 补 `aliases_json`（v2.12，纯加法） | 旧库缺列 | 无（幂等 `ALTER TABLE`，默认 `[]`） |
 | 12 | 旧 `memories.user_id` 裸平台 uid / 曾用名归并到 `global_uid`（v2.12） | 存在可唯一归属的裸 ID | `legacy_memory_user_ids_migrated_v1`（全部成功才写入；歧义行保持原样） |
 | 13 | `memories` 补 `tier1_since`（v2.12，纯加法） | 旧库缺列 | 无（幂等 `ALTER TABLE`，默认 `0`；旧 T1 回退 `created_at`） |
+| 14 | 旧 AstrBotConfig 非默认值 → `plugin_settings["runtime_config"]`（v2.13） | 首次启动且标记缺失 | `legacy_astrbot_config_migrated`（成功后写入；已由 Pages 保存的新值优先） |
 
 **关键原则**：一次性 flag 只有在**全部条目迁移成功**后才写入；失败保留未写入状态并记 warning「下次启动重试」，迁移逻辑本身幂等（已迁移项跳过，不会重复插入）。
+
+v2.13 的破坏性变化：
+
+- **`_conf_schema.json` 已删除**。AstrBot 原生「插件配置」面板不再出现 OnlyYou 的旧配置项，
+  Pages 控制台「设置」页成为唯一入口。升级后首次启动会把旧配置里的**非默认值**自动迁入
+  SQLite `plugin_settings["runtime_config"]`；此前通过 Pages 保存过的值优先，不会被旧配置覆盖。
+- **新增 `settings/get|save|reset` 三条 Web API**（总数 31 → 34）。保存后原地热更新配置、
+  唤醒后台心跳，不需要重载插件；修改心跳 / GC 周期会立即重排后台任务节拍。
+- **配置项扩容**：原代码里的 35+ 项硬编码参数（心跳周期、GC 周期、记忆字数上限、RAG 权重、
+  好感增益、冲击力表、看片兜底分、冲浪历史保留上限等）全部开放到「设置」页的常规 / 高级两层。
+- **回滚**：回退到 v2.12 时 `runtime_config` / 新增迁移标记会被旧版忽略，旧版重新读取
+  `_conf_schema.json`（需从 Git 恢复该文件）；角色、记忆、关系与日程数据不受影响。
 
 v2.9 另有两点**非迁移**的行为变化：
 
@@ -177,7 +190,7 @@ sqlite3 <数据目录>/only_you.db \
 
 有旧数据时，`legacy_umo_bindings_migrated` / `model_config_migrated_to_souls` / `legacy_user_identity_migrated_v2` / `user_relations_migrated_v1` 应为 `true`。本来就没有旧数据时 flag 可能不写入，属正常。
 
-### 5.4 Pages 验收（8 页）
+### 5.4 Pages 验收（9 页）
 
 | 页面 | 重点检查 |
 | :--- | :--- |
@@ -371,7 +384,7 @@ docker start astrbot
   - **提炼单批最多 3 条**：需要 decision 模型可用；失败时该批消息进入单批重试缓冲，下次提炼自动重试一次，不会永久丢失。
 - **历史裸 ID 归并**：`memories.user_id` 里旧的裸平台 uid（如 `"42"`）或曾用名会在启动时一次性改写到 `webchat:42` 这类规范 `global_uid`；同一 native uid 属于多个用户的歧义行保持原样，可在关系页手工合并。旧记忆不强制补向量，被召回后后台惰性补算。
 - **Embedding / Rerank 为可选**：不配置时自动降级为「content + keywords」词法检索，零报错；推荐在模型页绑定 AstrBot 已启用的 `BAAI/bge-m3` 与 `BAAI/bge-reranker-v2-m3`。
-- **回滚**：回退到 v2.11 时，新增列会被旧版忽略（旧版 SQL 不读它们），记忆 / 用户 / 关系数据不丢；已 `superseded_by` 归档的行在旧版里会重新参与召回，但不会造成数据损坏。回滚后建议把 `idle_roam_*` 新配置从 `_conf_schema.json` 之外的手工配置中移除（旧版不识别，会被 schema 完整性检查忽略）。
+- **回滚**：回退到 v2.11 时，新增列会被旧版忽略（旧版 SQL 不读它们），记忆 / 用户 / 关系数据不丢；已 `superseded_by` 归档的行在旧版里会重新参与召回，但不会造成数据损坏。回滚后建议把 `idle_roam_*` 等新配置从旧版 AstrBot 插件配置面板之外的手工配置中移除（旧版不识别，会被 schema 完整性检查忽略）。
 
 ### 11.9 v2.12：T1 保留期与回收修复
 
@@ -434,7 +447,7 @@ v2.10 只注入「形成时间」供模型解冻相对时间，**不会改写记
 [ ] souls/*.json 存在，含 card / model_config / bound_platforms / settings / updated_at / revision
 [ ] souls 表含 revision 列；user_relations 每角色有行且含 proactive_enabled
 [ ] plugin_settings 迁移 flag 状态符合预期
-[ ] Pages 8 页可打开，关系 / 机器人接口页按角色工作
+[ ] Pages 9 页可打开（含「设置」），关系 / 机器人接口页按角色工作
 [ ] 记忆页显示形成时间；关系页主动回复开关可保存并刷新保持
 [ ] 非 @ 群消息门闸符合预期（默认 80%，可调 0~100 或关闭）
 [ ] 两个角色各自模型与关系互不影响
