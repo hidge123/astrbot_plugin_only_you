@@ -85,6 +85,12 @@
     return Math.max(0, Math.min(1, n));
   }
 
+  /** 数值兜底：非数字时返回 fallback（Mock 内部多处使用） */
+  function num(value, fallback) {
+    var n = Number(value);
+    return isFinite(n) ? n : (fallback == null ? 0 : fallback);
+  }
+
   /** 夹到 0.5h 网格并限制在 [0.5, 8.0]（与后端 SlotInstance 不变量一致） */
   function roundHalf(value) {
     return Math.round(clamp(value, 0.5, 8) * 2) / 2;
@@ -565,6 +571,260 @@
     return card;
   }
 
+  /* ------------------------------------------------------------------ *
+   * v2.13 运行配置中心（Mock）：6 大分组 / 常规 + 高级两层
+   * ------------------------------------------------------------------ */
+  var MOCK_SETTINGS_SECTIONS = [
+    {
+      id: "schedule",
+      title: "⏱️ 运行节奏与日程",
+      icon: "calendar",
+      description: "后台心跳节拍、24h 动态时间轴与日程微调的全局参数。",
+      group: "roguelite_schedule_config",
+      fields: [
+        ["enable_roguelite_schedule", "启用随机日程", "bool", true],
+        ["heartbeat_interval_minutes", "心跳间隔", "int", 15, false, 5, 60, "分钟"],
+        ["max_mutations_per_day", "每日微调上限", "int", 2, false, 0, 20, "次"],
+        ["mutation_cooldown_minutes", "微调冷却", "int", 120, false, 0, 1440, "分钟"],
+        ["allow_l3_wake_from_resting", "允许 ★L3 唤醒", "bool", true],
+        ["gc_check_interval_hours", "GC 巡检周期", "int", 24, false, 1, 168, "小时"],
+        ["urgent_keywords", "紧急关键词", "list", ["急", "快看", "大瓜", "救命"], true],
+        ["surf_mutation_min_score", "刷片加钟分数线", "int", 88, true, 60, 100, "分"],
+        ["burst_window_seconds", "连发判定窗口", "int", 300, true, 60, 1800, "秒"],
+        [
+          "mutation_impact_table",
+          "冲击力分值表",
+          "object",
+          { sleep_wake_urgent: 88, sleep_wake_normal: 45, busy_l1: 10, busy_l3_direct: 78, busy_l3_ambient: 62, busy_l3_urgent_bonus: 12, busy_l2_burst: 52, busy_l2_single: 38, busy_l2_urgent_bonus: 15, prelude_l3: 75, prelude_l2: 68 },
+          true
+        ]
+      ]
+    },
+    {
+      id: "proactive",
+      title: "💬 主动搭话与未读补回",
+      icon: "message",
+      description: "闲逛主动搭话、翻群吃瓜与私聊未读补回的概率、冷却与预算。",
+      group: "roguelite_schedule_config",
+      fields: [
+        ["idle_roam_cooldown_minutes", "闲逛搭话冷却", "int", 120, false, 0, 1440, "分钟"],
+        ["idle_roam_trigger_probability", "闲逛触发概率", "int", 35, false, 0, 100, "%"],
+        ["idle_roam_daily_max_count", "每日搭话上限", "int", 3, false, 0, 50, "次"],
+        ["idle_roam_persona_topic_ratio", "人设话题占比", "int", 70, false, 0, 100, "%"],
+        ["unread_private_reply_enabled", "私聊未读补回", "bool", true],
+        ["unread_private_cooldown_minutes", "私聊补回冷却", "int", 60, false, 0, 1440, "分钟"],
+        ["unread_private_ttl_minutes", "私聊未读有效期", "int", 720, false, 60, 4320, "分钟"],
+        ["unread_group_cooldown_minutes", "翻群冷却", "int", 60, false, 0, 1440, "分钟"],
+        ["unread_group_ttl_minutes", "群未读有效期", "int", 120, false, 30, 1440, "分钟"],
+        ["unread_max_per_chat", "单会话未读上限", "int", 20, false, 5, 100, "条"],
+        ["unread_private_catchup_per_tick", "单次补回会话数", "int", 2, true, 1, 10, "个"],
+        ["unread_private_scan_limit", "私聊扫描候选数", "int", 5, true, 1, 20, "个"],
+        ["unread_private_context_turns", "私聊补回上下文轮数", "int", 8, true, 3, 30, "轮"],
+        ["group_lurk_scan_limit", "翻群扫描候选数", "int", 10, true, 1, 50, "个"],
+        ["group_lurk_transcript_turns", "翻群上下文轮数", "int", 12, true, 5, 40, "轮"],
+        ["proactive_anti_repeat_count", "防复读注入条数", "int", 5, true, 1, 15, "条"],
+        ["mused_memory_ring_size", "记忆去重队列容量", "int", 30, true, 10, 200, "条"],
+        ["muse_pick_count", "记忆联想抽样数", "int", 3, true, 1, 10, "条"],
+        ["muse_exclude_hours", "记忆冷却时长", "int", 72, true, 12, 720, "小时"],
+        ["unread_batch_max_chars", "未读摘要字数预算", "int", 800, true, 200, 3000, "字"]
+      ]
+    },
+    {
+      id: "atmosphere",
+      title: "🌬️ 群聊读空气",
+      icon: "wind",
+      description: "接管群聊自由接话、防抖等待与概率 / 频控门闸。",
+      group: "atmosphere_config",
+      fields: [
+        ["takeover_group_chat", "接管群聊回复", "bool", true],
+        ["debounce_seconds", "防抖等待", "float", 4.0, false, 0.5, 30, "秒"],
+        ["reply_gate_enabled", "概率门闸", "bool", true],
+        ["reply_gate_probability", "门闸通过概率", "int", 80, false, 0, 100, "%"],
+        ["reply_gate_hourly_limit", "每小时判定上限", "int", 0, false, 0, 500, "条"],
+        ["atmosphere_transcript_turns", "读空气上下文轮数", "int", 12, true, 5, 30, "轮"]
+      ]
+    },
+    {
+      id: "memory",
+      title: "🧠 记忆、RAG 与上下文预算",
+      icon: "memory",
+      description: "三级记忆、语义去重、混合召回权重与上下文注入预算。",
+      group: "memory_and_context_config",
+      fields: [
+        ["enable_tiered_memory", "启用分级记忆", "bool", true],
+        ["sliding_window_size", "会话滑窗条数", "int", 15, false, 3, 60, "条"],
+        ["extract_every_n_messages", "提炼触发条数", "int", 15, false, 5, 60, "条"],
+        ["max_injected_memories", "单次注入条数", "int", 6, false, 1, 20, "条"],
+        ["max_memory_chars_budget", "单次注入字数", "int", 400, false, 50, 3000, "字"],
+        ["memory_content_max_chars", "单条记忆字数上限", "int", 60, false, 30, 300, "字"],
+        ["max_tier1_memories", "T1 数量上限", "int", 30, false, 5, 200, "条"],
+        ["tier1_ttl_hours", "T1 存活时长", "int", 48, false, 6, 720, "小时"],
+        ["max_recall_candidates", "粗排候选数", "int", 24, false, 6, 100, "条"],
+        ["min_recall_score", "最低综合得分", "float", 0.38, false, 0, 1],
+        ["min_semantic_score", "最低语义相关", "float", 0.25, false, 0, 1],
+        ["recall_semantic_weight", "语义权重", "float", 0.55, false, 0, 1],
+        ["recall_recency_weight", "新鲜度权重", "float", 0.25, false, 0, 1],
+        ["recall_importance_weight", "重要度权重", "float", 0.2, false, 0, 1],
+        ["recent_duplicate_window_minutes", "新记忆防重复窗口", "int", 10, true, 0, 120, "分钟"],
+        ["recall_query_context_turns", "召回 Query 上下文条数", "int", 2, true, 0, 6, "条"],
+        ["reinforce_min_semantic", "记忆强化语义门槛", "float", 0.55, true, 0.1, 1],
+        ["reinforce_cooldown_hours", "记忆强化冷却", "int", 6, true, 0, 168, "小时"],
+        ["promote_t3_min_hits", "T2→T3 最低命中", "int", 8, true, 2, 50, "次"],
+        ["promote_t3_min_importance", "T2→T3 最低重要度", "int", 8, true, 5, 10],
+        ["promote_t3_min_age_hours", "T2→T3 最短沉淀", "int", 24, true, 0, 720, "小时"],
+        ["dedupe_cosine", "写入去重余弦阈值", "float", 0.85, true, 0.3, 0.99],
+        ["dedupe_jaccard", "写入去重字面阈值", "float", 0.65, true, 0.3, 0.99],
+        ["supersede_cosine", "状态替代余弦阈值", "float", 0.72, true, 0.3, 0.99],
+        ["supersede_jaccard", "状态替代字面阈值", "float", 0.5, true, 0.3, 0.99],
+        ["recall_bucket_ratios", "分层召回配额", "ratios", { "3": 30, "2": 40, "1": 30 }, true],
+        ["recall_pool_limit", "召回扫描池", "int", 400, true, 50, 2000, "条"],
+        ["dedupe_pool_limit", "去重扫描池", "int", 400, true, 50, 2000, "条"]
+      ]
+    },
+    {
+      id: "relationship",
+      title: "💝 用户关系与好感成长",
+      icon: "relations",
+      description: "L1→L2 自动晋升、好感度增益曲线与档案字段上限。",
+      group: "relationship_config",
+      fields: [
+        ["enable_auto_promotion_l2", "L1 自动晋升 L2", "bool", true],
+        ["auto_promote_l2_min_interactions", "晋升互动阈值", "int", 40, false, 1, 500, "回合"],
+        ["auto_promote_l2_min_affinity", "晋升好感阈值", "float", 30.0, false, 1, 100],
+        ["affinity_cooldown_seconds", "好感冷却", "int", 180, false, 0, 3600, "秒"],
+        ["affinity_daily_cap", "每日好感上限", "float", 5.0, false, 0, 50],
+        ["affinity_gain_group", "群聊单次增益", "float", 0.4, false, 0.05, 5],
+        ["affinity_gain_direct", "直呼单次增益", "float", 0.6, false, 0.05, 5],
+        ["affinity_slowdown_threshold", "好感减速门槛", "float", 60.0, false, 10, 100],
+        ["group_note_max_chars", "群档案备注字数上限", "int", 500, true, 100, 2000, "字"],
+        ["user_max_aliases", "曾用名数量上限", "int", 10, true, 3, 30, "个"]
+      ]
+    },
+    {
+      id: "surfing",
+      title: "📱 赛博冲浪与视频抓取",
+      icon: "surf",
+      description: "视频源抓取、视觉看片评分与主动分享门槛（按角色的源开关在冲浪页设置）。",
+      group: "surfing_config",
+      fields: [
+        ["bili_cookie", "B站 Cookie", "secret", ""],
+        ["douyin_api_base", "抖音解析接口", "text", "https://api.douyin.wtf"],
+        ["send_raw_video", "直发无水印视频", "bool", true],
+        ["surf_share_min_score", "分享评分门槛", "int", 80, false, 0, 100, "分"],
+        ["surf_share_cooldown_minutes", "分享冷却", "int", 90, false, 5, 1440, "分钟"],
+        ["surf_bili_candidates", "B站抓取条数", "int", 4, true, 1, 15, "条"],
+        ["surf_douyin_candidates", "抖音抓取条数", "int", 3, true, 1, 15, "条"],
+        ["surf_http_timeout_seconds", "视频源超时", "int", 8, true, 3, 30, "秒"],
+        ["surf_hot_comments_limit", "热评抓取条数", "int", 3, true, 0, 10, "条"],
+        ["vision_fallback_score", "看片兜底分", "int", 60, true, 0, 100, "分"],
+        ["vision_default_score", "看片缺省分", "int", 78, true, 0, 100, "分"],
+        ["surf_history_max_per_soul", "冲浪历史保留上限", "int", 200, true, 30, 2000, "条"]
+      ]
+    }
+  ];
+
+  function buildMockRuntimeConfig() {
+    var values = {};
+    MOCK_SETTINGS_SECTIONS.forEach(function (section) {
+      var bucket = {};
+      section.fields.forEach(function (field) {
+        bucket[field[0]] = clone(field[3]);
+      });
+      values[section.group] = values[section.group] || {};
+      Object.keys(bucket).forEach(function (key) {
+        values[section.group][key] = bucket[key];
+      });
+    });
+    return values;
+  }
+
+  function mockSettingValue(section, key) {
+    var group = db.runtimeConfig[section.group] || {};
+    return group[key];
+  }
+
+  function buildSettingsPayload() {
+    return {
+      version: 1,
+      updated_at: nowSeconds(),
+      sections: MOCK_SETTINGS_SECTIONS.map(function (section) {
+        return {
+          id: section.id,
+          title: section.title,
+          icon: section.icon,
+          description: section.description,
+          group: section.group,
+          fields: section.fields.map(function (field) {
+            var item = {
+              key: field[0],
+              label: field[1],
+              type: field[2],
+              default: clone(field[3]),
+              value: clone(mockSettingValue(section, field[0])),
+              advanced: !!field[4],
+              hint: "Mock 预览：" + field[1] + "（真实环境保存后即时生效）"
+            };
+            if (field[5] != null) item.min = field[5];
+            if (field[6] != null) item.max = field[6];
+            if (field[7]) item.unit = field[7];
+            if (field[2] === "secret") item.secret = true;
+            if (field[0] === "mutation_impact_table") {
+              item.fields = Object.keys(field[3]).map(function (key) {
+                return { key: key, label: key };
+              });
+            }
+            return item;
+          })
+        };
+      })
+    };
+  }
+
+  function saveMockSettings(payload) {
+    var source =
+      payload && payload.config && typeof payload.config === "object"
+        ? payload.config
+        : payload || {};
+    var changed = [];
+    MOCK_SETTINGS_SECTIONS.forEach(function (section) {
+      var incoming = source[section.id] || source[section.group];
+      if (!incoming || typeof incoming !== "object") return;
+      var bucket = db.runtimeConfig[section.group] || (db.runtimeConfig[section.group] = {});
+      section.fields.forEach(function (field) {
+        var key = field[0];
+        if (!Object.prototype.hasOwnProperty.call(incoming, key)) return;
+        var value = incoming[key];
+        if (field[2] === "int") value = Math.round(Number(value) || 0);
+        else if (field[2] === "float") value = Number(value) || 0;
+        else if (field[2] === "bool") value = !!value;
+        else if (field[2] === "list") {
+          value = Array.isArray(value)
+            ? value.slice()
+            : String(value || "").split(/[,，、\n]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+        }
+        bucket[key] = value;
+        changed.push(key);
+      });
+    });
+    return { changed: changed, sections: buildSettingsPayload().sections, updated_at: nowSeconds() };
+  }
+
+  function resetMockSettings(payload) {
+    var sectionId = String((payload && (payload.section || payload.section_id)) || "");
+    var groupId = String((payload && (payload.group || payload.storage_group)) || "");
+    var changed = [];
+    MOCK_SETTINGS_SECTIONS.forEach(function (section) {
+      if (sectionId && section.id !== sectionId) return;
+      if (groupId && section.group !== groupId) return;
+      var bucket = db.runtimeConfig[section.group] || (db.runtimeConfig[section.group] = {});
+      section.fields.forEach(function (field) {
+        bucket[field[0]] = clone(field[3]);
+        changed.push(field[0]);
+      });
+    });
+    return { changed: changed, sections: buildSettingsPayload().sections, updated_at: nowSeconds() };
+  }
+
   function buildInitialDb() {
     var cardJiu = buildCardJiu();
     var cardMan = buildCardXiaoman();
@@ -603,6 +863,8 @@
         }
       ],
       defaultSoulId: "default_soul",
+      /* v2.13：Pages「设置」页的唯一配置真源（Mock 与 SQLite runtime_config 同构） */
+      runtimeConfig: buildMockRuntimeConfig(),
       decks: {
         default_soul: {
           customCards: clone(DEFAULT_CUSTOM_CARDS)
@@ -1703,7 +1965,20 @@
       action_types: clone(ACTION_TYPE_DEFINITIONS),
       default_soul_id: db.defaultSoulId || "",
       /* v2.8：机器人接口 → 角色绑定映射（契约 §6.2 init_summary） */
-      platform_bindings: platformBindingsMap()
+      platform_bindings: platformBindingsMap(),
+      /* v2.13：Pages「设置」页摘要（配置存 SQLite，不再走 AstrBotConfig） */
+      settings: {
+        version: 1,
+        updated_at: nowSeconds(),
+        sections: MOCK_SETTINGS_SECTIONS.map(function (section) {
+          return {
+            id: section.id,
+            title: section.title,
+            icon: section.icon,
+            field_count: section.fields.length
+          };
+        })
+      }
     };
   }
 
@@ -1741,6 +2016,7 @@
         return Object.assign(card, { scope: "soul" });
       }),
       general_cards: clone(GENERAL_CARDS).map(function (card) {
+        card.is_builtin = true;
         return Object.assign(card, { scope: "global" });
       }),
       /* 编辑器 / 筛选用的四类行动定义（契约 §6.4） */
@@ -2241,13 +2517,17 @@
         actionType = "SURF";
       }
     }
+    var previousAction = coerceActionType(slot.action_type);
     slot.action_type = actionType;
     slot.state = newState;
     slot.label = actionLabelOf(actionType);
     var newTitle = body.new_title != null ? String(body.new_title).trim() : "";
     slot.title = newTitle || defaultTitleFor(actionType) || slot.title;
-    slot.busy_settled = false;
-    slot.completion_result = "";
+    /* v2.13 (#6)：只有行动类型变化或显式 reset_settled 才清空已结算繁忙成果 */
+    if (previousAction !== actionType || body.reset_settled === true) {
+      slot.busy_settled = false;
+      slot.completion_result = "";
+    }
     slot.mutated = false;
     slot.mutation_monologue = "";
     /* v2.6：忽略调用方传入的 armor，强制按行动类型固定档位（25/40/65/80） */
@@ -2755,6 +3035,13 @@
       superseded_count: counts.superseded_count,
       embedding_count: counts.embedding_count,
       sliding_window_size: 12,
+      /* v2.13 (#5)：单条记忆字数上限来自「设置 → 记忆」 */
+      memory_content_max_chars: Number(
+        (db.runtimeConfig.memory_and_context_config || {}).memory_content_max_chars || 60
+      ),
+      tier1_ttl_hours: Number(
+        (db.runtimeConfig.memory_and_context_config || {}).tier1_ttl_hours || 48
+      ),
       max_injected_memories: 5,
       max_memory_chars_budget: 400,
       max_recall_candidates: 24,
@@ -3041,6 +3328,12 @@
       /* ---- 17 条旧路由 ---- */
       case "init_summary":
         return buildInitSummary();
+      case "settings/get":
+        return buildSettingsPayload();
+      case "settings/save":
+        return saveMockSettings(payload);
+      case "settings/reset":
+        return resetMockSettings(payload);
       case "souls/detail":
         return buildSoulDetail(payload.soul_id || "");
       case "souls/import_persona":

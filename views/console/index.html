@@ -48,10 +48,12 @@
     </div>
   </div>
 
-  <!-- 通用浮层容器 -->
+  <!-- 通用浮层容器（confirm-root 永远在 modal/drawer 之上，用于二级确认） -->
   <div class="toast-container" id="toast-container" aria-live="polite" aria-atomic="false"></div>
-  <div class="overlay-root modal-root" id="modal-root"></div>
+  <div class="floating-tooltip" id="floating-tooltip" role="tooltip" aria-hidden="true"></div>
   <div class="overlay-root drawer-root" id="drawer-root"></div>
+  <div class="overlay-root modal-root" id="modal-root"></div>
+  <div class="overlay-root confirm-root" id="confirm-root"></div>
 
   <noscript>
     <div style="padding: 24px; font-family: sans-serif">OnlyYou 控制台需要启用 JavaScript。</div>
@@ -72,6 +74,7 @@
   <script src="page-surfing.js"></script>
   <script src="page-models.js"></script>
   <script src="page-sessions.js"></script>
+  <script src="page-settings.js"></script>
   <!-- `?mock=1` 或 file:// 直接打开时安装本地 Mock bridge（无 bridge 后台时用于离线预览/截图） -->
   <script src="mock.js"></script>
 </body>

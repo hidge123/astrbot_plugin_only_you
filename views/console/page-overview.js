@@ -21,8 +21,27 @@
     remaining: 0,
     total: 0,
     cooldown: 0,
-    data: null
+    data: null,
+    busyExpanded: false,
+    reachingZero: false,
+    boundaryRefreshes: 0
   };
+
+  /* #19：用通俗的门禁行为说明替代晦涩的「固定护甲」术语。 */
+  var GATE_DESCRIPTIONS = {
+    SLEEP:
+      "休息中：所有消息都不打扰，仅 ★L3 核心用户私聊强呼叫可以唤醒 0.5 小时清醒窗。",
+    BUSY_TASK:
+      "繁忙中：L1 普通用户的消息会转入未读，等空闲后补回；◆L2 / ★L3 可以正常接话。",
+    SURF:
+      "空闲冲浪：所有等级的消息都会正常接话（是否冒泡由群聊读空气决定）。",
+    IDLE_ROAM:
+      "空闲闲逛：所有等级的消息都会正常接话（是否冒泡由群聊读空气决定）。"
+  };
+
+  function gateDescription(type) {
+    return GATE_DESCRIPTIONS[type] || GATE_DESCRIPTIONS.IDLE_ROAM;
+  }
 
   function esc(str) {
     return window.OY_ESC ? window.OY_ESC(str) : String(str == null ? "" : str);
@@ -186,8 +205,8 @@
     return charts().ringGauge({
       value: progressPct,
       max: 100,
-      label: meta.label,
-      sublabel: "进度 " + progressPct + "%",
+      label: progressPct + "%",
+      sublabel: meta.label + " · 当前块进度",
       color: meta.color,
       size: 132
     });
@@ -261,13 +280,14 @@
   /** 今日繁忙成果（BUSY_TASK 结算生成的 Tier 1 短时记忆） */
   function busyResultsBlock(results) {
     var list = (Array.isArray(results) ? results : []).filter(Boolean);
+    var expanded = !!pageState.busyExpanded;
+    var visible = expanded ? list : list.slice(0, 4);
     if (!list.length) {
       return (
         '<div class="stat-empty">今天还没有繁忙成果 · 繁忙卡走完 100%（或被中途打断）时会结算一句话完成结果，写入 Tier 1 短时记忆</div>'
       );
     }
-    var rows = list
-      .slice(0, 4)
+    var rows = visible
       .map(function (item) {
         var startText = item.start_time || fmtHour(item.start_hour);
         var endText = item.end_time || fmtHour(item.end_hour);
@@ -297,8 +317,11 @@
       rows +
       "</div>" +
       (list.length > 4
-        ? '<div class="stat-desc">共 ' + list.length + " 条已结算成果（Tier 1 短时记忆）</div>"
-        : '<div class="stat-desc">每日随机完成结果 · 已写入 Tier 1 瞬时记忆</div>')
+        ? '<button class="btn btn-ghost btn-sm busy-result-toggle" type="button" data-action="toggle-busy-results">' +
+          (expanded ? "收起" : "展开全部 (" + list.length + ")") +
+          "</button>"
+        : "") +
+      '<div class="stat-desc">每日随机完成结果 · 已写入 Tier 1 瞬时记忆</div>'
     );
   }
 
@@ -455,9 +478,6 @@
       "概览" +
       "</h1>" +
       '<div class="page-actions">' +
-      '<button class="btn btn-ghost btn-sm" type="button" data-action="refresh-overview">' +
-      icon("refresh", 14) +
-      "刷新</button>" +
       '<button class="btn btn-primary btn-sm" type="button" data-action="quick-force">' +
       icon("zap", 14) +
       "切换行动" +
@@ -475,7 +495,9 @@
       '">' +
       stateMeta.label +
       "</span>" +
+      '<span data-role="action-badge">' +
       actionBadgeHtml(actionType, actionBadgeText(state, actionType)) +
+      "</span>" +
       '<span class="muted text-sm">' +
       esc(soulName || "") +
       "</span>" +
@@ -545,12 +567,9 @@
       icon("calendar", 15) +
       '24 小时日程轴<span class="card-sub">动态时间块 · 点击色块切换行动类型</span></div>';
     html +=
-      '<div class="axis-legend"><span class="legend-item"><span class="legend-dot" style="background:var(--state-idle)"></span>空闲</span>' +
-      '<span class="legend-item"><span class="legend-dot" style="background:var(--state-busy)"></span>繁忙</span>' +
-      '<span class="legend-item"><span class="legend-dot" style="background:var(--state-resting)"></span>休息</span>' +
-      '<span class="nowrap">现在 ' +
-      app.formatClock(Date.now()) +
-      "</span></div>";
+      '<div class="axis-legend">' +
+      charts().actionTimelineLegend(app.formatClock(Date.now())) +
+      "</div>";
     html += "</div>";
     html += '<div class="card-body">';
     if (slots.length) {
@@ -717,22 +736,86 @@
     };
   }
 
+  /**
+   * 当前时间块详情：时间范围 / 实时进度 / 繁忙成果 / 门禁行为说明。
+   * #9 要求在编辑抽屉（此页为弹窗）内完整展示 completion_result。
+   */
+  function slotDetailHtml(slot, isCurrent) {
+    var progress =
+      slot && slot.progress_pct != null && slot.progress_pct !== ""
+        ? Math.max(0, Math.min(100, Math.round(num(slot.progress_pct, 0))))
+        : null;
+    var result = String((slot && slot.completion_result) || "");
+    return (
+      '<div class="slot-edit-summary">' +
+      (isCurrent ? '<span class="slot-live-badge">正在生效</span>' : "") +
+      '<span class="mono">' +
+      esc(fmtHour(slot.start_hour) + "-" + fmtHour(slot.end_hour)) +
+      " · " +
+      esc(slot.slot_key || "") +
+      "</span>" +
+      (progress == null ? "" : '<span class="tag tag-muted">进度 ' + progress + "%</span>") +
+      (slot && slot.mutated ? '<span class="tag tag-primary">已微调</span>' : "") +
+      "</div>" +
+      (result
+        ? '<div class="busy-result-inline">' +
+          icon("check", 12) +
+          esc("该块繁忙成果：" + result) +
+          "</div>"
+        : "")
+    );
+  }
+
   function openSlotModal(app, slot, onSaved) {
     if (!slot) {
       app.toast("没有找到该时间块的数据", true);
       return;
     }
+    var isCurrent = !!(
+      app.currentSlotKey &&
+      app.currentSlotKey() === slot.slot_key
+    );
+    var originalType = resolveActionType(null, slot);
+    var originalTitle = String(slot.title || "");
+    var originalSettled = !!slot.busy_settled;
     var body = document.createElement("div");
     body.innerHTML =
-      '<div class="card-sub mb-12">' +
-      esc(fmtHour(slot.start_hour) + "-" + fmtHour(slot.end_hour) + " · " + (slot.slot_key || "")) +
-      "</div>" +
+      slotDetailHtml(slot, isCurrent) +
+      '<div class="mb-12"></div>' +
       actionFormHtml(app, slot) +
-      '<div class="hint mt-12">保存后立即生效（POST schedule/force_state），会覆盖该时间块今日抽到的活动。</div>';
+      '<div class="gate-note mt-12" data-role="gate-note">' +
+      esc(gateDescription(originalType)) +
+      "</div>" +
+      '<div class="gate-warning" data-role="sleep-warning" style="display:none">' +
+      "注意：这是当前正在生效的时间块。改为「睡觉」后，L1 / ◆L2 的消息都会转入未读，只有 ★L3 核心用户私聊强呼叫才能唤醒。" +
+      "</div>" +
+      '<div class="hint mt-12">保存后立即生效；只修改标题不会清空已结算的繁忙成果。</div>';
     bindActionForm(body);
+    var noteEl = body.querySelector('[data-role="gate-note"]');
+    var warnEl = body.querySelector('[data-role="sleep-warning"]');
+    var dirty = false;
+    body.addEventListener("input", function () {
+      dirty = true;
+    });
+    body.addEventListener("click", function (event) {
+      var btn = event.target.closest && event.target.closest("[data-action-type]");
+      if (!btn) return;
+      dirty = true;
+      if (noteEl) noteEl.textContent = gateDescription(btn.getAttribute("data-action-type"));
+      if (warnEl) {
+        warnEl.style.display =
+          isCurrent && btn.getAttribute("data-action-type") === "SLEEP" ? "block" : "none";
+      }
+    });
     app.modal({
-      title: "切换行动 · " + (slot.label || slot.slot_key || ""),
+      title:
+        "切换行动 · " +
+        (slot.label || slot.slot_key || "") +
+        (isCurrent ? "（当前生效块）" : ""),
       body: body,
+      isDirty: function () {
+        return dirty;
+      },
       actions: [
         { label: "取消" },
         {
@@ -741,7 +824,26 @@
           icon: "save",
           onClick: async function () {
             var form = readActionForm(body);
-            /* v2.6：护甲由行动类型固定档位自动应用，POST 不再携带 armor */
+            /* #6：完全没改就只关抽屉，避免无意义请求与副作用 */
+            if (form.action_type === originalType && form.new_title === originalTitle) {
+              app.toast("没有修改，未提交");
+              return;
+            }
+            if (
+              originalSettled &&
+              originalType === "BUSY_TASK" &&
+              form.action_type !== "BUSY_TASK"
+            ) {
+              var ok = await app.confirm({
+                title: "清空已结算的繁忙成果？",
+                message:
+                  "该时间块已生成今日繁忙成果，切换行动类型会清空该块成果。确定继续吗？",
+                danger: true,
+                confirmLabel: "继续并清空",
+                cancelLabel: "保留成果"
+              });
+              if (!ok) return false;
+            }
             var data = await app.apiPost("schedule/force_state", {
               soul_id: app.state.currentSoulId,
               slot_key: slot.slot_key,
@@ -750,6 +852,7 @@
             });
             if (data && data.schedule) app.state.activeSchedule = data.schedule;
             app.toast("已更新「" + (slot.label || slot.slot_key) + "」为 " + actionLabel(form.action_type, true));
+            dirty = false;
             if (typeof onSaved === "function") await onSaved();
           }
         }
@@ -776,7 +879,8 @@
       var actionEl = target.closest("[data-action]");
       if (!actionEl) return;
       var action = actionEl.getAttribute("data-action");
-      if (action === "refresh-overview") {
+      if (action === "toggle-busy-results") {
+        pageState.busyExpanded = !pageState.busyExpanded;
         render(container, app);
       } else if (action === "quick-force") {
         var current = currentSlot(data);
@@ -787,6 +891,11 @@
     };
   }
 
+  /**
+   * #10：所有进度展示共用同一个实时 pct：
+   * 环形 SVG stroke-dashoffset / 环形中心百分比 / 行动徽章百分比 / 进度条。
+   * 跨入下一时间块（倒计时归零）时自动重新拉取概览数据；时钟每分钟刷新。
+   */
   function startTimers(container, app, data) {
     stopTimers();
     var state = data.state || {};
@@ -796,29 +905,94 @@
     pageState.total = slotTotalSeconds(slot);
     pageState.remaining = num(state.remaining_seconds, 0);
     pageState.cooldown = num((data.quota || {}).cooldown_remaining_seconds, 0);
+    pageState.reachingZero = false;
+    var lastClockMinute = -1;
+
+    function paintProgress() {
+      var elapsed =
+        pageState.total > 0 ? clamp01(1 - pageState.remaining / pageState.total) : 1;
+      var pct = Math.max(0, Math.min(100, Math.round(elapsed * 100)));
+      var ring = container.querySelector('[data-role="ring-progress"]');
+      if (ring) {
+        var circ = num(ring.getAttribute("data-circ"), 0);
+        if (circ > 0) {
+          ring.setAttribute("stroke-dashoffset", (circ * (1 - elapsed)).toFixed(2));
+        }
+      }
+      var ringValue = container.querySelector('[data-role="ring-value"]');
+      if (ringValue) ringValue.textContent = pct + "%";
+      var badge = container.querySelector('[data-role="action-badge"]');
+      if (badge) {
+        var badgeLabel = actionLabel(actionType, false) || actionLabel(actionType, true);
+        var text = isBusyTask
+          ? badgeLabel + " · " + pct + "%"
+          : badgeLabel;
+        var badgeInner = badge.querySelector(".action-badge");
+        if (badgeInner) badgeInner.textContent = text;
+      }
+      var busyBar = container.querySelector('[data-role="busy-bar"]');
+      if (busyBar) busyBar.style.width = pct.toFixed(2) + "%";
+      var busyPctEl = container.querySelector('[data-role="busy-pct"]');
+      if (busyPctEl) busyPctEl.textContent = String(pct);
+      if (!isBusyTask) {
+        var barEl = container.querySelector('[data-role="remaining-bar"]');
+        if (barEl) barEl.style.width = pct.toFixed(2) + "%";
+      }
+      var textEl = container.querySelector('[data-role="remaining-text"]');
+      if (textEl) textEl.textContent = app.formatDuration(pageState.remaining);
+      return pct;
+    }
+
+    function paintClock(force) {
+      var now = new Date();
+      var minute = now.getHours() * 60 + now.getMinutes();
+      if (!force && minute === lastClockMinute) return;
+      lastClockMinute = minute;
+      var clockEl = container.querySelector('[data-role="timeline-now"]');
+      if (clockEl) clockEl.textContent = "现在 " + app.formatClock(Date.now());
+    }
+
+    paintProgress();
+    paintClock(true);
+    if (pageState.remaining <= 0 && pageState.total > 0) {
+      /* 页面恰好落在时间块边界：稍后自动拉取下一块数据（#10，最多重试 3 次） */
+      if (pageState.boundaryRefreshes >= 3) return;
+      pageState.boundaryRefreshes += 1;
+      pageState.reachingZero = true;
+      setTimeout(function () {
+        if (!app || app.route !== "overview") return;
+        render(container, app);
+      }, 1200);
+      return;
+    }
     if (pageState.remaining <= 0 && pageState.cooldown <= 0) return;
     pageState.timer = setInterval(function () {
       if (pageState.remaining > 0) {
         pageState.remaining -= 1;
-        var textEl = container.querySelector('[data-role="remaining-text"]');
-        if (textEl) textEl.textContent = app.formatDuration(pageState.remaining);
-        var elapsed = pageState.total > 0 ? clamp01(1 - pageState.remaining / pageState.total) : 1;
-        /* BUSY_TASK 刷新实时进度条，其它行动刷新剩余时间进度条 */
-        var busyBar = container.querySelector('[data-role="busy-bar"]');
-        if (busyBar) busyBar.style.width = (elapsed * 100).toFixed(2) + "%";
-        var busyPctEl = container.querySelector('[data-role="busy-pct"]');
-        if (busyPctEl) busyPctEl.textContent = String(Math.round(elapsed * 100));
-        if (!isBusyTask) {
-          var barEl = container.querySelector('[data-role="remaining-bar"]');
-          if (barEl) barEl.style.width = (elapsed * 100).toFixed(2) + "%";
-        }
+        paintProgress();
       }
+      var cooldownEl = container.querySelector('[data-role="cooldown-text"]');
       if (pageState.cooldown > 0) {
         pageState.cooldown -= 1;
-        var cooldownEl = container.querySelector('[data-role="cooldown-text"]');
         if (cooldownEl) cooldownEl.textContent = formatCooldown(pageState.cooldown);
       }
-      if (pageState.remaining <= 0 && pageState.cooldown <= 0) stopTimers();
+      paintClock(false);
+      if (
+        pageState.remaining <= 0 &&
+        pageState.total > 0 &&
+        !pageState.reachingZero
+      ) {
+        pageState.reachingZero = true;
+        stopTimers();
+        var seq = app._renderSeq;
+        setTimeout(function () {
+          if (!app || app.route !== "overview" || app._renderSeq !== seq) return;
+          render(container, app);
+        }, 1200);
+      }
+      if (pageState.remaining <= 0 && pageState.total <= 0 && pageState.cooldown <= 0) {
+        stopTimers();
+      }
     }, 1000);
   }
 
@@ -851,6 +1025,9 @@
       var data = await app.fetchOverview();
       if (!data) throw new Error("dashboard/overview 返回为空");
       pageState.data = data;
+      if (num(data.state && data.state.remaining_seconds, 0) > 0) {
+        pageState.boundaryRefreshes = 0;
+      }
       container.innerHTML = buildHtml(app, data);
       bindEvents(container, app, data);
       startTimers(container, app, data);
@@ -869,6 +1046,9 @@
   function destroy() {
     stopTimers();
     pageState.data = null;
+    pageState.busyExpanded = false;
+    pageState.reachingZero = false;
+    pageState.boundaryRefreshes = 0;
     _app = null;
   }
 

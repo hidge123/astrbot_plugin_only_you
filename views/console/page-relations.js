@@ -68,7 +68,8 @@
     counts: { l3_count: 0, l2_count: 0, l1_count: 0, total: 0 },
     filter: "",
     keyword: "",
-    busy: false
+    busy: false,
+    modalDirty: false
   };
 
   /* ------------------------------------------------------------------ *
@@ -447,7 +448,7 @@
       title = "还没有 " + meta.label + " 用户";
       text =
         Number(S.filter) === 3
-          ? "★L3 为管理员级，可由 AstrBot admins_id / core_user_ids 自动确定，也可以在用户详情里显式设为 L3。"
+          ? "★L3 为管理员级：平台管理员身份会自动成为 L3，也可以在用户详情里显式设置。"
           : "在群聊 / 私聊里和 Bot 互动后，用户会自动出现在这里。";
     }
     return (
@@ -459,11 +460,7 @@
       '<div class="empty-text">' +
       esc(text) +
       "</div>" +
-      '<div class="row mt-12">' +
-      actions +
-      '<button class="btn btn-outline" type="button" data-action="reload">' +
-      icon("refresh", 13) +
-      "刷新</button></div>" +
+      '<div class="row mt-12">' + actions + "</div>" +
       "</div></div>"
     );
   }
@@ -556,11 +553,7 @@
       '<div class="rel-row-metrics"><span>互动 <strong>' +
       esc(num(user.interaction_count, 0)) +
       "</strong> 次</span></div>" +
-      '<div class="rel-row-action"><button class="btn btn-outline btn-sm" type="button" data-action="detail-user" data-uid="' +
-      esc(uid) +
-      '">' +
-      "详情" +
-      "</button></div></div>"
+      '<div class="rel-row-action"><span class="rel-detail-hint">查看详情 ›</span></div></div>'
     );
   }
 
@@ -747,7 +740,10 @@
       esc(totalUsers) +
       " 位用户 · " +
       esc(S.groups.length) +
-      " 个群聊</span></h1></div>" +
+      " 个群聊</span></h1>" +
+      '<div class="page-actions"><button class="btn btn-ghost btn-sm" type="button" data-action="open-settings">' +
+      icon("settings", 13) +
+      "关系设置</button></div></div>" +
       scopeBar
     );
   }
@@ -766,9 +762,6 @@
       esc(S.keyword) +
       '" />' +
       "</div>" +
-      '<button class="btn btn-outline btn-sm rel-refresh-btn" type="button" data-action="reload" data-tip="重新拉取当前角色的用户与群聊档案">' +
-      icon("refresh", 13) +
-      "刷新</button>" +
       "</div>" +
       '<div class="rel-toolbar-hint">' +
       "<span>" +
@@ -777,7 +770,7 @@
       esc(soulName) +
       "」的等级 / 好感度 / 专属称呼 / 专属态度只属于当前角色；显示名称 / 平台账号是全局身份，所有角色共用。</span>" +
       "<span>★L3 管理员级不参与好感度计算与自动晋升；自动晋升只到 L2</span>" +
-      "<span>群聊滑窗 / 未读为内存态：清空只清内存滑窗 + 未读；保留 SQLite memories / users / surfing_history / 群档案（重启后未读队列会重置）</span>" +
+      "<span>群聊的最近消息与未读是内存态：清空只影响当前运行期间的数据，长期记忆与关系档案不会丢失。</span>" +
       "</div></div></div>"
     );
   }
@@ -983,19 +976,57 @@
     );
   }
 
-  function platformRowHtml(value) {
+  function splitPlatformValue(value) {
     var text = String(value == null ? "" : value).trim();
-    var isLegacy = !!text && text.indexOf(":") < 0;
+    var index = text.lastIndexOf(":");
+    if (index <= 0) return { platform: "", uid: text, legacy: !!text };
+    return {
+      platform: text.slice(0, index).trim(),
+      uid: text.slice(index + 1).trim(),
+      legacy: false
+    };
+  }
+
+  /** 平台下拉选项：已发现 / 已绑定的 platform_id + 自定义 */
+  function platformOptionsHtml(current) {
+    var app = S.app;
+    var ids = knownPlatformIds(app);
+    var selected = String(current || "");
+    if (selected && ids.indexOf(selected) < 0) ids = ids.concat([selected]);
+    var options =
+      '<option value="">自定义平台…</option>' +
+      ids
+        .map(function (pid) {
+          return (
+            '<option value="' +
+            esc(pid) +
+            '"' +
+            (pid === selected ? " selected" : "") +
+            ">" +
+            esc(pid) +
+            "</option>"
+          );
+        })
+        .join("");
+    return options;
+  }
+
+  function platformRowHtml(value) {
+    var parts = splitPlatformValue(value);
     return (
       '<div class="rel-platform-row' +
-      (isLegacy ? " is-legacy" : "") +
+      (parts.legacy ? " is-legacy" : "") +
       '" data-role="platform-row">' +
-      '<input class="input input-sm mono" type="text" list="rel-platform-options" data-role="platform-input" ' +
-      'placeholder="platform:uid，例如 qq bot:123456789" value="' +
-      esc(text) +
+      '<select class="select select-sm rel-platform-select" data-role="platform-select" aria-label="平台接口">' +
+      platformOptionsHtml(parts.platform) +
+      "</select>" +
+      '<span class="rel-platform-sep" aria-hidden="true">:</span>' +
+      '<input class="input input-sm mono" type="text" data-role="platform-input" ' +
+      'placeholder="账号 UID，例如 123456789" value="' +
+      esc(parts.uid) +
       '" />' +
-      (isLegacy
-        ? '<span class="rel-platform-legacy-tag" data-tip="旧版数据只有裸 ID：请在左侧补全为 platform:uid（如 qq bot:123456789），或直接移除该行。">' +
+      (parts.legacy
+        ? '<span class="rel-platform-legacy-tag" data-tip="旧版数据只有裸 ID：请选择左侧平台并保留 UID，或直接移除该行。">' +
           icon("alert", 12) +
           " 旧格式</span>"
         : "") +
@@ -1007,13 +1038,18 @@
 
   function collectPlatformIds(bodyEl) {
     var ids = [];
-    bodyEl.querySelectorAll('[data-role="platform-input"]').forEach(function (input) {
-      String(input.value || "")
-        .split(/[\n,，;；]+/)
-        .forEach(function (part) {
-          var value = part.trim();
-          if (value && ids.indexOf(value) < 0) ids.push(value);
-        });
+    bodyEl.querySelectorAll('[data-role="platform-row"]').forEach(function (row) {
+      var select = row.querySelector('[data-role="platform-select"]');
+      var input = row.querySelector('[data-role="platform-input"]');
+      var platform = select ? String(select.value || "").trim() : "";
+      var uid = input ? String(input.value || "").trim() : "";
+      if (!uid) return;
+      /* 兼容用户直接把 platform:uid 粘进 UID 输入框 */
+      var parts = splitPlatformValue(uid);
+      if (parts.platform && !platform) platform = parts.platform;
+      if (parts.platform && platform) uid = parts.uid;
+      var value = platform ? platform + ":" + uid : uid;
+      if (ids.indexOf(value) < 0) ids.push(value);
     });
     return ids;
   }
@@ -1046,6 +1082,9 @@
 
   function bindUserModalEvents(app, bodyEl, user) {
     syncTierUi(bodyEl, Number(user.tier) || 1);
+    bodyEl.addEventListener("input", function () {
+      S.modalDirty = true;
+    });
     bodyEl.addEventListener("change", function (event) {
       var target = event.target;
       if (!target || target.name !== "rel-tier") return;
@@ -1075,9 +1114,93 @@
         var row = btn.closest(".rel-platform-row");
         if (row && row.parentNode) row.parentNode.removeChild(row);
       } else if (action === "merge-account") {
-        app.closeModal();
-        openMergeModal(user.global_uid);
+        toggleInlineMergePanel(app, bodyEl, user);
       }
+    });
+  }
+
+  /**
+   * #4：在当前详情弹窗内部展开内嵌合并面板，不再关闭详情弹窗。
+   */
+  function toggleInlineMergePanel(app, bodyEl, user) {
+    var existing = bodyEl.querySelector('[data-role="inline-merge"]');
+    if (existing) {
+      existing.parentNode.removeChild(existing);
+      return;
+    }
+    var primaryUid = String(user.global_uid || "");
+    var candidates = S.users.filter(function (item) {
+      return String(item.global_uid || "") !== primaryUid;
+    });
+    var options = candidates
+      .map(function (item) {
+        return (
+          '<option value="' +
+          esc(item.global_uid || "") +
+          '">' +
+          esc(nameOf(item) + " · " + (item.global_uid || "")) +
+          "</option>"
+        );
+      })
+      .join("");
+    var html =
+      '<div class="rel-merge-inline" data-role="inline-merge">' +
+      '<div class="rel-form-section-head">' +
+      icon("link", 13) +
+      "<span>合并其他用户账号到此档案</span></div>" +
+      (candidates.length
+        ? '<select class="input rel-merge-select" data-role="merge-secondary">' +
+          '<option value="">— 请选择要合并到主档案的用户 —</option>' +
+          options +
+          "</select>" +
+          '<div class="rel-merge-actions">' +
+          '<button class="btn btn-outline btn-sm" type="button" data-action="cancel-inline-merge">取消</button>' +
+          '<button class="btn btn-primary btn-sm" type="button" data-action="confirm-inline-merge">确认合并</button>' +
+          "</div>"
+        : '<div class="rel-merge-empty">当前角色暂无其他用户可合并：先在群聊 / 私聊里让 Bot 与该用户产生互动，或切换到对应角色后再合并。</div>') +
+      '<div class="rel-platform-hint">合并目标只能是当前角色关系列表中的已有用户；合并后平台账号并入主档案，各角色关系档案按等级取高、好感度取高、互动次数相加。</div>' +
+      "</div>";
+    var anchor = bodyEl.querySelector(".rel-platform-editor");
+    if (!anchor) return;
+    anchor.insertAdjacentHTML("afterend", html);
+    S.modalDirty = true;
+    var panel = bodyEl.querySelector('[data-role="inline-merge"]');
+    if (!panel) return;
+    panel.addEventListener("click", function (event) {
+      var target = event.target;
+      if (!target || !target.closest) return;
+      var btn = target.closest("[data-action]");
+      if (!btn) return;
+      var action = btn.getAttribute("data-action");
+      if (action === "cancel-inline-merge") {
+        S.modalDirty = false;
+        if (panel.parentNode) panel.parentNode.removeChild(panel);
+        return;
+      }
+      if (action !== "confirm-inline-merge") return;
+      var select = panel.querySelector('[data-role="merge-secondary"]');
+      var secondary = select ? String(select.value || "").trim() : "";
+      if (!secondary) {
+        app.toast("请选择要合并的用户", true);
+        return;
+      }
+      btn.disabled = true;
+      app
+        .apiPost(
+          "users/update",
+          scopeBody({ action: "merge", primary_uid: primaryUid, secondary_uid: secondary })
+        )
+        .then(function (data) {
+          applyUsersPayload(data);
+          S.modalDirty = false;
+          app.closeModal("action");
+          paint();
+          app.toast("已合并用户账号，主档案已更新");
+        })
+        .catch(function (err) {
+          btn.disabled = false;
+          app.toast("合并失败：" + (err.message || err), true);
+        });
     });
   }
 
@@ -1098,32 +1221,21 @@
       : platformRowHtml("");
     var affinityValue = String(num(user.affinity, 0));
     var soulName = currentSoulName() || "当前角色";
-    var scopeNote =
-      '<div class="rel-scope-note">' +
-      icon("info", 13) +
-      "<span><b>全局身份</b>：显示名称与平台账号会影响所有角色；<b>当前角色关系</b>：等级、好感度、专属称呼、专属态度只属于当前角色「" +
-      esc(soulName) +
-      "」，切换到其他角色后互不影响。</span></div>";
     var body =
       userIdentityHtml(user, tier) +
-      scopeNote +
       '<div class="rel-form-section" data-role="global-identity">' +
       '<div class="rel-form-section-head">' +
       icon("user", 13) +
-      "<span>全局身份</span>" +
-      scopeTagHtml("global") +
+      "<span>全局身份（跨角色共享）</span>" +
       '<span class="rel-form-section-tip">所有角色共用同一份身份档案</span></div>' +
       '<div class="rel-form-grid">' +
-      '<label class="field"><span class="field-label">显示名称 <span class="req">*</span> ' +
-      scopeTagHtml("global") +
+      '<label class="field"><span class="field-label">显示名称 <span class="req">*</span>' +
       "</span>" +
       '<input class="input" type="text" data-role="display-name" maxlength="64" value="' +
       esc(user.display_name || nameOf(user)) +
       '" />' +
       '<div class="field-help">修改后所有角色看到的显示名称都会变化。</div></label>' +
-      '<div class="field is-full"><span class="field-label">平台账号 ' +
-      scopeTagHtml("global") +
-      "</span>" +
+      '<div class="field is-full"><span class="field-label">平台账号</span>' +
       '<div class="rel-platform-editor">' +
       '<div class="rel-platform-rows" data-role="platform-rows">' +
       rows +
@@ -1149,24 +1261,19 @@
       '<div class="rel-form-section" data-role="soul-relation">' +
       '<div class="rel-form-section-head">' +
       icon("heart", 13) +
-      "<span>当前角色关系 · " +
+      "<span>当前角色关系（仅对当前角色「" +
       esc(soulName) +
-      "</span>" +
-      scopeTagHtml("soul") +
-      '<span class="rel-form-section-tip">只影响当前角色，按 Soul 隔离存储</span></div>' +
+      "」生效）</span>" +
+      '<span class="rel-form-section-tip">按角色隔离存储，切换角色互不影响</span></div>' +
       '<div class="rel-form-grid">' +
-      '<label class="field"><span class="field-label">角色对 Ta 的专属称呼 <span class="mono muted">nickname</span> ' +
-      scopeTagHtml("soul") +
-      "</span>" +
+      '<label class="field"><span class="field-label">角色对 Ta 的专属称呼</span>' +
       '<input class="input" type="text" data-role="nickname" maxlength="64" value="' +
       esc(nickname) +
       '" />' +
       '<div class="field-help">仅「' +
       esc(soulName) +
       "」会这样称呼 Ta；留空使用显示名称。</div></label>" +
-      '<div class="field is-full"><span class="field-label">关系等级 ' +
-      scopeTagHtml("soul") +
-      "</span>" +
+      '<div class="field is-full"><span class="field-label">关系等级</span>' +
       '<div class="rel-tier-options" data-role="tier-options">' +
       TIER_ORDER.map(function (value) {
         return tierOptionHtml(value, tier);
@@ -1181,9 +1288,7 @@
       "</span></div></div>" +
       '<div class="field is-full' +
       (tier === 3 ? " is-disabled" : "") +
-      '" data-role="affinity-field"><span class="field-label">好感度 ' +
-      scopeTagHtml("soul") +
-      "</span>" +
+      '" data-role="affinity-field"><span class="field-label">好感度</span>' +
       '<input class="input" type="number" step="0.5" min="0" max="100" data-role="affinity" placeholder="' +
       (tier === 3 ? "管理员级无需好感度" : "0 ~ 100") +
       '" value="' +
@@ -1196,9 +1301,7 @@
         ? "管理员级无需好感度：★L3 不参与好感度计算与自动晋升。"
         : "L1 / L2 可手动调整好感度（0 ~ 100）；留空按 0 处理。只会写入当前角色的关系档案。") +
       "</div></div>" +
-      '<div class="field is-full"><span class="field-label">专属态度 <span class="mono muted">attitude</span> ' +
-      scopeTagHtml("soul") +
-      "</span>" +
+      '<div class="field is-full"><span class="field-label">专属态度</span>' +
       '<textarea class="input textarea" rows="3" maxlength="' +
       ATTITUDE_MAX +
       '" data-role="attitude" placeholder="例如：把 Ta 当成最信任的损友，说话可以毒舌一点但关键时刻很护短">' +
@@ -1220,17 +1323,21 @@
         "关闭后：仍会正常回复 Ta 发来的私聊与 @，但不会再主动补回未读、发呆联想私聊或分享视频。只影响当前角色「" + esc(soulName) + "」。"
       ) +
       "</div></div>";
+    S.modalDirty = false;
     app.modal({
       title: "用户详情 · " + nameOf(user) + (soulName ? "（" + soulName + "）" : ""),
       wide: true,
       body: body,
+      isDirty: function () {
+        return !!S.modalDirty;
+      },
       actions: [
         {
           label: "移除当前角色的关系档案",
           danger: true,
           icon: "trash",
           onClick: function () {
-            /* 打开二次确认会替换当前弹窗，返回 false 避免再次关闭确认框 */
+            /* #4：确认框渲染在独立 #confirm-root 上，详情弹窗与已编辑内容保持不变 */
             confirmDeleteUser(user.global_uid);
             return false;
           }
@@ -1333,6 +1440,8 @@
             scopeBody({ action: "delete", global_uid: uid })
           );
           applyUsersPayload(data);
+          S.modalDirty = false;
+          app.closeModal("action");
           paint();
           app.toast("已移除当前角色「" + soulName + "」对用户「" + name + "」的关系档案");
         }
@@ -1423,9 +1532,7 @@
       '<div class="rel-merge-arrow">' +
       icon("arrow-right", 14) +
       "<span>被合并用户</span></div>" +
-      '<div class="field"><span class="field-label">选择被合并的用户 <span class="req">*</span> ' +
-      scopeTagHtml("soul") +
-      "</span>" +
+      '<div class="field"><span class="field-label">选择被合并的用户 <span class="req">*</span></span>' +
       selectHtml +
       "</div>";
     app.modal({
@@ -1561,7 +1668,7 @@
         "关闭后：仍会正常执行 @ / 唤醒的被动回复，但不再翻群吃瓜冒泡、主动分享视频或发呆联想冒泡。"
       ) +
       "</div>" +
-      '<div class="rel-group-danger-hint">清空该群内存：只清该群的内存滑窗 + 未读队列；保留 SQLite memories / users / surfing_history / 群档案（重启后未读队列会重置）。移除群聊记录：会删除该群档案（下次收到群消息会重新记录），长期记忆与用户档案仍保留。</div>';
+      '<div class="rel-group-danger-hint">清空该群内存：只清该群的内存滑窗与未读队列，长期记忆与用户档案不受影响。移除群聊记录：会删除该群档案（下次收到群消息会重新记录）。</div>';
     app.modal({
       title: "群聊详情 · " + group.display_name,
       wide: true,
@@ -1654,7 +1761,7 @@
           "确定清空群聊「" +
           name +
           "」吗？清空：该群的内存滑窗 + 未读队列。" +
-          "保留：SQLite memories / users / surfing_history / 群档案；重启后未读队列本身会重置。",
+          "保留：长期记忆、用户关系档案与冲浪历史；重启后未读队列本身会重置。",
         danger: true,
         confirmLabel: "清空内存",
         onConfirm: async function () {
@@ -1687,7 +1794,7 @@
           "确定移除群聊「" +
           name +
           "」的档案吗？会删除该群档案并同时清空该群的内存滑窗 + 未读；" +
-          "保留 SQLite memories / users / surfing_history（长期记忆与用户档案不受影响）；下次收到群消息会重新记录，重启后未读队列本身会重置。",
+          "保留长期记忆与用户档案；下次收到群消息会重新记录，重启后未读队列本身会重置。",
         danger: true,
         confirmLabel: "移除记录",
         onConfirm: async function () {

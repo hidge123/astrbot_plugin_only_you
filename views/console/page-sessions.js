@@ -199,16 +199,22 @@
       return (
         '<button class="btn btn-outline btn-sm" type="button" data-action="unbind-platform" data-platform-id="' +
         pid +
-        '" data-tip="解绑只清空该平台的内存滑窗 + 未读队列；保留 SQLite memories / users / surfing_history / 群档案（重启后未读队列会重置）">' +
+        '">' +
         icon("link", 13) +
-        "解绑（清理该平台内存滑窗）</button>"
+        "解绑接口</button>"
       );
     }
     if (state === "other") {
+      var owner =
+        String(platform.bound_soul_name || "") || soulNameOf(platform.bound_soul_id);
       return (
-        '<button class="btn btn-outline btn-sm" type="button" disabled data-tip="一个机器人接口同一时刻只能绑定一个角色，不可跨角色共用">' +
+        '<div class="col" style="align-items:flex-end;gap:4px">' +
+        '<button class="btn btn-outline btn-sm" type="button" disabled>' +
         icon("link", 13) +
-        "绑定到当前角色</button>"
+        "绑定到当前角色</button>" +
+        '<span class="text-xs muted">已被「' +
+        esc(owner) +
+        '」绑定</span></div>'
       );
     }
     return (
@@ -284,12 +290,46 @@
           );
         })
         .join("");
+      var mobileCards = list
+        .map(function (platform) {
+          var boundName =
+            String(platform.bound_soul_name || "") || soulNameOf(platform.bound_soul_id);
+          return (
+            '<div class="session-card"><div class="session-card-head">' +
+            '<span class="session-card-title mono">' +
+            esc(platform.platform_id) +
+            "</span>" +
+            platformStateHtml(platform) +
+            "</div>" +
+            '<div class="session-card-row"><span>类型</span><span>' +
+            esc(platform.platform_type || "—") +
+            "</span></div>" +
+            '<div class="session-card-row"><span>运行状态</span><span>' +
+            runtimeHtml(platform) +
+            "</span></div>" +
+            '<div class="session-card-row"><span>活跃会话</span><span>' +
+            esc(num(platform.session_count, 0)) +
+            " 个</span></div>" +
+            (boundName
+              ? '<div class="session-card-row"><span>所属角色</span><span>' +
+                esc(boundName) +
+                "</span></div>"
+              : "") +
+            '<div class="session-card-actions">' +
+            platformActionHtml(platform) +
+            "</div></div>"
+          );
+        })
+        .join("");
       body =
-        '<div class="table-wrap" style="border:0;border-radius:0"><table class="table"><thead><tr>' +
+        '<div class="table-wrap sessions-table-wrap" style="border:0;border-radius:0"><table class="table"><thead><tr>' +
         "<th>机器人接口</th><th>类型</th><th>运行状态</th><th>活跃会话</th><th>绑定状态</th><th style=\"text-align:right\">操作</th>" +
         "</tr></thead><tbody>" +
         trs +
-        "</tbody></table></div>";
+        "</tbody></table></div>" +
+        '<div class="sessions-cards">' +
+        mobileCards +
+        "</div>";
     }
     return (
       '<section class="card" data-role="platform-card"><div class="card-head">' +
@@ -297,10 +337,7 @@
       icon("sessions", 15) +
       "机器人接口<span class=\"badge-count\">" +
       esc(boundPlatformCount()) +
-      '</span><span class="card-sub">一个接口同一时刻只属于一个角色</span></div>' +
-      '<div class="card-actions"><button class="btn btn-ghost btn-sm" type="button" data-action="refresh">' +
-      icon("refresh", 13) +
-      "刷新</button></div></div>" +
+      '</span><span class="card-sub">一个接口同一时刻只属于一个角色</span></div></div>' +
       body +
       '<div class="card-body tight" style="border-top:1px solid var(--border)"><div class="field-help">绑定后该机器人接口收到的消息由当前角色接管；已被其他角色占用的接口不可跨角色共用，请先到对应角色下解绑。</div></div>' +
       "</section>"
@@ -325,6 +362,9 @@
       ">" +
       icon("link", 13) +
       "绑定到当前角色</button></div>" +
+      (current
+        ? ""
+        : '<div class="field-help" style="color:var(--warning)">请先选择当前角色，才能手动绑定接口。</div>') +
       '<div class="field-help">platform_id 取 UMO 的第一段：如 <span class="mono">aiocqhttp:GroupMessage:123456</span> 的平台 ID 是 <span class="mono">aiocqhttp</span>。不能包含冒号，长度 ≤64。</div></div></div></section>'
     );
   }
@@ -478,11 +518,7 @@
       "机器人接口" +
       '<span class="card-sub">当前角色：' +
       esc(current ? currentSoulLabel() + "（" + current + "）" : "—") +
-      " · 接口绑定 + 活跃会话内存</span></h1>" +
-      '<div class="page-actions">' +
-      '<button class="btn btn-ghost btn-sm" type="button" data-action="refresh">' +
-      icon("refresh", 14) +
-      "重新加载</button></div></div>" +
+      " · 接口绑定 + 活跃会话内存</span></h1></div>" +
       '<div class="grid-2">' +
       manualCardHtml() +
       defaultCardHtml() +
@@ -604,11 +640,15 @@
         message:
           "确定解绑「" +
           pid +
-          "」吗？解绑后该平台的会话将改由默认角色兜底接管。" +
-          "清空：该平台所有 UMO 的内存滑窗 + 未读队列，以及该平台的 ★L3 私聊目标 / 主动消息冷却缓存。" +
-          "保留：SQLite memories / users / surfing_history / 群档案；重启后未读队列本身会重置。",
+          "」吗？解绑后该接口收到的消息将改由默认角色兜底接管。",
+        lines: [
+          "会清空：该接口下所有会话的内存滑窗与未读队列",
+          "会清空：该接口的 ★L3 私聊目标与主动消息冷却缓存",
+          "不会丢失：数据库中的长期记忆、用户关系档案与冲浪历史",
+          "重启后未读队列本身会重置，但不影响长期数据"
+        ],
         danger: true,
-        confirmLabel: "解绑并清理",
+        confirmLabel: "解绑接口",
         onConfirm: async function () {
           var data = await app.apiPost("sessions/unbind_platform", {
             soul_id: soulId(),
@@ -804,7 +844,7 @@
   window.OY_PAGES = window.OY_PAGES || {};
   window.OY_PAGES.sessions = {
     id: "sessions",
-    title: "会话",
+    title: "机器人接口",
     icon: "sessions",
     render: render,
     destroy: destroy

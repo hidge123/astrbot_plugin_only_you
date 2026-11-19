@@ -152,7 +152,9 @@
     html +=
       '<circle cx="' + c + '" cy="' + c + '" r="' + r + '" fill="none" stroke="' + track + '" stroke-width="' + stroke + '"/>';
     html +=
-      '<circle cx="' +
+      '<circle class="ring-gauge-progress" data-role="ring-progress" data-circ="' +
+      circ.toFixed(2) +
+      '" cx="' +
       c +
       '" cy="' +
       c +
@@ -173,7 +175,7 @@
       ')"/>';
     html += "</svg>";
     html +=
-      '<div class="ring-gauge-center"><div class="ring-gauge-value" style="color:' +
+      '<div class="ring-gauge-center"><div class="ring-gauge-value" data-role="ring-value" style="color:' +
       color +
       '">' +
       esc(label) +
@@ -390,12 +392,58 @@
     return html;
   }
 
+  /**
+   * 四类行动统一图例 + 实时「现在 HH:MM」。
+   * 概览页与日程页共用，避免两套颜色 / 文案不一致（#10）。
+   */
+  function actionTimelineLegend(nowText) {
+    var colors = {
+      SLEEP: "var(--action-sleep)",
+      BUSY_TASK: "var(--action-busy-task)",
+      SURF: "var(--action-surf)",
+      IDLE_ROAM: "var(--action-idle-roam)"
+    };
+    var labels = {
+      SLEEP: "睡觉",
+      BUSY_TASK: "繁忙主业",
+      SURF: "冲浪",
+      IDLE_ROAM: "闲逛"
+    };
+    var items = ["SLEEP", "BUSY_TASK", "SURF", "IDLE_ROAM"]
+      .map(function (type) {
+        return (
+          '<span class="legend-item" data-action-type="' +
+          esc(type) +
+          '"><span class="legend-dot" style="background:' +
+          colors[type] +
+          '"></span>' +
+          esc(labels[type]) +
+          "</span>"
+        );
+      })
+      .join("");
+    return (
+      '<div class="action-timeline-legend">' +
+      items +
+      '<span class="nowrap timeline-now" data-role="timeline-now">现在 ' +
+      esc(nowText || fmtClockNow()) +
+      "</span></div>"
+    );
+  }
+
+  function fmtClockNow() {
+    var d = new Date();
+    return pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+  }
+
   window.OYCharts = {
     ringGauge: ringGauge,
     scheduleAxis: scheduleAxis,
     donut: donut,
     bars: bars,
     dots: dots,
+    actionTimelineLegend: actionTimelineLegend,
+    fmtClockNow: fmtClockNow,
     stateClass: stateClass,
     stateLabel: stateLabel,
     fmtHour: fmtHour,

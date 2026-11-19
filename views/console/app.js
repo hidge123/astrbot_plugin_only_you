@@ -26,7 +26,7 @@
     { pages: ["relations"] },
     { pages: ["memory"] },
     { pages: ["surfing"] },
-    { label: "系统", pages: ["models", "sessions"] }
+    { label: "系统", pages: ["models", "sessions", "settings"] }
   ];
 
   /* 预期页面元数据（page-*.js 缺失时的占位信息 + 侧栏图标/标题兜底）。 */
@@ -38,7 +38,8 @@
     memory: { title: "记忆", icon: "memory", file: "page-memory.js" },
     surfing: { title: "冲浪", icon: "surf", file: "page-surfing.js" },
     models: { title: "模型", icon: "models", file: "page-models.js" },
-    sessions: { title: "会话", icon: "sessions", file: "page-sessions.js" }
+    sessions: { title: "机器人接口", icon: "sessions", file: "page-sessions.js" },
+    settings: { title: "设置", icon: "settings", file: "page-settings.js" }
   };
 
   function esc(str) {
@@ -120,6 +121,9 @@
     this._started = false;
     this._modalState = null;
     this._drawerState = null;
+    this._confirmState = null;
+    this._pendingSettingsSection = "";
+    this._tooltipBound = false;
     this._bound = false;
   }
 
@@ -618,6 +622,10 @@
   /** 重新拉取外壳数据并重渲染当前页（顶栏刷新按钮 / 页面保存后调用） */
   OnlyYouConsoleApp.prototype.refresh = async function (opts) {
     opts = opts || {};
+    if (!opts.force) {
+      var canLeave = await this._confirmDiscardDirty("刷新数据");
+      if (!canLeave) return;
+    }
     var refreshBtn = document.getElementById("btn-refresh");
     if (refreshBtn) refreshBtn.classList.add("is-loading");
     try {
@@ -785,6 +793,19 @@
       self.route = routeId;
       window.location.hash = target;
     });
+  };
+
+  /** 跳到「设置」页并可预选分组（业务页页头的快捷入口用）。 */
+  OnlyYouConsoleApp.prototype.openSettings = function (sectionId) {
+    this._pendingSettingsSection = String(sectionId || "");
+    this.navigate("settings");
+  };
+
+  /** 「设置」页渲染时取出待跳转分组（一次性消费）。 */
+  OnlyYouConsoleApp.prototype.consumeSettingsSection = function () {
+    var section = this._pendingSettingsSection || "";
+    this._pendingSettingsSection = "";
+    return section;
   };
 
   /** 当前页面是否声明了未保存修改（页面导出 isDirty 钩子）。 */
@@ -1140,11 +1161,20 @@
     });
   };
 
+  OnlyYouConsoleApp.prototype._safeIsDirty = function (fn) {
+    if (typeof fn !== "function") return false;
+    try {
+      return !!fn();
+    } catch (err) {
+      return false;
+    }
+  };
+
   OnlyYouConsoleApp.prototype.modal = function (opts) {
     opts = opts || {};
     var root = document.getElementById("modal-root");
     if (!root) return null;
-    if (this._modalState) this.closeModal();
+    if (this._modalState) this._closeModalNow("replace");
     var actions = opts.actions || [];
     root.innerHTML =
       '<div class="overlay-backdrop" data-overlay-close="1"></div>' +
@@ -1188,7 +1218,28 @@
     return bodyEl;
   };
 
+  /** 用户主动关闭（Esc / 遮罩 / ×）：有未保存修改时先二级确认。 */
   OnlyYouConsoleApp.prototype.closeModal = function (reason) {
+    var state = this._modalState;
+    if (!state) return;
+    var dismiss = reason !== "action";
+    if (dismiss && this._safeIsDirty(state.opts && state.opts.isDirty)) {
+      var self = this;
+      this.confirm({
+        title: "有未保存的修改",
+        message: "关闭该弹窗会丢弃尚未保存的修改，确定要放弃吗？",
+        danger: true,
+        confirmLabel: "放弃修改",
+        cancelLabel: "继续编辑"
+      }).then(function (ok) {
+        if (ok) self._closeModalNow(reason || "dismiss");
+      });
+      return;
+    }
+    this._closeModalNow(reason || "dismiss");
+  };
+
+  OnlyYouConsoleApp.prototype._closeModalNow = function (reason) {
     var root = document.getElementById("modal-root");
     var state = this._modalState;
     this._modalState = null;
@@ -1209,7 +1260,7 @@
     opts = opts || {};
     var root = document.getElementById("drawer-root");
     if (!root) return null;
-    if (this._drawerState) this.closeDrawer();
+    if (this._drawerState) this._closeDrawerNow("replace");
     var actions = opts.actions || [];
     root.innerHTML =
       '<div class="overlay-backdrop" data-overlay-close="1"></div>' +
@@ -1241,7 +1292,28 @@
     return bodyEl;
   };
 
+  /** 用户主动关闭（Esc / 遮罩 / ×）：有未保存修改时先二级确认。 */
   OnlyYouConsoleApp.prototype.closeDrawer = function (reason) {
+    var state = this._drawerState;
+    if (!state) return;
+    var dismiss = reason !== "action";
+    if (dismiss && this._safeIsDirty(state.opts && state.opts.isDirty)) {
+      var self = this;
+      this.confirm({
+        title: "有未保存的修改",
+        message: "关闭该抽屉会丢弃尚未保存的修改，确定要放弃吗？",
+        danger: true,
+        confirmLabel: "放弃修改",
+        cancelLabel: "继续编辑"
+      }).then(function (ok) {
+        if (ok) self._closeDrawerNow(reason || "dismiss");
+      });
+      return;
+    }
+    this._closeDrawerNow(reason || "dismiss");
+  };
+
+  OnlyYouConsoleApp.prototype._closeDrawerNow = function (reason) {
     var root = document.getElementById("drawer-root");
     var state = this._drawerState;
     this._drawerState = null;
@@ -1258,57 +1330,190 @@
     }
   };
 
-  /** 确认弹窗：返回 Promise<boolean> */
+  /**
+   * 二级确认弹窗（独立挂载在 #confirm-root，绝不关闭/覆盖当前 modal 或 drawer）。
+   * 返回 Promise<boolean>。支持 `lines: string[]` 逐条列出影响范围。
+   */
   OnlyYouConsoleApp.prototype.confirm = function (opts) {
     opts = opts || {};
     var self = this;
     return new Promise(function (resolve) {
+      var root = document.getElementById("confirm-root");
+      if (!root) {
+        resolve(false);
+        return;
+      }
+      // 同一时间只保留一个确认框：旧的按“取消”处理，避免 Promise 悬挂。
+      if (self._confirmState) self._settleConfirm(false, true);
       var settled = false;
       function finish(value) {
         if (settled) return;
         settled = true;
+        if (self._confirmState && self._confirmState.finish === finish) {
+          self._confirmState = null;
+          root.classList.remove("open");
+          root.innerHTML = "";
+        }
         resolve(value);
       }
-      self.modal({
-        title: opts.title || "确认操作",
-        body: '<div class="stat-desc">' + esc(opts.message || "") + "</div>",
-        actions: [
-          {
-            label: opts.cancelLabel || "取消",
-            onClick: function () {
-              finish(false);
-            }
-          },
-          {
-            label: opts.confirmLabel || "确认",
-            primary: !opts.danger,
-            danger: !!opts.danger,
-            confirmDanger: !!opts.danger,
-            onClick: async function () {
-              try {
-                if (typeof opts.onConfirm === "function") await opts.onConfirm();
+      var bodyHtml = '<div class="stat-desc confirm-message">' + esc(opts.message || "") + "</div>";
+      if (Array.isArray(opts.lines) && opts.lines.length) {
+        bodyHtml +=
+          '<ul class="confirm-list">' +
+          opts.lines
+            .map(function (line) {
+              return "<li>" + esc(line) + "</li>";
+            })
+            .join("") +
+          "</ul>";
+      }
+      root.innerHTML =
+        '<div class="overlay-backdrop" data-confirm-choice="cancel"></div>' +
+        '<div class="modal-wrap"><div class="modal confirm-modal" role="alertdialog" aria-modal="true" aria-label="' +
+        esc(opts.title || "确认操作") +
+        '">' +
+        '<div class="modal-head"><div class="modal-title">' +
+        esc(opts.title || "确认操作") +
+        "</div></div>" +
+        '<div class="modal-body">' +
+        bodyHtml +
+        "</div>" +
+        '<div class="modal-foot">' +
+        '<button class="btn btn-outline" type="button" data-confirm-choice="cancel">' +
+        esc(opts.cancelLabel || "取消") +
+        "</button>" +
+        '<button class="btn ' +
+        (opts.danger ? "btn-danger-solid" : "btn-primary") +
+        '" type="button" data-confirm-choice="ok">' +
+        esc(opts.confirmLabel || "确认") +
+        "</button></div></div></div>";
+      root.classList.add("open");
+      self._confirmState = { finish: finish, opts: opts };
+      root.querySelectorAll("[data-confirm-choice]").forEach(function (el) {
+        el.addEventListener("click", function () {
+          var choice = el.getAttribute("data-confirm-choice");
+          if (choice === "ok") {
+            var okBtn = root.querySelector('[data-confirm-choice="ok"]');
+            if (okBtn) okBtn.disabled = true;
+            Promise.resolve()
+              .then(function () {
+                if (typeof opts.onConfirm === "function") return opts.onConfirm();
+                return true;
+              })
+              .then(function () {
                 finish(true);
-              } catch (err) {
-                /* 弹窗保持打开，由用户重试或取消；外层不再重复 toast */
+              })
+              .catch(function (err) {
+                if (okBtn) okBtn.disabled = false;
                 self.toast((err && (err.message || err)) || "操作失败", true);
-                return false;
-              }
-            }
+              });
+          } else {
+            finish(false);
           }
-        ],
-        onClose: function () {
-          finish(false);
-        }
+        });
       });
+      var okBtn = root.querySelector('[data-confirm-choice="ok"]');
+      if (okBtn) {
+        setTimeout(function () {
+          try {
+            okBtn.focus();
+          } catch (err) {
+            /* ignore */
+          }
+        }, 30);
+      }
     });
   };
 
+  /** 关闭当前确认框（normally 用于 Esc / 替换）。 */
+  OnlyYouConsoleApp.prototype._settleConfirm = function (value, silent) {
+    var state = this._confirmState;
+    if (!state) return;
+    try {
+      state.finish(value);
+    } catch (err) {
+      if (!silent) console.warn("[OnlyYou] confirm settle failed:", err);
+    }
+  };
+
   /* ------------------------------ 事件绑定 ------------------------------ */
+
+  /* ------------------------------ 全局浮动 tooltip ------------------------------ */
+
+  /**
+   * 用 position: fixed 的全局气泡替代 [data-tip] CSS 伪元素，彻底避免被
+   * `overflow: hidden` 的时间轴 / 卡片容器裁切，并自动避让视口边缘。
+   */
+  OnlyYouConsoleApp.prototype._initFloatingTooltip = function () {
+    if (this._tooltipBound) return;
+    this._tooltipBound = true;
+    var tip = document.getElementById("floating-tooltip");
+    if (!tip) {
+      tip = document.createElement("div");
+      tip.id = "floating-tooltip";
+      tip.className = "floating-tooltip";
+      tip.setAttribute("role", "tooltip");
+      document.body.appendChild(tip);
+    }
+    document.documentElement.classList.add("floating-tooltip-enabled");
+
+    function targetOf(node) {
+      if (!node || !node.closest) return null;
+      var el = node.closest("[data-tip]");
+      if (!el) return null;
+      var text = el.getAttribute("data-tip");
+      if (!text) return null;
+      if (el.disabled || el.getAttribute("aria-disabled") === "true") return null;
+      return el;
+    }
+
+    function hide() {
+      tip.classList.remove("is-visible");
+      tip.setAttribute("aria-hidden", "true");
+    }
+
+    function show(el) {
+      var text = el.getAttribute("data-tip");
+      if (!text) return;
+      tip.textContent = text;
+      tip.classList.add("is-visible");
+      tip.setAttribute("aria-hidden", "false");
+      var rect = el.getBoundingClientRect();
+      var tipRect = tip.getBoundingClientRect();
+      var margin = 8;
+      var top = rect.top - tipRect.height - margin;
+      if (top < margin) top = rect.bottom + margin;
+      var left = rect.left + rect.width / 2 - tipRect.width / 2;
+      left = Math.max(margin, Math.min(window.innerWidth - tipRect.width - margin, left));
+      top = Math.max(margin, Math.min(window.innerHeight - tipRect.height - margin, top));
+      tip.style.left = left + "px";
+      tip.style.top = top + "px";
+    }
+
+    document.addEventListener("mouseover", function (event) {
+      var el = targetOf(event.target);
+      if (el) show(el);
+      else hide();
+    });
+    document.addEventListener("mouseout", function (event) {
+      var el = targetOf(event.target);
+      if (el) hide();
+    });
+    document.addEventListener("focusin", function (event) {
+      var el = targetOf(event.target);
+      if (el) show(el);
+      else hide();
+    });
+    document.addEventListener("focusout", hide);
+    window.addEventListener("scroll", hide, true);
+    window.addEventListener("resize", hide);
+  };
 
   OnlyYouConsoleApp.prototype._bindStaticEvents = function () {
     if (this._bound) return;
     this._bound = true;
     var self = this;
+    this._initFloatingTooltip();
 
     var refreshBtn = document.getElementById("btn-refresh");
     if (refreshBtn) {
@@ -1383,10 +1588,12 @@
 
     window.addEventListener("keydown", function (event) {
       if (event.key !== "Escape") return;
-      if (self._drawerState) {
-        self.closeDrawer();
+      if (self._confirmState) {
+        self._settleConfirm(false);
+      } else if (self._drawerState) {
+        self.closeDrawer("escape");
       } else if (self._modalState) {
-        self.closeModal();
+        self.closeModal("escape");
       }
     });
   };

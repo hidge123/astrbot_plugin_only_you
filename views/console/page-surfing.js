@@ -36,8 +36,13 @@
     /* v2.8.3：后台视频源（Soul settings.surfing_sources，来自 GET；默认 B站 + 抖音） */
     surfingSources: ["bilibili", "douyin"],
     sourceBusy: false,
+    /* 手动抓取选项：会话内保持（不再每次刷新强制重置） */
     platform: "",
-    ignoreGate: true,
+    ignoreGate: false,
+    manualOpen: false,
+    /* #18/#23：视频卡片墙的真正列表筛选 */
+    filter: "all",
+    expandedNotes: {},
     busy: false
   };
 
@@ -135,13 +140,17 @@
     );
   }
 
-  function platformSegmentedHtml() {
+  function manualOptionsHtml() {
+    if (!S.manualOpen) return "";
     var options = [
-      { value: "", label: "不限平台" },
-      { value: "bilibili", label: "B站" },
-      { value: "douyin", label: "抖音" }
+      { value: "", label: "跟随后台视频源" },
+      { value: "bilibili", label: "仅 B站" },
+      { value: "douyin", label: "仅抖音" }
     ];
     return (
+      '<div class="card manual-options" data-role="manual-options"><div class="card-body tight">' +
+      '<div class="row wrap" style="gap:14px">' +
+      '<span class="text-xs" style="font-weight:600">本次手动抓取平台</span>' +
       '<div class="segmented" data-role="platform-seg">' +
       options
         .map(function (item) {
@@ -156,8 +165,56 @@
           );
         })
         .join("") +
+      "</div>" +
+      '<label class="switch-label" data-tip="仅调试用：开启后即使不在 IDLE 空闲状态也会立即抓取视频">' +
+      '<span class="switch"><input type="checkbox" data-role="ignore-gate"' +
+      (S.ignoreGate ? " checked" : "") +
+      ' /><span class="switch-track"></span></span>' +
+      "调试：忽略三态门禁强制抓取</label>" +
+      "</div>" +
+      '<div class="text-xs muted mt-8">当前设置只在本次页面会话内保持；「跟随后台视频源」不会覆盖角色在下方保存的 B站 / 抖音开关。</div>' +
+      "</div></div>"
+    );
+  }
+
+  function filterSegHtml() {
+    var items = [
+      { id: "all", label: "全部" },
+      { id: "bilibili", label: "B站" },
+      { id: "douyin", label: "抖音" },
+      { id: "shared", label: "已分享" }
+    ];
+    return (
+      '<div class="segmented" data-role="video-filter">' +
+      items
+        .map(function (item) {
+          return (
+            '<button type="button" class="seg-btn' +
+            (S.filter === item.id ? " active" : "") +
+            '" data-action="set-filter" data-filter="' +
+            esc(item.id) +
+            '">' +
+            esc(item.label) +
+            "</button>"
+          );
+        })
+        .join("") +
       "</div>"
     );
+  }
+
+  function filteredVideos() {
+    if (S.filter === "shared") {
+      return S.videos.filter(function (video) {
+        return !!video.worth_sharing;
+      });
+    }
+    if (S.filter === "bilibili" || S.filter === "douyin") {
+      return S.videos.filter(function (video) {
+        return String(video.platform || "").toLowerCase() === S.filter;
+      });
+    }
+    return S.videos.slice();
   }
 
   function statsHtml() {
@@ -171,9 +228,9 @@
     var avg = total ? Math.round(scoreSum / total) : 0;
     return (
       '<div class="row wrap" style="gap:6px" data-role="surf-stats">' +
-      '<span class="tag">共 ' +
-      esc(total) +
-      " 条</span>" +
+      '<span class="tag">' +
+      (S.filter === "all" ? "共 " + esc(total) + " 条" : "显示 " + esc(filteredVideos().length) + " / " + esc(total) + " 条") +
+      "</span>" +
       '<span class="tag">平均评分 ' +
       esc(avg) +
       "</span>" +
@@ -193,9 +250,16 @@
       esc(S.videos.length) +
       " 条冲浪记录</span></h1>" +
       '<div class="page-actions">' +
-      '<button class="btn btn-ghost btn-sm" type="button" data-action="reload">' +
-      icon("refresh", 14) +
-      "刷新</button>" +
+      '<button class="btn btn-ghost btn-sm" type="button" data-action="open-settings">' +
+      icon("settings", 13) +
+      "冲浪设置</button>" +
+      '<button class="btn btn-outline btn-sm" type="button" data-action="toggle-manual-options" aria-expanded="' +
+      (S.manualOpen ? "true" : "false") +
+      '">' +
+      icon("sliders", 13) +
+      "手动抓取选项 " +
+      (S.manualOpen ? "▴" : "▾") +
+      "</button>" +
       '<button class="btn btn-primary btn-sm" type="button" data-action="surf">' +
       icon("play", 13) +
       "手动冲浪</button>" +
@@ -206,17 +270,13 @@
   function toolbarHtml() {
     return (
       '<div class="card"><div class="card-body tight"><div class="row-between wrap">' +
-      '<div class="row wrap">' +
-      platformSegmentedHtml() +
-      '<label class="switch-label" data-tip="开启后即使不在 IDLE 空闲状态也会立即抓取视频（调试用）">' +
-      '<span class="switch"><input type="checkbox" data-role="ignore-gate"' +
-      (S.ignoreGate ? " checked" : "") +
-      ' /><span class="switch-track"></span></span>' +
-      "忽略状态门禁</label>" +
+      '<div class="row wrap" style="gap:8px">' +
+      '<span class="text-xs" style="font-weight:600">列表筛选</span>' +
+      filterSegHtml() +
       "</div>" +
       statsHtml() +
       "</div>" +
-      '<div class="text-xs muted mt-8" data-tip="冲浪只在 IDLE 空闲状态下自动触发；这里的手动触发用于调试平台抓取与看片评分流程。">IDLE 空闲时自动冲浪；手动触发用于调试</div>' +
+      '<div class="text-xs muted mt-8" data-tip="冲浪只在 IDLE 空闲状态下自动触发；手动触发用于调试平台抓取与看片评分流程。">IDLE 空闲时自动冲浪；手动抓取用于调试</div>' +
       "</div></div>"
     );
   }
@@ -229,16 +289,21 @@
     var on = S.surfingEnabled !== false;
     return (
       '<div class="card" data-role="surf-master"><div class="card-body tight">' +
-      '<div class="switch-row">' +
+      '<label class="switch-row is-clickable" data-tip="赛博冲浪总开关（按当前角色独立保存）">' +
       '<div class="switch-row-text">' +
-      '<span class="switch-row-title">赛博冲浪总开关</span>' +
+      '<span class="switch-row-title">启用该角色赛博冲浪</span>' +
       '<span class="switch-row-desc">按当前角色独立保存：开启后 SURF 时段会主动刷 B 站 / 抖音视频并看片吐槽；关闭后不再主动刷视频。</span>' +
+      '<span class="tag ' +
+      (on ? "tag-primary" : "tag-muted") +
+      '" data-role="surfing-state-text">' +
+      (on ? "已开启" : "已关闭") +
+      "</span>" +
       "</div>" +
-      '<label class="switch" data-tip="赛博冲浪总开关（按当前角色独立保存）">' +
+      '<span class="switch">' +
       '<input type="checkbox" data-role="surfing-enabled"' +
       (on ? " checked" : "") +
-      ' /><span class="switch-track"></span></label>' +
-      "</div>" +
+      ' /><span class="switch-track"></span></span>' +
+      "</label>" +
       (on
         ? ""
         : '<div class="text-xs muted mt-8" data-role="surfing-off-hint">已关闭：SURF 时段将自动降级为空闲闲逛，不再主动刷视频</div>') +
@@ -252,12 +317,23 @@
     var shareUrl = String(video.share_url || "").trim();
     var score = num(video.score, 0);
     var tags = Array.isArray(video.tags) ? video.tags : [];
-    var tagHtml = tags
-      .slice(0, 4)
+    var shownTags = tags.slice(0, 4);
+    var extraTags = tags.slice(4);
+    var tagHtml = shownTags
       .map(function (tag) {
         return '<span class="tag">' + esc(tag) + "</span>";
       })
       .join("");
+    if (extraTags.length) {
+      tagHtml +=
+        '<span class="tag tag-muted" data-tip="' +
+        esc(extraTags.join(" / ")) +
+        '" title="' +
+        esc(extraTags.join(" / ")) +
+        '">+' +
+        extraTags.length +
+        "</span>";
+    }
     var coverInner = cover
       ? '<img src="' +
         esc(cover) +
@@ -293,13 +369,24 @@
       '" data-tip="从冲浪池删除" aria-label="删除">' +
       icon("trash", 13) +
       "</button></div></div>";
+    var titleText = String(video.title || "未命名视频");
     var titleHtml = shareUrl
-      ? '<a class="video-title" style="color:var(--text)" href="' +
+      ? '<a class="video-title" style="color:var(--text)" title="' +
+        esc(titleText) +
+        '" data-tip="' +
+        esc(titleText) +
+        '" href="' +
         esc(shareUrl) +
         '" target="_blank" rel="noopener noreferrer">' +
-        esc(video.title || "未命名视频") +
+        esc(titleText) +
         "</a>"
-      : '<div class="video-title">' + esc(video.title || "未命名视频") + "</div>";
+      : '<div class="video-title" title="' +
+        esc(titleText) +
+        '" data-tip="' +
+        esc(titleText) +
+        '">' +
+        esc(titleText) +
+        "</div>";
     return (
       '<div class="video-card" data-video-card="' +
       esc(video.id) +
@@ -325,20 +412,43 @@
           esc(video.commentary) +
           "</div>"
         : "") +
-      (tagHtml ? '<div class="row wrap" style="gap:4px">' + tagHtml + "</div>" : "") +
+      (tagHtml ? '<div class="video-tags">' + tagHtml + "</div>" : "") +
+      videoNotesHtml(video) +
       '<div class="row-between mt-4"><span class="text-xs muted">' +
       esc(fmtAgo(video.watched_at)) +
-      "</span>" +
-      (video.visual_notes
-        ? '<span class="text-xs muted ellipsis" style="max-width:60%" data-tip="' +
-          esc(video.visual_notes) +
-          '">看片笔记</span>'
+      "</span></div></div></div>"
+    );
+  }
+
+  /** #15：看片笔记直接渲染正文，超过 2 行可展开；不再只显示「看片笔记」四个字。 */
+  function videoNotesHtml(video) {
+    var notes = String(video.visual_notes || "").trim();
+    if (!notes) return "";
+    var key = String(video.id != null ? video.id : video.video_id || "");
+    var expanded = !!S.expandedNotes[key];
+    var needsToggle = notes.length > 56;
+    return (
+      '<div class="video-notes-wrap">' +
+      '<div class="video-notes' +
+      (needsToggle && !expanded ? " is-clamped" : "") +
+      '" data-tip="' +
+      esc(notes) +
+      '">' +
+      esc(notes) +
+      "</div>" +
+      (needsToggle
+        ? '<button class="video-notes-toggle" type="button" data-action="toggle-notes" data-note-key="' +
+          esc(key) +
+          '">' +
+          (expanded ? "收起笔记" : "展开笔记") +
+          "</button>"
         : "") +
-      "</div></div></div>"
+      "</div>"
     );
   }
 
   function gridHtml() {
+    var videos = filteredVideos();
     if (!S.videos.length) {
       return (
         '<div class="card"><div class="empty">' +
@@ -351,11 +461,25 @@
         "</div></div>"
       );
     }
-    return '<div class="video-grid">' + S.videos.map(videoCardHtml).join("") + "</div>";
+    if (!videos.length) {
+      return (
+        '<div class="card"><div class="empty">' +
+        icon("filter", 30) +
+        '<div class="empty-title">当前筛选下没有视频</div>' +
+        '<div class="empty-text">切换到「全部」或其他平台筛选再看看。</div></div></div>'
+      );
+    }
+    return '<div class="video-grid">' + videos.map(videoCardHtml).join("") + "</div>";
   }
 
   function pageHtml() {
-    return pageHeadHtml() + masterSwitchHtml() + toolbarHtml() + gridHtml();
+    return (
+      pageHeadHtml() +
+      manualOptionsHtml() +
+      masterSwitchHtml() +
+      toolbarHtml() +
+      gridHtml()
+    );
   }
 
   function paint() {
@@ -636,8 +760,20 @@
     var action = actionEl.getAttribute("data-action");
     var app = S.app;
     if (!app) return;
-    if (action === "reload") {
+    if (action === "open-settings") {
+      app.openSettings("surfing");
+    } else if (action === "reload") {
       reload(true);
+    } else if (action === "toggle-manual-options") {
+      S.manualOpen = !S.manualOpen;
+      paint();
+    } else if (action === "set-filter") {
+      S.filter = actionEl.getAttribute("data-filter") || "all";
+      paint();
+    } else if (action === "toggle-notes") {
+      var noteKey = actionEl.getAttribute("data-note-key") || "";
+      S.expandedNotes[noteKey] = !S.expandedNotes[noteKey];
+      paint();
     } else if (action === "surf") {
       triggerSurf(actionEl);
     } else if (action === "share-video") {
@@ -646,12 +782,7 @@
       confirmDeleteVideo(actionEl.getAttribute("data-video-id"), actionEl.getAttribute("data-row-id"));
     } else if (action === "set-platform") {
       S.platform = actionEl.getAttribute("data-platform") || "";
-      var seg = S.container ? S.container.querySelector('[data-role="platform-seg"]') : null;
-      if (seg) {
-        seg.querySelectorAll(".seg-btn").forEach(function (btn) {
-          btn.classList.toggle("active", (btn.getAttribute("data-platform") || "") === S.platform);
-        });
-      }
+      paint();
     }
   }
 
@@ -684,8 +815,6 @@
     S.knownUmos = [];
     S.surfingEnabled = true;
     S.toggleBusy = false;
-    S.platform = "";
-    S.ignoreGate = true;
     S.busy = false;
 
     container.innerHTML =

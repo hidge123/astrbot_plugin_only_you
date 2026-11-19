@@ -27,8 +27,24 @@
   var pageData = {
     schedule: null,
     cards: null,
-    filter: "ALL"
+    filter: "ALL",
+    drawerDirty: false
   };
+
+  var GATE_DESCRIPTIONS = {
+    SLEEP:
+      "休息中：所有消息都不打扰，仅 ★L3 核心用户私聊强呼叫可以唤醒 0.5 小时清醒窗。",
+    BUSY_TASK:
+      "繁忙中：L1 普通用户的消息会转入未读，等空闲后补回；◆L2 / ★L3 可以正常接话。",
+    SURF:
+      "空闲冲浪：所有等级的消息都会正常接话（是否冒泡由群聊读空气决定）。",
+    IDLE_ROAM:
+      "空闲闲逛：所有等级的消息都会正常接话（是否冒泡由群聊读空气决定）。"
+  };
+
+  function gateDescription(type) {
+    return GATE_DESCRIPTIONS[type] || GATE_DESCRIPTIONS.IDLE_ROAM;
+  }
 
   var STATE_LABELS = { IDLE: "空闲", BUSY: "繁忙", RESTING: "休息" };
   var ACTION_COLOR_VAR = {
@@ -157,18 +173,19 @@
    * 数据加载
    * ------------------------------------------------------------------ */
   async function loadData(app) {
-    var schedule = app.state.activeSchedule;
-    if (!schedule || !schedule.run) {
-      try {
-        var detail = await app.apiGet("souls/detail", { soul_id: app.state.currentSoulId });
-        if (detail && detail.schedule) {
-          schedule = detail.schedule;
-          app.state.activeSchedule = detail.schedule;
-        }
-      } catch (err) {
-        console.warn("[OnlyYou] 日程页加载 souls/detail 失败：", err);
+    /* #8：日程页渲染时直接拉取最新日程，避免顶栏刷新后仍显示旧缓存。 */
+    var schedule = null;
+    try {
+      var detail = await app.apiGet("souls/detail", { soul_id: app.state.currentSoulId });
+      if (detail && detail.schedule) {
+        schedule = detail.schedule;
+        app.state.activeSchedule = detail.schedule;
       }
+    } catch (err) {
+      console.warn("[OnlyYou] 日程页加载 souls/detail 失败：", err);
+      schedule = app.state.activeSchedule;
     }
+    if (!schedule || !schedule.run) schedule = app.state.activeSchedule;
     var cards = await app.apiGet("cards/list", { soul_id: app.state.currentSoulId });
     return { schedule: schedule || null, cards: cards || {} };
   }
@@ -230,6 +247,7 @@
     }
     minHours = clamp(minHours, 0.5, 8);
     maxHours = clamp(maxHours, 0.5, 8);
+    var builtin = !!card.is_builtin || card.scope === "global";
     return (
       '<div class="action-card ' +
       meta.cls +
@@ -246,17 +264,20 @@
       esc(card.title || "未命名行动卡") +
       "</div>" +
       '<div class="card-hover-actions">' +
-      '<button class="icon-btn" type="button" data-action="delete-card" data-card-id="' +
-      esc(card.card_id || "") +
-      '" data-scope="' +
-      esc(card.scope || "soul") +
-      '" data-tip="删除卡片" aria-label="删除卡片">' +
-      icon("trash", 14) +
-      "</button></div></div>" +
+      (builtin
+        ? ""
+        : '<button class="icon-btn" type="button" data-action="delete-card" data-card-id="' +
+          esc(card.card_id || "") +
+          '" data-scope="' +
+          esc(card.scope || "soul") +
+          '" data-tip="删除卡片" aria-label="删除卡片">' +
+          icon("trash", 14) +
+          "</button>") +
+      "</div></div>" +
       '<div class="action-card-meta">' +
       actionBadgeHtml(type, badgeLabelOf(type)) +
       '<span class="tag tag-scope">' +
-      (card.scope === "global" ? "内置" : "自定义") +
+      (builtin ? "内置默认" : "自定义") +
       '</span><span class="tag tag-muted" data-tip="抽卡权重">权重 ' +
       weight +
       "</span></div>" +
@@ -295,7 +316,7 @@
         '<div class="empty-title">' +
         esc(emptyTitle) +
         "</div>" +
-        '<div class="empty-text">切换筛选条件，或点击右上角「新建卡片」手动创建一张；也可以点「重抽日程卡池」让 AI 重新生成一整套四类专属行动卡。</div></div>';
+        '<div class="empty-text">切换筛选条件，或点击右上角「新建行动卡」手动创建一张；也可以点「重抽日程卡池」让 AI 重新生成一整套四类专属行动卡。</div></div>';
     return (
       '<section class="card"><div class="card-head">' +
       '<div class="card-title">' +
@@ -313,9 +334,9 @@
       '<div class="segmented">' +
       filterSegHtml(cards) +
       "</div>" +
-      '<button class="btn btn-outline btn-sm" type="button" data-action="new-card">' +
+      '<button class="btn btn-primary btn-sm" type="button" data-action="new-card">' +
       icon("plus", 13) +
-      "新建卡片</button>" +
+      "新建行动卡</button>" +
       "</div></div>" +
       body +
       "</section>"
@@ -363,14 +384,23 @@
       });
       html +=
         '<div class="axis-legend mt-12">' +
-        actionLegendHtml(data.cards) +
-        '<span class="nowrap">现在 ' +
-        app.formatClock(Date.now()) +
-        " · 共 " +
+        charts().actionTimelineLegend(app.formatClock(Date.now())) +
+        '<span class="nowrap">共 ' +
         slots.length +
         " 个时间块</span></div>";
+      var currentSlot = (data.schedule && data.schedule.current_slot) || null;
+      if (currentSlot && currentSlot.slot_key) {
+        html +=
+          '<div class="row mt-8"><span class="slot-live-badge">正在生效 · ' +
+          esc(currentSlot.label || currentSlot.slot_key) +
+          " · " +
+          esc(fmtHour(currentSlot.start_hour) + "-" + fmtHour(currentSlot.end_hour)) +
+          "</span><span class=\"text-xs muted\">" +
+          esc(gateDescription(slotActionType(currentSlot))) +
+          "</span></div>";
+      }
     } else {
-      html += '<div class="stat-empty">今日日程尚未生成，点击右上角「刷新」或发送 /onlyyou status 生成今日时间轴。</div>';
+      html += '<div class="stat-empty">今日日程尚未生成，点击顶栏刷新按钮或发送 /onlyyou status 生成今日时间轴。</div>';
     }
     html += "</div></section>";
     return html;
@@ -384,12 +414,15 @@
       "日程" +
       "</h1>" +
       '<div class="page-actions">' +
-      '<button class="btn btn-ghost btn-sm" type="button" data-action="refresh-page">' +
-      icon("refresh", 14) +
-      "刷新</button>" +
-      '<button class="btn btn-primary btn-sm" type="button" data-action="reroll">' +
+      '<button class="btn btn-ghost btn-sm" type="button" data-action="open-settings" data-section="schedule">' +
+      icon("settings", 13) +
+      "设置</button>" +
+      '<button class="btn btn-outline btn-sm" type="button" data-action="reroll">' +
       icon("wand", 14) +
       "重抽日程卡池</button>" +
+      '<button class="btn btn-primary btn-sm" type="button" data-action="new-card">' +
+      icon("plus", 14) +
+      "新建行动卡</button>" +
       "</div></div>";
     html += timelineBlock(app, data);
     html += cardsBlock(app, data);
@@ -427,15 +460,32 @@
     return "IDLE_ROAM";
   }
 
-  function slotFormHtml(app, slot, cards) {
+  function slotFormHtml(app, slot, cards, isCurrent) {
     var defs = actionTypeDefs(cards);
     var currentType = slotActionType(slot);
     var currentState = actionStateOf(currentType) || (slot && slot.state) || "IDLE";
+    var progress =
+      slot && slot.progress_pct != null && slot.progress_pct !== ""
+        ? Math.max(0, Math.min(100, Math.round(num(slot.progress_pct, 0))))
+        : null;
+    var result = String((slot && slot.completion_result) || "");
     var html = "";
     html +=
-      '<div class="card-sub mb-12">' +
+      '<div class="slot-edit-summary">' +
+      (isCurrent ? '<span class="slot-live-badge">正在生效</span>' : "") +
+      '<span class="mono">' +
       esc(fmtHour(slot.start_hour) + "-" + fmtHour(slot.end_hour) + " · " + (slot.slot_key || "")) +
+      "</span>" +
+      (progress == null ? "" : '<span class="tag tag-muted">进度 ' + progress + "%</span>") +
+      (slot && slot.mutated ? '<span class="tag tag-primary">已微调</span>' : "") +
       "</div>";
+    if (result) {
+      html +=
+        '<div class="busy-result-inline">' +
+        icon("check", 12) +
+        esc("该块繁忙成果：" + result) +
+        "</div>";
+    }
     html += '<div class="field"><span class="field-label">行动类型</span><div class="segmented" data-role="slot-action-seg">';
     defs.forEach(function (def) {
       html +=
@@ -455,7 +505,13 @@
     html +=
       '<div class="field-help">绑定状态：<span class="tag" data-role="slot-state-hint">' +
       esc(STATE_LABELS[String(currentState).toUpperCase()] || "空闲") +
-      "</span> · 该行动类型自带固定护甲档位（由后端自动应用）</div></div>";
+      "</span></div>" +
+      '<div class="gate-note" data-role="slot-gate-note">' +
+      esc(gateDescription(currentType)) +
+      "</div>" +
+      '<div class="gate-warning" data-role="slot-sleep-warning" style="display:none">' +
+      "注意：这是当前正在生效的时间块。改为「睡觉」后，L1 / ◆L2 的消息都会转入未读，只有 ★L3 核心用户私聊强呼叫才能唤醒。" +
+      "</div></div>";
     html +=
       '<div class="field"><span class="field-label">正在做的事（活动标题）</span>' +
       '<input class="input" data-role="slot-title" maxlength="120" placeholder="如：埋头赶稿 / 躺沙发刷 B 站" value="' +
@@ -468,19 +524,33 @@
   function bindSlotForm(body) {
     var seg = body.querySelector('[data-role="slot-action-seg"]');
     var hint = body.querySelector('[data-role="slot-state-hint"]');
+    var gateNote = body.querySelector('[data-role="slot-gate-note"]');
+    var sleepWarning = body.querySelector('[data-role="slot-sleep-warning"]');
     if (seg) {
       seg.addEventListener("click", function (event) {
         var btn = event.target.closest("[data-action-type]");
         if (!btn) return;
+        var type = btn.getAttribute("data-action-type");
         seg.querySelectorAll(".seg-btn").forEach(function (el) {
           el.classList.remove("active");
         });
         btn.classList.add("active");
+        pageData.drawerDirty = true;
         if (hint) {
           var stateId = String(btn.getAttribute("data-state") || "").toUpperCase();
           hint.textContent = STATE_LABELS[stateId] || "空闲";
           hint.className = "tag " + (stateId ? "st-" + stateId.toLowerCase() : "");
         }
+        if (gateNote) gateNote.textContent = gateDescription(type);
+        if (sleepWarning) {
+          sleepWarning.style.display = type === "SLEEP" ? "block" : "none";
+        }
+      });
+    }
+    var titleInput = body.querySelector('[data-role="slot-title"]');
+    if (titleInput) {
+      titleInput.addEventListener("input", function () {
+        pageData.drawerDirty = true;
       });
     }
   }
@@ -501,12 +571,33 @@
       return;
     }
     var cards = pageData.cards || {};
+    var currentKey =
+      (pageData.schedule &&
+        pageData.schedule.current_slot &&
+        pageData.schedule.current_slot.slot_key) ||
+      (app.currentSlotKey ? app.currentSlotKey() : "");
+    var isCurrent = !!currentKey && slot.slot_key === currentKey;
+    var originalType = slotActionType(slot);
+    var originalTitle = String(slot.title || "");
+    var originalSettled = !!slot.busy_settled;
     var body = document.createElement("div");
-    body.innerHTML = slotFormHtml(app, slot, cards);
+    body.innerHTML = slotFormHtml(app, slot, cards, isCurrent);
+    pageData.drawerDirty = false;
     bindSlotForm(body);
+    var sleepWarning = body.querySelector('[data-role="slot-sleep-warning"]');
+    if (sleepWarning) {
+      sleepWarning.style.display =
+        isCurrent && originalType === "SLEEP" ? "block" : "none";
+    }
     app.drawer({
-      title: "编辑时间块 · " + (slot.label || slot.slot_key || ""),
+      title:
+        "编辑时间块 · " +
+        (slot.label || slot.slot_key || "") +
+        (isCurrent ? "（当前生效块）" : ""),
       body: body,
+      isDirty: function () {
+        return !!pageData.drawerDirty;
+      },
       actions: [
         { label: "取消" },
         {
@@ -515,7 +606,27 @@
           icon: "save",
           onClick: async function () {
             var form = readSlotForm(body);
-            /* v2.6：护甲由行动类型固定档位自动应用，POST 不再携带 armor */
+            /* #6：完全没改 -> 直接关闭，不发请求、不清空已结算成果 */
+            if (form.action_type === originalType && form.new_title === originalTitle) {
+              pageData.drawerDirty = false;
+              app.toast("没有修改，未提交");
+              return;
+            }
+            if (
+              originalSettled &&
+              originalType === "BUSY_TASK" &&
+              form.action_type !== "BUSY_TASK"
+            ) {
+              var ok = await app.confirm({
+                title: "清空已结算的繁忙成果？",
+                message:
+                  "该时间块已生成今日繁忙成果，切换行动类型会清空该块成果。确定继续吗？",
+                danger: true,
+                confirmLabel: "继续并清空",
+                cancelLabel: "保留成果"
+              });
+              if (!ok) return false;
+            }
             var data = await app.apiPost("schedule/force_state", {
               soul_id: app.state.currentSoulId,
               slot_key: slot.slot_key,
@@ -526,11 +637,17 @@
               app.state.activeSchedule = data.schedule;
               pageData.schedule = data.schedule;
             }
+            pageData.drawerDirty = false;
             paint(container, app, {
               schedule: pageData.schedule,
               cards: pageData.cards
             });
-            app.toast("已更新「" + (slot.label || slot.slot_key) + "」为 " + shortLabelOf(form.action_type));
+            app.toast(
+              "已更新「" +
+                (slot.label || slot.slot_key) +
+                "」为 " +
+                shortLabelOf(form.action_type)
+            );
           }
         }
       ]
@@ -550,7 +667,8 @@
       message:
         "将删除当前角色的所有行动卡并由 AI 重新生成一套新卡片。" +
         "今日已排好的 24h 时间轴保持不变，明天起将从新卡池中抽取日程。",
-      confirmLabel: "重抽",
+      confirmLabel: "重抽并覆盖卡池",
+      danger: true,
       onConfirm: async function () {
         var btn = container.querySelector('[data-action="reroll"]');
         if (btn) btn.classList.add("is-loading");
@@ -624,6 +742,7 @@
           schedule: pageData.schedule,
           cards: pageData.cards
         });
+        if (app._drawerState) app.closeDrawer("action");
         app.toast("已删除行动卡");
       }
     });
@@ -632,8 +751,13 @@
   /* ------------------------------------------------------------------ *
    * 交互：行动卡编辑器（title / action_type / min~max / weight / scope）
    * ------------------------------------------------------------------ */
+  function isBuiltinCard(card) {
+    return !!card && (!!card.is_builtin || card.scope === "global");
+  }
+
   function openCardDrawer(app, container, card) {
     var isNew = !card;
+    pageData.drawerDirty = false;
     var defs = actionTypeDefs(pageData.cards);
     var defaultType = "IDLE_ROAM";
     var source = card || {
@@ -713,7 +837,12 @@
       (isNew
         ? ""
         : '<div class="field-help">已存在卡片的作用域固定；如需移动请新建后再删除旧卡。</div>') +
-      "</div>";
+      "</div>" +
+      (!isNew && !isBuiltinCard(source)
+        ? '<div class="card-actions mt-12"><button class="btn btn-danger btn-sm" type="button" data-action="delete-card-inline">' +
+          icon("trash", 13) +
+          "删除此行动卡</button></div>"
+        : "");
 
     var typeSelect = body.querySelector('[data-role="card-action-type"]');
     var boundState = body.querySelector('[data-role="card-bound-state"]');
@@ -737,10 +866,26 @@
       }
     }
     bindSlider("card-weight", "card-weight-value");
+    body.addEventListener("input", function () {
+      pageData.drawerDirty = true;
+    });
+    body.addEventListener("change", function () {
+      pageData.drawerDirty = true;
+    });
+    body.addEventListener("click", function (event) {
+      var target = event.target;
+      if (!target || !target.closest) return;
+      var btn = target.closest('[data-action="delete-card-inline"]');
+      if (!btn) return;
+      doDeleteCard(app, container, source.card_id, source.scope || "soul");
+    });
 
     app.drawer({
       title: isNew ? "新增行动卡" : "编辑行动卡",
       body: body,
+      isDirty: function () {
+        return !!pageData.drawerDirty;
+      },
       actions: [
         { label: "取消" },
         {
@@ -788,6 +933,7 @@
             if (data && (Array.isArray(data.custom_cards) || Array.isArray(data.general_cards))) {
               pageData.cards = data;
             }
+            pageData.drawerDirty = false;
             paint(container, app, {
               schedule: pageData.schedule,
               cards: pageData.cards
@@ -810,8 +956,8 @@
       var actionEl = target.closest("[data-action]");
       if (actionEl) {
         var action = actionEl.getAttribute("data-action");
-        if (action === "refresh-page") {
-          render(container, app);
+        if (action === "open-settings") {
+          app.openSettings("schedule");
         } else if (action === "reroll") {
           doReroll(app, container);
         } else if (action === "filter-cards") {
@@ -883,6 +1029,7 @@
     pageData.schedule = null;
     pageData.cards = null;
     pageData.filter = "ALL";
+    pageData.drawerDirty = false;
   }
 
   window.OY_PAGES = window.OY_PAGES || {};

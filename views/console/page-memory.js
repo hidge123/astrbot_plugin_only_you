@@ -61,6 +61,8 @@
     users: [],
     /* v2.8：T1 瞬时记忆条数上限（来自 memories/list 的 data.tier1_limit，默认 30） */
     tier1Limit: 30,
+    maxChars: 60,
+    modalDirty: false,
     tier: "",
     keyword: "",
     userId: "",
@@ -210,10 +212,23 @@
     );
   }
 
+  function isFiltering() {
+    return !!(S.keyword || S.tier || S.userId);
+  }
+
   function summaryStripHtml() {
     var counts = statCounts();
+    var filtering = isFiltering();
+    var hit = S.memories.length;
     return (
       '<div class="memory-summary-strip" data-role="memory-summary">' +
+      (filtering
+        ? '<div class="memory-filter-summary">当前筛选命中 <b>' +
+          esc(hit) +
+          "</b> 条（全库共 " +
+          esc(counts.total) +
+          " 条）</div>"
+        : "") +
       '<div class="memory-summary-items">' +
       summaryItemHtml("all", "全部", counts.total) +
       summaryItemHtml("3", "💎 T3 核心", counts["3"]) +
@@ -287,7 +302,7 @@
       budget +
       " 字；会话滑窗保留最近 " +
       windowSize +
-      ' 条消息。预算 / 滑窗 / 提炼阈值等运行参数统一在「AstrBot 插件配置 → OnlyYou → 记忆与上下文」中修改。">每次注入 ≤' +
+      ' 条消息。预算 / 滑窗 / 提炼阈值等运行参数统一在「设置 → 记忆」中修改。">每次注入 ≤' +
       esc(injected) +
       " 条 · " +
       esc(budget) +
@@ -425,34 +440,29 @@
 
   function tierSwitchHtml(memory, tier) {
     var current = Number(tier) || 2;
-    var buttons = TIER_ORDER.filter(function (value) {
-      return value !== current;
-    })
-      .sort(function (a, b) {
-        return a - b;
-      })
+    var options = [3, 2, 1]
       .map(function (value) {
         var meta = tierMeta(value);
-        var direction = value > current ? " is-up" : " is-down";
-        var tip = value > current ? "提升为 " + meta.label + " 记忆" : "降级为 " + meta.label + " 记忆";
         return (
-          '<button type="button" class="tier-btn' +
-          direction +
-          '" data-action="switch-tier" data-id="' +
-          esc(memory.id) +
-          '" data-tier="' +
+          '<option value="' +
           esc(value) +
-          '" data-tip="' +
-          esc(tip) +
-          '" aria-label="' +
-          esc(tip) +
-          '">' +
-          esc(meta.short) +
-          "</button>"
+          '"' +
+          (value === current ? " selected" : "") +
+          ">" +
+          esc(meta.label) +
+          "</option>"
         );
       })
       .join("");
-    return '<span class="tier-switch" data-role="tier-switch">' + buttons + "</span>";
+    return (
+      '<select class="memory-tier-select" data-action="switch-tier-select" data-id="' +
+      esc(memory.id) +
+      '" data-current="' +
+      esc(current) +
+      '" aria-label="调整记忆分级" data-tip="调整记忆分级（T3 永久 / T2 近期 / T1 瞬时）">' +
+      options +
+      "</select>"
+    );
   }
 
   function memoryRowHtml(memory) {
@@ -577,7 +587,9 @@
     var rows = S.memories.filter(function (memory) {
       return (Number(memory.memory_tier) || 2) === Number(tier);
     });
-    var count = counts[String(tier)] != null ? counts[String(tier)] : rows.length;
+    var totalCount = counts[String(tier)] != null ? counts[String(tier)] : rows.length;
+    /* #13：筛选激活时分组头显示「命中 / 全库」，避免拿全库数字误导用户。 */
+    var count = isFiltering() ? rows.length + " / " + totalCount : totalCount;
     var collapsed = isGroupCollapsed(tier, rows);
     var body = rows.length
       ? rows.map(memoryRowHtml).join("")
@@ -662,15 +674,15 @@
       esc(total) +
       " 条分级记忆</span></h1>" +
       '<div class="page-actions">' +
+      '<button class="btn btn-ghost btn-sm" type="button" data-action="open-settings">' +
+      icon("settings", 13) +
+      "记忆设置</button>" +
       '<button class="btn btn-outline btn-sm" type="button" data-action="extract">' +
       icon("wand", 13) +
       "提炼</button>" +
-      '<button class="btn btn-outline btn-sm" type="button" data-action="gc" data-tip="运行每日遗忘清理：T1 过期删除 / T2 活力衰减 / T3 访问强化晋升">' +
-      icon("refresh", 13) +
-      "GC</button>" +
-      '<button class="btn btn-outline btn-sm" type="button" data-action="reload">' +
-      icon("refresh", 13) +
-      "刷新</button>" +
+      '<button class="btn btn-outline btn-sm" type="button" data-action="gc" data-tip="清理过期记忆：T1 超时删除 / T2 活力衰减 / T3 访问强化晋升">' +
+      icon("sparkles", 13) +
+      "清理过期</button>" +
       '<button class="btn btn-primary btn-sm" type="button" data-action="create">' +
       icon("plus", 13) +
       "新增</button>" +
@@ -706,6 +718,11 @@
     S.stats = data.stats && typeof data.stats === "object" ? data.stats : null;
     /* v2.8：T1 每角色上限（配置 memory_and_context_config.max_tier1_memories，默认 30） */
     S.tier1Limit = data.tier1_limit != null ? Math.max(0, num(data.tier1_limit, 30)) : 30;
+    /* #5：单条记忆字数上限由「设置 → 记忆」控制，默认 60（可调到 300）。 */
+    S.maxChars =
+      S.stats && S.stats.memory_content_max_chars != null
+        ? Math.max(10, num(S.stats.memory_content_max_chars, 60))
+        : 60;
   }
 
   /** 关联用户下拉数据源：失败时静默降级（用记忆里的 user_id 充当选项） */
@@ -770,15 +787,21 @@
     var isEdit = !!memory;
     var content = isEdit ? memory.content || "" : "";
     var keywords = isEdit ? memory.keywords || "" : "";
-    var importance = isEdit ? num(memory.importance, 8) : 8;
-    var tier = isEdit ? Number(memory.memory_tier) || 3 : 3;
+    /* #21：新建默认 T2 · 近期记忆 + episode + 重要度 6（短期情节不该默认进永久区）。 */
+    var importance = isEdit ? num(memory.importance, 8) : 6;
+    var tier = isEdit ? Number(memory.memory_tier) || 2 : 2;
     var memoryType = isEdit ? String(memory.memory_type || "episode") : "episode";
+    var limit = Math.max(10, num(S.maxChars, 60));
     return (
       '<div class="field"><span class="field-label">记忆内容 <span class="req">*</span></span>' +
       '<textarea class="textarea" rows="4" data-role="content" placeholder="例如：阿泽严重海鲜过敏，聚餐千万别点海鲜">' +
       esc(content) +
       "</textarea>" +
-      '<div class="field-help">按核心记忆设计，内容会持久化为单条 ≤60 字的事实短句；更长的说明请拆成多条。</div></div>' +
+      '<div class="field-help" data-role="content-count">' +
+      esc(content.length) +
+      " / " +
+      limit +
+      ' 字 · 上限可在「设置 → 记忆」调整；超长内容会被截断。</div></div>' +
       '<div class="field"><span class="field-label">关键词</span>' +
       '<input class="input" type="text" data-role="keywords" value="' +
       esc(keywords) +
@@ -822,7 +845,10 @@
         );
       }).join("") +
       "</select>" +
-      '<div class="field-help">只有「人物画像 / 关系共识」且重要度 ≥ 8 的记忆，才可能在长期有效命中后晋升为 T3 永久记忆。</div></div>'
+      '<div class="field-help" data-role="memory-type-help">只有「人物画像 / 关系共识」且重要度 ≥ 8 的记忆，才可能在长期有效命中后晋升为 T3 永久记忆。</div></div>' +
+      '<div class="gate-note" data-role="tier3-note" style="display:' +
+      (tier === 3 ? "block" : "none") +
+      '">永久保存、不参与遗忘清理；T3 记忆会优先注入 System Prompt。</div>'
     );
   }
 
@@ -852,12 +878,69 @@
     }
   }
 
-  function openCreateModal() {
+  /**
+   * #5 / #21：实时字数统计、超限禁用保存、T3 永久记忆提示与分类联动。
+   */
+  function bindFormState(bodyEl) {
+    var contentEl = bodyEl.querySelector('[data-role="content"]');
+    var countEl = bodyEl.querySelector('[data-role="content-count"]');
+    var tierEl = bodyEl.querySelector('[data-role="memory-tier"]');
+    var typeEl = bodyEl.querySelector('[data-role="memory-type"]');
+    var typeHelp = bodyEl.querySelector('[data-role="memory-type-help"]');
+    var tier3Note = bodyEl.querySelector('[data-role="tier3-note"]');
+    var limit = Math.max(10, num(S.maxChars, 60));
+    var saveBtn =
+      document.querySelector('#modal-root .modal-foot button[data-action-index="1"]') || null;
+
+    function sync() {
+      var length = contentEl ? String(contentEl.value || "").trim().length : 0;
+      var over = length > limit;
+      if (countEl) {
+        countEl.textContent = over
+          ? length + " / " + limit + " 字 · 已超出上限，请精简或到「设置 → 记忆」调大上限"
+          : length + " / " + limit + " 字 · 上限可在「设置 → 记忆」调整；超长内容会被截断。";
+        countEl.style.color = over ? "var(--danger, #dc2626)" : "";
+        countEl.style.fontWeight = over ? "600" : "";
+      }
+      if (saveBtn) saveBtn.disabled = over;
+      if (tierEl && tier3Note) {
+        tier3Note.style.display = Number(tierEl.value) === 3 ? "block" : "none";
+      }
+      if (tierEl && typeEl && typeHelp) {
+        var isT3 = Number(tierEl.value) === 3;
+        if (isT3 && typeEl.value === "episode") {
+          typeEl.value = "profile";
+        }
+        typeEl.querySelectorAll("option").forEach(function (option) {
+          var value = option.value;
+          var disabled = isT3 && (value === "episode" || value === "state");
+          option.disabled = disabled;
+        });
+        typeHelp.textContent = isT3
+          ? "T3 为永久核心记忆：只能归类为「人物画像 / 关系共识」，短期情节与近期状态请留在 T1/T2。"
+          : "只有「人物画像 / 关系共识」且重要度 ≥ 8 的记忆，才可能在长期有效命中后晋升为 T3 永久记忆。";
+      }
+      S.modalDirty = true;
+    }
+
+    if (contentEl) contentEl.addEventListener("input", sync);
+    if (tierEl) tierEl.addEventListener("change", sync);
+    if (typeEl) typeEl.addEventListener("change", sync);
+    sync();
+    S.modalDirty = false;
+    return sync;
+  }
+
+  function openMemoryModal(title, memory) {
     var app = S.app;
     if (!app) return;
+    S.modalDirty = false;
     app.modal({
-      title: "新增记忆",
-      body: formHtml(null),
+      title: title,
+      body: formHtml(memory),
+      isDirty: function () {
+        return !!S.modalDirty;
+      },
       actions: [
         { label: "取消" },
         {
@@ -870,20 +953,41 @@
               modalApp.toast("记忆内容不能为空", true);
               return false;
             }
-            var data = await modalApp.apiPost("memories/mutate", {
-              action: "add",
+            if (form.content.length > Math.max(10, num(S.maxChars, 60))) {
+              modalApp.toast(
+                "内容超过单条记忆字数上限（" +
+                  Math.max(10, num(S.maxChars, 60)) +
+                  " 字），请精简后保存",
+                true
+              );
+              return false;
+            }
+            var payload = {
+              action: memory ? "edit" : "add",
               soul_id: soulId(),
               content: form.content,
               keywords: form.keywords,
               importance: form.importance,
               memory_tier: form.memory_tier,
               memory_type: form.memory_type
-            });
-            if (data && data.new_id != null) {
+            };
+            if (memory) payload.id = memory.id;
+            var data = await modalApp.apiPost("memories/mutate", payload);
+            if (data && data.truncated) {
+              modalApp.toast(
+                "内容超过 " +
+                  num(data.max_chars, S.maxChars) +
+                  " 字，已按上限截断保存",
+                true
+              );
+            } else if (memory) {
+              modalApp.toast("已保存记忆 #" + memory.id);
+            } else if (data && data.new_id != null) {
               modalApp.toast("已新增记忆 #" + data.new_id);
             } else {
               modalApp.toast("已新增记忆");
             }
+            S.modalDirty = false;
             await reloadMemories(false);
             return true;
           }
@@ -891,8 +995,13 @@
       ],
       onMount: function (bodyEl) {
         bindFormSliders(bodyEl);
+        bindFormState(bodyEl);
       }
     });
+  }
+
+  function openCreateModal() {
+    openMemoryModal("新增记忆", null);
   }
 
   function findMemory(id) {
@@ -903,44 +1012,9 @@
   }
 
   function openEditModal(memoryId) {
-    var app = S.app;
     var memory = findMemory(memoryId);
-    if (!app || !memory) return;
-    app.modal({
-      title: "编辑记忆 #" + memory.id,
-      body: formHtml(memory),
-      actions: [
-        { label: "取消" },
-        {
-          label: "保存",
-          primary: true,
-          icon: "save",
-          onClick: async function (modalApp, bodyEl) {
-            var form = readForm(bodyEl);
-            if (!form.content) {
-              modalApp.toast("记忆内容不能为空", true);
-              return false;
-            }
-            await modalApp.apiPost("memories/mutate", {
-              action: "edit",
-              id: memory.id,
-              soul_id: soulId(),
-              content: form.content,
-              keywords: form.keywords,
-              importance: form.importance,
-              memory_tier: form.memory_tier,
-              memory_type: form.memory_type
-            });
-            modalApp.toast("已保存记忆 #" + memory.id);
-            await reloadMemories(false);
-            return true;
-          }
-        }
-      ],
-      onMount: function (bodyEl) {
-        bindFormSliders(bodyEl);
-      }
-    });
+    if (!memory) return;
+    openMemoryModal("编辑记忆 #" + memory.id, memory);
   }
 
   /* ------------------------------------------------------------------ *
@@ -1009,10 +1083,10 @@
     if (!app) return;
     app
       .confirm({
-        title: "运行遗忘清理 (GC)",
+        title: "清理过期记忆",
         message:
-          "将执行一次每日遗忘清理：Tier 1 超过 48 小时的记忆会被删除，Tier 2 按重要度与新鲜度衰减活力值（活力归零则物理删除），访问次数达到阈值的记忆晋升为 Tier 3。此操作不可撤销，是否继续？",
-        confirmLabel: "开始 GC",
+          "将执行一次遗忘清理：Tier 1 超过保留时长的记忆会被删除，Tier 2 按重要度与新鲜度衰减活力值（活力归零则物理删除），访问次数达到阈值的记忆晋升为 Tier 3。此操作不可撤销，是否继续？",
+        confirmLabel: "开始清理",
         onConfirm: async function () {
           try {
             var data = await app.apiPost("memories/mutate", {
@@ -1021,7 +1095,7 @@
             });
             var stats = (data && data.gc_stats) || {};
             app.toast(
-              "GC 完成：清理 T1 " +
+              "清理完成：T1 " +
                 num(stats.deleted_tier1, 0) +
                 " 条 / 删除 T2 " +
                 num(stats.deleted_tier2, 0) +
@@ -1031,7 +1105,7 @@
             );
             await reloadMemories(false);
           } catch (err) {
-            app.toast("GC 失败：" + (err.message || err), true);
+            app.toast("清理失败：" + (err.message || err), true);
             throw err;
           }
         }
@@ -1042,13 +1116,35 @@
   }
 
   /** 升降级：改级沿用既有 memories/mutate API（升 T3 走 pin_core，降级走 edit.memory_tier） */
-  async function switchTier(memoryId, tier, buttonEl) {
+  async function switchTier(memoryId, tier, buttonEl, currentTier) {
     var app = S.app;
     if (!app) return;
     var targetTier = Number(tier);
+    var fromTier = Number(currentTier) || 0;
     if (targetTier !== 1 && targetTier !== 2 && targetTier !== 3) return;
+    if (fromTier && targetTier === fromTier) return;
     var memory = findMemory(memoryId);
     var meta = tierMeta(targetTier);
+    /* #11：降级必须明确告知清理后果。 */
+    if (fromTier && targetTier < fromTier) {
+      var message =
+        targetTier === 1
+          ? "降为 T1 瞬时记忆后，将在 " +
+            Math.max(1, Math.round(num(S.stats && S.stats.t1_ttl_hours, 48))) +
+            " 小时后被自动清理，确定降级吗？"
+          : "降为 T2 近期记忆后，活力值会随时间衰减，活力归零将被遗忘清理删除，确定降级吗？";
+      var ok = await app.confirm({
+        title: "降级记忆分级",
+        message: message,
+        danger: true,
+        confirmLabel: "确定降级",
+        cancelLabel: "保持原级"
+      });
+      if (!ok) {
+        if (buttonEl) buttonEl.value = String(fromTier);
+        return;
+      }
+    }
     if (buttonEl) buttonEl.classList.add("is-loading");
     try {
       if (targetTier === 3) {
@@ -1128,6 +1224,10 @@
     var actionEl = target.closest("[data-action]");
     if (!actionEl) return;
     var action = actionEl.getAttribute("data-action");
+    if (action === "open-settings") {
+      app.openSettings("memory");
+      return;
+    }
     if (action === "reload") {
       reloadMemories(true);
     } else if (action === "create") {
@@ -1149,6 +1249,18 @@
         actionEl
       );
     }
+  }
+
+  function handleChange(event) {
+    var target = event.target;
+    if (!target || !target.getAttribute) return;
+    if (target.getAttribute("data-action") !== "switch-tier-select") return;
+    switchTier(
+      target.getAttribute("data-id"),
+      target.value,
+      target,
+      target.getAttribute("data-current")
+    );
   }
 
   async function setTier(tier) {
@@ -1203,6 +1315,10 @@
     container.addEventListener("change", function (event) {
       var target = event.target;
       if (!target || !target.getAttribute) return;
+      if (target.getAttribute("data-action") === "switch-tier-select") {
+        handleChange(event);
+        return;
+      }
       if (target.getAttribute("data-role") !== "user-filter") return;
       S.userId = String(target.value || "").trim();
       applyUserFilter(app);

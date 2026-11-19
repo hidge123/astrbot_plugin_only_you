@@ -108,7 +108,11 @@
     busy: false,
     autoSaveTimer: null,
     autoSavePending: false,
-    autoSaveFailed: false
+    autoSaveFailed: false,
+    /* #7：文本输入只有 change / blur / Enter / 「应用」才保存 */
+    pendingRoles: {},
+    saveStates: {},
+    candidateExpanded: {}
   };
 
   /* ------------------------------------------------------------------ *
@@ -434,8 +438,16 @@
       return '<span class="hint">没有拉取到候选模型，请手动输入模型名。</span>';
     }
     var current = S.cfg[role] ? String(S.cfg[role].model || "") : "";
-    return models
-      .slice(0, 40)
+    /* #24：随模型输入框关键词实时过滤；默认只渲染前 40 个并准确说明总数。 */
+    var keyword = current.trim().toLowerCase();
+    var all = models.filter(function (item) {
+      var model = str(item && item.model);
+      if (!model) return false;
+      return !keyword || model.toLowerCase().indexOf(keyword) >= 0;
+    });
+    var expanded = !!S.candidateExpanded[role];
+    var visible = expanded ? all : all.slice(0, 40);
+    var buttons = visible
       .map(function (item) {
         var model = str(item && item.model);
         if (!model) return "";
@@ -463,10 +475,21 @@
           "</button>"
         );
       })
-      .join("") +
-      '<span class="hint">共 ' +
-      esc(models.length) +
-      " 个候选，点击填入</span>";
+      .join("");
+    var footer = all.length
+      ? '<span class="hint">' +
+        (expanded ? "共 " + all.length : "显示前 " + visible.length + " / 共 " + all.length) +
+        " 个候选，点击填入</span>"
+      : '<span class="hint">没有匹配「' + esc(current) + "」的候选模型，可以直接手动输入。</span>";
+    var toggle =
+      all.length > 40
+        ? '<button class="btn btn-ghost btn-xs" type="button" data-action="expand-candidates" data-role-key="' +
+          esc(role) +
+          '">' +
+          (expanded ? "收起候选" : "展开全部 " + all.length + " 个") +
+          "</button>"
+        : "";
+    return buttons + footer + toggle;
   }
 
   function testResultHtml(role) {
@@ -579,6 +602,38 @@
     return roleControlsHtml(role);
   }
 
+  function saveStateMeta(role) {
+    var state = S.saveStates[role] || "saved";
+    var pending = !!S.pendingRoles[role];
+    if (state === "error") {
+      return { cls: "is-error", text: "保存失败 · 点击应用重试" };
+    }
+    if (state === "saving" || S.autoSavePending) {
+      return { cls: "is-saving", text: "保存中…" };
+    }
+    if (pending) return { cls: "is-pending", text: "待应用" };
+    return { cls: "is-saved", text: "已生效" };
+  }
+
+  function cardSaveToolsHtml(role) {
+    var meta = saveStateMeta(role);
+    return (
+      '<div class="model-save-tools">' +
+      '<span class="model-save-badge ' +
+      meta.cls +
+      '" data-role="model-save-' +
+      esc(role) +
+      '">' +
+      esc(meta.text) +
+      "</span>" +
+      '<button class="btn btn-outline btn-xs" type="button" data-action="apply-role" data-role-key="' +
+      esc(role) +
+      '">' +
+      icon("check", 12) +
+      "应用</button></div>"
+    );
+  }
+
   function chatCardHtml(role) {
     var meta = roleMeta(role);
     var info = statusInfo(role);
@@ -598,6 +653,7 @@
       '</span><span class="model-role-desc">' +
       esc(meta.desc) +
       "</span></div></div>" +
+      cardSaveToolsHtml(role) +
       '<div class="model-status"' +
       statusStyle +
       ' data-tip="' +
@@ -756,6 +812,7 @@
       '</span><span class="model-role-desc">' +
       esc(meta.desc) +
       "</span></div></div>" +
+      cardSaveToolsHtml(role) +
       '<div class="model-status" data-tip="' +
       esc(info.tip) +
       '"><span class="status-light ' +
@@ -912,6 +969,7 @@
       '</span><span class="model-role-desc">' +
       esc(meta.desc) +
       "</span></div></div>" +
+      cardSaveToolsHtml("tts") +
       '<div class="model-status" data-tip="' +
       esc(info.tip) +
       '"><span class="status-light ' +
@@ -1000,11 +1058,7 @@
       "模型" +
       '<span class="card-sub">当前角色：' +
       esc(currentSoulLabel()) +
-      " · 四角色模型按角色独立配置 · 修改即时生效</span></h1>" +
-      '<div class="page-actions">' +
-      '<button class="btn btn-ghost btn-sm" type="button" data-action="reload">' +
-      icon("refresh", 14) +
-      "重新读取</button></div></div>" +
+      " · 四角色模型按角色独立配置 · 修改即时生效</span></h1></div>" +
       soulBannerHtml() +
       bannerHtml() +
       '<div class="model-grid">' +
@@ -1059,11 +1113,77 @@
     if (S.autoSaveTimer) clearTimeout(S.autoSaveTimer);
     S.autoSaveTimer = null;
     S.autoSavePending = true;
+    refreshSaveBadges();
     S.autoSaveTimer = setTimeout(function () {
       S.autoSaveTimer = null;
       S.autoSavePending = false;
       autoSaveConfig();
     }, 700);
+  }
+
+  /** 保存前完整性校验（#7）：选了源却没填模型时不要向后端发送重建请求。 */
+  function validateRole(role) {
+    if (!S.cfg) return "";
+    if (CHAT_ROLES.indexOf(role) >= 0) {
+      var cfg = S.cfg[role] || {};
+      if (str(cfg.inherit_from)) return "";
+      if (str(cfg.source_id) && !str(cfg.model)) return "请填写或选择模型名称";
+      return "";
+    }
+    if (VECTOR_ROLES.indexOf(role) >= 0) {
+      var vector = vectorMeta(role);
+      if (str(vector.mode) === "source" && str(vector.source_id) && !str(vector.model)) {
+        return "请填写或选择模型名称";
+      }
+      return "";
+    }
+    if (role === "tts") {
+      var tts = ttsMeta();
+      if (str(tts.mode) === "source" && str(tts.source_id) && !str(tts.model)) {
+        return "请填写 TTS 模型名称";
+      }
+      return "";
+    }
+    return "";
+  }
+
+  function firstValidationError() {
+    var roles = CHAT_ROLES.concat(VECTOR_ROLES, ["tts"]);
+    for (var i = 0; i < roles.length; i++) {
+      var error = validateRole(roles[i]);
+      if (error) return { role: roles[i], message: error };
+    }
+    return null;
+  }
+
+  function refreshSaveBadges() {
+    if (!S.container) return;
+    ["main", "decision", "vision", "tts"]
+      .concat(VECTOR_ROLES)
+      .forEach(function (role) {
+        var el = S.container.querySelector('[data-role="model-save-' + role + '"]');
+        if (!el) return;
+        var meta = saveStateMeta(role);
+        el.className = "model-save-badge " + meta.cls;
+        el.textContent = meta.text;
+      });
+  }
+
+  /** 「应用」按钮 / Enter / change：提交一个角色的文本编辑并触发保存。 */
+  function commitRole(role) {
+    if (!S.cfg) return;
+    var error = validateRole(role);
+    if (error) {
+      S.saveStates[role] = "error";
+      refreshSaveBadges();
+      if (S.app) S.app.toast(error, true);
+      return false;
+    }
+    delete S.pendingRoles[role];
+    S.saveStates[role] = "saved";
+    refreshSaveBadges();
+    scheduleAutoSave();
+    return true;
   }
 
   async function autoSaveConfig() {
@@ -1073,13 +1193,26 @@
       scheduleAutoSave();
       return;
     }
+    var invalid = firstValidationError();
+    if (invalid) {
+      S.saveStates[invalid.role] = "error";
+      S.autoSaveFailed = true;
+      refreshSaveBadges();
+      if (app) app.toast(invalid.message, true);
+      return;
+    }
     if (!computeDirty()) {
       S.autoSaveFailed = false;
+      refreshSaveBadges();
       return;
     }
     var payload = clone(S.cfg);
     var payloadJson = JSON.stringify(normalizeConfig(payload));
     S.busy = true;
+    ["main", "decision", "vision", "tts"].concat(VECTOR_ROLES).forEach(function (role) {
+      S.saveStates[role] = "saving";
+    });
+    refreshSaveBadges();
     try {
       var data = await app.apiPost("models/config", configBody(payload));
       if (S.destroyed || !S.app) return;
@@ -1097,14 +1230,29 @@
         data && data.status && typeof data.status === "object" ? data.status : S.status;
       if (app.applyModelStatus) app.applyModelStatus(S.status);
       S.autoSaveFailed = false;
+      ["main", "decision", "vision", "tts"].concat(VECTOR_ROLES).forEach(function (role) {
+        S.saveStates[role] = "saved";
+      });
       refreshStatusBadges();
-      app.toast("模型配置已即时生效");
+      refreshSaveBadges();
+      /* #7：成功不再每次刷屏 toast，状态徽章已经展示「已生效」 */
     } catch (err) {
       S.autoSaveFailed = true;
-      if (app) app.toast("模型配置自动保存失败：" + (err.message || err), true);
+      ["main", "decision", "vision", "tts"].concat(VECTOR_ROLES).forEach(function (role) {
+        S.saveStates[role] = "error";
+      });
+      refreshSaveBadges();
+      if (app) app.toast("模型配置保存失败：" + (err.message || err), true);
     } finally {
       S.busy = false;
-      if (S.app && !S.autoSaveFailed && computeDirty()) scheduleAutoSave();
+      if (
+        S.app &&
+        !S.autoSaveFailed &&
+        computeDirty() &&
+        !Object.keys(S.pendingRoles).length
+      ) {
+        scheduleAutoSave();
+      }
     }
   }
 
@@ -1405,12 +1553,49 @@
       S.cfg.tts.scope = scope;
       refreshTtsDetail();
       scheduleAutoSave();
+    } else if (action === "apply-role") {
+      var applyRole = actionEl.getAttribute("data-role-key");
+      if (applyRole && commitRole(applyRole)) {
+        S.app && S.app.toast("已应用「" + roleMeta(applyRole).name + "」配置");
+      }
+    } else if (action === "expand-candidates") {
+      var candRole = actionEl.getAttribute("data-role-key");
+      if (candRole) {
+        S.candidateExpanded[candRole] = !S.candidateExpanded[candRole];
+        var wrap = S.container
+          ? S.container.querySelector('[data-role="candidates-' + candRole + '"]')
+          : null;
+        if (wrap) wrap.innerHTML = candidatesHtml(candRole);
+      }
     }
+  }
+
+  function isTextControl(el) {
+    var tag = String((el && el.tagName) || "").toLowerCase();
+    if (tag === "textarea") return true;
+    if (tag !== "input") return false;
+    var type = String(el.type || "text").toLowerCase();
+    return (
+      type === "text" ||
+      type === "password" ||
+      type === "number" ||
+      type === "search" ||
+      type === "url"
+    );
+  }
+
+  function rerenderCandidates(role) {
+    if (!S.container) return;
+    var wrap = S.container.querySelector('[data-role="candidates-' + role + '"]');
+    if (wrap) wrap.innerHTML = candidatesHtml(role);
   }
 
   function handleFieldChange(event) {
     var el = event.target;
     if (!el || !el.getAttribute) return;
+    var commit = event.type === "change" || event.type === "blur";
+    var textControl = isTextControl(el);
+
     /* 模型字段（提供商源 / 模型名）用 data-model-role 标记；来源模式用 data-role-key */
     var roleKey =
       el.getAttribute("data-role-key") || el.getAttribute("data-model-role");
@@ -1420,6 +1605,7 @@
       if (legalInheritValues(roleKey).indexOf(inheritFrom) < 0) inheritFrom = "";
       S.cfg[roleKey].inherit_from = inheritFrom;
       S.cfg[roleKey].inherit = !!inheritFrom;
+      delete S.pendingRoles[roleKey];
       refreshRoleControls(roleKey);
       scheduleAutoSave();
       return;
@@ -1430,10 +1616,22 @@
       if (modelField === "source_id") {
         /* 切换提供商源后清空旧候选，避免误选到别的源的模型 */
         S.candidates[roleKey] = null;
-        var candidatesWrap = S.container
-          ? S.container.querySelector('[data-role="candidates-' + roleKey + '"]')
-          : null;
-        if (candidatesWrap) candidatesWrap.innerHTML = candidatesHtml(roleKey);
+        rerenderCandidates(roleKey);
+        scheduleAutoSave();
+        return;
+      }
+      if (modelField === "model") {
+        rerenderCandidates(roleKey);
+        /* #7：文本输入不再边打字边保存，只有 change / blur / Enter / 应用才提交 */
+        if (textControl && !commit) {
+          S.pendingRoles[roleKey] = true;
+          S.saveStates[roleKey] = "pending";
+          refreshSaveBadges();
+          return;
+        }
+        refreshInheritPreviews();
+        commitRole(roleKey);
+        return;
       }
       refreshInheritPreviews();
       scheduleAutoSave();
@@ -1445,10 +1643,20 @@
       S.cfg[vectorRole][vectorField] = String(el.value == null ? "" : el.value);
       if (vectorField === "source_id") {
         S.candidates[vectorRole] = null;
-        var vectorCandidates = S.container
-          ? S.container.querySelector('[data-role="candidates-' + vectorRole + '"]')
-          : null;
-        if (vectorCandidates) vectorCandidates.innerHTML = candidatesHtml(vectorRole);
+        rerenderCandidates(vectorRole);
+        scheduleAutoSave();
+        return;
+      }
+      if (vectorField === "model") {
+        rerenderCandidates(vectorRole);
+        if (textControl && !commit) {
+          S.pendingRoles[vectorRole] = true;
+          S.saveStates[vectorRole] = "pending";
+          refreshSaveBadges();
+          return;
+        }
+        commitRole(vectorRole);
+        return;
       }
       scheduleAutoSave();
       return;
@@ -1458,16 +1666,24 @@
       if (!S.cfg.tts) S.cfg.tts = normalizeConfig({}).tts;
       if (ttsField === "dual_output") {
         S.cfg.tts.dual_output = !!el.checked;
+        scheduleAutoSave();
       } else if (ttsField === "probability") {
         S.cfg.tts.probability = clamp(el.value, 0, 1);
         var valueEl = S.container
           ? S.container.querySelector('[data-role="probability-value"]')
           : null;
         if (valueEl) valueEl.textContent = Math.round(S.cfg.tts.probability * 100) + "%";
+        if (commit) scheduleAutoSave();
       } else {
         S.cfg.tts[ttsField] = String(el.value == null ? "" : el.value);
+        if (textControl && !commit) {
+          S.pendingRoles.tts = true;
+          S.saveStates.tts = "pending";
+          refreshSaveBadges();
+          return;
+        }
+        commitRole("tts");
       }
-      scheduleAutoSave();
     }
   }
 
@@ -1475,6 +1691,20 @@
     container.addEventListener("click", handleClick);
     container.addEventListener("input", handleFieldChange);
     container.addEventListener("change", handleFieldChange);
+    container.addEventListener("blur", handleFieldChange, true);
+    /* Enter = 立即应用当前卡片的文本编辑 */
+    container.addEventListener("keydown", function (event) {
+      if (event.key !== "Enter") return;
+      var el = event.target;
+      if (!el || !isTextControl(el)) return;
+      var role =
+        el.getAttribute("data-model-role") ||
+        el.getAttribute("data-vector-role") ||
+        (el.getAttribute("data-tts-field") ? "tts" : "");
+      if (!role) return;
+      event.preventDefault();
+      commitRole(role);
+    });
     /* Ctrl/Cmd + S 保存 */
     S._keydownHandler = function (event) {
       if (!(event.metaKey || event.ctrlKey) || String(event.key).toLowerCase() !== "s") return;
@@ -1506,6 +1736,9 @@
     S.autoSaveTimer = null;
     S.autoSavePending = false;
     S.autoSaveFailed = false;
+    S.pendingRoles = {};
+    S.saveStates = {};
+    S.candidateExpanded = {};
 
     container.innerHTML =
       '<div class="loading"><span class="spinner"></span><span>加载当前角色的模型配置…</span></div>';
@@ -1539,6 +1772,9 @@
     }
     S.autoSavePending = false;
     S.autoSaveFailed = false;
+    S.pendingRoles = {};
+    S.saveStates = {};
+    S.candidateExpanded = {};
     if (S._keydownHandler) {
       document.removeEventListener("keydown", S._keydownHandler);
       S._keydownHandler = null;
@@ -1559,9 +1795,9 @@
 
   window.OY_PAGES = window.OY_PAGES || {};
   function isDirty() {
-    /* 等待自动保存的改动视为「将会生效」，只有自动保存失败时才提示离开确认。 */
-    if (S.autoSavePending && !S.autoSaveFailed) return false;
-    return computeDirty();
+    /* #7：存在未应用的文本编辑 / 保存中 / 保存失败都提示离开确认。 */
+    if (Object.keys(S.pendingRoles || {}).length > 0) return true;
+    return !!S.autoSavePending || !!S.autoSaveFailed || computeDirty();
   }
 
   window.OY_PAGES.models = {

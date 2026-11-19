@@ -54,6 +54,7 @@ class TestFrontendSyntax(unittest.TestCase):
             "page-surfing.js",
             "page-models.js",
             "page-sessions.js",
+            "page-settings.js",
         ]
         for script in expected:
             assert script in html, script

@@ -26,6 +26,7 @@
    * 模块内状态（每次 render 重置）
    * ------------------------------------------------------------------ */
   var S = {
+    collapsed: {},
     app: null,
     container: null,
     destroyed: false,
@@ -424,26 +425,14 @@
       icon("list", 14) +
       '分区完成度<span class="badge-count">' +
       S.schema.length +
-      "</span></div></div>" +
+      "</span></div>" +
+      '<button class="btn btn-ghost btn-xs char-collapse-btn" type="button" data-action="toggle-all-sections">' +
+      (allSectionsCollapsed() ? "全部展开" : "全部折叠") +
+      "</button></div>" +
       '<div class="card-body tight"><div class="section-nav" data-role="section-nav">' +
       nav +
-      "</div></div></div>" +
-      '<div class="card"><div class="card-head"><div class="card-title">' +
-      icon("wand", 14) +
-      "操作</div></div>" +
-      '<div class="card-body tight col">' +
-      '<button class="btn btn-outline" type="button" data-action="ai-card">' +
-      icon("wand", 14) +
-      "AI 生成整卡</button>" +
-      '<button class="btn btn-outline" type="button" data-action="import-persona">' +
-      icon("download", 14) +
-      "从 AstrBot 导入</button>" +
-      '<button class="btn btn-outline" type="button" data-action="preview-prompt">' +
-      icon("list", 14) +
-      "Prompt 预览</button>" +
-      '<button class="btn btn-ghost" type="button" data-action="more-menu">' +
-      icon("dots", 14) +
-      "新建 / 改 ID / 删除</button>" +
+      "</div>" +
+      '<div class="char-aside-hint mt-8">点击分区导航会自动展开并滚动到对应卡片。</div>' +
       "</div></div>" +
       "</aside>"
     );
@@ -732,8 +721,16 @@
     );
   }
 
+  function allSectionsCollapsed() {
+    if (!S.schema.length) return false;
+    return S.schema.every(function (section) {
+      return !!S.collapsed[section.id];
+    });
+  }
+
   function sectionHtml(section) {
     var stat = completionOf(section);
+    var collapsed = !!S.collapsed[section.id];
     var fields = (section.fields || []).map(function (field) {
       return fieldHtml(section, field);
     });
@@ -744,6 +741,15 @@
       esc(section.id) +
       '">' +
       '<div class="card-section-head">' +
+      '<button class="btn btn-ghost btn-sm section-collapse-toggle" type="button" data-action="toggle-section" data-section="' +
+      esc(section.id) +
+      '" aria-expanded="' +
+      (collapsed ? "false" : "true") +
+      '" data-tip="' +
+      esc(collapsed ? "展开该分区" : "折叠该分区") +
+      '">' +
+      icon(collapsed ? "chevron" : "chevron-down", 14) +
+      "</button>" +
       '<div class="card-section-title">' +
       esc(section.title || section.id) +
       '<span class="tag tag-muted" data-role="section-count">' +
@@ -760,7 +766,9 @@
       icon("wand", 13) +
       "AI 补全</button>" +
       "</div></div>" +
-      '<div class="card-section-body"><div class="section-grid">' +
+      '<div class="card-section-body' +
+      (collapsed ? " char-section-collapsed" : "") +
+      '"><div class="section-grid">' +
       fields.join("") +
       "</div></div></section>"
     );
@@ -779,7 +787,9 @@
 
   function savebarHtml() {
     return (
-      '<div class="char-savebar">' +
+      '<div class="char-savebar' +
+      (S.dirty ? " is-dirty" : "") +
+      '">' +
       '<div class="row">' +
       '<span class="save-status' +
       (S.dirty ? " is-dirty" : "") +
@@ -789,9 +799,6 @@
       (S.draft ? '<span class="tag tag-primary">有 AI 草稿待确认</span>' : "") +
       "</div>" +
       '<div class="btn-group">' +
-      '<button class="btn btn-ghost btn-sm" type="button" data-action="reload" data-tip="放弃本地修改并从后端重新加载">' +
-      icon("refresh", 13) +
-      "重新加载</button>" +
       '<button class="btn btn-primary btn-sm" type="button" data-action="save-card"' +
       (S.dirty ? "" : " disabled") +
       ">" +
@@ -811,18 +818,40 @@
       esc(S.soulId || "未选择角色") +
       "</span>" +
       "</h1>" +
-      '<div class="page-actions">' +
-      '<button class="btn btn-ghost btn-sm" type="button" data-action="reload">' +
-      icon("refresh", 14) +
-      "重新加载</button>" +
+      '<div class="page-actions char-page-actions">' +
+      '<span class="char-save-state' +
+      (S.dirty ? " is-dirty" : "") +
+      '" data-role="save-state-head">' +
+      '<span class="status-light ' +
+      (S.dirty ? "light-warn" : "light-ok") +
+      '"></span>' +
+      (S.dirty ? "有未保存修改" : "已同步") +
+      "</span>" +
+      '<button class="btn btn-outline btn-sm" type="button" data-action="ai-card">' +
+      icon("wand", 14) +
+      "AI 生成整卡</button>" +
+      '<button class="btn btn-outline btn-sm" type="button" data-action="import-persona">' +
+      icon("download", 14) +
+      "从 AstrBot 导入</button>" +
+      '<button class="btn btn-outline btn-sm" type="button" data-action="preview-prompt">' +
+      icon("list", 14) +
+      "Prompt 预览</button>" +
+      '<button class="btn btn-ghost btn-sm" type="button" data-action="more-menu" data-tip="新建 / 改 ID / 删除角色">' +
+      icon("dots", 14) +
+      "更多</button>" +
+      '<button class="btn btn-primary btn-sm" type="button" data-action="save-card"' +
+      (S.dirty ? "" : " disabled") +
+      ">" +
+      icon("save", 13) +
+      "保存角色卡</button>" +
       "</div></div>" +
       '<div class="char-layout">' +
       asideHtml() +
       '<div class="section-stack">' +
       draftBannerHtml() +
       (S.schema.length ? S.schema.map(sectionHtml).join("") : emptySchemaHtml()) +
-      "</div></div>" +
-      savebarHtml()
+      savebarHtml() +
+      "</div></div>"
     );
   }
 
@@ -927,8 +956,20 @@
       status.textContent = S.dirty ? "未保存修改" : "所有更改已保存";
       status.classList.toggle("is-dirty", S.dirty);
     }
-    var saveBtn = S.container.querySelector('[data-action="save-card"]');
-    if (saveBtn) saveBtn.disabled = !S.dirty;
+    var bar = S.container.querySelector(".char-savebar");
+    if (bar) bar.classList.toggle("is-dirty", S.dirty);
+    var headState = S.container.querySelector('[data-role="save-state-head"]');
+    if (headState) {
+      headState.innerHTML =
+        '<span class="status-light ' +
+        (S.dirty ? "light-warn" : "light-ok") +
+        '"></span>' +
+        (S.dirty ? "有未保存修改" : "已同步");
+      headState.classList.toggle("is-dirty", S.dirty);
+    }
+    S.container.querySelectorAll('[data-action="save-card"]').forEach(function (btn) {
+      btn.disabled = !S.dirty;
+    });
     refreshNav();
   }
 
@@ -981,6 +1022,10 @@
 
   function scrollToSection(sectionId) {
     if (!S.container) return;
+    if (S.collapsed[sectionId]) {
+      delete S.collapsed[sectionId];
+      paint();
+    }
     var el = S.container.querySelector('[data-section-card="' + sectionId + '"]');
     if (!el) return;
     S.activeSection = sectionId;
@@ -1443,13 +1488,17 @@
       '<button class="btn btn-outline" type="button" data-menu-action="rename">' +
       icon("edit", 14) +
       "修改 Soul ID</button>" +
+      '<button class="btn btn-outline" type="button" data-menu-action="reload">' +
+      icon("refresh", 14) +
+      "放弃修改并重新加载</button>" +
       '<button class="btn btn-danger" type="button" data-menu-action="delete"' +
       (canDelete ? "" : " disabled") +
-      ' data-tip="' +
-      (canDelete ? "删除当前角色的角色卡、日程与关联记忆" : "至少保留一个角色") +
-      '">' +
+      '>' +
       icon("trash", 14) +
       "删除当前角色</button>" +
+      (canDelete
+        ? ""
+        : '<div class="field-help">至少保留 1 个角色，当前无法删除。</div>') +
       "</div>" +
       '<div class="field-help mt-12">当前 Soul ID：<span class="mono">' +
       esc(S.soulId) +
@@ -1466,6 +1515,7 @@
             modalApp.closeModal();
             if (action === "create") openCreateModal();
             else if (action === "rename") openRenameModal();
+            else if (action === "reload") reloadAll(true);
             else if (action === "delete") {
               if (!canDelete) {
                 modalApp.toast("至少保留一个角色", true);
@@ -1800,6 +1850,17 @@
       reloadAll(true);
     } else if (action === "goto-section") {
       scrollToSection(actionEl.getAttribute("data-section"));
+    } else if (action === "toggle-section") {
+      var collapseId = actionEl.getAttribute("data-section");
+      S.collapsed[collapseId] = !S.collapsed[collapseId];
+      paint();
+    } else if (action === "toggle-all-sections") {
+      var collapseAll = !allSectionsCollapsed();
+      S.schema.forEach(function (section) {
+        S.collapsed[section.id] = collapseAll;
+      });
+      paint();
+      if (!collapseAll && S.activeSection) scrollToSection(S.activeSection);
     } else if (action === "ai-section") {
       aiGenerateSection(actionEl.getAttribute("data-section"), actionEl);
     } else if (action === "ai-card") {
@@ -1884,6 +1945,7 @@
     S.savedCard = null;
     S.dirty = false;
     S.activeSection = "";
+    S.collapsed = {};
     S._pickingAvatar = false;
     S.soulId = (app.state && app.state.currentSoulId) || "";
 
