@@ -852,7 +852,14 @@ class OnlyYouPlugin(Star):
                     str(item).strip() for item in values if isinstance(item, str) and item.strip()
                 ]
                 if cleaned:
-                    mapping[soul_key] = cleaned[-5:]
+                    mapping[soul_key] = cleaned[
+                        -max(
+                            1,
+                            _plugin_runtime_int(
+                                self, "proactive_anti_repeat_count", 5
+                            ),
+                        ) :
+                    ]
 
         def _idle_roam_daily() -> None:
             mapping = getattr(self, "_idle_roam_daily_counts", None)
@@ -1009,7 +1016,14 @@ class OnlyYouPlugin(Star):
                     str(item).strip() for item in values if isinstance(item, str) and item.strip()
                 ]
                 if cleaned:
-                    result[soul_key] = cleaned[-5:]
+                    result[soul_key] = cleaned[
+                        -max(
+                            1,
+                            _plugin_runtime_int(
+                                self, "proactive_anti_repeat_count", 5
+                            ),
+                        ) :
+                    ]
             return result
 
         def _idle_roam_daily_map() -> dict[str, dict[str, Any]]:
