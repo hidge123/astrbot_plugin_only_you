@@ -112,6 +112,7 @@
     /* #7：文本输入只有 change / blur / Enter / 「应用」才保存 */
     pendingRoles: {},
     saveStates: {},
+    saveErrors: {},
     candidateExpanded: {}
   };
 
@@ -606,7 +607,10 @@
     var state = S.saveStates[role] || "saved";
     var pending = !!S.pendingRoles[role];
     if (state === "error") {
-      return { cls: "is-error", text: "保存失败 · 点击应用重试" };
+      return {
+        cls: "is-error",
+        text: S.saveErrors[role] || "保存失败 · 点击应用重试"
+      };
     }
     if (state === "saving" || S.autoSavePending) {
       return { cls: "is-saving", text: "保存中…" };
@@ -1175,11 +1179,13 @@
     var error = validateRole(role);
     if (error) {
       S.saveStates[role] = "error";
+      S.saveErrors[role] = error;
       refreshSaveBadges();
       if (S.app) S.app.toast(error, true);
       return false;
     }
     delete S.pendingRoles[role];
+    delete S.saveErrors[role];
     S.saveStates[role] = "saved";
     refreshSaveBadges();
     scheduleAutoSave();
@@ -1196,6 +1202,7 @@
     var invalid = firstValidationError();
     if (invalid) {
       S.saveStates[invalid.role] = "error";
+      S.saveErrors[invalid.role] = invalid.message;
       S.autoSaveFailed = true;
       refreshSaveBadges();
       if (app) app.toast(invalid.message, true);
@@ -1232,6 +1239,7 @@
       S.autoSaveFailed = false;
       ["main", "decision", "vision", "tts"].concat(VECTOR_ROLES).forEach(function (role) {
         S.saveStates[role] = "saved";
+        delete S.saveErrors[role];
       });
       refreshStatusBadges();
       refreshSaveBadges();
@@ -1738,6 +1746,7 @@
     S.autoSaveFailed = false;
     S.pendingRoles = {};
     S.saveStates = {};
+    S.saveErrors = {};
     S.candidateExpanded = {};
 
     container.innerHTML =
@@ -1774,6 +1783,7 @@
     S.autoSaveFailed = false;
     S.pendingRoles = {};
     S.saveStates = {};
+    S.saveErrors = {};
     S.candidateExpanded = {};
     if (S._keydownHandler) {
       document.removeEventListener("keydown", S._keydownHandler);

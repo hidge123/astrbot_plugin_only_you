@@ -250,6 +250,7 @@
         slot.title || "",
         fmtHour(seg.start) + "-" + fmtHour(seg.end)
       ];
+      if (isCurrent) tipParts.push("正在生效");
       if (progressPct != null) tipParts.push("进度 " + progressPct + "%");
       if (slot.busy_settled && slot.completion_result) {
         tipParts.push("完成：" + slot.completion_result);
@@ -281,6 +282,7 @@
       /* 宽度足够时显示标题 + 行动 label；过窄只留小色块（避免文字溢出） */
       if (width >= 8 && spanHours >= 1) {
         var metaText = actionLabel(actionType, true) || stateLabel(state);
+        if (isCurrent) metaText = "正在生效 · " + metaText;
         if (busyProgressPct != null) metaText += " · " + busyProgressPct + "%";
         if (slot.mutated) metaText += " · 已微调";
         html += '<span class="sched-seg-name">' + esc(slot.title || slot.label || slot.slot_key) + "</span>";
@@ -393,6 +395,44 @@
   }
 
   /**
+   * 窄屏专用：时间轴的紧凑可点选时间块标签列表。
+   * 0.5h 色块在手机上只有 3px 左右无法点按，用这排 ≥32px 的按钮作为等价入口。
+   */
+  function scheduleCompactList(opts) {
+    opts = opts || {};
+    var slots = opts.slots || [];
+    var currentKey = opts.currentKey || "";
+    if (!slots.length) return "";
+    var html = '<div class="sched-compact-list" role="list" aria-label="时间块快捷选择">';
+    slots.forEach(function (slot) {
+      var actionType = actionTypeOf(slot);
+      var state = String(slot.state || actionState(actionType) || "").toUpperCase();
+      var isCurrent = !!currentKey && slot.slot_key === currentKey;
+      var range = fmtHour(slot.start_hour) + "-" + fmtHour(slot.end_hour);
+      var label = actionLabel(actionType, true) || stateLabel(state);
+      var title = String(slot.title || slot.label || "");
+      html +=
+        '<button type="button" class="sched-chip ' +
+        stateClass(state) +
+        (isCurrent ? " is-current" : "") +
+        '" role="listitem" data-action="pick-slot" data-slot-key="' +
+        esc(slot.slot_key || "") +
+        '" data-tip="' +
+        esc(range + " · " + label + (title ? " · " + title : "") + (isCurrent ? "（正在生效）" : "")) +
+        '">' +
+        '<span class="sched-chip-time">' +
+        esc(range) +
+        "</span>" +
+        '<span class="sched-chip-label">' +
+        esc(label) +
+        "</span>" +
+        (title ? '<span class="sched-chip-title">' + esc(title) + "</span>" : "") +
+        "</button>";
+    });
+    return html + "</div>";
+  }
+
+  /**
    * 四类行动统一图例 + 实时「现在 HH:MM」。
    * 概览页与日程页共用，避免两套颜色 / 文案不一致（#10）。
    */
@@ -439,6 +479,7 @@
   window.OYCharts = {
     ringGauge: ringGauge,
     scheduleAxis: scheduleAxis,
+    scheduleCompactList: scheduleCompactList,
     donut: donut,
     bars: bars,
     dots: dots,

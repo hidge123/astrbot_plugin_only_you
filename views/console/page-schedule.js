@@ -382,6 +382,12 @@
         nowHour: app.nowHour(),
         clickable: true
       });
+      if (charts().scheduleCompactList) {
+        html += charts().scheduleCompactList({
+          slots: slots,
+          currentKey: currentKey
+        });
+      }
       html +=
         '<div class="axis-legend mt-12">' +
         charts().actionTimelineLegend(app.formatClock(Date.now())) +
@@ -956,6 +962,14 @@
       var actionEl = target.closest("[data-action]");
       if (actionEl) {
         var action = actionEl.getAttribute("data-action");
+        if (action === "pick-slot") {
+          var chipSlot = findSlot(
+            pageData.schedule,
+            actionEl.getAttribute("data-slot-key")
+          );
+          openSlotDrawer(app, container, chipSlot);
+          return;
+        }
         if (action === "open-settings") {
           app.openSettings("schedule");
         } else if (action === "reroll") {

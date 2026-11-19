@@ -579,6 +579,12 @@
         nowHour: nowHour,
         clickable: true
       });
+      if (charts().scheduleCompactList) {
+        html += charts().scheduleCompactList({
+          slots: slots,
+          currentKey: currentKey
+        });
+      }
     } else {
       html += '<div class="stat-empty">日程数据尚未生成</div>';
     }
@@ -865,6 +871,17 @@
     container.onclick = function (event) {
       var target = event.target;
       if (!target || !target.closest) return;
+
+      var chip = target.closest('[data-action="pick-slot"]');
+      if (chip) {
+        var chipSlot =
+          findSlot(data, chip.getAttribute("data-slot-key")) ||
+          (data.schedule && data.schedule.current_slot);
+        openSlotModal(app, chipSlot, function () {
+          return render(container, app);
+        });
+        return;
+      }
 
       var seg = target.closest(".sched-seg.is-clickable");
       if (seg) {

@@ -6206,3 +6206,61 @@ html.dark .confirm-root .overlay-backdrop {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* v2.13 窄屏时间块快捷选择（#25）：0.5h 色块过窄时用 ≥32px 的按钮代替点按 */
+.sched-compact-list {
+  display: none;
+}
+
+@media (max-width: 768px) {
+  .sched-compact-list {
+    display: flex;
+    align-items: stretch;
+    gap: 6px;
+    margin-top: 8px;
+    padding-bottom: 4px;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+  }
+
+  .sched-chip {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 2px;
+    min-width: 96px;
+    min-height: 36px;
+    padding: 5px 9px;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--st, var(--primary));
+    border-radius: var(--radius-sm);
+    background: var(--st-block, var(--surface-2));
+    color: var(--st-text, var(--text-2));
+    font-size: 10.5px;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .sched-chip.is-current {
+    box-shadow: inset 0 0 0 1.5px var(--st, var(--primary));
+    font-weight: 650;
+  }
+
+  .sched-chip-time {
+    font-variant-numeric: tabular-nums;
+    opacity: 0.85;
+  }
+
+  .sched-chip-label {
+    font-weight: 650;
+  }
+
+  .sched-chip-title {
+    max-width: 132px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    opacity: 0.8;
+  }
+}
