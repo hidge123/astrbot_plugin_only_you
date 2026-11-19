@@ -19,6 +19,13 @@ from ..core.soul_manager import (
 )
 from ..core.state_machine import BotState, StateController
 
+try:
+    from astrbot.api import logger
+except ImportError:  # pragma: no cover - offline unit tests / no AstrBot container
+    import logging
+
+    logger = logging.getLogger("onlyyou.surfing")
+
 
 class CyberSurfingPipeline:
     """
@@ -41,12 +48,21 @@ class CyberSurfingPipeline:
         self.session_buffer = session_buffer
         self.schedule_mutator = schedule_mutator
         self.plugin_config = plugin_config
-        self.vision_processor = VideoVisionProcessor(model_hub=model_hub)
+        self.vision_processor = VideoVisionProcessor(
+            model_hub=model_hub, plugin_config=plugin_config
+        )
         self._watched_ids: set[str] = set()
 
     @property
     def cfg(self) -> dict[str, Any]:
         return self.plugin_config.get("surfing_config", {}) or {}
+
+    def _cfg_int(self, key: str, default: int, low: int, high: int) -> int:
+        try:
+            value = int(self.cfg.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(low, min(high, value))
 
     def is_enabled(self, soul: Any = None) -> bool:
         """Whether cyber surfing is enabled for ``soul`` (v2.8.2 Pages-only switch).
@@ -121,9 +137,22 @@ class CyberSurfingPipeline:
         if p_filter == "bilibili" or (
             not p_filter and "bilibili" in soul_sources
         ):
-            bili = BilibiliAdapter(cookie=str(self.cfg.get("bili_cookie") or ""))
+            try:
+                bili = BilibiliAdapter(
+                    cookie=str(self.cfg.get("bili_cookie") or ""),
+                    timeout=float(self._cfg_int("surf_http_timeout_seconds", 8, 3, 60)),
+                    hot_comments_limit=self._cfg_int(
+                        "surf_hot_comments_limit", 3, 0, 10
+                    ),
+                )
+            except TypeError:
+                # Duck-typed adapter (tests / third-party) only accepts ``cookie``.
+                bili = BilibiliAdapter(cookie=str(self.cfg.get("bili_cookie") or ""))
             candidates.extend(
-                await bili.fetch_recommend_feed(preferences=soul.surfing_preferences, limit=4)
+                await bili.fetch_recommend_feed(
+                    preferences=soul.surfing_preferences,
+                    limit=self._cfg_int("surf_bili_candidates", 4, 1, 20),
+                )
             )
 
         if p_filter == "douyin" or (
@@ -133,7 +162,10 @@ class CyberSurfingPipeline:
                 api_base=str(self.cfg.get("douyin_api_base") or "https://api.douyin.wtf")
             )
             candidates.extend(
-                await douyin.fetch_recommend_feed(preferences=soul.surfing_preferences, limit=3)
+                await douyin.fetch_recommend_feed(
+                    preferences=soul.surfing_preferences,
+                    limit=self._cfg_int("surf_douyin_candidates", 3, 1, 20),
+                )
             )
 
         if not candidates:
@@ -208,6 +240,59 @@ class CyberSurfingPipeline:
         )
 
         return review
+
+    async def trim_history(self, max_per_soul: int = 200) -> int:
+        """Cap each Soul's `surfing_history` rows (`surf_history_max_per_soul`).
+
+        Called from the daily GC ticker; returns the number of deleted rows.
+        """
+        cap = max(1, int(max_per_soul or 200))
+        deleted = 0
+        try:
+            souls = await self.memory_manager.db.fetchall(
+                "SELECT DISTINCT soul_id FROM surfing_history"
+            )
+        except Exception:  # noqa: BLE001 - trimming is best effort
+            return 0
+        for row in souls or []:
+            soul_id = str(row.get("soul_id") or "")
+            if not soul_id:
+                continue
+            try:
+                row = await self.memory_manager.db.fetchone(
+                    "SELECT COUNT(*) AS n FROM surfing_history WHERE soul_id = ?",
+                    (soul_id,),
+                )
+                before = int((row or {}).get("n") or 0)
+                if before <= cap:
+                    continue
+                await self.memory_manager.db.execute(
+                    """
+                    DELETE FROM surfing_history
+                    WHERE soul_id = ?
+                      AND id NOT IN (
+                          SELECT id FROM surfing_history
+                          WHERE soul_id = ?
+                          ORDER BY watched_at DESC, id DESC
+                          LIMIT ?
+                      )
+                    """,
+                    (soul_id, soul_id, cap),
+                )
+                after_row = await self.memory_manager.db.fetchone(
+                    "SELECT COUNT(*) AS n FROM surfing_history WHERE soul_id = ?",
+                    (soul_id,),
+                )
+                after = int((after_row or {}).get("n") or 0)
+                deleted += max(0, before - after)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"[OnlyYou] trim surf history failed for {soul_id}: {exc}")
+        if deleted:
+            logger.info(
+                f"[OnlyYou] Trimmed {deleted} surf history row(s) "
+                f"(cap {cap}/soul)."
+            )
+        return deleted
 
     async def list_history(
         self, soul_id: Optional[str] = None, limit: int = 30

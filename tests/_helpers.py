@@ -45,6 +45,7 @@ def load_plugin_modules():
         return _MODULES
 
     import OnlyYou.core.character_card as character_card
+    import OnlyYou.core.config_manager as config_manager
     import OnlyYou.core.atmosphere_reader as atmosphere_reader
     import OnlyYou.core.context_budget as context_budget
     import OnlyYou.core.memory_manager as memory_manager
@@ -65,6 +66,7 @@ def load_plugin_modules():
 
     _MODULES = SimpleNamespace(
         character_card=character_card,
+        config_manager=config_manager,
         atmosphere_reader=atmosphere_reader,
         context_budget=context_budget,
         memory_manager=memory_manager,
@@ -608,6 +610,8 @@ async def build_fake_plugin(
     """Assemble a fake plugin object using the *real* OnlyYou business components."""
     mods = load_plugin_modules()
     config = config or make_plugin_config()
+    config_manager = mods.config_manager.PluginConfigManager(db, config)
+    await config_manager.load()
     provider_manager = FakeProviderManager(
         sources=DEFAULT_FAKE_SOURCES if sources is None else sources,
         providers=DEFAULT_FAKE_PROVIDERS if providers is None else providers,
@@ -659,6 +663,7 @@ async def build_fake_plugin(
         session_buffer=buffer,
         context_budget=budget,
         surfing_pipeline=pipeline,
+        config_manager=config_manager,
     )
     api = mods.web_api.OnlyYouWebAPI(plugin)
     plugin.web_api = api

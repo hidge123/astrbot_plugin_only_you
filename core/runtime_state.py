@@ -194,7 +194,11 @@ def _normalize_timestamp_map(
 
 
 def normalize_snapshot(
-    snapshot: Any, now: Optional[float] = None
+    snapshot: Any,
+    now: Optional[float] = None,
+    *,
+    mused_memory_limit: int = MAX_MUSED_MEMORY_IDS_PER_SOUL,
+    recent_proactive_limit: int = MAX_RECENT_PROACTIVE_MESSAGES_PER_SOUL,
 ) -> dict[str, Any]:
     """Return a defensive, fully-typed snapshot (never raises).
 
@@ -240,7 +244,7 @@ def normalize_snapshot(
             clean_soul = _clean_key(soul_id)
             if not clean_soul:
                 continue
-            items = _normalize_memory_ids(values, MAX_MUSED_MEMORY_IDS_PER_SOUL)
+            items = _normalize_memory_ids(values, max(1, int(mused_memory_limit)))
             if items:
                 cleaned_ids[clean_soul] = items
         result["mused_memory_ids"] = cleaned_ids
@@ -263,7 +267,9 @@ def normalize_snapshot(
             if not clean_soul:
                 continue
             # Stored oldest-first; keep only the newest N entries.
-            items = _normalize_string_list(values, MAX_RECENT_PROACTIVE_MESSAGES_PER_SOUL)
+            items = _normalize_string_list(
+                values, max(1, int(recent_proactive_limit))
+            )
             if items:
                 recent[clean_soul] = items
         result["recent_proactive_messages"] = recent
@@ -303,9 +309,34 @@ class RuntimeStateStore:
         self,
         db: Any = None,
         setting_key: str = RUNTIME_STATE_SETTING_KEY,
+        plugin_config: Optional[dict[str, Any]] = None,
     ) -> None:
         self.db = db
         self.setting_key = str(setting_key or RUNTIME_STATE_SETTING_KEY)
+        # v2.13: caps follow the Pages「设置」values without a restart.
+        self.plugin_config = plugin_config if plugin_config is not None else {}
+
+    @property
+    def _proactive_cfg(self) -> dict[str, Any]:
+        try:
+            return self.plugin_config.get("roguelite_schedule_config", {}) or {}
+        except (AttributeError, TypeError):
+            return {}
+
+    def _cfg_int(self, key: str, default: int, low: int, high: int) -> int:
+        try:
+            value = int(self._proactive_cfg.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(low, min(high, value))
+
+    @property
+    def mused_memory_limit(self) -> int:
+        return self._cfg_int("mused_memory_ring_size", 30, 1, 2000)
+
+    @property
+    def recent_proactive_limit(self) -> int:
+        return self._cfg_int("proactive_anti_repeat_count", 5, 1, 200)
 
     # ------------------------------------------------------------------
     # public API
@@ -314,6 +345,17 @@ class RuntimeStateStore:
     def normalize(snapshot: Any, now: Optional[float] = None) -> dict[str, Any]:
         """Static alias of :func:`normalize_snapshot` (test / caller convenience)."""
         return normalize_snapshot(snapshot, now=now)
+
+    def normalize_with_config(
+        self, snapshot: Any, now: Optional[float] = None
+    ) -> dict[str, Any]:
+        """Like :meth:`normalize` but applies the Pages-configured ring caps."""
+        return normalize_snapshot(
+            snapshot,
+            now=now,
+            mused_memory_limit=self.mused_memory_limit,
+            recent_proactive_limit=self.recent_proactive_limit,
+        )
 
     async def load(self) -> dict[str, Any]:
         """Load + normalize the persisted snapshot (defaults on any failure)."""
@@ -325,7 +367,7 @@ class RuntimeStateStore:
             logger.warning(f"[OnlyYou] runtime state load failed: {exc}")
             return default_snapshot()
         try:
-            return normalize_snapshot(raw)
+            return self.normalize_with_config(raw)
         except Exception as exc:  # noqa: BLE001 - normalize is defensive but belt+suspenders
             logger.warning(f"[OnlyYou] runtime state normalize failed: {exc}")
             return default_snapshot()
@@ -335,7 +377,7 @@ class RuntimeStateStore:
         if self.db is None:
             return False
         try:
-            payload = normalize_snapshot(snapshot)
+            payload = self.normalize_with_config(snapshot)
             await self.db.set_setting(self.setting_key, payload)
             return True
         except Exception as exc:  # noqa: BLE001 - persistence is best-effort

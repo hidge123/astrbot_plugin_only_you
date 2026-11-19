@@ -173,6 +173,15 @@ class SessionBuffer:
         return max(1, count)
 
     @property
+    def unread_batch_max_chars(self) -> int:
+        """Max characters of one unread-batch transcript (`unread_batch_max_chars`)."""
+        try:
+            value = int(self.roguelite_cfg.get("unread_batch_max_chars", 800))
+        except (TypeError, ValueError):
+            value = 800
+        return max(200, min(6000, value))
+
+    @property
     def sliding_window_size(self) -> int:
         return max(3, int(self.cfg.get("sliding_window_size", 15)))
 
@@ -396,14 +405,16 @@ class SessionBuffer:
             self._unread_kind.pop(umo, None)
         return stats
 
-    @staticmethod
-    def format_unread_batch(batch: list[BufferedMessage], max_chars: int = 800) -> str:
+    def format_unread_batch(
+        self, batch: list[BufferedMessage], max_chars: Optional[int] = None
+    ) -> str:
         """Render an unread batch as a compact transcript snippet."""
+        budget = int(max_chars) if max_chars else self.unread_batch_max_chars
         lines: list[str] = []
         used = 0
         for message in batch:
             line = message.format_for_transcript()
-            if used + len(line) > max_chars:
+            if used + len(line) > budget:
                 lines.append("……（更早的未读消息已省略）")
                 break
             lines.append(line)
@@ -687,9 +698,45 @@ class ContextBudgetManager:
     def cfg(self) -> dict[str, Any]:
         return self.plugin_config.get("memory_and_context_config", {}) or {}
 
+    def _cfg_float(self, key: str, default: float, low: float, high: float) -> float:
+        try:
+            value = float(self.cfg.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(low, min(high, value))
+
+    def _cfg_int(self, key: str, default: int, low: int, high: int) -> int:
+        try:
+            value = int(self.cfg.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(low, min(high, value))
+
     @property
     def max_injected_memories(self) -> int:
         return max(1, int(self.cfg.get("max_injected_memories", 6)))
+
+    @property
+    def recall_semantic_weight(self) -> float:
+        return self._cfg_float("recall_semantic_weight", SEMANTIC_WEIGHT, 0.0, 1.0)
+
+    @property
+    def recall_recency_weight(self) -> float:
+        return self._cfg_float("recall_recency_weight", RECENCY_WEIGHT, 0.0, 1.0)
+
+    @property
+    def recall_importance_weight(self) -> float:
+        return self._cfg_float("recall_importance_weight", IMPORTANCE_WEIGHT, 0.0, 1.0)
+
+    @property
+    def recent_duplicate_window_seconds(self) -> int:
+        return (
+            self._cfg_int("recent_duplicate_window_minutes", 10, 0, 10080) * 60
+        )
+
+    @property
+    def recall_query_context_turns(self) -> int:
+        return self._cfg_int("recall_query_context_turns", QUERY_CONTEXT_USER_MESSAGES, 0, 50)
 
     @property
     def max_memory_chars_budget(self) -> int:
@@ -739,7 +786,7 @@ class ContextBudgetManager:
                 recent = getter(
                     umo,
                     sender_id=str(getattr(user, "global_uid", "") or ""),
-                    limit=QUERY_CONTEXT_USER_MESSAGES,
+                    limit=self.recall_query_context_turns,
                 )
             except Exception as exc:  # noqa: BLE001 - query enrichment is best effort
                 logger.debug(f"[OnlyYou] build recall query failed: {exc}")
@@ -892,7 +939,7 @@ class ContextBudgetManager:
             created_at = int(getattr(mem, "created_at", 0) or 0)
         except (TypeError, ValueError):
             created_at = 0
-        if not created_at or (now - created_at) > RECENT_DUPLICATE_WINDOW_SECONDS:
+        if not created_at or (now - created_at) > self.recent_duplicate_window_seconds:
             return False
         content = str(getattr(mem, "content", "") or "").strip()
         if not content:
@@ -1195,11 +1242,20 @@ class ContextBudgetManager:
             days_old = max(0.0, (now - max(0, event_ts)) / 86400.0)
             recency_score = math.exp(-0.15 * days_old)
             imp_score = max(1, min(10, int(mem.importance))) / 10.0
-            total_score = (
-                SEMANTIC_WEIGHT * sem_score
-                + RECENCY_WEIGHT * recency_score
-                + IMPORTANCE_WEIGHT * imp_score
+            weight_sum = (
+                self.recall_semantic_weight
+                + self.recall_recency_weight
+                + self.recall_importance_weight
             )
+            if weight_sum <= 0:
+                weight_sum = (
+                    SEMANTIC_WEIGHT + RECENCY_WEIGHT + IMPORTANCE_WEIGHT
+                )
+            total_score = (
+                self.recall_semantic_weight * sem_score
+                + self.recall_recency_weight * recency_score
+                + self.recall_importance_weight * imp_score
+            ) / weight_sum
             # v2.12 最低相关性门闸：不相关的记忆绝不硬凑注入（旧版 0 分也会塞 6 条）。
             if total_score < self.min_recall_score:
                 continue

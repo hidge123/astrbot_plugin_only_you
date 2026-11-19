@@ -9,7 +9,7 @@ Verifies the migration checklist documented in ``docs/UPGRADE.md``:
    (``legacy_umo_bindings_migrated`` / ``model_config_migrated_to_souls``) are set;
 2. the upgrade is idempotent (a second pass changes nothing and duplicates no
    platform binding) and never needs a manual SQL step;
-3. the plugin startup logs advertise ``Registered 31 Web API routes`` (the v2.8
+3. the plugin startup logs advertise ``Registered 34 Web API routes`` (the v2.8
    route count) and the whole upgrade emits no Traceback;
 4. a partially failed migration leaves the flag unset so the next startup retries
    (already covered deeply in ``test_v28_consistency.py``; asserted here for the
@@ -49,7 +49,7 @@ OnlyYouWebAPI = mods.web_api.OnlyYouWebAPI
 
 LEGACY_UMO_FLAG = "legacy_umo_bindings_migrated"
 SOUL_MODEL_FLAG = "model_config_migrated_to_souls"
-EXPECTED_WEB_API_ROUTES = 31
+EXPECTED_WEB_API_ROUTES = 34
 
 OLD_SOULS_TABLE = """
     CREATE TABLE souls (
@@ -269,7 +269,7 @@ class TestV27ToV28Upgrade(V27ToV28UpgradeBase):
             )
         assert "Traceback" not in formatted
 
-    async def test_web_api_registers_31_routes_with_expected_log(self):
+    async def test_web_api_registers_34_routes_with_expected_log(self):
         plugin, api = await build_fake_plugin(self.db, self.tmpdir)
         plugin.context.registered_routes.clear()
         with mock.patch.object(mods.web_api.logger, "info") as fake_info:

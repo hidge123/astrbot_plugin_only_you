@@ -15,8 +15,21 @@ class BilibiliAdapter(BaseVideoAdapter):
 
     platform_name = "bilibili"
 
-    def __init__(self, cookie: str = ""):
+    def __init__(
+        self,
+        cookie: str = "",
+        timeout: float = 8.0,
+        hot_comments_limit: int = 3,
+    ):
         self.cookie = (cookie or "").strip()
+        try:
+            self.timeout = max(1.0, float(timeout))
+        except (TypeError, ValueError):
+            self.timeout = 8.0
+        try:
+            self.hot_comments_limit = max(0, int(hot_comments_limit))
+        except (TypeError, ValueError):
+            self.hot_comments_limit = 3
 
     def _headers(self) -> dict[str, str]:
         headers = {
@@ -36,7 +49,9 @@ class BilibiliAdapter(BaseVideoAdapter):
         """Fetch Bilibili popular videos, with fallback sample items if network is restricted."""
         items: list[VideoItem] = []
         try:
-            async with httpx.AsyncClient(timeout=8.0, headers=self._headers()) as client:
+            async with httpx.AsyncClient(
+                timeout=self.timeout, headers=self._headers()
+            ) as client:
                 resp = await client.get(
                     "https://api.bilibili.com/x/web-interface/popular",
                     params={"ps": max(5, limit * 2), "pn": 1},
@@ -55,8 +70,14 @@ class BilibiliAdapter(BaseVideoAdapter):
                         (entry.get("rcmd_reason") or {}).get("content") or ""
                     )
                     comments = [rcmd_reason] if rcmd_reason else []
-                    if aid and not comments:
-                        comments = await self.fetch_hot_comments(aid, limit=3)
+                    if (
+                        aid
+                        and not comments
+                        and self.hot_comments_limit > 0
+                    ):
+                        comments = await self.fetch_hot_comments(
+                            aid, limit=self.hot_comments_limit
+                        )
                     items.append(
                         VideoItem(
                             platform="bilibili",
@@ -100,7 +121,9 @@ class BilibiliAdapter(BaseVideoAdapter):
         if not str(video_id).isdigit():
             return []
         try:
-            async with httpx.AsyncClient(timeout=5.0, headers=self._headers()) as client:
+            async with httpx.AsyncClient(
+                timeout=min(self.timeout, 8.0), headers=self._headers()
+            ) as client:
                 resp = await client.get(
                     "https://api.bilibili.com/x/v2/reply/main",
                     params={"type": 1, "oid": video_id, "mode": 3, "ps": limit},

@@ -41,8 +41,25 @@ class VideoVisionProcessor:
     - 提供基于封面图 (`cover_url`) + 标题 + 热评的多模态看片评分与第一人称吐槽生成
     """
 
-    def __init__(self, model_hub: ModelHub):
+    def __init__(self, model_hub: ModelHub, plugin_config: Optional[dict[str, Any]] = None):
         self.model_hub = model_hub
+        self.plugin_config = plugin_config if plugin_config is not None else {}
+
+    def _cfg_int(self, key: str, default: int, low: int, high: int) -> int:
+        """Read a Pages「设置」score (`vision_*`) with a safe fallback."""
+        try:
+            value = int((self.plugin_config.get("surfing_config", {}) or {}).get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(low, min(high, value))
+
+    @property
+    def fallback_score(self) -> int:
+        return self._cfg_int("vision_fallback_score", 60, 0, 100)
+
+    @property
+    def default_score(self) -> int:
+        return self._cfg_int("vision_default_score", 78, 0, 100)
 
     async def build_3x3_keyframe_grid(
         self, video_stream_url: str, duration_sec: int = 60
@@ -95,7 +112,9 @@ class VideoVisionProcessor:
         if isinstance(res, dict) and "commentary" in res:
             commentary = str(res.get("commentary") or "").strip()
             try:
-                score = max(0, min(100, int(res.get("score") or 78)))
+                score = max(
+                    0, min(100, int(res.get("score") or self.default_score))
+                )
             except (TypeError, ValueError):
                 score = None
             v_notes = str(res.get("visual_notes") or default_notes).strip()
@@ -112,7 +131,7 @@ class VideoVisionProcessor:
         # so ``_maybe_share_surfed_video`` never shares an unverified video.
         return VideoReviewResult(
             video=video,
-            score=60,
+            score=self.fallback_score,
             commentary=f"刚刷到《{video.title}》，评论区笑死我了hhh",
             visual_notes=default_notes,
             is_fallback=True,

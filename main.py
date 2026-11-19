@@ -146,6 +146,7 @@ except ImportError:
             return self
 
 from .core.atmosphere_reader import AtmosphereReader
+from .core.config_manager import PluginConfigManager
 from .core.context_budget import ContextBudgetManager, SessionBuffer
 from .core.memory_manager import MemoryManager, MemoryTier
 from .core.model_hub import ModelHub
@@ -204,6 +205,57 @@ except ImportError:  # pragma: no cover - character_card is created in parallel
         except Exception:
             return ""
 
+
+
+# ==========================================================================
+# v2.13 module-level runtime-config helpers
+#
+# Offline tests bind selected ``OnlyYouPlugin`` methods onto a lightweight
+# ``SimpleNamespace`` fake that has no ``_runtime_*`` helpers.  All new call
+# sites therefore go through these module-level functions (which tolerate a
+# missing ``config_manager`` / missing ``config``), while the instance methods
+# remain thin aliases for readability.
+# ==========================================================================
+_CONFIG_MISSING = object()
+
+
+def _plugin_runtime_setting(plugin: Any, key: str, default: Any = None) -> Any:
+    manager = getattr(plugin, "config_manager", None)
+    if manager is not None:
+        try:
+            value = manager.get(key, _CONFIG_MISSING)
+            if value is not _CONFIG_MISSING:
+                return value
+        except Exception:  # noqa: BLE001 - fake plugins in tests have no manager
+            pass
+    try:
+        for group in (getattr(plugin, "config", None) or {}).values():
+            if isinstance(group, dict) and key in group:
+                return group[key]
+    except (AttributeError, TypeError):
+        pass
+    return default
+
+
+def _plugin_runtime_int(plugin: Any, key: str, default: int) -> int:
+    try:
+        return int(_plugin_runtime_setting(plugin, key, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _plugin_runtime_float(plugin: Any, key: str, default: float) -> float:
+    try:
+        return float(_plugin_runtime_setting(plugin, key, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _plugin_runtime_bool(plugin: Any, key: str, default: bool = True) -> bool:
+    value = _plugin_runtime_setting(plugin, key, default)
+    if isinstance(value, str):
+        return value.strip().lower() not in ("0", "false", "off", "no", "")
+    return bool(value)
 
 
 # ==========================================================================
@@ -380,10 +432,17 @@ class OnlyYouPlugin(Star):
 
         # Initialize core components
         self.db = DatabaseManager(self.db_path)
+        # v2.13: single source of truth for runtime configuration.  The shared
+        # ``self.config`` dict is kept in the legacy nested-group shape and is
+        # updated **in place** by the manager, so every sub-module that holds a
+        # reference sees new values without a plugin reload.
+        self.config_manager = PluginConfigManager(self.db, self.config)
+        self._heartbeat_wake_event: Optional[asyncio.Event] = None
+        self._gc_wake_event: Optional[asyncio.Event] = None
         # v2.8: restart-safe snapshot of the proactive-message runtime bookkeeping
         # (shared video ids / cooldowns / MEMORY_MUSE rotation / ★L3 targets).
         # ``RuntimeStateStore`` no-ops safely when the DB is unavailable.
-        self.runtime_state_store = RuntimeStateStore(self.db)
+        self.runtime_state_store = RuntimeStateStore(self.db, plugin_config=self.config)
         self.provider_factory = ProviderFactory(self.context)
         self.model_hub = ModelHub(
             context=self.context,
@@ -403,6 +462,9 @@ class OnlyYouPlugin(Star):
             model_hub=self.model_hub,
             plugin_config=self.config,
         )
+        # v2.13: per-Soul urgent keywords / impact table overrides live in the
+        # config manager; the mutator reads them lazily on every input.
+        self.schedule_mutator.config_manager = self.config_manager
         self.user_relation = UserRelationManager(
             db=self.db,
             platform_bridge=self.platform_bridge,
@@ -493,6 +555,21 @@ class OnlyYouPlugin(Star):
     async def initialize(self) -> None:
         """AstrBot Star lifecycle initialization hook."""
         await self._ensure_initialized()
+        # v2.13: restore the Pages-owned runtime config (legacy AstrBotConfig is
+        # migrated once) before any background task starts using the values.
+        config_manager = getattr(self, "config_manager", None)
+        if config_manager is not None:
+            try:
+                await config_manager.load()
+                config_manager.bind_change_hook(self._on_runtime_config_changed)
+            except Exception as exc:  # noqa: BLE001 - defaults keep the plugin usable
+                logger.warning(f"[OnlyYou] runtime config load failed: {exc}")
+        try:
+            self._heartbeat_wake_event = asyncio.Event()
+            self._gc_wake_event = asyncio.Event()
+        except Exception:  # noqa: BLE001 - degraded environment without a loop
+            self._heartbeat_wake_event = None
+            self._gc_wake_event = None
         # v2.8.2: QQ「戳一戳」/ 撤回 / 群文件等 OneBot notice 会被 AstrBot 适配器
         # 转成空文本伪消息事件；标记启动以便线上日志确认过滤器已生效。
         logger.info(
@@ -1188,6 +1265,7 @@ class OnlyYouPlugin(Star):
             "deleted_tier2": 0,
             "decayed_tier2": 0,
             "promoted_to_tier3": 0,
+            "surf_history_trimmed": 0,
         }
         cleaner = getattr(self.memory_manager, "cleanup_tier1", None)
         if callable(cleaner):
@@ -1222,6 +1300,20 @@ class OnlyYouPlugin(Star):
                         stats[key] = int(full.get(key, 0) or 0)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"[OnlyYou] daily Forgetting GC failed: {exc}")
+        # v2.13: cap each Soul's surf history (`surf_history_max_per_soul`).
+        surfing_pipeline = getattr(self, "surfing_pipeline", None)
+        trimmer = getattr(surfing_pipeline, "trim_history", None)
+        if callable(trimmer):
+            try:
+                trimmed = await trimmer(
+                    max_per_soul=max(
+                        30, _plugin_runtime_int(self, "surf_history_max_per_soul", 200)
+                    )
+                )
+                if isinstance(trimmed, int):
+                    stats["surf_history_trimmed"] = trimmed
+            except Exception as exc:  # noqa: BLE001 - never break the heartbeat
+                logger.warning(f"[OnlyYou] surf history trim failed: {exc}")
         stats["gc_ran"] = 1
         try:
             await self.db.set_setting("last_forgetting_gc_date", today)
@@ -1246,6 +1338,93 @@ class OnlyYouPlugin(Star):
             return (self.config.get("roguelite_schedule_config") or {}).get(key, default)
         except (AttributeError, TypeError):
             return default
+
+    # ------------------------------------------------------------------
+    # v2.13 centralized runtime config helpers (Pages「设置」page)
+    # ------------------------------------------------------------------
+    _CONFIG_MISSING = object()
+
+    def _runtime_setting(self, key: str, default: Any = None) -> Any:
+        """Read one runtime config field (Pages-owned; legacy dict fallback)."""
+        manager = getattr(self, "config_manager", None)
+        if manager is not None:
+            try:
+                value = manager.get(key, self._CONFIG_MISSING)
+                if value is not self._CONFIG_MISSING:
+                    return value
+            except Exception:  # noqa: BLE001 - fake plugins in tests have no manager
+                pass
+        try:
+            for group in (self.config or {}).values():
+                if isinstance(group, dict) and key in group:
+                    return group[key]
+        except (AttributeError, TypeError):
+            pass
+        return default
+
+    def _runtime_int(self, key: str, default: int) -> int:
+        try:
+            return int(self._runtime_setting(key, default))
+        except (TypeError, ValueError):
+            return int(default)
+
+    def _runtime_float(self, key: str, default: float) -> float:
+        try:
+            return float(self._runtime_setting(key, default))
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _runtime_bool(self, key: str, default: bool = True) -> bool:
+        value = self._runtime_setting(key, default)
+        if isinstance(value, str):
+            return value.strip().lower() not in ("0", "false", "off", "no", "")
+        return bool(value)
+
+    def _heartbeat_interval_seconds(self) -> int:
+        """Background heartbeat period (`heartbeat_interval_minutes`, 5~60)."""
+        minutes = max(5, min(60, _plugin_runtime_int(self, "heartbeat_interval_minutes", 15)))
+        return minutes * 60
+
+    def _gc_interval_seconds(self) -> int:
+        """Forgetting-GC / surf-history trim period (`gc_check_interval_hours`)."""
+        hours = max(1, min(168, _plugin_runtime_int(self, "gc_check_interval_hours", 24)))
+        return hours * 3600
+
+    async def _on_runtime_config_changed(self, changed: Any = None) -> None:
+        """Hot-reload hook fired after Pages「设置」saves / resets config."""
+        wake = getattr(self, "_heartbeat_wake_event", None)
+        if wake is not None:
+            try:
+                wake.set()
+            except Exception:  # noqa: BLE001 - never break saving
+                pass
+        gc_wake = getattr(self, "_gc_wake_event", None)
+        if gc_wake is not None:
+            try:
+                gc_wake.set()
+            except Exception:  # noqa: BLE001
+                pass
+        for attr in (
+            "deck_engine",
+            "schedule_mutator",
+            "user_relation",
+            "memory_manager",
+            "session_buffer",
+            "context_budget",
+            "atmosphere_reader",
+            "surfing_pipeline",
+        ):
+            module = getattr(self, attr, None)
+            hook = getattr(module, "reload_config", None)
+            if not callable(hook):
+                continue
+            try:
+                result = hook()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:  # noqa: BLE001 - one module must not block others
+                logger.warning(f"[OnlyYou] reload_config failed for {attr}: {exc}")
+        logger.info("[OnlyYou] Runtime config hot-reloaded (%s).", changed or [])
 
     def _group_lurk_cooldown_seconds(self) -> int:
         """Per-group GROUP_LURK cooldown (`unread_group_cooldown_minutes`, default 60)."""
@@ -1443,7 +1622,9 @@ class OnlyYouPlugin(Star):
         now = time.time()
         cooldown = self._group_lurk_cooldown_seconds()
         try:
-            chats = self.session_buffer.list_unread_chats(private=False, limit=10)
+            chats = self.session_buffer.list_unread_chats(
+                private=False, limit=_plugin_runtime_int(self, "group_lurk_scan_limit", 10)
+            )
         except Exception as exc:  # noqa: BLE001 - never break the heartbeat
             logger.warning(f"[OnlyYou] list_unread_chats failed: {exc}")
             chats = []
@@ -1465,7 +1646,8 @@ class OnlyYouPlugin(Star):
                 continue
             try:
                 transcript = self.session_buffer.get_window_transcript(
-                    umo, max_turns=12
+                    umo,
+                    max_turns=_plugin_runtime_int(self, "group_lurk_transcript_turns", 12),
                 )
             except Exception:
                 transcript = "（暂无近期对话）"
@@ -1682,14 +1864,19 @@ class OnlyYouPlugin(Star):
                 self._recent_proactive_messages = recent
             except Exception:  # noqa: BLE001
                 recent = {}
+        max_recent = 5
+        try:
+            max_recent = max(1, _plugin_runtime_int(self, "proactive_anti_repeat_count", 5))
+        except Exception:  # noqa: BLE001 - fake plugin in tests
+            max_recent = 5
         text = str(message or "").strip()
         if text:
             ring = list(recent.get(sid, []))
             ring.append(text)
-            recent[sid] = ring[-5:]
+            recent[sid] = ring[-max(1, max_recent):]
 
     def _anti_repeat_block(self, soul_id: str) -> str:
-        """Negative prompt block built from the last 5 proactive messages."""
+        """Negative prompt block built from recent proactive messages."""
         sid = str(soul_id or "")
         recent = getattr(self, "_recent_proactive_messages", None)
         if not isinstance(recent, dict):
@@ -1697,14 +1884,16 @@ class OnlyYouPlugin(Star):
                 "（暂无近期主动消息记录；仍不要用「在干嘛 / 干嘛呢 / 睡了吗」"
                 "这类烂大街开场。）"
             )
-        messages = list(recent.get(sid, []))[-5:]
+        limit = max(1, _plugin_runtime_int(self, "proactive_anti_repeat_count", 5))
+        messages = list(recent.get(sid, []))[-limit:]
         if not messages:
             return (
                 "（暂无近期主动消息记录；仍不要用「在干嘛 / 干嘛呢 / 睡了吗」"
                 "这类烂大街开场。）"
             )
         lines = [
-            "你最近 5 条主动消息如下（**严禁**重复它们聊过的话题，**严禁**写近似的句式）："
+            f"你最近 {len(messages)} 条主动消息如下（**严禁**重复它们聊过的话题，"
+            "**严禁**写近似的句式）："
         ]
         lines.extend(f"- {text}" for text in messages)
         starters = sorted({text[0] for text in messages if text})
@@ -1749,7 +1938,11 @@ class OnlyYouPlugin(Star):
             return []
         recent_ids = list((getattr(self, "_mused_memory_ids", None) or {}).get(soul_id, []))
         try:
-            sampled = await sampler(soul_id=soul_id, exclude_ids=recent_ids, pick=3)
+            sampled = await sampler(
+                soul_id=soul_id,
+                exclude_ids=recent_ids,
+                pick=_plugin_runtime_int(self, "muse_pick_count", 3),
+            )
         except TypeError:
             try:
                 sampled = await sampler(soul_id)
@@ -1782,7 +1975,8 @@ class OnlyYouPlugin(Star):
             if (
                 created_at
                 and last_accessed > created_at + 60
-                and (now - last_accessed) < 72 * 3600
+                and (now - last_accessed)
+                < _plugin_runtime_int(self, "muse_exclude_hours", 72) * 3600
             ):
                 continue
             return [item]
@@ -2064,7 +2258,8 @@ class OnlyYouPlugin(Star):
                     except Exception:  # pragma: no cover - defensive
                         pass
                 ring = list(muse_ids.get(soul_id, [])) + memory_ids
-                muse_ids[soul_id] = ring[-30:]
+                ring_size = max(1, _plugin_runtime_int(self, "mused_memory_ring_size", 30))
+                muse_ids[soul_id] = ring[-ring_size:]
 
             logger.info(
                 f"[OnlyYou] IDLE_ROAM({roam_mode}) proactive message sent to "
@@ -2116,7 +2311,8 @@ class OnlyYouPlugin(Star):
             return 0
         try:
             candidates = self.session_buffer.list_unread_chats(
-                private=True, limit=5
+                private=True,
+                limit=_plugin_runtime_int(self, "unread_private_scan_limit", 5),
             )
         except Exception as exc:  # noqa: BLE001 - never break the heartbeat
             logger.warning(f"[OnlyYou] private unread listing failed: {exc}")
@@ -2129,8 +2325,9 @@ class OnlyYouPlugin(Star):
         slot_title = str(getattr(current_slot, "title", "") or "休息/忙档")
         current_time = datetime.now().strftime("%H:%M")
         processed = 0
+        max_per_tick = max(1, _plugin_runtime_int(self, "unread_private_catchup_per_tick", 2))
         for umo, batch in candidates:
-            if processed >= 2:
+            if processed >= max_per_tick:
                 break
             if not umo or not batch:
                 continue
@@ -2165,7 +2362,8 @@ class OnlyYouPlugin(Star):
             sender_name = str(getattr(last, "sender_name", "") or "")
             try:
                 recent_text = self.session_buffer.get_window_transcript(
-                    umo, max_turns=8
+                    umo,
+                    max_turns=_plugin_runtime_int(self, "unread_private_context_turns", 8),
                 )
                 prompt = UNREAD_PRIVATE_CATCHUP_PROMPT.format(
                     soul_name=getattr(soul, "name", "") or "小星",
@@ -2493,15 +2691,28 @@ class OnlyYouPlugin(Star):
             return False
 
     async def _heartbeat_loop(self) -> None:
-        """Every 15 minutes: per-Soul busy settlement + action dispatch.
+        """Dynamic heartbeat: per-Soul busy settlement + action dispatch.
 
+        The period comes from ``heartbeat_interval_minutes`` (Pages「设置」), so a
+        config save wakes this loop immediately and it restarts on the new period.
         v2.8 drives **every Soul that owns bot instances** (plus the default Soul as
         the fallback for unbound platforms), each with its own timeline, model config
         and platform-scoped unread backlog.  Also runs the restart-safe daily GC.
         """
         while True:
             try:
-                await asyncio.sleep(900)
+                event = self._heartbeat_wake_event
+                if event is not None:
+                    try:
+                        await asyncio.wait_for(
+                            event.wait(), timeout=self._heartbeat_interval_seconds()
+                        )
+                        event.clear()
+                        continue
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    await asyncio.sleep(self._heartbeat_interval_seconds())
                 await self._ensure_initialized()
                 await self._maybe_run_scheduled_gc()
                 souls = await self._souls_for_heartbeat()
@@ -2526,10 +2737,25 @@ class OnlyYouPlugin(Star):
                 logger.warning(f"[OnlyYou] Heartbeat loop error: {e}")
 
     async def _daily_gc_loop(self) -> None:
-        """Fallback daily GC ticker (the persisted date keeps it idempotent)."""
+        """Forgetting-GC ticker; period follows ``gc_check_interval_hours``.
+
+        The persisted GC date keeps the actual cleanup idempotent, while the wake
+        event makes an interval change take effect without a plugin restart.
+        """
         while True:
             try:
-                await asyncio.sleep(86400)
+                event = self._gc_wake_event
+                if event is not None:
+                    try:
+                        await asyncio.wait_for(
+                            event.wait(), timeout=self._gc_interval_seconds()
+                        )
+                        event.clear()
+                        continue
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    await asyncio.sleep(self._gc_interval_seconds())
                 await self._ensure_initialized()
                 await self._maybe_run_scheduled_gc()
             except asyncio.CancelledError:
@@ -3363,7 +3589,7 @@ class OnlyYouPlugin(Star):
             if action == "add" and len(tokens) >= 6:
                 if not self.memory_manager.enabled:
                     yield event.plain_result(
-                        "🧠 分级记忆已在 AstrBot 插件配置中关闭（enable_tiered_memory=false），"
+                        "🧠 分级记忆已在 Pages「设置 → 记忆」中关闭（enable_tiered_memory=false），"
                         "本次未写入。"
                     )
                     return

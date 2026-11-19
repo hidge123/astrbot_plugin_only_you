@@ -187,7 +187,11 @@ def _clean_alias(value: Any) -> str:
 
 
 def _normalize_aliases(
-    values: Any, *, canonical: str = "", exclude: Any = ()
+    values: Any,
+    *,
+    canonical: str = "",
+    exclude: Any = (),
+    max_aliases: int = MAX_ALIASES,
 ) -> list[str]:
     """Dedupe / cap / filter an alias list (newest last, FIFO capped)."""
     blocked = {str(item or "").strip() for item in (exclude or []) if str(item or "").strip()}
@@ -198,7 +202,7 @@ def _normalize_aliases(
         if not text or text in aliases or text in blocked:
             continue
         aliases.append(text)
-    return aliases[-MAX_ALIASES:]
+    return aliases[-max(1, int(max_aliases or MAX_ALIASES)):]
 
 
 @dataclass
@@ -378,6 +382,45 @@ class UserRelationManager:
     # ------------------------------------------------------------------
     # v2.12: slower, effective-reply-only affinity curve
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # v2.13: Pages「设置」驱动的参数
+    # ------------------------------------------------------------------
+    def _cfg_int(self, key: str, default: int, low: int, high: int) -> int:
+        try:
+            value = int(self.cfg.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(low, min(high, value))
+
+    def _cfg_float(self, key: str, default: float, low: float, high: float) -> float:
+        try:
+            value = float(self.cfg.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(low, min(high, value))
+
+    @property
+    def affinity_gain_group(self) -> float:
+        return self._cfg_float("affinity_gain_group", self.AFFINITY_GAIN_GROUP, 0.0, 100.0)
+
+    @property
+    def affinity_gain_direct(self) -> float:
+        return self._cfg_float("affinity_gain_direct", self.AFFINITY_GAIN_DIRECT, 0.0, 100.0)
+
+    @property
+    def affinity_slowdown_threshold(self) -> float:
+        return self._cfg_float(
+            "affinity_slowdown_threshold", self.AFFINITY_SLOWDOWN_THRESHOLD, 0.0, 100.0
+        )
+
+    @property
+    def group_note_max_chars(self) -> int:
+        return self._cfg_int("group_note_max_chars", 500, 50, 10000)
+
+    @property
+    def user_max_aliases(self) -> int:
+        return self._cfg_int("user_max_aliases", MAX_ALIASES, 1, 200)
+
     @property
     def auto_promote_min_interactions(self) -> int:
         """L1 -> L2 minimum effective interactions (default 40)."""
@@ -488,15 +531,15 @@ class UserRelationManager:
             return user
 
         gain = (
-            self.AFFINITY_GAIN_DIRECT
+            self.affinity_gain_direct
             if (is_direct_mention or is_private)
-            else self.AFFINITY_GAIN_GROUP
+            else self.affinity_gain_group
         )
         try:
             current_affinity = float(user.affinity)
         except (TypeError, ValueError):
             current_affinity = 0.0
-        if current_affinity >= self.AFFINITY_SLOWDOWN_THRESHOLD:
+        if current_affinity >= self.affinity_slowdown_threshold:
             gain *= 0.5
         if cap > 0:
             gain = min(gain, max(0.0, cap - used_today))
@@ -629,6 +672,7 @@ class UserRelationManager:
             raw_aliases,
             canonical=nickname or display_name,
             exclude=[global_uid, display_name, nickname],
+            max_aliases=self.user_max_aliases,
         )
         return UserProfile(
             global_uid=global_uid,
@@ -643,8 +687,7 @@ class UserRelationManager:
             aliases=aliases,
         )
 
-    @staticmethod
-    def _remember_alias(profile: UserProfile, name: Any) -> bool:
+    def _remember_alias(self, profile: UserProfile, name: Any) -> bool:
         """Append a previous display name to ``profile.aliases`` (bounded/deduped).
 
         The old *display name* is exactly what we are about to replace, so it must
@@ -665,6 +708,7 @@ class UserRelationManager:
             list(profile.aliases) + [candidate],
             canonical=canonical,
             exclude=[profile.global_uid],
+            max_aliases=self.user_max_aliases,
         )
         return candidate in profile.aliases
 
@@ -1303,7 +1347,14 @@ class UserRelationManager:
                 profile.global_uid,
                 profile.display_name,
                 json.dumps(profile.platform_ids, ensure_ascii=False),
-                json.dumps(_normalize_aliases(profile.aliases, canonical=profile.canonical_name), ensure_ascii=False),
+                json.dumps(
+                    _normalize_aliases(
+                        profile.aliases,
+                        canonical=profile.canonical_name,
+                        max_aliases=self.user_max_aliases,
+                    ),
+                    ensure_ascii=False,
+                ),
                 int(time.time()),
             ),
         )
@@ -1387,7 +1438,14 @@ class UserRelationManager:
                 json.dumps(profile.platform_ids, ensure_ascii=False),
                 profile.attitude,
                 1 if profile.proactive_enabled else 0,
-                json.dumps(_normalize_aliases(profile.aliases, canonical=profile.canonical_name), ensure_ascii=False),
+                json.dumps(
+                    _normalize_aliases(
+                        profile.aliases,
+                        canonical=profile.canonical_name,
+                        max_aliases=self.user_max_aliases,
+                    ),
+                    ensure_ascii=False,
+                ),
                 int(time.time()),
             ),
         )
@@ -1626,6 +1684,7 @@ class UserRelationManager:
             + [p_id, s_id],
             canonical=primary.canonical_name,
             exclude=[primary_uid_value],
+            max_aliases=self.user_max_aliases,
         )
         primary.soul_id = ""
         await self._upsert_identity(primary)
@@ -2092,7 +2151,7 @@ class UserRelationManager:
                 else self._default_group_display_name(profile.group_id, profile.umo)
             )
         if notes is not None:
-            profile.notes = str(notes).strip()[:_GROUP_NOTES_MAX_CHARS]
+            profile.notes = str(notes).strip()[: self.group_note_max_chars]
         if proactive_enabled is not None:
             profile.proactive_enabled = bool(proactive_enabled)
         await self._persist_groups()

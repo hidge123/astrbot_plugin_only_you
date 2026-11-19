@@ -325,22 +325,23 @@ class TestHourlyBudget(GateTestBase):
 class TestReplyGateSchema(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        with open(
-            os.path.join(PROJECT_ROOT, "_conf_schema.json"), "r", encoding="utf-8"
-        ) as handle:
-            cls.schema = json.load(handle)
-        cls.items = cls.schema["atmosphere_config"]["items"]
+        mods = load_plugin_modules()
+        config_manager = mods.config_manager
+        cls.items = {
+            field.key: field
+            for field in config_manager.SECTION_MAP["atmosphere"].fields
+        }
 
     def test_gate_items_present_with_expected_defaults(self):
-        assert self.items["reply_gate_enabled"]["type"] == "bool"
-        assert self.items["reply_gate_enabled"]["default"] is True
-        assert self.items["reply_gate_probability"]["type"] == "int"
-        assert self.items["reply_gate_probability"]["default"] == 80
-        assert self.items["reply_gate_hourly_limit"]["type"] == "int"
-        assert self.items["reply_gate_hourly_limit"]["default"] == 0
+        assert self.items["reply_gate_enabled"].type == "bool"
+        assert self.items["reply_gate_enabled"].default is True
+        assert self.items["reply_gate_probability"].type == "int"
+        assert self.items["reply_gate_probability"].default == 80
+        assert self.items["reply_gate_hourly_limit"].type == "int"
+        assert self.items["reply_gate_hourly_limit"].default == 0
 
     def test_probability_default_is_a_valid_percentage(self):
-        default = self.items["reply_gate_probability"]["default"]
+        default = self.items["reply_gate_probability"].default
         assert 0 <= int(default) <= 100
 
     def test_every_gate_item_has_short_description_and_hint(self):
@@ -350,9 +351,9 @@ class TestReplyGateSchema(unittest.TestCase):
             "reply_gate_hourly_limit",
         ):
             item = self.items[key]
-            description = str(item.get("description") or "").strip()
-            hint = str(item.get("hint") or "").strip()
-            assert description, f"{key} 缺少 description"
+            description = str(item.label or "").strip()
+            hint = str(item.hint or "").strip()
+            assert description, f"{key} 缺少 label"
             assert len(description) <= 24, f"{key} 标题过长"
             assert hint, f"{key} 缺少 hint"
 

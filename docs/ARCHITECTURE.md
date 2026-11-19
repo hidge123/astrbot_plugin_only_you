@@ -16,7 +16,7 @@ OnlyYou 是一个 AstrBot `Star` 插件：在**不接管平台底层**的前提�
 | 决策与状态层 | `state_machine.py`、`roguelite_deck.py`、`schedule_mutator.py`、`atmosphere_reader.py` | 三态门禁、24h 时间轴、输入驱动微调、是否接话 |
 | 能力层 | `memory_manager.py`、`context_budget.py`、`soul_manager.py`、`model_hub.py`、`provider_factory.py`、`user_relation.py`、`surfing/` | 记忆（RAG）、上下文、角色配置、多角色模型（含 Embedding / Rerank）、用户关系、赛博冲浪 |
 | 持久化层 | `storage/db.py`、`core/runtime_state.py`、`souls/*.json` | SQLite 业务表 + 角色 JSON 唯一真源 + 运行态快照 |
-| 控制台 | `core/web_api.py` + `views/console/` | 31 条 Web API 与 8 页无构建 Plugin Pages |
+| 控制台 | `core/web_api.py` + `views/console/` | 34 条 Web API 与 9 页无构建 Plugin Pages |
 
 ```mermaid
 flowchart LR
@@ -67,10 +67,10 @@ flowchart LR
 ```text
 OnlyYou/
 ├── metadata.yaml                # 插件元数据（name / version / help）
-├── _conf_schema.json            # AstrBot 配置 Schema：只放运行参数
 ├── requirements.txt
 ├── main.py                      # 插件入口：钩子、门禁、心跳、未读、指令树、生命周期
 ├── core/
+│   ├── config_manager.py         # 运行配置中心：6 大分组 / 默认值 / 钳制 / 旧配置迁移 / 原地热更新
 │   ├── state_machine.py         # BotState / ActionType / UserTier / StateController 门禁矩阵
 │   ├── roguelite_deck.py        # 24h 时间轴：卡片、SlotInstance、作息曲线、拼接与重排
 │   ├── schedule_mutator.py      # 三重门禁微调、Impact 计算、BUSY 切分 / SLEEP 唤醒 / IDLE 加钟
@@ -84,9 +84,9 @@ OnlyYou/
 │   ├── provider_factory.py      # 唯一触碰 AstrBot Provider 内部结构的封装
 │   ├── platform_bridge.py       # 唤醒决策、平台实例枚举、分段回复、主动消息 / 语音
 │   ├── runtime_state.py         # runtime_state_v1 快照（去重 / 冷却 / ★L3 目标）
-│   ├── web_api.py               # 31 条 Plugin Pages 后端路由
+│   ├── web_api.py               # 34 条 Plugin Pages 后端路由
 │   └── atmosphere_reader.py     # 防抖窗口、引用/@ 解线团、五维读空气、概率与每小时预算门闸
-├── views/console/               # 8 页控制台（无构建 classic script）
+├── views/console/               # 9 页控制台（无构建 classic script）
 ├── surfing/
 │   ├── pipeline.py              # 冲浪流水线（仅 IDLE）
 │   ├── video_vision.py          # 多模态看片评分（role=vision）
@@ -255,7 +255,7 @@ L1 普通用户即使重要度 8 也只能进 T2；`episode` / `state` 永远不
 3. **上下文感知 Query**：当前消息 + 滑窗内该用户最近 2 条发言；有 `embedding` 角色时同时取 Query 向量。
 4. **三路粗排候选池（Top-24）**：仅 `superseded_by IS NULL`；Dense（向量余弦）+ Sparse（`content + keywords` BM25）+ T3/T2/T1 分桶保底，防止高 tier 吃满候选名额。
 5. **Rerank 精排**：有 `rerank` 角色时调用 `rerank(query, docs)` 得到 `sem_score`；否则用向量余弦，两个角色都关闭时用「内容 N-gram + 关键词命中」的词法相似度。综合分 `total = 0.55×sem + 0.25×recency(event_at) + 0.20×importance`。
-6. **最低相关性门闸**：`total < 0.38` 或 `sem < 0.25` 的记忆直接丢弃（默认值可在插件配置调整），绝不 0 分硬凑。
+6. **最低相关性门闸**：`total < 0.38` 或 `sem < 0.25` 的记忆直接丢弃（默认值可在 Pages「设置 → 记忆」调整），绝不 0 分硬凑。
 7. **滑窗去重 + 预算裁剪**：跳过 10 分钟内刚提炼且内容仍在当前滑窗内的记忆；最多 6 条、总字符 <= 400，**字符预算计入时间标签**，超长项 `continue` 而不是 `break`，让后面更短的相关记忆仍能注入。
 8. **True-Hit 强化**：仅 `sem >= 0.55` 且距上次强化超过 6 小时才 `access_count += 1`；T3 晋升见 6.1。
 9. **状态 / 关系注入**：繁忙进度、空闲繁忙成果与看片、变卦独白；`USER_RELATION_CONTEXT_PROMPT` 注入三级法则 + 当前对话人档案 + **身份归一说明** + 群聊其他活跃对话者摘要（≤4 条）。整段异常静默降级为空。
@@ -481,21 +481,35 @@ v2.12 起共 **6 个角色**：`main` / `decision` / `vision` / `tts` / `embeddi
 
 | 层 | 存放位置 | 内容 |
 | :--- | :--- | :--- |
-| AstrBot 配置 | `_conf_schema.json` | 只放**运行参数**（日程、读空气、冲浪接口与门槛、记忆/上下文阈值） |
+| 运行配置（Pages「设置」） | SQLite `plugin_settings["runtime_config"]` | 6 大分组的全部运行参数；保存后原地热更新（心跳唤醒 / 模块 `reload_config`），AstrBot 原生配置面板已退场 |
 | 插件自治设置 | SQLite `plugin_settings` | `default_soul_id`、迁移 flag、`runtime_state_v1`、`group_profiles`、旧全局 `model_config` |
 | 角色配置 | `souls/<soul_id>.json` | 角色卡、行动卡池、多角色模型（含 Embedding / Rerank）、平台绑定、冲浪开关与视频源 |
 
 配置项**不得**跨层重复：用户等级/名单、角色冲浪开关、后台视频源、模型配置都不在普通配置里。
 
-### 11.2 `_conf_schema.json` 分组
+### 11.2 `runtime_config` 六大分组
 
-| 分组 | 键（默认值） |
-| :--- | :--- |
-| `roguelite_schedule_config` | `enable_roguelite_schedule`(true)、`max_mutations_per_day`(2)、`mutation_cooldown_minutes`(120)、`idle_roam_cooldown_minutes`(120)、`idle_roam_trigger_probability`(35)、`idle_roam_daily_max_count`(3)、`idle_roam_persona_topic_ratio`(70)、`allow_l3_wake_from_resting`(true)、`unread_private_reply_enabled`(true)、`unread_group_ttl_minutes`(120)、`unread_private_ttl_minutes`(720)、`unread_max_per_chat`(20)、`unread_group_cooldown_minutes`(60)、`unread_private_cooldown_minutes`(60) |
-| `relationship_config` | `enable_auto_promotion_l2`(true)、`auto_promote_l2_min_interactions`(40)、`auto_promote_l2_min_affinity`(30.0)、`affinity_cooldown_seconds`(180)、`affinity_daily_cap`(5.0) |
-| `atmosphere_config` | `takeover_group_chat`(true)、`debounce_seconds`(4.0)、`reply_gate_enabled`(true)、`reply_gate_probability`(80)、`reply_gate_hourly_limit`(0) |
-| `surfing_config` | `bili_cookie`("")、`douyin_api_base`、`send_raw_video`(true)、`surf_share_min_score`(80)、`surf_share_cooldown_minutes`(90) |
-| `memory_and_context_config` | `enable_tiered_memory`(true)、`sliding_window_size`(15)、`extract_every_n_messages`(15)、`max_injected_memories`(6)、`max_memory_chars_budget`(400)、`max_tier1_memories`(30)、`max_recall_candidates`(24)、`min_recall_score`(0.38)、`min_semantic_score`(0.25) |
+配置 Schema 定义在 `core/config_manager.py`（`ConfigSection` / `ConfigField`），Pages「设置」页按
+「常规配置（默认展开）+ 高级参数（默认折叠）」两层渲染。存储分组沿用原 `plugin_config` 嵌套结构，
+所有子模块继续读取同一份共享字典，因此保存后无需重建实例：
+
+| 前端分组 | 存储分组 | 主要内容 |
+| :--- | :--- | :--- |
+| `schedule` | `roguelite_schedule_config` | 随机日程开关、心跳周期、微调配额/冷却、★L3 唤醒、GC 周期、紧急关键词、刷片分数线、连发窗口、冲击力表 |
+| `proactive` | `roguelite_schedule_config` | 闲逛搭话概率/冷却/日上限、人设话题占比、未读补回开关/冷却/TTL/容量、翻群/联想/防复读预算 |
+| `atmosphere` | `atmosphere_config` | 接管群聊、防抖秒数、概率门闸与每小时预算、读空气上下文轮数 |
+| `memory` | `memory_and_context_config` | 分级记忆开关、滑窗/提炼/注入预算、单条记忆字数上限、T1 上限与 TTL、召回池与分层配额、去重/替代/强化/晋升阈值、RAG 三权重 |
+| `relationship` | `relationship_config` | L1→L2 自动晋升阈值、好感冷却/日上限/单次增益/减速门槛、群备注与曾用名上限 |
+| `surfing` | `surfing_config` | B站 Cookie、抖音解析接口、直发视频、分享评分/冷却、抓取条数、HTTP 超时、热评数、看片兜底分、冲浪历史保留上限 |
+
+**热更新契约**：`settings/save` 先在 Schema 层做类型归一化与范围钳制，写入 SQLite 后
+**原地**更新共享配置字典（保持 dict / 分组对象同一引用），再依次调用各模块可选的
+`reload_config()` 并 `set()` 心跳唤醒事件；后台心跳与 GC 巡检按新的周期重新计时。
+
+**一次性迁移**：首次启动若检测到旧版 AstrBotConfig 中的非默认值，会合并进
+`runtime_config` 并写入 `legacy_astrbot_config_migrated = True`；已由 Pages 保存过的新值
+优先，旧配置不再覆盖。仓库不再携带 `_conf_schema.json`，AstrBot 原生插件配置面板
+不会再出现重复配置项。
 
 ### 11.3 SQLite 表
 
@@ -512,17 +526,18 @@ v2.12 起共 **6 个角色**：`main` / `decision` / `vision` / `tts` / `embeddi
 
 ### 11.4 `plugin_settings` 关键键
 
-`default_soul_id`、`model_config`（旧全局，仅迁移源）、`legacy_model_migrated`、`model_config_migrated_to_souls`、`legacy_umo_bindings_migrated`、`legacy_user_identity_migrated_v2`、`user_relations_migrated_v1`、`group_profiles`、`runtime_state_v1`、`last_forgetting_gc_date`。
+`runtime_config`、`legacy_astrbot_config_migrated`、`default_soul_id`、`model_config`（旧全局，仅迁移源）、`legacy_model_migrated`、`model_config_migrated_to_souls`、`legacy_umo_bindings_migrated`、`legacy_user_identity_migrated_v2`、`user_relations_migrated_v1`、`group_profiles`、`runtime_state_v1`、`last_forgetting_gc_date`。
 
 ---
 
-## 十二、 Web API（31 条）
+## 十二、 Web API（34 条）
 
 - 挂载：`context.register_web_api`，实际路径 **`/api/plug/astrbot_plugin_only_you/<route>`**，与 Dashboard 同端口、同 JWT 体系。
 - 信封：成功 `{status:"ok", message, data}`；失败 `{status:"error", message, data:{code}}`。
 
 | 分组 | 路由 |
 | :--- | :--- |
+| 运行配置（3） | `settings/get`、`settings/save`、`settings/reset` |
 | 角色与初始化（6） | `init_summary`、`souls/detail`、`souls/save`、`souls/rename`、`souls/delete`、`souls/import_persona` |
 | 日程与卡片（6） | `schedule/reroll`、`schedule/force_state`、`cards/list`、`cards/save`、`cards/delete`、`cards/ai_generate` |
 | 角色卡（4） | `card/schema`、`card/save`、`card/ai_generate`、`card/preview_prompt` |
@@ -557,10 +572,10 @@ node --check views/console/*.js
 | `test_v212_identity_relation.py` | 曾用名 / 规范称呼、孤儿记忆归并、合并用户、好感冷却 / 上限 / 减速 / AND 晋升、身份归一 Prompt |
 | `test_v212_proactive.py` | 冷却 / 概率 / 每日上限、PERSONA_TOPIC 与繁忙成果单次消费、MEMORY_MUSE 不回退全量列表、最近 5 条反反复读、运行态新键、提炼单批重试 |
 | `test_v212_api.py` | `models/sources` 的 RAG 提供商、`models/config` 六角色读写与状态、`models/test`、记忆分类 / 归档 / 过滤统计 |
-| `test_web_api.py` / `test_v26_api.py` | 31 路由信封与 payload |
+| `test_web_api.py` / `test_v26_api.py` | 34 路由信封与 payload |
 | `test_js_syntax.py` | 控制台脚本语法与 `index.html` 清单 |
 
-改动以下契约时必须同步测试：时间轴不变量、`ActionType` 固定护甲、`settle_busy_block` 单次结算、未读定义、Soul JSON 真源与 revision 裁决、记忆时间 / 事件时间锚点、记忆分类与去重 / Supersede、召回门槛与 T3 晋升门闸、身份归一与好感曲线、主动对话节奏与反反复读、读空气概率/预算门闸、主动回复开关、31 条路由形状。
+改动以下契约时必须同步测试：时间轴不变量、`ActionType` 固定护甲、`settle_busy_block` 单次结算、未读定义、Soul JSON 真源与 revision 裁决、记忆时间 / 事件时间锚点、记忆分类与去重 / Supersede、召回门槛与 T3 晋升门闸、身份归一与好感曲线、主动对话节奏与反反复读、读空气概率/预算门闸、主动回复开关、配置文件热更新与 34 条路由形状。
 
 ---
 

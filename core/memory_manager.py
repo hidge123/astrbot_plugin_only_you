@@ -307,7 +307,13 @@ class MemoryItem:
             return 0
         return self.tier1_started_at + TIER1_TTL_SECONDS
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, ttl_seconds: Optional[int] = None) -> dict[str, Any]:
+        ttl = int(ttl_seconds) if ttl_seconds else TIER1_TTL_SECONDS
+        expires_at = (
+            self.tier1_started_at + ttl
+            if int(self.memory_tier or 0) == MemoryTier.EPHEMERAL
+            else 0
+        )
         return {
             "id": self.id,
             "soul_id": self.soul_id,
@@ -344,15 +350,11 @@ class MemoryItem:
             "tier1_since_text": (
                 format_local_datetime(self.tier1_since) if self.tier1_since else ""
             ),
-            "tier1_expires_at": self.tier1_expires_at,
+            "tier1_expires_at": expires_at,
             "tier1_remaining_seconds": (
-                max(0, self.tier1_expires_at - int(time.time()))
-                if self.tier1_expires_at
-                else 0
+                max(0, expires_at - int(time.time())) if expires_at else 0
             ),
-            "tier1_expired": bool(
-                self.tier1_expires_at and self.tier1_expires_at <= int(time.time())
-            ),
+            "tier1_expired": bool(expires_at and expires_at <= int(time.time())),
         }
 
 
@@ -392,6 +394,107 @@ class MemoryManager:
     @property
     def enabled(self) -> bool:
         return bool(self.cfg.get("enable_tiered_memory", True))
+
+    # ------------------------------------------------------------------
+    # v2.13: Pages「设置」驱动的参数（默认值与原硬编码常量一致）
+    # ------------------------------------------------------------------
+    def _cfg_int(self, key: str, default: int, low: int, high: int) -> int:
+        try:
+            value = int(self.cfg.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(low, min(high, value))
+
+    def _cfg_float(self, key: str, default: float, low: float, high: float) -> float:
+        try:
+            value = float(self.cfg.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(low, min(high, value))
+
+    @property
+    def memory_content_max_chars(self) -> int:
+        """Max characters of one memory (`memory_content_max_chars`, default 60)."""
+        return self._cfg_int("memory_content_max_chars", 60, 10, 4000)
+
+    @property
+    def tier1_ttl_seconds(self) -> int:
+        """Tier-1 retention in seconds (`tier1_ttl_hours`, default 48h)."""
+        return self._cfg_int("tier1_ttl_hours", 48, 1, 8760) * 3600
+
+    @property
+    def dedupe_cosine_threshold(self) -> float:
+        return self._cfg_float("dedupe_cosine", DEDUPE_COSINE_THRESHOLD, 0.0, 1.0)
+
+    @property
+    def dedupe_jaccard_threshold(self) -> float:
+        return self._cfg_float("dedupe_jaccard", DEDUPE_JACCARD_THRESHOLD, 0.0, 1.0)
+
+    @property
+    def supersede_cosine_min(self) -> float:
+        return self._cfg_float(
+            "supersede_cosine", SUPERSEDE_STATE_COSINE_MIN, 0.0, 1.0
+        )
+
+    @property
+    def supersede_jaccard_min(self) -> float:
+        return self._cfg_float(
+            "supersede_jaccard", SUPERSEDE_STATE_JACCARD_MIN, 0.0, 1.0
+        )
+
+    @property
+    def reinforce_min_semantic_score(self) -> float:
+        return self._cfg_float(
+            "reinforce_min_semantic", REINFORCE_MIN_SEMANTIC_SCORE, 0.0, 1.0
+        )
+
+    @property
+    def reinforce_cooldown_seconds(self) -> int:
+        return self._cfg_int("reinforce_cooldown_hours", 6, 0, 8760) * 3600
+
+    @property
+    def promote_t3_min_access(self) -> int:
+        return self._cfg_int(
+            "promote_t3_min_hits", PROMOTE_TO_T3_MIN_ACCESS, 1, 1000
+        )
+
+    @property
+    def promote_t3_min_importance(self) -> int:
+        return self._cfg_int(
+            "promote_t3_min_importance", PROMOTE_TO_T3_MIN_IMPORTANCE, 1, 10
+        )
+
+    @property
+    def promote_t3_min_age_seconds(self) -> int:
+        return self._cfg_int("promote_t3_min_age_hours", 24, 0, 8760) * 3600
+
+    @property
+    def candidate_bucket_ratios(self) -> dict[int, float]:
+        """T3 / T2 / T1 coarse-recall quotas (normalised percentages)."""
+        raw = self.cfg.get("recall_bucket_ratios")
+        base = {3: 0.30, 2: 0.40, 1: 0.30}
+        if not isinstance(raw, dict):
+            return base
+        ratios: dict[int, float] = {}
+        for tier in (3, 2, 1):
+            value = raw.get(str(tier), raw.get(tier, base[tier] * 100))
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                number = base[tier] * 100
+            ratios[tier] = max(0.0, number)
+        total = sum(ratios.values())
+        if total <= 0:
+            return base
+        return {tier: value / total for tier, value in ratios.items()}
+
+    @property
+    def recall_pool_limit(self) -> int:
+        return self._cfg_int("recall_pool_limit", 400, 1, 10000)
+
+    @property
+    def dedupe_pool_limit(self) -> int:
+        return self._cfg_int("dedupe_pool_limit", 400, 1, 10000)
 
     @staticmethod
     def resolve_tier_by_importance(importance: int, user_tier: int = 1) -> int:
@@ -444,7 +547,7 @@ class MemoryManager:
         """
         if not self.enabled:
             return 0
-        clean_content = (content or "").strip()[:60]
+        clean_content = (content or "").strip()[: self.memory_content_max_chars]
         if not clean_content:
             return 0
 
@@ -565,9 +668,10 @@ class MemoryManager:
         return _load_vector(vector) if vector else []
 
     async def _load_dedupe_pool(
-        self, soul_id: str, user_id: Optional[str], limit: int = 400
+        self, soul_id: str, user_id: Optional[str], limit: Optional[int] = None
     ) -> list[MemoryItem]:
         """Active memories of one soul that may duplicate / supersede a new row."""
+        pool_limit = int(limit) if limit else self.dedupe_pool_limit
         uid = str(user_id or "").strip()
         if uid:
             rows = await self.db.fetchall(
@@ -578,7 +682,7 @@ class MemoryManager:
                 ORDER BY created_at DESC, id DESC
                 LIMIT ?
                 """,
-                (soul_id, uid, int(limit)),
+                (soul_id, uid, pool_limit),
             )
         else:
             # A public memory is only compared with other public memories: a private
@@ -591,7 +695,7 @@ class MemoryManager:
                 ORDER BY created_at DESC, id DESC
                 LIMIT ?
                 """,
-                (soul_id, int(limit)),
+                (soul_id, pool_limit),
             )
         return [MemoryItem.from_row(row) for row in rows]
 
@@ -647,7 +751,9 @@ class MemoryManager:
             return None, explicit_target
 
         threshold = (
-            DEDUPE_COSINE_THRESHOLD if best_is_vector else DEDUPE_JACCARD_THRESHOLD
+            self.dedupe_cosine_threshold
+            if best_is_vector
+            else self.dedupe_jaccard_threshold
         )
         if best_score >= threshold:
             return best.id, None
@@ -659,14 +765,14 @@ class MemoryManager:
             memory_type == "state"
             and best.memory_type == "state"
             and best_is_vector
-            and best_score >= SUPERSEDE_STATE_COSINE_MIN
+            and best_score >= self.supersede_cosine_min
         ):
             return None, best.id
         if (
             memory_type == "state"
             and best.memory_type == "state"
             and not best_is_vector
-            and best_score >= SUPERSEDE_STATE_JACCARD_MIN
+            and best_score >= self.supersede_jaccard_min
         ):
             return None, best.id
         _ = now_ts
@@ -738,7 +844,7 @@ class MemoryManager:
         query_text: str = "",
         query_embedding: Any = None,
         limit: int = 24,
-        pool_limit: int = 400,
+        pool_limit: Optional[int] = None,
     ) -> list[MemoryItem]:
         """v2.12 三路混合粗排候选池（Dense / Sparse / Tier 分桶保底）。
 
@@ -754,6 +860,7 @@ class MemoryManager:
             desired = max(1, int(limit))
         except (TypeError, ValueError):
             desired = 24
+        pool_cap = int(pool_limit) if pool_limit else self.recall_pool_limit
         uid = str(user_id or "").strip()
         if uid:
             rows = await self.db.fetchall(
@@ -764,7 +871,7 @@ class MemoryManager:
                 ORDER BY COALESCE(NULLIF(event_at, 0), created_at) DESC, id DESC
                 LIMIT ?
                 """,
-                (soul_id, uid, int(max(desired, pool_limit))),
+                (soul_id, uid, int(max(desired, pool_cap))),
             )
         else:
             rows = await self.db.fetchall(
@@ -774,7 +881,7 @@ class MemoryManager:
                 ORDER BY COALESCE(NULLIF(event_at, 0), created_at) DESC, id DESC
                 LIMIT ?
                 """,
-                (soul_id, int(max(desired, pool_limit))),
+                (soul_id, int(max(desired, pool_cap))),
             )
         items = [MemoryItem.from_row(row) for row in rows]
         if not items:
@@ -806,8 +913,9 @@ class MemoryManager:
 
         selected: list[MemoryItem] = []
         selected_ids: set[int] = set()
+        bucket_ratios = self.candidate_bucket_ratios
         for tier in (3, 2, 1):
-            quota = max(1, int(round(desired * CANDIDATE_BUCKET_RATIOS.get(tier, 0.2))))
+            quota = max(1, int(round(desired * bucket_ratios.get(tier, 0.2))))
             for item in by_tier.get(tier, [])[:quota]:
                 if item.id in selected_ids:
                     continue
@@ -977,14 +1085,14 @@ class MemoryManager:
         expired = await self.db.fetchall(
             "SELECT id FROM memories WHERE memory_tier = 1 AND "
             "(? - COALESCE(NULLIF(tier1_since, 0), created_at)) > ?",
-            (now, TIER1_TTL_SECONDS),
+            (now, self.tier1_ttl_seconds),
         )
         if expired:
             stats["deleted_expired"] = len(expired)
             await self.db.execute(
                 "DELETE FROM memories WHERE memory_tier = 1 AND "
                 "(? - COALESCE(NULLIF(tier1_since, 0), created_at)) > ?",
-                (now, TIER1_TTL_SECONDS),
+                (now, self.tier1_ttl_seconds),
             )
 
         souls = await self.db.fetchall(
@@ -1045,12 +1153,15 @@ class MemoryManager:
             score = scores.get(mid)
             if score is not None:
                 try:
-                    if float(score) < REINFORCE_MIN_SEMANTIC_SCORE:
+                    if float(score) < self.reinforce_min_semantic_score:
                         continue
                 except (TypeError, ValueError):
                     continue
             last_reinforced = int(row.get("last_reinforced_at") or 0)
-            if last_reinforced and (now - last_reinforced) < REINFORCE_COOLDOWN_SECONDS:
+            if (
+                last_reinforced
+                and (now - last_reinforced) < self.reinforce_cooldown_seconds
+            ):
                 continue
 
             access_count = int(row.get("access_count") or 0) + 1
@@ -1061,10 +1172,10 @@ class MemoryManager:
             promote = (
                 tier == MemoryTier.RECENT
                 and memory_type in PROMOTABLE_MEMORY_TYPES
-                and importance >= PROMOTE_TO_T3_MIN_IMPORTANCE
-                and access_count >= PROMOTE_TO_T3_MIN_ACCESS
+                and importance >= self.promote_t3_min_importance
+                and access_count >= self.promote_t3_min_access
                 and created_at > 0
-                and (now - created_at) >= PROMOTE_TO_T3_MIN_AGE_SECONDS
+                and (now - created_at) >= self.promote_t3_min_age_seconds
             )
             await self.db.execute(
                 """
@@ -1140,14 +1251,14 @@ class MemoryManager:
         expired_t1 = await self.db.fetchall(
             "SELECT id FROM memories WHERE memory_tier = 1 AND "
             "(? - COALESCE(NULLIF(tier1_since, 0), created_at)) > ?",
-            (now, TIER1_TTL_SECONDS),
+            (now, self.tier1_ttl_seconds),
         )
         stats["deleted_tier1"] = len(expired_t1)
         if expired_t1:
             await self.db.execute(
                 "DELETE FROM memories WHERE memory_tier = 1 AND "
                 "(? - COALESCE(NULLIF(tier1_since, 0), created_at)) > ?",
-                (now, TIER1_TTL_SECONDS),
+                (now, self.tier1_ttl_seconds),
             )
 
         # Evaluate Tier 2 decay & promotion
@@ -1164,11 +1275,11 @@ class MemoryManager:
 
             promotable = (
                 normalize_memory_type(row.get("memory_type")) in PROMOTABLE_MEMORY_TYPES
-                and int(row["importance"]) >= PROMOTE_TO_T3_MIN_IMPORTANCE
-                and int(row["access_count"]) >= PROMOTE_TO_T3_MIN_ACCESS
+                and int(row["importance"]) >= self.promote_t3_min_importance
+                and int(row["access_count"]) >= self.promote_t3_min_access
                 and int(row.get("created_at") or 0) > 0
                 and (now - int(row.get("created_at") or 0))
-                >= PROMOTE_TO_T3_MIN_AGE_SECONDS
+                >= self.promote_t3_min_age_seconds
             )
             if new_vitality <= 0:
                 await self.db.execute("DELETE FROM memories WHERE id = ?", (row["id"],))
@@ -1572,7 +1683,11 @@ class MemoryManager:
         if not row:
             return None
         item = MemoryItem.from_row(row)
-        new_content = (content.strip()[:60] if content is not None else item.content) or item.content
+        new_content = (
+            content.strip()[: self.memory_content_max_chars]
+            if content is not None
+            else item.content
+        ) or item.content
         new_kw = keywords.strip() if keywords is not None else item.keywords
         new_imp = max(1, min(10, int(importance))) if importance is not None else item.importance
         new_tier = item.memory_tier

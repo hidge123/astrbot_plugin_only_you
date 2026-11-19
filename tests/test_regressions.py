@@ -2014,27 +2014,20 @@ class TestProjectSanity(unittest.TestCase):
         assert "仅管理员" in metadata
         assert "奇遇" not in metadata
 
-    def test_conf_schema_is_valid_and_has_no_model_config(self):
-        path = os.path.join(PROJECT_ROOT, "_conf_schema.json")
-        with open(path, "r", encoding="utf-8") as handle:
-            schema = json.load(handle)
-        assert isinstance(schema, dict) and schema
-        assert "model_hub_config" not in schema
-        for removed in (
-            "small_llm_provider_id",
-            "embedding_provider_id",
-            "rerank_provider_id",
-        ):
-            assert removed not in json.dumps(schema)
+    def test_runtime_config_defaults_are_pages_owned(self):
+        """v2.13: AstrBot plugin config is gone; defaults live in config_manager."""
+        assert not os.path.exists(os.path.join(PROJECT_ROOT, "_conf_schema.json"))
+        defaults = mods.config_manager.default_values()
+        roguelite = defaults["roguelite_schedule_config"]
         # 24h dynamic timeline config: encounter count removed, roam cooldown added.
-        roguelite = schema.get("roguelite_schedule_config", {}).get("items", {})
         assert "daily_encounter_count" not in roguelite
-        assert "idle_roam_cooldown_minutes" in roguelite
-        # v2.12: proactive pace is slower and fully configurable.
-        assert roguelite["idle_roam_cooldown_minutes"]["default"] == 120
-        assert roguelite["idle_roam_trigger_probability"]["default"] == 35
-        assert roguelite["idle_roam_daily_max_count"]["default"] == 3
-        assert roguelite["idle_roam_persona_topic_ratio"]["default"] == 70
+        assert roguelite["idle_roam_cooldown_minutes"] == 120
+        assert roguelite["idle_roam_trigger_probability"] == 35
+        assert roguelite["idle_roam_daily_max_count"] == 3
+        assert roguelite["idle_roam_persona_topic_ratio"] == 70
+        assert roguelite["heartbeat_interval_minutes"] == 15
+        assert defaults["memory_and_context_config"]["memory_content_max_chars"] == 60
+        assert defaults["surfing_config"]["surf_history_max_per_soul"] == 200
 
     def test_compileall_passes_without_repo_artifacts(self):
         pycache_prefix = tempfile.mkdtemp(prefix="onlyyou-pyc-")

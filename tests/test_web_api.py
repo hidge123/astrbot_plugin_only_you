@@ -5,7 +5,7 @@ RogueliteDeckEngine / MemoryManager / UserRelationManager / CyberSurfingPipeline
 assembled against a temporary SQLite database, plus ``set_mock_request`` so the
 handlers can be awaited without FastAPI/AstrBot request context.
 
-Covers: the **31** registered routes (v2.8 added the four ``sessions/*`` bot-instance
+Covers: the **34** registered routes (v2.8 added the four ``sessions/*`` bot-instance
 binding routes, contract §6.1), the ``{status, message, data}`` envelope, the new
 ``dashboard/overview`` / ``card/*`` / ``models/*`` / ``sessions/*`` routes and the
 legacy routes (``souls/detail``, ``cards/list``, ``users/list``,
@@ -35,6 +35,9 @@ mods = load_plugin_modules()
 API_PREFIX = mods.web_api.API_PREFIX
 LEGACY_ROUTES = [
     "/init_summary",
+    "/settings/get",
+    "/settings/save",
+    "/settings/reset",
     "/souls/detail",
     "/souls/import_persona",
     "/souls/save",
@@ -118,11 +121,11 @@ class WebApiTestBase(DatabaseAsyncTestCase):
 
 
 class TestRouteRegistration(WebApiTestBase):
-    async def test_registers_31_routes(self):
+    async def test_registers_34_routes(self):
         self.plugin.context.registered_routes.clear()
         self.api.register_routes()
         routes = self.plugin.context.registered_routes
-        assert len(routes) == 31
+        assert len(routes) == 34
         paths = [item["route"] for item in routes]
         assert len(paths) == len(set(paths))
         for path in paths:

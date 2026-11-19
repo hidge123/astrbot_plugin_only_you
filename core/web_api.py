@@ -238,6 +238,21 @@ def _enrich_slot(slot: Any, now_dt: Optional[datetime] = None) -> dict[str, Any]
     return data
 
 
+def _memory_payload(item: Any, ttl_seconds: Optional[int] = None) -> dict[str, Any]:
+    """Serialize a memory row, honouring the Pages-configured Tier-1 TTL."""
+    to_dict = getattr(item, "to_dict", None)
+    if not callable(to_dict):
+        return {}
+    try:
+        return dict(to_dict(ttl_seconds=ttl_seconds) or {})
+    except TypeError:
+        return dict(to_dict() or {})
+
+
+def _memory_list_payload(items: Any, ttl_seconds: Optional[int] = None) -> list[dict[str, Any]]:
+    return [_memory_payload(item, ttl_seconds) for item in (items or [])]
+
+
 #: Card fields mirrored from the flat body into the nested `card` payload.
 #: ``valid_slots`` / ``armor`` are intentionally gone (legacy v2.4 fields; armor is
 #: a derived fixed tier per ``action_type`` and is never client-writable).
@@ -305,7 +320,7 @@ def _busy_results_payload(run: Any, now_dt: Optional[datetime] = None) -> list[d
 
 class OnlyYouWebAPI:
     """
-    🖥️ Registers and handles all 31 RESTful Web API routes for the revamped
+    🖥️ Registers and handles all 34 RESTful Web API routes for the revamped
     `views/console` AstrBot Plugin Pages (17 legacy routes kept for compatibility
     plus 10 new dashboard / character-card / model / session routes and the four
     v2.8 bot-platform binding routes in `register_routes`).
@@ -359,7 +374,7 @@ class OnlyYouWebAPI:
         return dict(self._mock_body)
 
     def register_routes(self) -> None:
-        """Register all 31 WebUI Console routes with `self.plugin.context.register_web_api`."""
+        """Register all 34 WebUI Console routes with `self.plugin.context.register_web_api`."""
         ctx = getattr(self.plugin, "context", None)
         register_fn = getattr(ctx, "register_web_api", None) if ctx is not None else None
         if not callable(register_fn):
@@ -372,6 +387,24 @@ class OnlyYouWebAPI:
                 self.api_init_summary,
                 ["GET"],
                 "OnlyYou: 获取角色列表、AstrBot原生Persona列表与全局模型状态",
+            ),
+            (
+                f"{API_PREFIX}/settings/get",
+                self.api_settings_get,
+                ["GET"],
+                "OnlyYou: 读取 Pages「设置」页的 6 大分组运行配置 Schema 与当前值",
+            ),
+            (
+                f"{API_PREFIX}/settings/save",
+                self.api_settings_save,
+                ["POST"],
+                "OnlyYou: 校验/钳制后保存运行配置并原地热更新（无需重启插件）",
+            ),
+            (
+                f"{API_PREFIX}/settings/reset",
+                self.api_settings_reset,
+                ["POST"],
+                "OnlyYou: 将指定分组或全部运行配置恢复默认值",
             ),
             (
                 f"{API_PREFIX}/souls/detail",
@@ -1726,11 +1759,76 @@ class OnlyYouWebAPI:
                     "default_soul_id": default_soul_id,
                     "model_status": model_status,
                     "action_types": ACTION_TYPE_DEFINITIONS,
+                    # v2.13: Pages「设置」lives in SQLite, not AstrBotConfig.
+                    "settings": self._settings_summary(),
                 }
             )
         except Exception as e:
             logger.warning(f"[OnlyYou] api_init_summary error: {e}")
             return err_response(f"初始化摘要加载失败: {e}")
+
+    def _settings_summary(self) -> dict[str, Any]:
+        manager = getattr(self.plugin, "config_manager", None)
+        summarize = getattr(manager, "summary", None)
+        if not callable(summarize):
+            return {"version": 0, "sections": []}
+        try:
+            return summarize()
+        except Exception as exc:  # noqa: BLE001 - summary is non-critical
+            logger.warning(f"[OnlyYou] settings summary failed: {exc}")
+            return {"version": 0, "sections": []}
+
+    async def api_settings_get(self) -> dict[str, Any]:
+        try:
+            await self.plugin._ensure_initialized()
+            manager = getattr(self.plugin, "config_manager", None)
+            if manager is None:
+                return err_response("配置管理器未就绪，请检查插件日志")
+            loader = getattr(manager, "load", None)
+            # The manager is loaded at startup; reload only when it never ran.
+            if callable(loader) and not getattr(manager, "_loaded", False):
+                await loader()
+            return ok_response(manager.snapshot())
+        except Exception as e:
+            logger.warning(f"[OnlyYou] api_settings_get error: {e}")
+            return err_response(f"读取运行配置失败: {e}")
+
+    async def api_settings_save(self) -> dict[str, Any]:
+        try:
+            await self.plugin._ensure_initialized()
+            manager = getattr(self.plugin, "config_manager", None)
+            if manager is None:
+                return err_response("配置管理器未就绪，请检查插件日志")
+            body = await self._get_json_body()
+            result = await manager.save(body)
+            changed = list(result.get("changed") or [])
+            return ok_response(
+                result,
+                message=(
+                    f"已保存 {len(changed)} 项配置并即时生效"
+                    if changed
+                    else "配置无变化"
+                ),
+            )
+        except Exception as e:
+            logger.warning(f"[OnlyYou] api_settings_save error: {e}")
+            return err_response(f"保存运行配置失败: {e}")
+
+    async def api_settings_reset(self) -> dict[str, Any]:
+        try:
+            await self.plugin._ensure_initialized()
+            manager = getattr(self.plugin, "config_manager", None)
+            if manager is None:
+                return err_response("配置管理器未就绪，请检查插件日志")
+            body = await self._get_json_body()
+            result = await manager.reset(body)
+            return ok_response(
+                result,
+                message=f"已恢复默认值（{len(result.get('changed') or [])} 项变更）",
+            )
+        except Exception as e:
+            logger.warning(f"[OnlyYou] api_settings_reset error: {e}")
+            return err_response(f"恢复默认配置失败: {e}")
 
     async def api_souls_detail(self) -> dict[str, Any]:
         try:
@@ -2059,6 +2157,7 @@ class OnlyYouWebAPI:
                 new_title=new_title,
                 slot_key=slot_key,
                 action_type=action_type,
+                reset_settled=_as_bool(body.get("reset_settled"), False),
             )
             sched_payload = await self._build_schedule_payload(soul)
             updated_action = _slot_action_type(updated_slot) or ActionType.IDLE_ROAM
@@ -2230,7 +2329,8 @@ class OnlyYouWebAPI:
                     {**c.to_dict(), "scope": "soul"} for c in soul.state_event_cards
                 ],
                 "general_cards": [
-                    {**c.to_dict(), "scope": "global"} for c in DEFAULT_STATE_EVENT_CARDS
+                    {**c.to_dict(), "scope": "global", "is_builtin": True}
+                    for c in DEFAULT_STATE_EVENT_CARDS
                 ],
                 "action_types": ACTION_TYPE_DEFINITIONS,
                 "chronotype": self._soul_chronotype(soul),
@@ -2536,6 +2636,20 @@ class OnlyYouWebAPI:
     # ==========================================================================
     # 4. Tiered Memory Vault (`memories/*`)
     # ==========================================================================
+    def _memory_ttl_seconds(self) -> Optional[int]:
+        manager = getattr(self.plugin, "memory_manager", None)
+        try:
+            return int(getattr(manager, "tier1_ttl_seconds"))
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+    def _memory_content_limit(self) -> int:
+        manager = getattr(self.plugin, "memory_manager", None)
+        try:
+            return int(getattr(manager, "memory_content_max_chars"))
+        except (TypeError, ValueError, AttributeError):
+            return 60
+
     async def api_memories_list(self) -> dict[str, Any]:
         try:
             await self.plugin._ensure_initialized()
@@ -2596,10 +2710,12 @@ class OnlyYouWebAPI:
                 "max_recall_candidates": self.plugin.context_budget.max_recall_candidates,
                 "min_recall_score": self.plugin.context_budget.min_recall_score,
                 "min_semantic_score": self.plugin.context_budget.min_semantic_score,
+                # v2.13 (#5): single-memory length limit (Pages「设置」adjustable).
+                "memory_content_max_chars": self._memory_content_limit(),
             }
             return ok_response(
                 {
-                    "memories": [m.to_dict() for m in items],
+                    "memories": _memory_list_payload(items, self._memory_ttl_seconds()),
                     "stats": stats,
                     # v2.8 §5.6: T1 capacity shown by the Pages memory panel.
                     "tier1_limit": self._tier1_limit(),
@@ -2621,7 +2737,7 @@ class OnlyYouWebAPI:
                 return ok_response(
                     {
                         "gc_stats": gc_stats,
-                        "memories": [m.to_dict() for m in mems],
+                        "memories": _memory_list_payload(mems, self._memory_ttl_seconds()),
                     },
                     message=(
                         f"遗忘清理完成：清理T1({gc_stats['deleted_tier1']})、"
@@ -2638,8 +2754,8 @@ class OnlyYouWebAPI:
                 mems = await self.plugin.memory_manager.list_memories(soul_id=pinned.soul_id)
                 return ok_response(
                     {
-                        "memory": pinned.to_dict(),
-                        "memories": [m.to_dict() for m in mems],
+                        "memory": _memory_payload(pinned, self._memory_ttl_seconds()),
+                        "memories": _memory_list_payload(mems, self._memory_ttl_seconds()),
                     },
                     message=f"已将记忆 #{mid} 锁定为永久核心记忆 (Tier 3)",
                 )
@@ -2649,7 +2765,7 @@ class OnlyYouWebAPI:
                 await self.plugin.memory_manager.delete_memory(mid)
                 mems = await self.plugin.memory_manager.list_memories(soul_id=soul_id)
                 return ok_response(
-                    {"memories": [m.to_dict() for m in mems]},
+                    {"memories": _memory_list_payload(mems, self._memory_ttl_seconds())},
                     message=f"已物理删除记忆 #{mid}",
                 )
 
@@ -2668,13 +2784,25 @@ class OnlyYouWebAPI:
                 )
                 if not updated:
                     return err_response("未找到要修改的记忆条目")
+                truncated = False
+                if body.get("content") is not None:
+                    truncated = len(str(body.get("content") or "").strip()) > self._memory_content_limit()
                 mems = await self.plugin.memory_manager.list_memories(soul_id=updated.soul_id)
                 return ok_response(
                     {
-                        "memory": updated.to_dict(),
-                        "memories": [m.to_dict() for m in mems],
+                        "memory": _memory_payload(updated, self._memory_ttl_seconds()),
+                        "memories": _memory_list_payload(mems, self._memory_ttl_seconds()),
+                        "truncated": truncated,
+                        "max_chars": self._memory_content_limit(),
                     },
-                    message=f"已保存记忆 #{mid}",
+                    message=(
+                        f"已保存记忆 #{mid}"
+                        + (
+                            f"（内容超过 {self._memory_content_limit()} 字已截断）"
+                            if truncated
+                            else ""
+                        )
+                    ),
                 )
 
             if action == "extract":
@@ -2701,7 +2829,7 @@ class OnlyYouWebAPI:
                 return ok_response(
                     {
                         "extracted_count": count,
-                        "memories": [m.to_dict() for m in mems],
+                        "memories": _memory_list_payload(mems, self._memory_ttl_seconds()),
                     },
                     message=f"已从会话滑窗提炼 {count} 条记忆",
                 )
@@ -2709,11 +2837,12 @@ class OnlyYouWebAPI:
             # Default: `action == "add"`
             if not self.plugin.memory_manager.enabled:
                 return err_response(
-                    "分级记忆已在 AstrBot 插件配置（enable_tiered_memory）中关闭，未写入记忆"
+                    "分级记忆已在 Pages「设置 → 记忆」中关闭（enable_tiered_memory），未写入记忆"
                 )
             content = str(body.get("content") or "").strip()
             if not content:
                 return err_response("记忆内容不能为空")
+            truncated = len(content) > self._memory_content_limit()
             keywords = str(body.get("keywords") or "").strip()
             importance = int(body.get("importance") or 8)
             mtier_raw = body.get("memory_tier")
@@ -2737,9 +2866,18 @@ class OnlyYouWebAPI:
             return ok_response(
                 {
                     "new_id": mid,
-                    "memories": [m.to_dict() for m in mems],
+                    "memories": _memory_list_payload(mems, self._memory_ttl_seconds()),
+                    "truncated": truncated,
+                    "max_chars": self._memory_content_limit(),
                 },
-                message=f"已新增记忆 #{mid}",
+                message=(
+                    f"已新增记忆 #{mid}"
+                    + (
+                        f"（内容超过 {self._memory_content_limit()} 字已截断）"
+                        if truncated
+                        else ""
+                    )
+                ),
             )
         except Exception as e:
             return err_response(f"操作记忆库失败: {e}")

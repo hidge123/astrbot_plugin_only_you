@@ -159,14 +159,14 @@ class WebApiV28TestBase(DatabaseAsyncTestCase):
 
 
 # ==============================================================================
-# Route registration (v2.8 §6.1: 27 -> 31)
+# Route registration (v2.8 §6.1: 27 -> 31; v2.13 settings -> 34)
 # ==============================================================================
 class TestRouteRegistrationV28(WebApiV28TestBase):
     async def test_four_new_session_routes_registered(self):
         self.plugin.context.registered_routes.clear()
         self.api.register_routes()
         routes = self.plugin.context.registered_routes
-        assert len(routes) == 31
+        assert len(routes) == 34
         mapping = {
             item["route"].replace(mods.web_api.API_PREFIX, ""): item
             for item in routes
@@ -940,12 +940,11 @@ class TestMemoriesTier1Limit(WebApiV28TestBase):
         assert data["tier1_limit"] == 30
         assert "stats" in data and "memories" in data
 
-    async def test_tier1_limit_reads_plugin_config(self):
-        config = make_plugin_config()
-        config["memory_and_context_config"] = dict(
-            config["memory_and_context_config"], max_tier1_memories=7
+    async def test_tier1_limit_reads_runtime_config(self):
+        """v2.13: the cap lives in SQLite runtime_config (Pages「设置」)."""
+        await self.plugin.config_manager.save(
+            {"memory_and_context_config": {"max_tier1_memories": 7}}
         )
-        await self._build_plugin(config=config)
         data = self.assert_ok(await self.call("GET", self.api.api_memories_list))
         assert data["tier1_limit"] == 7
 

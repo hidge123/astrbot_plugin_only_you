@@ -1290,6 +1290,7 @@ class RogueliteDeckEngine:
         slot_key: Optional[str] = None,
         now_dt: Optional[datetime] = None,
         action_type: Optional[Any] = None,
+        reset_settled: bool = False,
     ) -> SlotInstance:
         """Manually override the current (or specified ``slot_key``) block.
 
@@ -1297,6 +1298,11 @@ class RogueliteDeckEngine:
         tier derived from its ``action_type`` (``SLEEP=80`` / ``BUSY_TASK=65`` /
         ``SURF=40`` / ``IDLE_ROAM=25``), so the parameter is kept only for call-site
         signature compatibility and is ignored.
+
+        v2.13 (#6): a settled ``BUSY_TASK`` block keeps ``busy_settled`` /
+        ``completion_result`` when the edit only renames the block.  Its settlement
+        is cleared **only** when the action type actually changes, or when the
+        caller explicitly passes ``reset_settled=True``.
         """
         run, current_slot, _ = await self.get_current_and_next_slot(
             soul_id=soul_id, now_dt=now_dt
@@ -1307,6 +1313,10 @@ class RogueliteDeckEngine:
             if found is not None:
                 target_slot = found
 
+        try:
+            previous_action = target_slot.action
+        except Exception:  # noqa: BLE001 - legacy / duck-typed slots
+            previous_action = None
         parsed_action = ActionType.coerce(action_type, None)
         if parsed_action is not None:
             target_slot.action_type = parsed_action
@@ -1329,6 +1339,10 @@ class RogueliteDeckEngine:
         target_slot.mutated = False
         target_slot.mutation_monologue = ""
         target_slot.delay_minutes = 0
-        target_slot.reset_busy()
+        action_changed = (
+            previous_action is not None and target_slot.action != previous_action
+        )
+        if reset_settled or action_changed:
+            target_slot.reset_busy()
         await self.save_run(run)
         return target_slot

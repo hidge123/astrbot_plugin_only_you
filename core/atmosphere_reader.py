@@ -85,7 +85,19 @@ class AtmosphereReader:
 
     @property
     def debounce_seconds(self) -> float:
-        return max(0.0, float(self.cfg.get("debounce_seconds", 4.0)))
+        try:
+            return max(0.0, float(self.cfg.get("debounce_seconds", 4.0)))
+        except (TypeError, ValueError):
+            return 4.0
+
+    @property
+    def atmosphere_transcript_turns(self) -> int:
+        """Group transcript turns read by the 5D atmosphere model (default 12)."""
+        try:
+            value = int(self.cfg.get("atmosphere_transcript_turns", 12))
+        except (TypeError, ValueError):
+            value = 12
+        return max(1, min(100, value))
 
     # ------------------------------------------------------------------
     # v2.10: probability / budget reply gate (non-@ ordinary group messages only)
@@ -313,7 +325,7 @@ class AtmosphereReader:
         # Group debounce window for un-mentioned group messages
         seq = self._latest_seq.get(umo, 0) + 1
         self._latest_seq[umo] = seq
-        wait_s = min(self.debounce_seconds, 6.0)
+        wait_s = min(self.debounce_seconds, 30.0)
         if wait_s > 0:
             await asyncio.sleep(wait_s)
             if self._latest_seq.get(umo, 0) != seq:
@@ -321,7 +333,9 @@ class AtmosphereReader:
                 return False
 
         # Evaluate group atmosphere via the decision model
-        transcript = self.session_buffer.get_window_transcript(umo=umo, max_turns=10)
+        transcript = self.session_buffer.get_window_transcript(
+            umo=umo, max_turns=self.atmosphere_transcript_turns
+        )
         prompt = ATMOSPHERE_EVAL_PROMPT.format(
             soul_name=soul.name,
             soul_archetype=soul.archetype,

@@ -111,6 +111,9 @@ class BoundedScheduleMutator:
         # completion_result / busy_settled / Tier 1 memory / save_run). Tests may
         # inject a stub; main.py assigns ``plugin.settle_busy_block`` after init.
         self.busy_settler = busy_settler
+        # v2.13: optional PluginConfigManager for per-Soul keyword / impact overrides
+        # (main.py attaches it after construction; tests may leave it ``None``).
+        self.config_manager: Optional[Any] = None
         # Track recent private call bursts from L3 core users for wake-from-resting
         self._l3_wake_bursts: dict[str, list[float]] = {}
 
@@ -129,6 +132,82 @@ class BoundedScheduleMutator:
     @property
     def allow_l3_wake_from_resting(self) -> bool:
         return bool(self.cfg.get("allow_l3_wake_from_resting", True))
+
+    # ------------------------------------------------------------------
+    # v2.13: Pages「设置」驱动的参数（支持角色级覆盖）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _soul_settings(soul: Any) -> dict[str, Any]:
+        if soul is None:
+            return {}
+        settings = getattr(soul, "settings", None)
+        if isinstance(settings, dict):
+            return settings
+        if isinstance(soul, dict):
+            nested = soul.get("settings")
+            return nested if isinstance(nested, dict) else soul
+        return {}
+
+    def urgent_keywords(self, soul: Any = None) -> list[str]:
+        """Role-level ``settings.urgent_keywords`` wins over the global list."""
+        manager = self.config_manager
+        if manager is not None:
+            try:
+                keywords = manager.urgent_keywords(soul)
+                if keywords:
+                    return list(keywords)
+            except Exception:  # noqa: BLE001 - config must never break the gate
+                pass
+        override = self._soul_settings(soul).get("urgent_keywords")
+        if isinstance(override, str):
+            items = [part.strip() for part in override.split(",") if part.strip()]
+            if items:
+                return items
+        if isinstance(override, (list, tuple)):
+            items = [str(item).strip() for item in override if str(item).strip()]
+            if items:
+                return items
+        raw = self.cfg.get("urgent_keywords", list(URGENT_KEYWORDS))
+        if isinstance(raw, str):
+            items = [part.strip() for part in raw.split(",") if part.strip()]
+        elif isinstance(raw, (list, tuple)):
+            items = [str(item).strip() for item in raw if str(item).strip()]
+        else:
+            items = []
+        return items or list(URGENT_KEYWORDS)
+
+    def impact_table(self, soul: Any = None) -> dict[str, int]:
+        """Role-level ``settings.mutation_impact`` overrides the global table."""
+        manager = self.config_manager
+        if manager is not None:
+            try:
+                return dict(manager.mutation_impact_table(soul))
+            except Exception:  # noqa: BLE001
+                pass
+        raw = self.cfg.get("mutation_impact_table")
+        from .config_manager import normalize_impact_table
+
+        return normalize_impact_table(raw)
+
+    def surf_mutation_min_score(self, soul: Any = None) -> int:
+        """High-score threshold that triggers a "刷片上头" extension (默认 88)."""
+        override = self._soul_settings(soul).get("surf_mutation_min_score")
+        if override is not None:
+            try:
+                return max(0, min(100, int(override)))
+            except (TypeError, ValueError):
+                pass
+        try:
+            return max(0, min(100, int(self.cfg.get("surf_mutation_min_score", 88))))
+        except (TypeError, ValueError):
+            return 88
+
+    @property
+    def burst_window_seconds(self) -> float:
+        try:
+            return max(10.0, float(self.cfg.get("burst_window_seconds", 300)))
+        except (TypeError, ValueError):
+            return 300.0
 
     # ==========================================================================
     # Action-type helpers (prefer action_type, fall back to legacy state)
@@ -245,6 +324,8 @@ class BoundedScheduleMutator:
         is_private_chat: bool,
         is_direct_mention: bool,
         recent_l2_l3_burst_count: int = 0,
+        urgent_keywords: Optional[list[str]] = None,
+        impact_table: Optional[dict[str, int]] = None,
     ) -> int:
         """
         Calculate the impact score (0 ~ 100) of an incoming message across the 3 message scenarios.
@@ -255,7 +336,15 @@ class BoundedScheduleMutator:
         - Scenario 3 (核心唤醒): SLEEP -> IDLE_ROAM ONLY when L3 Core User calls in private chat
         """
         msg = (message_str or "").strip()
-        has_urgent_kw = any(keyword in msg for keyword in URGENT_KEYWORDS)
+        keywords = urgent_keywords if urgent_keywords is not None else self.urgent_keywords()
+        has_urgent_kw = any(keyword in msg for keyword in keywords)
+        table = impact_table if impact_table is not None else self.impact_table()
+
+        def score(key: str, fallback: int) -> int:
+            try:
+                return max(0, min(100, int(table.get(key, fallback))))
+            except (TypeError, ValueError):
+                return fallback
 
         current_action = self._slot_action(current_slot)
         next_action = self._slot_action(next_slot)
@@ -269,25 +358,44 @@ class BoundedScheduleMutator:
                 return 0
 
             now = time.time()
-            history = [t for t in self._l3_wake_bursts.get(user_id, []) if now - t <= 300]
+            window = self.burst_window_seconds
+            history = [
+                t for t in self._l3_wake_bursts.get(user_id, []) if now - t <= window
+            ]
             history.append(now)
             self._l3_wake_bursts[user_id] = history
 
             # Consecutive messages from L3 in private chat or urgent wake call
             if len(history) >= 2 or has_urgent_kw:
-                return 88
-            return 45
+                return score("sleep_wake_urgent", 88)
+            return score("sleep_wake_normal", 45)
 
         # Scenario 1: BUSY_TASK (legacy BUSY)
         if current_action == ActionType.BUSY_TASK:
             if user_tier == UserTier.L1_NORMAL:
-                return 10
+                return score("busy_l1", 10)
             if user_tier == UserTier.L3_CORE:
-                base = 78 if (is_private_chat or is_direct_mention) else 62
-                return min(98, base + (12 if has_urgent_kw or len(msg) >= 15 else 0))
+                base = (
+                    score("busy_l3_direct", 78)
+                    if (is_private_chat or is_direct_mention)
+                    else score("busy_l3_ambient", 62)
+                )
+                return min(
+                    98,
+                    base
+                    + (
+                        score("busy_l3_urgent_bonus", 12)
+                        if has_urgent_kw or len(msg) >= 15
+                        else 0
+                    ),
+                )
             if user_tier == UserTier.L2_IMPORTANT:
-                base = 52 if recent_l2_l3_burst_count >= 2 else 38
-                return min(85, base + (15 if has_urgent_kw else 0))
+                base = (
+                    score("busy_l2_burst", 52)
+                    if recent_l2_l3_burst_count >= 2
+                    else score("busy_l2_single", 38)
+                )
+                return min(85, base + (score("busy_l2_urgent_bonus", 15) if has_urgent_kw else 0))
 
         # Scenario 2: SURF / IDLE_ROAM about to enter a SLEEP / BUSY_TASK block
         if (
@@ -297,13 +405,13 @@ class BoundedScheduleMutator:
             if user_tier == UserTier.L3_CORE and (
                 has_urgent_kw or recent_l2_l3_burst_count >= 3
             ):
-                return 75
+                return score("prelude_l3", 75)
             if (
                 user_tier == UserTier.L2_IMPORTANT
                 and recent_l2_l3_burst_count >= 4
                 and has_urgent_kw
             ):
-                return 68
+                return score("prelude_l2", 68)
 
         return 0
 
@@ -340,6 +448,8 @@ class BoundedScheduleMutator:
             is_private_chat=is_private_chat,
             is_direct_mention=is_direct_mention,
             recent_l2_l3_burst_count=recent_l2_l3_burst_count,
+            urgent_keywords=self.urgent_keywords(soul),
+            impact_table=self.impact_table(soul),
         )
 
         if not await self.can_mutate(run, current_slot, impact):
@@ -376,7 +486,7 @@ class BoundedScheduleMutator:
         Scenario 4 (刷片上头): In an IDLE block, watching a high-score video (`>= 88`)
         when the next block is BUSY_TASK or SLEEP extends the current block by 0.5h.
         """
-        if video_score < 88:
+        if video_score < self.surf_mutation_min_score(soul):
             return False
 
         run, current_slot, next_slot = await self._fetch_current_and_next(
