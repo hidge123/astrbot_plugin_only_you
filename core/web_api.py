@@ -2712,6 +2712,10 @@ class OnlyYouWebAPI:
                 "min_semantic_score": self.plugin.context_budget.min_semantic_score,
                 # v2.13 (#5): single-memory length limit (Pages「设置」adjustable).
                 "memory_content_max_chars": self._memory_content_limit(),
+                # v2.13: T1 retention shown by the downgrade confirmation.
+                "tier1_ttl_hours": max(
+                    1, int(self._memory_ttl_seconds() or 48 * 3600) // 3600
+                ),
             }
             return ok_response(
                 {
