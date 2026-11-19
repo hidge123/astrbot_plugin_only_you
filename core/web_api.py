@@ -2889,6 +2889,23 @@ class OnlyYouWebAPI:
     # ==========================================================================
     # 5. Cyber Surfing Pool (`surfing/list_and_trigger`)
     # ==========================================================================
+    def _mark_shared_videos(self, soul: Any, items: Any) -> list[dict[str, Any]]:
+        """Annotate history rows with whether they were actually shared (#18 filter)."""
+        soul_id = str(getattr(soul, "soul_id", "") or "")
+        mapping = getattr(self.plugin, "_shared_video_ids", None)
+        shared_ids: set[str] = set()
+        if isinstance(mapping, dict):
+            try:
+                shared_ids = set(mapping.get(soul_id, set()) or set())
+            except TypeError:
+                shared_ids = set()
+        result: list[dict[str, Any]] = []
+        for item in items or []:
+            data = dict(item) if isinstance(item, dict) else {}
+            data["shared"] = str(data.get("video_id") or "") in shared_ids
+            result.append(data)
+        return result
+
     async def api_surfing_list_and_trigger(self) -> dict[str, Any]:
         try:
             await self.plugin._ensure_initialized()
@@ -2898,6 +2915,7 @@ class OnlyYouWebAPI:
                 soul = await self._resolve_soul(self._get_query_param("soul_id"))
                 soul_id = self._get_query_param("soul_id") or None
                 items = await self.plugin.surfing_pipeline.list_history(soul_id=soul_id, limit=30)
+                items = self._mark_shared_videos(soul, items)
                 bindings = await self.plugin.soul_manager.get_umo_bindings()
                 return ok_response(
                     {
@@ -2989,7 +3007,10 @@ class OnlyYouWebAPI:
                     video_id=vid_id,
                 )
                 items = await self.plugin.surfing_pipeline.list_history(soul_id=soul.soul_id)
-                return ok_response({"videos": items}, message="已从冲浪池移除该视频")
+                return ok_response(
+                    {"videos": self._mark_shared_videos(soul, items)},
+                    message="已从冲浪池移除该视频",
+                )
 
             if action == "share":
                 video_id = str(body.get("video_id") or "").strip()
@@ -3036,6 +3057,17 @@ class OnlyYouWebAPI:
                     )
                     sent = True
 
+                if sent:
+                    try:
+                        mapping = getattr(self.plugin, "_shared_video_ids", None)
+                        if not isinstance(mapping, dict):
+                            mapping = {}
+                            self.plugin._shared_video_ids = mapping
+                        mapping.setdefault(str(soul.soul_id or ""), set()).add(
+                            str(target_vid.get("video_id") or "")
+                        )
+                    except Exception as exc:  # noqa: BLE001 - marking is best effort
+                        logger.debug(f"[OnlyYou] mark shared video failed: {exc}")
                 return ok_response(
                     {
                         "sent": sent,
@@ -3066,7 +3098,7 @@ class OnlyYouWebAPI:
             return ok_response(
                 {
                     "review": review.to_dict(),
-                    "videos": items,
+                    "videos": self._mark_shared_videos(soul, items),
                     "schedule": sched_payload,
                 },
                 message=f"冲浪完成：《{review.video.title}》(评分 {review.score}/100)",

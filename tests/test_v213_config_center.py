@@ -270,6 +270,27 @@ class TestBusySettlementPreservedOnTitleEdit(ConfigManagerTestBase):
         assert target.busy_settled is False
 
 
+class TestSurfSharedFlag(ConfigManagerTestBase):
+    async def test_history_rows_are_marked_with_real_shared_flag(self):
+        plugin, api = await self.build()
+        soul = (await plugin.soul_manager.list_souls())[0]
+        for index, video_id in enumerate(("bv-shared", "bv-new")):
+            await self.db.execute(
+                """
+                INSERT INTO surfing_history (
+                    soul_id, video_id, platform, title, author, watched_at
+                ) VALUES (?, ?, 'bilibili', ?, 'up', ?)
+                """,
+                (soul.soul_id, video_id, f"视频{index}", 2000 + index),
+            )
+        plugin._shared_video_ids = {soul.soul_id: {"bv-shared"}}
+        api.set_mock_request("GET", query={"soul_id": soul.soul_id}, body={})
+        response = await api.api_surfing_list_and_trigger()
+        assert response["status"] == "ok", response
+        flags = {item["video_id"]: item["shared"] for item in response["data"]["videos"]}
+        assert flags == {"bv-shared": True, "bv-new": False}
+
+
 class TestHardcodedParametersAreConfigurable(ConfigManagerTestBase):
     async def test_main_intervals_follow_config(self):
         config = make_plugin_config()

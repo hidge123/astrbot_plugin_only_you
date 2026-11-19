@@ -206,7 +206,8 @@
   function filteredVideos() {
     if (S.filter === "shared") {
       return S.videos.filter(function (video) {
-        return !!video.worth_sharing;
+        /* 后端 v2.13 返回真实 shared；旧数据回退「值得分享」 */
+        return video.shared != null ? !!video.shared : !!video.worth_sharing;
       });
     }
     if (S.filter === "bilibili" || S.filter === "douyin") {
@@ -403,7 +404,11 @@
       '<span class="tag">' +
       esc(platformLabel(video.platform)) +
       "</span>" +
-      (video.worth_sharing ? '<span class="tag tag-primary">值得分享</span>' : "") +
+      (video.shared
+        ? '<span class="tag tag-primary">已分享</span>'
+        : video.worth_sharing
+        ? '<span class="tag tag-primary">值得分享</span>'
+        : "") +
       "</div>" +
       (video.commentary
         ? '<div class="video-commentary" data-tip="' +
