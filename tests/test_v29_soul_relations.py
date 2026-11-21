@@ -404,6 +404,85 @@ class TestMigration(SoulRelationsTestBase):
         assert await self.relation_row("soul-default", "legacy-user") is not None
 
 
+class TestLegacyGlobalColumnsAreNotInherited(SoulRelationsTestBase):
+    """A brand-new Soul must not inherit the pre-v2.9 global nickname / attitude.
+
+    ``users.nickname`` / ``users.attitude`` were the single-character global
+    columns. After per-Soul relations landed they can still hold a stale value
+    (old DB, legacy no-``soul_id`` writes, ``merge_users`` legacy fallback);
+    seeding a new relation row from them makes every new role call the user by
+    the old role's pet name — the reported "串味" bug.
+    """
+
+    async def seed_legacy_global(self, uid="qq bot:42", pids=("qq bot:42",)):
+        await self.db.execute(
+            """
+            INSERT INTO users (
+                global_uid, display_name, nickname, tier, interaction_count,
+                affinity, platform_ids_json, attitude, updated_at
+            ) VALUES (?, ?, '旧全局昵称', 2, 5, 10.0, ?, '旧全局态度', 1)
+            """,
+            (uid, "阿一", json.dumps(list(pids), ensure_ascii=False)),
+        )
+
+    async def test_new_soul_starts_with_empty_nickname_and_attitude(self):
+        await self.seed_legacy_global()
+        await self.relation.migrate_user_relations(
+            {"qq bot": "soul-a"}, "soul-a", ["soul-a", "soul-b"]
+        )
+        # The Soul the legacy row was migrated into keeps the historical value.
+        owner = await self.relation.get_user("qq bot:42", soul_id="soul-a")
+        assert (owner.nickname, owner.attitude) == ("旧全局昵称", "旧全局态度")
+        # A Soul the user has never talked to must start clean.
+        fresh = await self.relation.get_or_create_user(
+            "42", display_name="阿一", umo="qq bot:FriendMessage:42", soul_id="soul-b"
+        )
+        assert fresh.soul_id == "soul-b"
+        assert (fresh.nickname, fresh.attitude) == ("", "")
+        row = await self.relation_row("soul-b", fresh.global_uid)
+        assert (row["nickname"], row["attitude"]) == ("", "")
+        # Portable relationship state is still seeded from the legacy row.
+        assert fresh.tier == UserTier.L2_IMPORTANT
+        assert fresh.interaction_count == 5
+        assert fresh.affinity == 10.0
+        assert fresh.proactive_enabled is True
+        # Legacy fallback read paths are untouched by the fix.
+        assert (await self.relation.get_user("qq bot:42")).nickname == "旧全局昵称"
+        assert (await self.user_row("qq bot:42"))["nickname"] == "旧全局昵称"
+
+    async def test_console_edit_on_new_soul_keeps_legacy_nickname_out(self):
+        await self.seed_legacy_global()
+        updated = await self.relation.update_user_details(
+            "qq bot:42", display_name="阿一", tier=3, soul_id="soul-b"
+        )
+        assert (updated.nickname, updated.attitude) == ("", "")
+        row = await self.relation_row("soul-b", "qq bot:42")
+        assert (row["nickname"], row["attitude"]) == ("", "")
+        assert int(row["tier"]) == 3
+        # An explicit nickname for this Soul is still accepted and persisted.
+        renamed = await self.relation.update_user_details(
+            "qq bot:42", nickname="新角色专属称呼", soul_id="soul-b"
+        )
+        assert renamed.nickname == "新角色专属称呼"
+        stored = await self.relation_row("soul-b", "qq bot:42")
+        assert stored["nickname"] == "新角色专属称呼"
+        # Soul-scoped edits never rewrite the legacy global column.
+        assert (await self.user_row("qq bot:42"))["nickname"] == "旧全局昵称"
+
+    async def test_merge_legacy_fallback_does_not_seed_new_soul(self):
+        await self.seed_legacy_global("p", ["qq bot:1"])
+        await self.seed_legacy_global("s", ["qq bot:2"])
+        await self.relation.update_user_details("p", display_name="主号", soul_id="soul-a")
+        await self.relation.update_user_details("s", display_name="副号", soul_id="soul-a")
+        await self.relation.merge_users("p", "s", soul_id="soul-a")
+        # ``merge_users`` keeps the historical fallback write on the merged identity.
+        assert (await self.user_row("p"))["nickname"] == "旧全局昵称"
+        fresh = await self.relation.get_or_create_user(
+            "p", display_name="主号", soul_id="soul-b"
+        )
+        assert fresh.nickname == ""
+
+
 class TestSoulDeletionCascade(DatabaseAsyncTestCase):
     async def asyncSetUp(self):
         await super().asyncSetUp()

@@ -284,7 +284,7 @@ L1 普通用户即使重要度 8 也只能进 T2；`episode` / `state` 永远不
 
 - `users`：**全局身份**——`global_uid`（主键，规范形如 `platform_id:native_uid`）、`display_name`、`platform_ids`、`aliases`（v2.12 曾用名 / 多端昵称）。
 - `user_relations`：**按角色隔离的关系状态**——`(soul_id, global_uid)` → `tier / interaction_count / affinity / nickname / attitude / proactive_enabled`。
-- 读取时优先 `user_relations`，首次访问从 `users` 旧关系列种值（legacy 回退）；所有关系 API 都接受可选 `soul_id`，不传时保持 v2.8 全局视图。
+- 读取时优先 `user_relations`；缺少当前角色的关系行时，只从 `users` 旧关系列继承可搬运的状态（`tier / interaction_count / affinity / proactive_enabled`）。`nickname / attitude` 是**角色专属文本**（前一个角色对该用户的称呼与语气），新角色一律从空开始，绝不从旧全局列播种；`users.nickname / attitude` 只服务于不带 `soul_id` 的 legacy 读取。所有关系 API 都接受可选 `soul_id`，不传时保持 v2.8 全局视图。
 - `proactive_enabled` 在 v2.11 加入：`user_relations` 为权威值，`users` 同名列作为无 Soul 调用的 legacy 回退；合并账号时按**双方都允许才开启**的 AND 语义。
 - 合并用户只能从**当前角色**的关系列表下拉选择；删除默认只删当前角色关系，全部角色都无关系行时才删全局身份；记忆不随用户档案删除。
 - **身份归一（v2.12）**：用户改名时旧 `display_name` 自动收入 `aliases`（上限 10 条、单条 <= 40 字、过滤平台账号）；`canonical_name` 优先取角色专属 `nickname`，其次主 `display_name`，最后 `global_uid`。滑窗 transcript、记忆提炼与关系上下文统一使用规范称呼。
@@ -518,7 +518,7 @@ v2.12 起共 **6 个角色**：`main` / `decision` / `vision` / `tts` / `embeddi
 | `memories` | `id` | 分级记忆（活力 / 访问次数 / 时间戳 + v2.12 `memory_type` / `event_at` / `embedding_json` / `superseded_by` / `last_reinforced_at` + v2.12 `tier1_since`） |
 | `souls` | `soul_id` | 角色索引（`profile_json` + `revision`） |
 | `daily_schedules` | `(soul_id, date_str)` | 当日 24h 时间轴快照 |
-| `users` | `global_uid` | 全局用户身份（`aliases_json` 曾用名 v2.12；旧关系列 + `proactive_enabled` legacy 回退列保留） |
+| `users` | `global_uid` | 全局用户身份（`aliases_json` 曾用名 v2.12；旧关系列 + `proactive_enabled` 仅作无 `soul_id` 的 legacy 回退，`nickname / attitude` 不向新角色播种） |
 | `user_relations` | `(soul_id, global_uid)` | 按角色的关系状态（含 `proactive_enabled`） |
 | `umo_soul_bindings` | `umo` | 旧版单会话绑定（仅兼容） |
 | `plugin_settings` | `key` | JSON KV：自治设置 / flag / 运行态 |

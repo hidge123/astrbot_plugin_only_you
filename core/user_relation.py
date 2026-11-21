@@ -877,7 +877,18 @@ class UserRelationManager:
     async def _ensure_relation_row(
         self, soul_id: str, profile: UserProfile
     ) -> dict[str, Any]:
-        """Load a Soul relation row, seeding it once from the legacy users columns."""
+        """Load a Soul relation row, seeding the portable fields once.
+
+        ``users.nickname`` / ``users.attitude`` are the pre-v2.9 **global** columns
+        of a single-character install. They remain the read/write fallback for
+        callers without ``soul_id``, but they must never be copied into a brand-new
+        Soul's relation row: that nickname / attitude was written for a *different*
+        role, so seeding it makes every new role inherit the old role's pet name and
+        tone ("旧昵称串味"). Only portable relationship state — tier, interaction
+        count, affinity and the proactive-message consent — is seeded; the two
+        character-specific text fields start empty and are only filled by explicit
+        edits for that Soul (legacy rows are imported by ``migrate_user_relations``).
+        """
         soul = self._soul_key(soul_id)
         uid = str(profile.global_uid or "").strip()
         existing = await self._load_relation(soul, uid)
@@ -890,8 +901,9 @@ class UserRelationManager:
             "tier": int(profile.tier.value),
             "interaction_count": int(profile.interaction_count),
             "affinity": float(profile.affinity),
-            "nickname": profile.nickname or "",
-            "attitude": profile.attitude or "",
+            # Character-specific: never inherit the legacy global columns here.
+            "nickname": "",
+            "attitude": "",
             "proactive_enabled": 1 if profile.proactive_enabled else 0,
             "updated_at": now,
         }
@@ -983,9 +995,11 @@ class UserRelationManager:
 
         v2.8.4: identity is the canonical ``platform_id:native_uid`` account.
         v2.9: when ``soul_id`` is given, the relationship fields come from the
-        ``user_relations(soul_id, global_uid)`` row (seeded from the legacy users
-        columns on first use); without ``soul_id`` the legacy ``users`` columns are
-        used (backward compatibility).
+        ``user_relations(soul_id, global_uid)`` row. A missing row is seeded with
+        the portable legacy state only (tier / affinity / interactions / proactive
+        consent) — the legacy global ``nickname`` / ``attitude`` belong to another
+        role and are never inherited. Without ``soul_id`` the legacy ``users``
+        columns are used (backward compatibility).
         """
         uid = str(user_id).strip() or "anonymous"
         name = (display_name or uid).strip()
