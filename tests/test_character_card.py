@@ -138,6 +138,32 @@ class TestCardSchema(unittest.TestCase):
         )
         assert native_field.get("readonly") is True
 
+    def test_long_text_fields_use_resizable_textareas(self):
+        """Narrative fields must not be single-line inputs (they get truncated)."""
+        long_text = {
+            ("appearance", "outfit_style"),
+            ("personality", "strengths"),
+            ("personality", "weaknesses"),
+            ("personality", "values"),
+            ("background", "family"),
+            ("background", "key_experiences"),
+            ("interests", "likes"),
+            ("interests", "dislikes"),
+            ("social", "group_role"),
+        }
+        by_key = {
+            (section["id"], field["key"]): field
+            for section in cc.CARD_SCHEMA
+            for field in section["fields"]
+        }
+        for key in long_text:
+            assert by_key[key]["type"] == "textarea", key
+        # The imported native persona blob gets a taller initial box.
+        assert by_key[("extra", "native_persona_prompt")].get("rows", 0) >= 6
+        # List-shaped fields stay list-typed (the console renders a row editor).
+        assert by_key[("speech", "catchphrases")]["type"] == "list"
+        assert by_key[("speech", "banned_expressions")]["type"] == "list"
+
     def test_empty_card_shape(self):
         card = cc.empty_card()
         assert set(card) == set(cc.CARD_SECTION_IDS)

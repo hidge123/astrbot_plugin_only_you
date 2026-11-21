@@ -159,7 +159,7 @@ def build_sections() -> tuple[ConfigSection, ...]:
     """返回 6 大分组的完整 Schema（顺序即前端展示顺序）。"""
     schedule = ConfigSection(
         id="schedule",
-        title="⏱️ 运行节奏与日程",
+        title="运行节奏",
         icon="calendar",
         description="后台心跳节拍、24h 动态时间轴与日程微调的全局参数。",
         storage_group="roguelite_schedule_config",
@@ -193,7 +193,7 @@ def build_sections() -> tuple[ConfigSection, ...]:
 
     proactive = ConfigSection(
         id="proactive",
-        title="💬 主动搭话与未读补回",
+        title="主动搭话",
         icon="message",
         description="闲逛主动搭话、翻群吃瓜与私聊未读补回的概率、冷却与预算。",
         storage_group="roguelite_schedule_config",
@@ -244,7 +244,7 @@ def build_sections() -> tuple[ConfigSection, ...]:
 
     atmosphere = ConfigSection(
         id="atmosphere",
-        title="🌬️ 群聊读空气",
+        title="群聊读空气",
         icon="wind",
         description="接管群聊自由接话、防抖等待与概率 / 频控门闸。",
         storage_group="atmosphere_config",
@@ -268,7 +268,7 @@ def build_sections() -> tuple[ConfigSection, ...]:
 
     memory = ConfigSection(
         id="memory",
-        title="🧠 记忆、RAG 与上下文预算",
+        title="记忆与上下文",
         icon="memory",
         description="三级记忆、语义去重、混合召回权重与上下文注入预算。",
         storage_group="memory_and_context_config",
@@ -338,7 +338,7 @@ def build_sections() -> tuple[ConfigSection, ...]:
 
     relationship = ConfigSection(
         id="relationship",
-        title="💝 用户关系与好感成长",
+        title="用户关系",
         icon="relations",
         description="L1→L2 自动晋升、好感度增益曲线与档案字段上限。",
         storage_group="relationship_config",
@@ -369,7 +369,7 @@ def build_sections() -> tuple[ConfigSection, ...]:
 
     surfing = ConfigSection(
         id="surfing",
-        title="📱 赛博冲浪与视频抓取",
+        title="冲浪抓取",
         icon="surf",
         description="视频源抓取、视觉看片评分与主动分享门槛（按角色的源开关在冲浪页设置）。",
         storage_group="surfing_config",

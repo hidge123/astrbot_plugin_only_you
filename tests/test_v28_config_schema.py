@@ -13,6 +13,7 @@
 
 import os
 import sys
+import unicodedata
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -83,6 +84,16 @@ class TestRuntimeConfigSchema(unittest.TestCase):
         assert fields["auto_promote_l2_min_interactions"].default == 40
         assert fields["auto_promote_l2_min_affinity"].default == 30.0
         assert not ({"core_user_ids", "important_user_ids"} & set(fields))
+
+    def test_section_titles_are_short_and_emoji_free(self):
+        """The Pages「设置」tab rail must stay scannable (no emoji, <= 8 chars)."""
+        for section in config_manager.SECTIONS:
+            title = section.title
+            assert 1 <= len(title) <= 8, (section.id, title)
+            assert not [ch for ch in title if unicodedata.category(ch) in ("So", "Sk", "Sm")], (
+                section.id,
+                title,
+            )
 
     def test_every_item_has_label_hint_and_legal_default(self):
         for section in config_manager.SECTIONS:

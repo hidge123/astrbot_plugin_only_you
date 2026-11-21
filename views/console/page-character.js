@@ -314,12 +314,26 @@
     S.card[sectionId][fieldKey] = value;
   }
 
+  /** tags / list 只有在至少一条非空内容时才算填写完成。 */
+  function isFieldFilled(field, value) {
+    var type = fieldType(field);
+    if (type === "tags" || type === "list") {
+      return (
+        Array.isArray(value) &&
+        value.some(function (item) {
+          return String(item == null ? "" : item).trim() !== "";
+        })
+      );
+    }
+    return !isBlank(value);
+  }
+
   function completionOf(section) {
     var total = 0;
     var filled = 0;
     (section.fields || []).forEach(function (field) {
       total += 1;
-      if (!isBlank(getValue(section.id, field.key))) filled += 1;
+      if (isFieldFilled(field, getValue(section.id, field.key))) filled += 1;
     });
     return { filled: filled, total: total };
   }
@@ -532,8 +546,11 @@
     var disabled = readonly ? " readonly" : "";
 
     if (type === "textarea") {
+      var rows = num(field.rows, 3) || 3;
       return (
-        '<textarea class="textarea" rows="3"' +
+        '<textarea class="textarea" rows="' +
+        rows +
+        '"' +
         attrs +
         placeholder +
         disabled +
@@ -607,15 +624,60 @@
     }
     if (type === "list") {
       var items = Array.isArray(value) ? value : [];
+      var listRows = items
+        .map(function (item, index) {
+          var rowPlaceholder =
+            field.placeholder && index === 0 ? field.placeholder : "第 " + (index + 1) + " 条…";
+          return (
+            '<div class="list-row" data-list-row="' +
+            index +
+            '">' +
+            '<span class="list-index mono" aria-hidden="true">' +
+            (index + 1) +
+            "</span>" +
+            '<input class="input" type="text" data-role="list-input" data-list-item' +
+            attrs +
+            ' data-index="' +
+            index +
+            '" placeholder="' +
+            esc(rowPlaceholder) +
+            '" value="' +
+            esc(item) +
+            '"' +
+            disabled +
+            " />" +
+            '<button class="icon-btn btn-sm" type="button" data-action="remove-list-item" data-section="' +
+            esc(section.id) +
+            '" data-field="' +
+            esc(field.key) +
+            '" data-index="' +
+            index +
+            '" data-tip="删除第 ' +
+            (index + 1) +
+            ' 条" aria-label="删除第 ' +
+            (index + 1) +
+            ' 条">' +
+            icon("trash", 13) +
+            "</button></div>"
+          );
+        })
+        .join("");
       return (
-        '<textarea class="textarea" rows="3" data-role="list-input"' +
-        attrs +
-        placeholder +
-        disabled +
-        ">" +
-        esc(items.join("\n")) +
-        "</textarea>" +
-        '<div class="field-help">每行一条，保存时会自动整理为列表</div>'
+        '<div class="list-editor" data-list-editor="' +
+        esc(section.id + "." + field.key) +
+        '">' +
+        (listRows ||
+          '<div class="field-help">还没有内容，点下方「添加一条」开始。</div>') +
+        '<div class="list-editor-foot">' +
+        '<button class="btn btn-outline btn-sm" type="button" data-action="add-list-item" data-section="' +
+        esc(section.id) +
+        '" data-field="' +
+        esc(field.key) +
+        '">' +
+        icon("plus", 13) +
+        "添加一条</button>" +
+        '<span class="field-help">回车新增一条；粘贴多行文本会自动拆分。</span>' +
+        "</div></div>"
       );
     }
     if (type === "dialogs") {
@@ -635,16 +697,16 @@
             '" placeholder="用户的话" value="' +
             esc(dialog.user) +
             '" />' +
-            '<div class="row">' +
-            '<input class="input input-sm grow" type="text" data-dialog="character" data-section="' +
+            '<div class="row dialog-reply-row">' +
+            '<textarea class="textarea dialog-reply" rows="2" data-dialog="character" data-section="' +
             esc(section.id) +
             '" data-field="' +
             esc(field.key) +
             '" data-index="' +
             index +
-            '" placeholder="角色的回复" value="' +
+            '" placeholder="角色的回复">' +
             esc(dialog.character) +
-            '" />' +
+            "</textarea>" +
             '<button class="icon-btn btn-sm" type="button" data-action="remove-dialog" data-section="' +
             esc(section.id) +
             '" data-field="' +
@@ -1261,6 +1323,25 @@
   /* ------------------------------------------------------------------ *
    * 保存 / 预览
    * ------------------------------------------------------------------ */
+  /** 保存前丢弃 tags / list 里的空行（后端也会过滤，这里保证完成度 / 脏检查一致）。 */
+  function cardForSave() {
+    var card = clone(S.card) || {};
+    S.schema.forEach(function (section) {
+      (section.fields || []).forEach(function (field) {
+        var type = fieldType(field);
+        if (type !== "tags" && type !== "list") return;
+        var data = card[section.id];
+        if (!data || !Array.isArray(data[field.key])) return;
+        data[field.key] = data[field.key]
+          .map(function (item) {
+            return String(item == null ? "" : item).trim();
+          })
+          .filter(Boolean);
+      });
+    });
+    return card;
+  }
+
   async function saveCard() {
     var app = S.app;
     if (!app) return;
@@ -1279,7 +1360,7 @@
     try {
       var data = await app.apiPost("card/save", {
         soul_id: S.soulId,
-        card: S.card
+        card: cardForSave()
       });
       var serverCard = data && data.soul && data.soul.card ? data.soul.card : S.card;
       S.card = normalizeWorkingCard(serverCard);
@@ -1700,7 +1781,17 @@
     if (type === "tags") return; /* tags 由 keydown 处理 */
     if (type === "dialogs") return; /* dialogs 由 data-dialog 处理 */
     var value = el.value;
-    if (type === "list") value = splitLines(value);
+    if (type === "list") {
+      var itemIndex = parseInt(el.getAttribute("data-index"), 10);
+      var items = getValue(sectionId, fieldKey);
+      if (!Array.isArray(items)) items = [];
+      if (isNaN(itemIndex) || itemIndex < 0) itemIndex = items.length;
+      items[itemIndex] = String(value == null ? "" : value);
+      setValue(sectionId, fieldKey, items);
+      S.dirty = computeDirty();
+      refreshSavebar();
+      return;
+    }
     setValue(sectionId, fieldKey, value);
     S.dirty = computeDirty();
     if (sectionId === "identity" && fieldKey === "avatar") updateAvatarPreviews();
@@ -1796,6 +1887,93 @@
     refreshSavebar();
   }
 
+  function focusListItem(sectionId, fieldKey, index) {
+    if (!S.container) return;
+    var selector =
+      '[data-list-editor="' +
+      sectionId +
+      "." +
+      fieldKey +
+      '"] [data-list-item][data-index="' +
+      index +
+      '"]';
+    var next = S.container.querySelector(selector);
+    if (!next) return;
+    try {
+      next.focus();
+    } catch (err) {
+      /* ignore */
+    }
+  }
+
+  function addListItem(buttonEl) {
+    var sectionId = buttonEl.getAttribute("data-section");
+    var fieldKey = buttonEl.getAttribute("data-field");
+    var items = getValue(sectionId, fieldKey);
+    if (!Array.isArray(items)) items = [];
+    var index = items.length;
+    items.push("");
+    setValue(sectionId, fieldKey, items);
+    S.dirty = computeDirty();
+    refreshField(sectionId, fieldKey);
+    refreshSavebar();
+    focusListItem(sectionId, fieldKey, index);
+  }
+
+  function insertListItem(sectionId, fieldKey, index) {
+    var items = getValue(sectionId, fieldKey);
+    if (!Array.isArray(items)) items = [];
+    items.splice(index, 0, "");
+    setValue(sectionId, fieldKey, items);
+    S.dirty = computeDirty();
+    refreshField(sectionId, fieldKey);
+    refreshSavebar();
+    focusListItem(sectionId, fieldKey, index);
+  }
+
+  function removeListItem(buttonEl) {
+    var sectionId = buttonEl.getAttribute("data-section");
+    var fieldKey = buttonEl.getAttribute("data-field");
+    var index = parseInt(buttonEl.getAttribute("data-index"), 10);
+    var items = getValue(sectionId, fieldKey);
+    if (!Array.isArray(items)) return;
+    if (isNaN(index) || index < 0 || index >= items.length) return;
+    items.splice(index, 1);
+    setValue(sectionId, fieldKey, items);
+    S.dirty = computeDirty();
+    refreshField(sectionId, fieldKey);
+    refreshSavebar();
+    if (items.length) {
+      focusListItem(sectionId, fieldKey, Math.min(index, items.length - 1));
+    }
+  }
+
+  /** 多行粘贴 → 拆成多条列表项（从当前行替换 / 插入）。 */
+  function handlePaste(event) {
+    var el = event.target;
+    if (!el || !el.getAttribute || el.getAttribute("data-field-type") !== "list") return;
+    var clipboard = event.clipboardData || window.clipboardData;
+    var clipboardText = clipboard ? clipboard.getData("text") : "";
+    if (!clipboardText || !/[\r\n]/.test(clipboardText)) return;
+    var parts = splitLines(clipboardText);
+    if (!parts.length) return;
+    event.preventDefault();
+    var sectionId = el.getAttribute("data-section");
+    var fieldKey = el.getAttribute("data-field");
+    var items = getValue(sectionId, fieldKey);
+    if (!Array.isArray(items)) items = [];
+    var index = parseInt(el.getAttribute("data-index"), 10);
+    if (isNaN(index) || index < 0 || index >= items.length) index = items.length;
+    var current = String(el.value || "").trim();
+    var replacement = current ? [current].concat(parts) : parts;
+    Array.prototype.splice.apply(items, [index, 1].concat(replacement));
+    setValue(sectionId, fieldKey, items);
+    S.dirty = computeDirty();
+    refreshField(sectionId, fieldKey);
+    refreshSavebar();
+    focusListItem(sectionId, fieldKey, index + replacement.length - 1);
+  }
+
   function handleKeydown(event) {
     var el = event.target;
     if (!el || !el.getAttribute) return;
@@ -1809,6 +1987,35 @@
       return;
     }
     var type = el.getAttribute("data-field-type");
+    if (type === "list") {
+      var listSectionId = el.getAttribute("data-section");
+      var listFieldKey = el.getAttribute("data-field");
+      if (!listSectionId || !listFieldKey) return;
+      var listItems = getValue(listSectionId, listFieldKey);
+      if (!Array.isArray(listItems)) return;
+      var listIndex = parseInt(el.getAttribute("data-index"), 10);
+      if (isNaN(listIndex) || listIndex < 0 || listIndex >= listItems.length) return;
+      var composing = event.isComposing || event.keyCode === 229;
+      if (event.key === "Enter" && !composing) {
+        event.preventDefault();
+        insertListItem(listSectionId, listFieldKey, listIndex + 1);
+      } else if (event.key === "Backspace" && !el.value) {
+        event.preventDefault();
+        listItems.splice(listIndex, 1);
+        setValue(listSectionId, listFieldKey, listItems);
+        S.dirty = computeDirty();
+        refreshField(listSectionId, listFieldKey);
+        refreshSavebar();
+        if (listItems.length) {
+          focusListItem(
+            listSectionId,
+            listFieldKey,
+            Math.min(listIndex, listItems.length - 1)
+          );
+        }
+      }
+      return;
+    }
     if (type !== "tags") return;
     var key = event.key;
     if (key === "Enter" || key === "," || key === "，" || key === "、" || key === "/") {
@@ -1883,6 +2090,10 @@
       addDialog(actionEl);
     } else if (action === "remove-dialog") {
       removeDialog(actionEl);
+    } else if (action === "add-list-item") {
+      addListItem(actionEl);
+    } else if (action === "remove-list-item") {
+      removeListItem(actionEl);
     } else if (action === "upload-profile-avatar" || action === "upload-avatar") {
       uploadAvatar();
     } else if (action === "clear-avatar") {
@@ -1903,6 +2114,7 @@
       }
     });
     container.addEventListener("keydown", handleKeydown);
+    container.addEventListener("paste", handlePaste);
     container.addEventListener(
       "focusout",
       function (event) {

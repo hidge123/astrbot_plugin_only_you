@@ -1657,10 +1657,10 @@
       '<input class="input" type="text" data-role="group-name" maxlength="64" value="' +
       esc(group.display_name) +
       '" /></label>' +
-      '<label class="field"><span class="field-label">群备注 <span class="mono muted">notes</span></span>' +
-      '<input class="input" type="text" data-role="group-notes" maxlength="200" value="' +
+      '<div class="field is-full"><span class="field-label">群备注 <span class="mono muted">notes</span></span>' +
+      '<textarea class="input textarea" rows="2" data-role="group-notes" maxlength="200" placeholder="例如：酒狐的主场群，晚上最热闹">' +
       esc(group.notes) +
-      '" placeholder="例如：酒狐的主场群，晚上最热闹" /></label>' +
+      "</textarea></div>" +
       proactiveSwitchHtml(
         "group-proactive-enabled",
         proactiveEnabledOf(group),

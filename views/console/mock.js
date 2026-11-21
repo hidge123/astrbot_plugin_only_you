@@ -312,7 +312,7 @@
       title: "外貌形象",
       fields: [
         field("appearance", "外貌描述", "textarea", "发色、瞳色、身高、常穿的衣服……"),
-        field("outfit_style", "穿衣风格", "text", "如：宽松卫衣 + 帆布鞋")
+        field("outfit_style", "穿衣风格", "textarea", "如：宽松卫衣 + 帆布鞋")
       ]
     },
     {
@@ -321,10 +321,10 @@
       fields: [
         field("personality_tags", "性格标签", "tags", "回车添加，如：嘴硬心软"),
         field("mbti", "MBTI", "select", "", "", { options: MBTI_OPTIONS }),
-        field("strengths", "优点", "text", "如：共情能力强、记性好"),
-        field("weaknesses", "缺点", "text", "如：拖延、起床气"),
+        field("strengths", "优点", "textarea", "如：共情能力强、记性好"),
+        field("weaknesses", "缺点", "textarea", "如：拖延、起床气"),
         field("temperament", "情绪与脾气", "textarea", "什么时候会炸毛、怎么哄……"),
-        field("values", "价值观", "text", "如：真诚比聪明重要")
+        field("values", "价值观", "textarea", "如：真诚比聪明重要")
       ]
     },
     {
@@ -332,8 +332,8 @@
       title: "背景故事",
       fields: [
         field("growth_story", "成长经历", "textarea", "从小到大影响最深的经历……"),
-        field("family", "家庭", "text", "家庭成员与关系"),
-        field("key_experiences", "重要经历", "text", "如：大学时组过乐队")
+        field("family", "家庭", "textarea", "家庭成员与关系"),
+        field("key_experiences", "重要经历", "textarea", "如：大学时组过乐队")
       ]
     },
     {
@@ -341,8 +341,8 @@
       title: "兴趣喜好",
       fields: [
         field("hobbies", "爱好", "tags", "回车添加，如：摄影"),
-        field("likes", "喜欢的东西", "text", "如：冰美式、下雨天"),
-        field("dislikes", "讨厌的东西 / 雷点", "text", "如：被已读不回"),
+        field("likes", "喜欢的东西", "textarea", "如：冰美式、下雨天"),
+        field("dislikes", "讨厌的东西 / 雷点", "textarea", "如：被已读不回"),
         field("surfing_preferences", "冲浪偏好", "tags", "回车添加，如：搞笑整活")
       ]
     },
@@ -351,7 +351,7 @@
       title: "说话方式",
       fields: [
         field("speaking_style", "整体风格", "textarea", "如：口语化短句，像微信好友一样自然"),
-        field("catchphrases", "口头禅", "list", "每行一句，如：真的假的"),
+        field("catchphrases", "口头禅", "list", "例如：真的假的", "一行一条；回车新增，支持粘贴多行自动拆分"),
         field("verbal_tics", "常用语气词 / 颜文字", "text", "如：hhh、呜呜、awa"),
         field("punctuation_habit", "标点习惯", "text", "如：很少用句号，爱用省略号"),
         field("reply_length", "回复长度偏好", "select", "", "", {
@@ -362,7 +362,7 @@
             { value: "long", label: "长（可以多段展开）" }
           ]
         }),
-        field("banned_expressions", "禁用表达", "list", "每行一条，如：作为 AI")
+        field("banned_expressions", "禁用表达", "list", "例如：作为 AI", "一行一条；回车新增，支持粘贴多行自动拆分")
       ]
     },
     {
@@ -370,7 +370,7 @@
       title: "社交关系",
       fields: [
         /* v2.6：按等级的固定态度已移除，改为在「关系页」为用户逐个设置专属 attitude */
-        field("group_role", "群聊中的角色定位", "text", "如：气氛组 / 潜水员 / 百科")
+        field("group_role", "群聊中的角色定位", "textarea", "如：气氛组 / 潜水员 / 百科")
       ]
     },
     {
@@ -399,7 +399,7 @@
       title: "补充设定",
       fields: [
         field("extra_notes", "自由补充", "textarea", "任何想补充的设定"),
-        field("native_persona_prompt", "原生人设原文（只读）", "textarea", "从 AstrBot Persona 导入时的原始文本", "只读：记录导入来源，不参与 Prompt 渲染", { readonly: true })
+        field("native_persona_prompt", "原生人设原文（只读）", "textarea", "从 AstrBot Persona 导入时的原始文本", "只读：记录导入来源，不参与 Prompt 渲染", { readonly: true, rows: 8 })
       ]
     }
   ];
@@ -577,7 +577,7 @@
   var MOCK_SETTINGS_SECTIONS = [
     {
       id: "schedule",
-      title: "⏱️ 运行节奏与日程",
+      title: "运行节奏",
       icon: "calendar",
       description: "后台心跳节拍、24h 动态时间轴与日程微调的全局参数。",
       group: "roguelite_schedule_config",
@@ -602,7 +602,7 @@
     },
     {
       id: "proactive",
-      title: "💬 主动搭话与未读补回",
+      title: "主动搭话",
       icon: "message",
       description: "闲逛主动搭话、翻群吃瓜与私聊未读补回的概率、冷却与预算。",
       group: "roguelite_schedule_config",
@@ -631,7 +631,7 @@
     },
     {
       id: "atmosphere",
-      title: "🌬️ 群聊读空气",
+      title: "群聊读空气",
       icon: "wind",
       description: "接管群聊自由接话、防抖等待与概率 / 频控门闸。",
       group: "atmosphere_config",
@@ -646,7 +646,7 @@
     },
     {
       id: "memory",
-      title: "🧠 记忆、RAG 与上下文预算",
+      title: "记忆与上下文",
       icon: "memory",
       description: "三级记忆、语义去重、混合召回权重与上下文注入预算。",
       group: "memory_and_context_config",
@@ -683,7 +683,7 @@
     },
     {
       id: "relationship",
-      title: "💝 用户关系与好感成长",
+      title: "用户关系",
       icon: "relations",
       description: "L1→L2 自动晋升、好感度增益曲线与档案字段上限。",
       group: "relationship_config",
@@ -702,7 +702,7 @@
     },
     {
       id: "surfing",
-      title: "📱 赛博冲浪与视频抓取",
+      title: "冲浪抓取",
       icon: "surf",
       description: "视频源抓取、视觉看片评分与主动分享门槛（按角色的源开关在冲浪页设置）。",
       group: "surfing_config",

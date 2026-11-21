@@ -238,6 +238,111 @@
     );
   }
 
+  /** 关键词列表：chip 编辑器（回车 / 逗号添加，× 删除）。 */
+  function settingsListEditorHtml(sectionId, field, value) {
+    var items = Array.isArray(value) ? value : [];
+    var chips = items
+      .map(function (item, index) {
+        return (
+          '<span class="tag">' +
+          esc(item) +
+          '<button class="tag-remove" type="button" data-action="remove-settings-list-item" data-index="' +
+          index +
+          '" aria-label="删除第 ' +
+          (index + 1) +
+          ' 项">' +
+          icon("close", 9) +
+          "</button></span>"
+        );
+      })
+      .join("");
+    return (
+      '<div class="settings-list-wrap" data-role="settings-list-wrap" data-section="' +
+      esc(sectionId) +
+      '" data-key="' +
+      esc(field.key) +
+      '">' +
+      '<div class="tag-editor">' +
+      chips +
+      '<input class="tag-input" type="text" data-role="settings-list-input" placeholder="' +
+      (items.length ? "输入后回车添加" : esc(field.placeholder || "输入后回车添加")) +
+      '" />' +
+      "</div>" +
+      '<div class="field-help">输入后按回车（或逗号）添加；点 × 删除。</div></div>'
+    );
+  }
+
+  function refreshSettingsList(sectionId, fieldKey) {
+    if (!S.container) return null;
+    var wrap = S.container.querySelector(
+      '[data-role="settings-list-wrap"][data-section="' +
+        sectionId +
+        '"][data-key="' +
+        fieldKey +
+        '"]'
+    );
+    if (!wrap) return null;
+    var section = sectionById(sectionId);
+    var field = null;
+    (section.fields || []).forEach(function (item) {
+      if (item.key === fieldKey) field = item;
+    });
+    if (!field) return null;
+    var holder = document.createElement("div");
+    holder.innerHTML = settingsListEditorHtml(sectionId, field, S.values[sectionId][fieldKey]);
+    var next = holder.firstChild;
+    if (!next) return null;
+    wrap.parentNode.replaceChild(next, wrap);
+    var input = next.querySelector('[data-role="settings-list-input"]');
+    if (input) {
+      try {
+        input.focus();
+      } catch (err) {
+        /* ignore */
+      }
+    }
+    return next;
+  }
+
+  function addSettingsListItem(inputEl) {
+    if (!inputEl || !inputEl.closest) return;
+    var wrap = inputEl.closest('[data-role="settings-list-wrap"]');
+    if (!wrap) return;
+    var sectionId = wrap.getAttribute("data-section");
+    var fieldKey = wrap.getAttribute("data-key");
+    if (!sectionId || !fieldKey) return;
+    var parts = String(inputEl.value == null ? "" : inputEl.value)
+      .split(/[,，、\n]+/)
+      .map(function (part) {
+        return part.trim();
+      })
+      .filter(Boolean);
+    if (!parts.length) return;
+    var current = S.values[sectionId][fieldKey];
+    if (!Array.isArray(current)) current = [];
+    parts.forEach(function (part) {
+      if (current.indexOf(part) < 0) current.push(part);
+    });
+    S.values[sectionId][fieldKey] = current;
+    markFieldModified(sectionId, fieldKey);
+    refreshSettingsList(sectionId, fieldKey);
+  }
+
+  function removeSettingsListItem(buttonEl) {
+    if (!buttonEl || !buttonEl.closest) return;
+    var wrap = buttonEl.closest('[data-role="settings-list-wrap"]');
+    if (!wrap) return;
+    var sectionId = wrap.getAttribute("data-section");
+    var fieldKey = wrap.getAttribute("data-key");
+    var index = parseInt(buttonEl.getAttribute("data-index"), 10);
+    var current = S.values[sectionId][fieldKey];
+    if (!Array.isArray(current) || isNaN(index) || index < 0 || index >= current.length) return;
+    current.splice(index, 1);
+    S.values[sectionId][fieldKey] = current;
+    markFieldModified(sectionId, fieldKey);
+    refreshSettingsList(sectionId, fieldKey);
+  }
+
   function fieldControlHtml(section, field) {
     var sectionId = section.id;
     var value = (S.values[sectionId] || {})[field.key];
@@ -275,16 +380,7 @@
       );
     }
     if (field.type === "list") {
-      var list = Array.isArray(value) ? value : [];
-      return (
-        '<textarea class="textarea settings-textarea" rows="2" data-section="' +
-        esc(sectionId) +
-        '" data-key="' +
-        esc(field.key) +
-        '" data-value-type="list" placeholder="用逗号分隔，例如：急, 救命, 大瓜">' +
-        esc(list.join(", ")) +
-        "</textarea>"
-      );
+      return settingsListEditorHtml(sectionId, field, value);
     }
     if (field.type === "object") return objectInputHtml(sectionId, field, value);
     if (field.type === "ratios") return ratiosInputHtml(sectionId, field, value);
@@ -580,6 +676,8 @@
         });
         S.showAdvanced[S.activeSection] = hasAdvanced ? !S.showAdvanced[S.activeSection] : false;
         paint(container, app);
+      } else if (action === "remove-settings-list-item") {
+        removeSettingsListItem(actionEl);
       } else if (action === "toggle-secret") {
         var key = actionEl.getAttribute("data-target-key");
         var input = container.querySelector(
@@ -599,6 +697,17 @@
       }
     };
     container.onkeydown = function (event) {
+      var target = event.target;
+      if (
+        target &&
+        target.getAttribute &&
+        target.getAttribute("data-role") === "settings-list-input" &&
+        (event.key === "Enter" || event.key === "," || event.key === "，" || event.key === "、")
+      ) {
+        event.preventDefault();
+        addSettingsListItem(target);
+        return;
+      }
       if ((event.metaKey || event.ctrlKey) && String(event.key).toLowerCase() === "s") {
         event.preventDefault();
         saveSettings(app, container);

@@ -964,6 +964,12 @@ html.dark .btn-primary {
   cursor: not-allowed;
 }
 
+.input[readonly],
+.textarea[readonly] {
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+
 .input.is-invalid,
 .textarea.is-invalid {
   border-color: var(--danger);
@@ -2736,7 +2742,56 @@ html.dark .sched-seg.is-clickable:hover {
 .dialog-row {
   display: grid;
   grid-template-columns: 1fr 1fr;
+  align-items: start;
   gap: 8px;
+}
+
+.dialog-reply-row {
+  align-items: flex-start;
+}
+
+.dialog-row .dialog-reply {
+  flex: 1;
+  min-width: 0;
+  min-height: 56px;
+  resize: vertical;
+}
+
+/* 角色卡 list 编辑器（口头禅 / 禁用表达等）：一行一条，可增删 / 回车追加 */
+.list-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.list-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.list-row .list-index {
+  flex: none;
+  width: 18px;
+  text-align: right;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.list-row .input {
+  flex: 1;
+  min-width: 0;
+}
+
+.list-row .icon-btn {
+  flex: none;
+}
+
+.list-editor-foot {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
 }
 
 .char-savebar {
@@ -5598,6 +5653,8 @@ html.dark .confirm-root .overlay-backdrop {
 }
 
 .settings-unit {
+  flex: 0 0 auto;
+  white-space: nowrap;
   font-size: 11px;
   color: var(--text-3);
 }
