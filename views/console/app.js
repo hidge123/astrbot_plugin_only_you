@@ -670,7 +670,8 @@
     if (!select) return;
     var state = this.state;
     var options = state.souls.map(function (soul) {
-      var label = (soul.name || soul.soul_id) + " · " + soul.soul_id;
+      // 顶栏选择器以配置文件标识（soul_id）为准，不再拼接角色名。
+      var label = soul.soul_id || soul.name || "";
       return (
         '<option value="' +
         esc(soul.soul_id) +
