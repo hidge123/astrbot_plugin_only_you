@@ -636,7 +636,7 @@
       '<div class="empty-text">' +
       (filtering
         ? "试试切换层级 / 关联用户，或清空搜索关键词。"
-        : "可以在会话页点「提炼」让决策模型从聊天滑窗里总结记忆，也可以手动新增一条。") +
+        : "可以在会话页点「提炼」让主模型从聊天滑窗里总结记忆，也可以手动新增一条。") +
       "</div>" +
       '<div class="row mt-12">' +
       '<button class="btn btn-outline" type="button" data-action="extract">' +
@@ -1043,7 +1043,7 @@
       '<select class="select" data-role="umo">' +
       options +
       "</select>" +
-      '<div class="field-help">调用决策模型从最近 15 轮对话中提炼值得长期记住的事实与偏好；不指定 UMO 时自动选择最近活跃会话。</div></div>' +
+      '<div class="field-help">调用主模型从最近 15 轮对话中提炼值得长期记住的事实与偏好；不指定 UMO 时自动选择最近活跃会话。</div></div>' +
       '<div class="card" style="background:var(--surface-2);border:0"><div class="card-body tight"><div class="text-xs muted">提示：提炼只读取会话滑窗，不会重复写入已有记忆；结果可以在列表里继续编辑、升降级或删除。</div></div></div>';
     app.modal({
       title: "从会话滑窗提炼记忆",

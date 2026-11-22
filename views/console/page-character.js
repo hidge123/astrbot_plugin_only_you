@@ -1495,7 +1495,7 @@
       '<label class="switch"><input type="checkbox" data-role="ai-card" /><span class="switch-track"></span></label></div>' +
       '<div class="switch-row"><div class="switch-row-text">' +
       '<span class="switch-row-title">同时生成行动卡 / 奇遇卡</span>' +
-      '<span class="switch-row-desc">用决策模型扩写该角色的 Roguelite 卡池</span></div>' +
+      '<span class="switch-row-desc">用主模型扩写该角色的 Roguelite 卡池</span></div>' +
       '<label class="switch"><input type="checkbox" data-role="auto-cards" checked /><span class="switch-track"></span></label></div>';
     app.modal({
       title: "从 AstrBot 导入 Persona",
