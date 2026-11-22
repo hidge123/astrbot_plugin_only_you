@@ -9,7 +9,7 @@
  *   POST `models/test` { role, soul_id? } → { status: "ok"|"error", role, latency_ms, reply | audio_base64 | error }
  *
  * v2.8：模型配置挂在 Soul 上（每个角色一套对话 / 主 / 决策 / 视觉等模型）。页面顶部展示当前角色，
- * 加载 / 自动保存都带 `soul_id`；切换角色后 app.js 会重渲染本页并重新拉取该角色的配置。
+ * 加载 / 保存都带 `soul_id`；切换角色后 app.js 会重渲染本页并重新拉取该角色的配置。
  *
  * 页面结构：基础卡片 —— 主模型（基模·必填）/ 对话 / 决策·读空气 / 视频解析 + 语音 TTS。
  * 聊天卡：模型来源模式下拉（独立配置 / 继承自主模型；决策与视觉还可继承对话模型）+「独立配置」时
@@ -51,7 +51,7 @@
       name: "决策模型",
       desc: "读空气 / 是否接话",
       icon: "activity",
-      help: "只做群聊读空气判断。默认继承主模型，也可独立配置通用聊天模型（输出 JSON 判定）；判断模型是可选模式，切换后不会自动改你的提供商源或模型名。"
+      help: "只做群聊读空气判断。默认继承主模型，也可独立配置通用聊天模型（输出 JSON 判定）；判断模型是可选模式，需先选择提供商源并填写判断模型名（如 ~typesafe/jev-latest），切换后不会自动改你的源或模型。"
     },
     vision: {
       name: "视频解析模型",
@@ -127,9 +127,6 @@
     status: {},
     candidates: {},
     busy: false,
-    autoSaveTimer: null,
-    autoSavePending: false,
-    autoSaveFailed: false,
     /* #7：文本输入只有 change / blur / Enter / 「应用」才保存 */
     pendingRoles: {},
     saveStates: {},
@@ -385,7 +382,7 @@
       return {
         cls: "light-err",
         text: "判断模型未就绪",
-        tip: info.label || "请补全判断模型与 API Key（提供商源或 OPENROUTER_API_KEY）"
+        tip: info.label || "请选择提供商源并填写判断模型"
       };
     }
     if (info.configured === false || info.mode === "unconfigured") {
@@ -460,19 +457,6 @@
    * ------------------------------------------------------------------ */
   function roleControlsHtml(role) {
     var cfg = S.cfg[role] || {};
-    var helper;
-    if (chatSources().length === 0) {
-      helper = "还没有可用的提供商源：请先在 AstrBot WebUI → 服务提供商里添加一个聊天模型源。";
-    } else if (role === "dialogue") {
-      helper =
-        "对话模型只负责聊天回复，建议选稳定、响应快的模型；可直接填写模型名，或点「拉取」读取候选模型，修改后自动保存并即时生效。";
-    } else if (role === "main") {
-      helper =
-        "主模型是基模：对话 / 决策 / 视觉默认继承它；建议选能力更强的模型，可直接填写模型名，或点「拉取」读取候选模型。";
-    } else {
-      helper =
-        "独立配置：使用本卡片的提供商源与模型；留空表示停用该角色（不会回退）。可直接填写模型名，或点「拉取」读取候选模型；修改后自动保存并即时生效。";
-    }
     return (
       '<div class="field"><span class="field-label">提供商源</span>' +
       '<select class="select" data-model-role="' +
@@ -496,9 +480,6 @@
       esc(role) +
       '">' +
       candidatesHtml(role) +
-      "</div>" +
-      '<div class="field-help">' +
-      esc(helper) +
       "</div></div>"
     );
   }
@@ -621,10 +602,7 @@
           );
         })
         .join("") +
-      "</select>" +
-      '<div class="field-help">' +
-      esc(descMap[role] || "") +
-      "</div></div>"
+      "</select></div>"
     );
   }
 
@@ -660,13 +638,7 @@
       "</strong>" +
       '<span class="mono text-sm">' +
       esc(configured ? pairLabel(parent.source_id, parent.model) : "未配置，该角色将停用") +
-      "</span></div>" +
-      '<div class="field-help mt-8">' +
-      esc(
-        "继承模式下该角色直接复用父角色当前生效的提供商源与模型，独立选择器已折叠；切回「独立配置」即可单独指定（留空表示停用该角色）。" +
-          chainNote
-      ) +
-      "</div></div></div></div>"
+      "</span></div></div></div></div>"
     );
   }
 
@@ -696,7 +668,7 @@
           );
         })
         .join("") +
-      '</div><div class="field-help">通用模型：任意聊天模型，读空气 Prompt 输出 JSON；判断模型：OpenRouter Decisions API（Jev 等 System-One 模型）返回概率，不生成文本。</div></div>'
+      "</div></div>"
     );
   }
 
@@ -711,8 +683,7 @@
       '" />' +
       '<span class="slider-value" data-role="decision-threshold-value">' +
       Math.round(threshold * 100) +
-      "%</span></div>" +
-      '<div class="field-help">判断模型给出 REPLY 的概率达到该阈值才会接话，默认 50%。调高更克制，调低更活跃。</div></div>'
+      "%</span></div></div>"
     );
   }
 
@@ -739,8 +710,7 @@
       esc(role) +
       '" data-model-field="source_id">' +
       sourceOptionsHtml(cfg.source_id, true) +
-      "</select>" +
-      '<div class="field-help">源可留空：留空时读取环境变量 <code>OPENROUTER_API_KEY</code>；Jev 等模型需选择 OpenRouter 或兼容 Decisions API 的网关。判断模型不会创建聊天实例。</div></div>' +
+      "</select></div>" +
       '<div class="field mt-12"><span class="field-label">判断模型名</span>' +
       '<input class="input" type="text" list="decision-model-options" data-model-role="' +
       esc(role) +
@@ -749,8 +719,7 @@
       '" placeholder="~typesafe/jev-latest" />' +
       '<datalist id="decision-model-options">' +
       datalist +
-      "</datalist>" +
-      '<div class="field-help">Decisions 模型示例：<code>~typesafe/jev-latest</code>、<code>typesafe/jev-1.14</code>，或 GPT-6 Luna / Clef / D1；通用模型请切回「通用模型（JSON 判定）」，默认决策模型继承主模型。</div></div>' +
+      "</datalist></div>" +
       decisionThresholdHtml(role)
     );
   }
@@ -773,13 +742,14 @@
     if (state === "error") {
       return {
         cls: "is-error",
-        text: S.saveErrors[role] || "保存失败 · 点击应用重试"
+        text: "保存失败",
+        tip: S.saveErrors[role] || "点击「应用」重试"
       };
     }
-    if (state === "saving" || S.autoSavePending) {
+    if (state === "saving") {
       return { cls: "is-saving", text: "保存中…" };
     }
-    if (pending) return { cls: "is-pending", text: "待应用" };
+    if (pending) return { cls: "is-pending", text: "待保存" };
     return { cls: "is-saved", text: "已生效" };
   }
 
@@ -791,7 +761,9 @@
       meta.cls +
       '" data-role="model-save-' +
       esc(role) +
-      '">' +
+      '"' +
+      (meta.tip ? ' data-tip="' + esc(meta.tip) + '"' : "") +
+      '>' +
       esc(meta.text) +
       "</span>" +
       '<button class="btn btn-outline btn-xs" type="button" data-action="apply-role" data-role-key="' +
@@ -799,6 +771,17 @@
       '">' +
       icon("check", 12) +
       "应用</button></div>"
+    );
+  }
+
+  function helpButtonHtml(role) {
+    var meta = roleMeta(role);
+    return (
+      '<button type="button" class="model-help" data-tip="' +
+      esc(meta.help) +
+      '" aria-label="' +
+      esc(meta.name + "说明") +
+      '">?</button>'
     );
   }
 
@@ -820,7 +803,9 @@
       (role === "main" ? '<span class="tag tag-danger" style="margin-left:6px">基模 · 必填</span>' : "") +
       '</span><span class="model-role-desc">' +
       esc(meta.desc) +
-      "</span></div></div>" +
+      "</span></div>" +
+      helpButtonHtml(role) +
+      "</div>" +
       cardSaveToolsHtml(role) +
       '<div class="model-status"' +
       statusStyle +
@@ -848,14 +833,11 @@
       '">' +
       icon("zap", 13) +
       "测试连接</button>" +
-      '<span class="hint">测试使用当前已即时生效的配置（如刚修改会自动先保存）。</span></div>' +
+      '<span class="hint">测试使用已保存的配置；有修改请先点击「应用」。</span></div>' +
       '<div data-role="test-wrap-' +
       esc(role) +
       '">' +
       testResultHtml(role) +
-      "</div>" +
-      '<div class="field-help mt-8">' +
-      esc(meta.help) +
       "</div></div></section>"
     );
   }
@@ -920,10 +902,7 @@
         esc(role) +
         '">' +
         candidatesHtml(role) +
-        "</div>" +
-        '<div class="field-help">插件会按 (提供商源, 模型) 复用已加载实例，否则自建 ' +
-        esc(role) +
-        " 实例；修改后自动保存并即时生效。</div></div>"
+        "</div></div>"
       );
     }
     var options = '<option value="">— 选择 AstrBot ' + esc(roleName) + " —</option>";
@@ -959,10 +938,7 @@
       esc(role) +
       '" data-vector-field="provider_id">' +
       options +
-      "</select>" +
-      '<div class="field-help">复用 AstrBot WebUI → 服务提供商里已启用的' +
-      (isEmbedding ? "嵌入" : "重排") +
-      "实例；关闭卡片即停用该角色。</div></div>"
+      "</select></div>"
     );
   }
 
@@ -982,7 +958,9 @@
       esc(meta.name) +
       '</span><span class="model-role-desc">' +
       esc(meta.desc) +
-      "</span></div></div>" +
+      "</span></div>" +
+      helpButtonHtml(role) +
+      "</div>" +
       cardSaveToolsHtml(role) +
       '<div class="model-status" data-tip="' +
       esc(info.tip) +
@@ -1008,7 +986,7 @@
           "</button>"
         );
       }).join("") +
-      '</div><div class="field-help">关闭：降级 / 不调用；提供商源：按 (源, 模型) 自建或复用；AstrBot 提供商：直接复用平台已启用实例。</div></div>' +
+      "</div></div>" +
       '<div data-role="vector-detail-' +
       esc(role) +
       '" class="mt-12">' +
@@ -1024,9 +1002,6 @@
       esc(role) +
       '">' +
       testResultHtml(role) +
-      "</div>" +
-      '<div class="field-help mt-8">' +
-      esc(meta.help) +
       "</div></div></section>"
     );
   }
@@ -1058,8 +1033,7 @@
         '<div class="field mt-12"><span class="field-label">音色 voice</span>' +
         '<input class="input" type="text" data-tts-field="voice" value="' +
         esc(tts.voice) +
-        '" placeholder="例如：alloy / zh-CN-XiaoxiaoNeural" />' +
-        '<div class="field-help">插件会用该提供商源的 api_base / key 自建 openai_tts_api 实例，音色写入 openai-tts-voice。</div></div>';
+        '" placeholder="例如：alloy / zh-CN-XiaoxiaoNeural" /></div>';
     } else if (mode === "provider") {
       var options = '<option value="">— 选择 AstrBot TTS 提供商 —</option>';
       var providerMatched = false;
@@ -1088,8 +1062,7 @@
         '<div class="field"><span class="field-label">AstrBot TTS 提供商</span>' +
         '<select class="select" data-tts-field="provider_id">' +
         options +
-        "</select>" +
-        '<div class="field-help">直接复用 AstrBot 已安装的 TTS 提供商实例（edge_tts / dashscope_tts 等）。</div></div>';
+        "</select></div>";
     }
     return (
       detail +
@@ -1100,8 +1073,7 @@
       '" />' +
       '<span class="slider-value" data-role="probability-value">' +
       Math.round(clamp(tts.probability, 0, 1) * 100) +
-      "%</span></div>" +
-      '<div class="field-help">每次回复按该概率决定是否把文字转成语音发送。</div></div>' +
+      "%</span></div></div>" +
       '<div class="field mt-12"><span class="field-label">生效范围</span>' +
       '<div class="segmented" data-role="tts-scope-seg">' +
       TTS_SCOPES.map(function (item) {
@@ -1115,10 +1087,10 @@
           "</button>"
         );
       }).join("") +
-      '</div><div class="field-help">私聊 = 仅好友私聊；仅L3 = 只给 ★L3 核心用户；全部 = 任何会话。</div></div>' +
+      "</div></div>" +
       '<div class="switch-row"><div class="switch-row-text">' +
       '<span class="switch-row-title">语音 + 文字双发</span>' +
-      '<span class="switch-row-desc">开启后同时保留原文字消息；关闭则只发语音。若在 AstrBot 里也开了原生 TTS，请勿开启双发以免重复播报。</span></div>' +
+      '<span class="switch-row-desc">同时保留原文字消息；关闭则只发语音。</span></div>' +
       '<label class="switch"><input type="checkbox" data-tts-field="dual_output"' +
       (tts.dual_output ? " checked" : "") +
       ' /><span class="switch-track"></span></label></div>'
@@ -1139,7 +1111,9 @@
       esc(meta.name) +
       '</span><span class="model-role-desc">' +
       esc(meta.desc) +
-      "</span></div></div>" +
+      "</span></div>" +
+      helpButtonHtml("tts") +
+      "</div>" +
       cardSaveToolsHtml("tts") +
       '<div class="model-status" data-tip="' +
       esc(info.tip) +
@@ -1162,7 +1136,7 @@
           "</button>"
         );
       }).join("") +
-      '</div><div class="field-help">关闭：不合成语音；提供商源：插件自建 OpenAI 兼容 TTS；AstrBot TTS：复用平台提供商。</div></div>' +
+      "</div></div>" +
       '<div data-role="tts-detail">' +
       ttsDetailHtml() +
       "</div></div>" +
@@ -1176,9 +1150,6 @@
       '<span class="hint">使用当前配置合成「你好呀，我是 OnlyYou」。</span></div>' +
       '<div data-role="test-wrap-tts">' +
       testResultHtml("tts") +
-      "</div>" +
-      '<div class="field-help mt-8">' +
-      esc(meta.help) +
       "</div></div></div></div>" +
       "</div></div></section>"
     );
@@ -1229,7 +1200,10 @@
       "模型" +
       '<span class="card-sub">当前角色：' +
       esc(currentSoulLabel()) +
-      " · 主模型为基模，对话 / 决策 / 视觉默认继承 · 修改即时生效</span></h1></div>" +
+      " · 主模型为基模，对话 / 决策 / 视觉默认继承 · 修改后点击保存生效</span></h1>" +
+      '<button class="btn btn-primary btn-sm" type="button" data-action="save-config">' +
+      icon("check", 13) +
+      "保存全部</button></div>" +
       soulBannerHtml() +
       bannerHtml() +
       '<div class="model-grid model-grid-chat">' +
@@ -1275,47 +1249,68 @@
     });
   }
 
-  /**
-   * 防抖自动保存：任何模型配置修改停下约 0.7s 后自动 POST models/config，
-   * 让「选源 / 模型 / 来源模式 / TTS」修改即时生效，无需手动点保存。
-   */
-  function scheduleAutoSave() {
-    if (S.destroyed) return;
-    if (S.autoSaveTimer) clearTimeout(S.autoSaveTimer);
-    S.autoSaveTimer = null;
-    S.autoSavePending = true;
-    refreshSaveBadges();
-    S.autoSaveTimer = setTimeout(function () {
-      S.autoSaveTimer = null;
-      S.autoSavePending = false;
-      autoSaveConfig();
-    }, 700);
+  function roleDirty(role) {
+    if (!S.cfg || !S.savedCfg) return false;
+    try {
+      return JSON.stringify(S.cfg[role]) !== JSON.stringify(S.savedCfg[role]);
+    } catch (err) {
+      return true;
+    }
   }
 
-  /** 保存前完整性校验（#7）：选了源却没填模型时不要向后端发送重建请求。 */
+  function markPending(role) {
+    if (!role || !S.cfg || !S.cfg[role]) return;
+    if (!roleDirty(role)) {
+      delete S.pendingRoles[role];
+      delete S.saveErrors[role];
+      S.saveStates[role] = "saved";
+    } else {
+      S.pendingRoles[role] = true;
+      delete S.saveErrors[role];
+      S.saveStates[role] = "pending";
+    }
+    refreshSaveBadges();
+  }
+
+  function markAllPending() {
+    if (!S.cfg) return;
+    CHAT_ROLES.concat(["tts"]).concat(VECTOR_ROLES).forEach(markPending);
+  }
+
+  /* 兼容旧调用点：修改字段只标记待保存，不再自动提交。 */
+  function scheduleAutoSave() {
+    if (S.destroyed) return;
+    markAllPending();
+  }
+
+  /** 保存前完整性校验。 */
   function validateRole(role) {
     if (!S.cfg) return "";
     if (CHAT_ROLES.indexOf(role) >= 0) {
       var cfg = S.cfg[role] || {};
       if (role === "decision" && str(cfg.mode) === "judge") {
+        if (!str(cfg.source_id)) return "请选择判断模型的提供商源";
         if (!str(cfg.model)) return "请填写判断模型名称（如 ~typesafe/jev-latest）";
         return "";
       }
       if (str(cfg.inherit_from)) return "";
       if (str(cfg.source_id) && !str(cfg.model)) return "请填写或选择模型名称";
+      if (str(cfg.model) && !str(cfg.source_id)) return "请选择提供商源";
       return "";
     }
     if (VECTOR_ROLES.indexOf(role) >= 0) {
       var vector = vectorMeta(role);
-      if (str(vector.mode) === "source" && str(vector.source_id) && !str(vector.model)) {
-        return "请填写或选择模型名称";
+      if (str(vector.mode) === "source") {
+        if (!str(vector.source_id)) return "请选择提供商源";
+        if (!str(vector.model)) return "请填写或选择模型名称";
       }
       return "";
     }
     if (role === "tts") {
       var tts = ttsMeta();
-      if (str(tts.mode) === "source" && str(tts.source_id) && !str(tts.model)) {
-        return "请填写 TTS 模型名称";
+      if (str(tts.mode) === "source") {
+        if (!str(tts.source_id)) return "请选择 TTS 提供商源";
+        if (!str(tts.model)) return "请填写 TTS 模型名称";
       }
       return "";
     }
@@ -1341,12 +1336,14 @@
         var meta = saveStateMeta(role);
         el.className = "model-save-badge " + meta.cls;
         el.textContent = meta.text;
+        if (meta.tip) el.setAttribute("data-tip", meta.tip);
+        else el.removeAttribute("data-tip");
       });
   }
 
-  /** 「应用」按钮 / Enter / change：提交一个角色的文本编辑并触发保存。 */
+  /** 点击「应用」：只把该角色当前编辑提交到后端，其他未应用修改保留在页面上。 */
   function commitRole(role) {
-    if (!S.cfg) return;
+    if (!S.cfg || !S.cfg[role]) return false;
     var error = validateRole(role);
     if (error) {
       S.saveStates[role] = "error";
@@ -1355,89 +1352,93 @@
       if (S.app) S.app.toast(error, true);
       return false;
     }
-    delete S.pendingRoles[role];
-    delete S.saveErrors[role];
-    S.saveStates[role] = "saved";
-    refreshSaveBadges();
-    scheduleAutoSave();
+    saveRole(role);
     return true;
   }
 
-  async function autoSaveConfig() {
+  /**
+   * 保存一个角色。以服务端已保存配置为基底，只覆盖该角色，避免把其他角色
+   * 尚未点击「应用」的编辑一起提交。
+   */
+  async function saveRole(role) {
+    if (!S.app || !S.cfg || S.busy || S.destroyed) return;
+    var base = clone(S.savedCfg || normalizeConfig({}));
+    base[role] = clone(S.cfg[role]);
+    await persistConfig(base, role);
+  }
+
+  async function persistConfig(payload, appliedRole) {
     var app = S.app;
-    if (!app || !S.cfg || S.destroyed) return;
-    if (S.busy) {
-      scheduleAutoSave();
-      return;
-    }
-    var invalid = firstValidationError();
-    if (invalid) {
-      S.saveStates[invalid.role] = "error";
-      S.saveErrors[invalid.role] = invalid.message;
-      S.autoSaveFailed = true;
-      refreshSaveBadges();
-      if (app) app.toast(invalid.message, true);
-      return;
-    }
-    if (!computeDirty()) {
-      S.autoSaveFailed = false;
-      refreshSaveBadges();
-      return;
-    }
-    var payload = clone(S.cfg);
-    var payloadJson = JSON.stringify(normalizeConfig(payload));
+    if (!app || S.destroyed || S.busy) return;
     S.busy = true;
-    CHAT_ROLES.concat(["tts"]).concat(VECTOR_ROLES).forEach(function (role) {
-      S.saveStates[role] = "saving";
-    });
-    refreshSaveBadges();
+    if (appliedRole && appliedRole !== "all") {
+      S.saveStates[appliedRole] = "saving";
+      refreshSaveBadges();
+    } else {
+      CHAT_ROLES.concat(["tts"]).concat(VECTOR_ROLES).forEach(function (role) {
+        S.saveStates[role] = "saving";
+      });
+      refreshSaveBadges();
+    }
     try {
       var data = await app.apiPost("models/config", configBody(payload));
       if (S.destroyed || !S.app) return;
-      var saved =
+      var server = normalizeConfig(
         data && data.model_config && typeof data.model_config === "object"
-          ? normalizeConfig(data.model_config)
-          : normalizeConfig(payload);
-      /* 关键：savedCfg 必须是深拷贝，否则与 S.cfg 共享引用，
-         后续编辑会同时改到 savedCfg，computeDirty() 永远为 false（自动保存失效）。 */
-      S.savedCfg = clone(saved);
-      /* 保存期间用户若继续编辑，保留其新改动继续下一轮自动保存 */
-      if (JSON.stringify(S.cfg) === payloadJson) S.cfg = saved;
-      /* 已成功落盘的文本编辑不再显示「待应用」 */
-      Object.keys(S.pendingRoles || {}).forEach(function (role) {
-        if (JSON.stringify(S.cfg[role]) === JSON.stringify(S.savedCfg[role])) {
-          delete S.pendingRoles[role];
+          ? data.model_config
+          : payload
+      );
+      var merged = normalizeConfig(S.cfg || {});
+      Object.keys(server).forEach(function (key) {
+        merged[key] = server[key];
+      });
+      if (appliedRole !== "all") {
+        CHAT_ROLES.concat(["tts"]).concat(VECTOR_ROLES).forEach(function (role) {
+          if (role !== appliedRole && S.pendingRoles[role]) {
+            merged[role] = clone(S.cfg[role]);
+          }
+        });
+      }
+      S.savedCfg = clone(server);
+      S.cfg = merged;
+      if (appliedRole === "all") {
+        S.pendingRoles = {};
+        S.saveErrors = {};
+      } else if (appliedRole) {
+        delete S.pendingRoles[appliedRole];
+        delete S.saveErrors[appliedRole];
+      }
+      CHAT_ROLES.concat(["tts"]).concat(VECTOR_ROLES).forEach(function (role) {
+        if (!S.pendingRoles[role]) {
+          S.saveStates[role] = "saved";
+          delete S.saveErrors[role];
         }
       });
       if (data && data.soul_id) S.soulId = String(data.soul_id);
       S.status =
         data && data.status && typeof data.status === "object" ? data.status : S.status;
       if (app.applyModelStatus) app.applyModelStatus(S.status);
-      S.autoSaveFailed = false;
-      CHAT_ROLES.concat(["tts"]).concat(VECTOR_ROLES).forEach(function (role) {
-        S.saveStates[role] = "saved";
-        delete S.saveErrors[role];
-      });
-      refreshStatusBadges();
-      refreshSaveBadges();
-      /* #7：成功不再每次刷屏 toast，状态徽章已经展示「已生效」 */
+      paint();
+      if (appliedRole && appliedRole !== "all") {
+        app.toast("已保存「" + roleMeta(appliedRole).name + "」配置");
+      } else {
+        app.toast("模型配置已保存");
+      }
     } catch (err) {
-      S.autoSaveFailed = true;
-      CHAT_ROLES.concat(["tts"]).concat(VECTOR_ROLES).forEach(function (role) {
-        S.saveStates[role] = "error";
-      });
+      if (appliedRole && appliedRole !== "all") {
+        S.saveStates[appliedRole] = "error";
+        S.saveErrors[appliedRole] = err.message || String(err);
+      } else {
+        CHAT_ROLES.concat(["tts"]).concat(VECTOR_ROLES).forEach(function (role) {
+          S.saveStates[role] = "error";
+          S.saveErrors[role] = err.message || String(err);
+        });
+      }
       refreshSaveBadges();
       if (app) app.toast("模型配置保存失败：" + (err.message || err), true);
     } finally {
       S.busy = false;
-      if (
-        S.app &&
-        !S.autoSaveFailed &&
-        computeDirty() &&
-        !Object.keys(S.pendingRoles).length
-      ) {
-        scheduleAutoSave();
-      }
+      refreshSaveBadges();
     }
   }
 
@@ -1644,7 +1645,8 @@
     var app = S.app;
     if (!app) return;
     if (computeDirty()) {
-      await autoSaveConfig();
+      app.toast("请先点击「应用」保存当前修改后再测试", true);
+      return;
     }
     if (buttonEl) buttonEl.classList.add("is-loading");
     renderTestResult(role, null);
@@ -1669,33 +1671,19 @@
   async function saveConfig() {
     var app = S.app;
     if (!app || S.busy) return;
-    if (!computeDirty()) {
-      app.toast("模型配置已即时生效，无需手动保存");
+    var invalid = firstValidationError();
+    if (invalid) {
+      S.saveStates[invalid.role] = "error";
+      S.saveErrors[invalid.role] = invalid.message;
+      refreshSaveBadges();
+      app.toast(invalid.message, true);
       return;
     }
-    S.busy = true;
-    var saveBtn = S.container ? S.container.querySelector('[data-action="save-config"]') : null;
-    if (saveBtn) saveBtn.classList.add("is-loading");
-    try {
-      var data = await app.apiPost("models/config", configBody(S.cfg));
-      if (S.destroyed || !S.app) return;
-      if (data && data.model_config && typeof data.model_config === "object") {
-        S.cfg = normalizeConfig(data.model_config);
-      }
-      if (data && data.soul_id) S.soulId = String(data.soul_id);
-      S.savedCfg = clone(S.cfg);
-      S.autoSaveFailed = false;
-      S.status = data && data.status && typeof data.status === "object" ? data.status : S.status;
-      if (app.applyModelStatus) app.applyModelStatus(S.status);
-      paint();
-      app.toast("模型配置已保存并即时生效");
-    } catch (err) {
-      app.toast("保存模型配置失败：" + (err.message || err), true);
-    } finally {
-      S.busy = false;
-      var nextBtn = S.container ? S.container.querySelector('[data-action="save-config"]') : null;
-      if (nextBtn) nextBtn.classList.remove("is-loading");
+    if (!computeDirty() && !Object.keys(S.pendingRoles).length) {
+      app.toast("没有需要保存的修改");
+      return;
     }
+    await persistConfig(clone(S.cfg), "all");
   }
 
   /* ------------------------------------------------------------------ *
@@ -1747,7 +1735,7 @@
       S.cfg.decision.mode = nextMode;
       if (nextMode === "judge" && str(S.cfg.decision.inherit_from)) {
         /* 判断模式必须显式指定判断模型，但绝不自动绑定 OpenRouter 或 Jev：
-           清空继承来的聊天模型，交给用户自己选源 / 填模型（源可留空走环境变量）。 */
+           清空继承来的聊天模型，交给用户自己选源 / 填模型。 */
         S.cfg.decision.inherit = false;
         S.cfg.decision.inherit_from = "";
         S.cfg.decision.source_id = "";
@@ -1782,10 +1770,7 @@
       refreshTtsDetail();
       scheduleAutoSave();
     } else if (action === "apply-role") {
-      var applyRole = actionEl.getAttribute("data-role-key");
-      if (applyRole && commitRole(applyRole)) {
-        S.app && S.app.toast("已应用「" + roleMeta(applyRole).name + "」配置");
-      }
+      commitRole(actionEl.getAttribute("data-role-key"));
     } else if (action === "expand-candidates") {
       var candRole = actionEl.getAttribute("data-role-key");
       if (candRole) {
@@ -1858,7 +1843,7 @@
           return;
         }
         refreshInheritPreviews();
-        commitRole(roleKey);
+        scheduleAutoSave();
         return;
       }
       refreshInheritPreviews();
@@ -1883,7 +1868,7 @@
           refreshSaveBadges();
           return;
         }
-        commitRole(vectorRole);
+        scheduleAutoSave();
         return;
       }
       scheduleAutoSave();
@@ -1922,7 +1907,7 @@
           refreshSaveBadges();
           return;
         }
-        commitRole("tts");
+        scheduleAutoSave();
       }
     }
   }
@@ -1973,9 +1958,6 @@
     S.status = {};
     S.candidates = {};
     S.busy = false;
-    S.autoSaveTimer = null;
-    S.autoSavePending = false;
-    S.autoSaveFailed = false;
     S.pendingRoles = {};
     S.saveStates = {};
     S.saveErrors = {};
@@ -2007,12 +1989,6 @@
 
   function destroy() {
     S.destroyed = true;
-    if (S.autoSaveTimer) {
-      clearTimeout(S.autoSaveTimer);
-      S.autoSaveTimer = null;
-    }
-    S.autoSavePending = false;
-    S.autoSaveFailed = false;
     S.pendingRoles = {};
     S.saveStates = {};
     S.saveErrors = {};
@@ -2037,9 +2013,9 @@
 
   window.OY_PAGES = window.OY_PAGES || {};
   function isDirty() {
-    /* #7：存在未应用的文本编辑 / 保存中 / 保存失败都提示离开确认。 */
     if (Object.keys(S.pendingRoles || {}).length > 0) return true;
-    return !!S.autoSavePending || !!S.autoSaveFailed || computeDirty();
+    if (Object.keys(S.saveErrors || {}).length > 0) return true;
+    return computeDirty();
   }
 
   window.OY_PAGES.models = {
