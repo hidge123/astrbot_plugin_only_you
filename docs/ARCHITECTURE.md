@@ -1,6 +1,6 @@
-# OnlyYou (只有你) —— 技术架构设计 (v3.0)
+# OnlyYou (只有你) —— 技术架构设计 (v3.1)
 
-> 适用版本：插件 **v3.0.0**（`metadata.yaml` / `main.py @register` 为版本真源）。
+> 适用版本：插件 **v3.1.0**（`metadata.yaml` / `main.py @register` 为版本真源）。
 > 本文只描述**当前实现**的架构、数据契约与运行机制；代码是最终真源，文档与代码冲突时以代码为准。
 > 生产升级、迁移校验、回滚与「清理 vs 保留」语义见 [`UPGRADE.md`](UPGRADE.md)。
 

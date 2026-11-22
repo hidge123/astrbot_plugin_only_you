@@ -1,9 +1,9 @@
-# OnlyYou 生产升级与迁移指南 (v3.0)
+# OnlyYou 生产升级与迁移指南 (v3.1)
 
-> 适用对象：从 **v2.6.x ~ v2.13.x** 升级到 **v3.0.0** 的 AstrBot 部署（更早版本按同一流程升级，但旧行动卡 / 日程会在 v2.9 清理规则下被重抽或丢弃）。
+> 适用对象：从 **v2.6.x ~ v3.0.x** 升级到 **v3.1.0** 的 AstrBot 部署（更早版本按同一流程升级，但旧行动卡 / 日程会在 v2.9 清理规则下被重抽或丢弃）。
 > 本文只写升级、迁移、校验、回滚与排障语义，不含真实服务器地址或密钥；命令中的 `$SERVER_IP`、`<数据目录>`、`/path/to/OnlyYou` 均为占位符。
-> 版本口径：插件 `v3.0.0`；Web API **34 条**（含 `settings/*` 三条）；控制台 **9 页**（含「设置」）；角色卡 **10 分区 / 36 字段**。
-> **版本基线**：3.0.0 起以 Major 作为配置 / 交互破坏性变更的分界；`_conf_schema.json` 退场、Pages「设置」成为唯一配置入口的契约从该版本起正式生效。从 v2.13.0 升级无额外迁移（代码一致，仅版本号不同）；从 v2.12.x 及更早升级会自动执行下表的旧配置迁移。
+> 版本口径：插件 `v3.1.0`；Web API **34 条**（含 `settings/*` 三条）；控制台 **9 页**（含「设置」）；角色卡 **10 分区 / 36 字段**。
+> **版本基线**：3.0.0 起以 Major 作为配置 / 交互破坏性变更的分界；`_conf_schema.json` 退场、Pages「设置」成为唯一配置入口的契约从该版本起正式生效。3.1.0 为 Minor：模型角色重排与模型页保存交互变化，旧配置自动迁移；从 v3.0.x 升级无需手工改库。从 v2.12.x 及更早升级会自动执行下表的旧配置迁移。
 
 ---
 
@@ -27,9 +27,19 @@
 | 12 | 旧 `memories.user_id` 裸平台 uid / 曾用名归并到 `global_uid`（v2.12） | 存在可唯一归属的裸 ID | `legacy_memory_user_ids_migrated_v1`（全部成功才写入；歧义行保持原样） |
 | 13 | `memories` 补 `tier1_since`（v2.12，纯加法） | 旧库缺列 | 无（幂等 `ALTER TABLE`，默认 `0`；旧 T1 回退 `created_at`） |
 | 14 | 旧 AstrBotConfig 非默认值 → `plugin_settings["runtime_config"]`（v3.0） | 首次启动且标记缺失 | `legacy_astrbot_config_migrated`（成功后写入；已由 Pages 保存的新值优先） |
-| 15 | 模型角色布局：旧 `main`→`dialogue`、旧 `decision`→`main`+`decision` | 旧配置缺 `dialogue` | `model_role_layout_migrated_v1`（每个 Soul 全部成功才写入） |
+| 15 | 模型角色布局 v1：旧 `main`→`dialogue`、旧 `decision`→`main`（对话为根的中间布局） | 旧配置缺 `dialogue` | `model_role_layout_migrated_v1`（每个 Soul 全部成功才写入） |
+| 16 | 模型角色布局 v2：`main` 作为基模，`dialogue` / `decision` / `vision` 默认继承 `main` | 对话为根 / 中间布局 | `model_role_layout_migrated_v2`（每个 Soul 全部成功才写入） |
 
 **关键原则**：一次性 flag 只有在**全部条目迁移成功**后才写入；失败保留未写入状态并记 warning「下次启动重试」，迁移逻辑本身幂等（已迁移项跳过，不会重复插入）。
+
+v3.1 的模型角色与交互变化（Minor）：
+
+- **主模型成为基模**：`main` 是唯一根配置，`dialogue` / `decision` / `vision` 默认继承 `main`；各角色仍可独立配置。
+- **职责拆分**：对话模型只负责聊天回复；主模型负责造卡、记忆提炼、行动卡、繁忙成果、主动消息等后台生成；决策模型只做读空气 / 是否接话。
+- **判断模型（可选）**：决策卡可切换「判断模型（Jev / Decisions API）」，需选择提供商源并填写判断模型名；通用 JSON 模式保持默认。
+- **角色自动迁移**：旧 `main`（对话）→ `dialogue`，旧 `decision`（混合）→ `main`；中间布局（对话为根）也会转为 `main` 基模，flag `model_role_layout_migrated_v2`。迁移保留各角色原有效模型，只改写旧布局配置。
+- **模型页交互**：修改配置只标记「待保存」，点击卡片「应用」或页头「保存全部」/ `Ctrl/Cmd+S` 后生效；测试按钮只使用已保存配置。
+- **回滚**：回退到 3.0.x 前请恢复 `/root/astrbot_backups/` 的插件目录与 `only_you.db` / `souls/` 备份。旧版只识别「对话为根」的模型配置，直接回退可能导致继承关系被误读。
 
 v3.0 的破坏性变化（配置系统统一）：
 
