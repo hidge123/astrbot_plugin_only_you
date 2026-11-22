@@ -51,7 +51,7 @@
       name: "决策模型",
       desc: "读空气 / 是否接话",
       icon: "activity",
-      help: "只做群聊读空气判断。可用通用聊天模型（输出 JSON 判定），也可切换为判断模型（OpenRouter Decisions API，如 Jev）返回概率结果；默认继承主模型。"
+      help: "只做群聊读空气判断。默认继承主模型，也可独立配置通用聊天模型（输出 JSON 判定）；判断模型是可选模式，切换后不会自动改你的提供商源或模型名。"
     },
     vision: {
       name: "视频解析模型",
@@ -413,19 +413,6 @@
     };
   }
 
-  /** 判断模型的默认提供商源：优先 api_base 指向 OpenRouter 的聊天源。 */
-  function judgeSourceId() {
-    for (var i = 0; i < (S.sources || []).length; i++) {
-      var source = S.sources[i] || {};
-      var providerType = str(source.provider_type);
-      if (providerType && providerType !== "chat_completion") continue;
-      if (str(source.api_base).toLowerCase().indexOf("openrouter.ai") >= 0) {
-        return str(source.id);
-      }
-    }
-    return "";
-  }
-
   function chatSources() {
     return S.sources.filter(function (source) {
       var providerType = str(source.provider_type);
@@ -752,7 +739,7 @@
       '" data-model-field="source_id">' +
       sourceOptionsHtml(cfg.source_id, true) +
       "</select>" +
-      '<div class="field-help">优先使用所选源的 API Key；未选择或源不是 OpenRouter 时读取环境变量 <code>OPENROUTER_API_KEY</code>。判断模型不会创建聊天实例。</div></div>' +
+      '<div class="field-help">源可留空：留空时读取环境变量 <code>OPENROUTER_API_KEY</code>；Jev 等模型需选择 OpenRouter 或兼容 Decisions API 的网关。判断模型不会创建聊天实例。</div></div>' +
       '<div class="field mt-12"><span class="field-label">判断模型名</span>' +
       '<input class="input" type="text" list="decision-model-options" data-model-role="' +
       esc(role) +
@@ -762,7 +749,7 @@
       '<datalist id="decision-model-options">' +
       datalist +
       "</datalist>" +
-      '<div class="field-help">OpenRouter Decisions 模型：<code>~typesafe/jev-latest</code>、<code>typesafe/jev-1.14</code>，或 GPT-6 Luna / Clef / D1 等 decisions 模型。</div></div>' +
+      '<div class="field-help">Decisions 模型示例：<code>~typesafe/jev-latest</code>、<code>typesafe/jev-1.14</code>，或 GPT-6 Luna / Clef / D1；通用模型请切回「通用模型（JSON 判定）」，默认决策模型继承主模型。</div></div>' +
       decisionThresholdHtml(role)
     );
   }
@@ -1755,20 +1742,13 @@
       if (DECISION_MODES.indexOf(nextMode) < 0) nextMode = "chat";
       if (!S.cfg.decision) return;
       S.cfg.decision.mode = nextMode;
-      if (nextMode === "judge") {
-        if (str(S.cfg.decision.inherit_from)) {
-          var inheritedDecision = effectivePair("decision");
-          S.cfg.decision.inherit = false;
-          S.cfg.decision.inherit_from = "";
-          if (!str(S.cfg.decision.source_id) && str(inheritedDecision.source_id)) {
-            S.cfg.decision.source_id = inheritedDecision.source_id;
-          }
-        }
-        var preferredSource = judgeSourceId();
-        if (preferredSource) S.cfg.decision.source_id = preferredSource;
-        if (!str(S.cfg.decision.model)) {
-          S.cfg.decision.model = "~typesafe/jev-latest";
-        }
+      if (nextMode === "judge" && str(S.cfg.decision.inherit_from)) {
+        /* 判断模式必须显式指定判断模型，但绝不自动绑定 OpenRouter 或 Jev：
+           清空继承来的聊天模型，交给用户自己选源 / 填模型（源可留空走环境变量）。 */
+        S.cfg.decision.inherit = false;
+        S.cfg.decision.inherit_from = "";
+        S.cfg.decision.source_id = "";
+        S.cfg.decision.model = "";
       }
       paint();
       scheduleAutoSave();
@@ -1777,13 +1757,13 @@
       var inheritedPair = effectivePair("decision");
       S.cfg.decision.inherit = false;
       S.cfg.decision.inherit_from = "";
-      var judgeSource = judgeSourceId();
-      if (judgeSource) {
-        S.cfg.decision.source_id = judgeSource;
-      } else if (str(inheritedPair.source_id)) {
+      /* 保留当前生效的源 / 模型，只解除继承；不擅自换成 Jev / OpenRouter。 */
+      if (!str(S.cfg.decision.source_id) && str(inheritedPair.source_id)) {
         S.cfg.decision.source_id = inheritedPair.source_id;
       }
-      S.cfg.decision.model = "~typesafe/jev-latest";
+      if (!str(S.cfg.decision.model) && str(inheritedPair.model)) {
+        S.cfg.decision.model = inheritedPair.model;
+      }
       paint();
       scheduleAutoSave();
     } else if (action === "set-tts-mode") {

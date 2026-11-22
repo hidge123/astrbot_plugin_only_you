@@ -1054,8 +1054,7 @@
       sources: [
         { id: "deepseek", type: "openai_chat_completion", provider_type: "chat_completion", provider: "DeepSeek", api_base: "https://api.deepseek.com/v1", has_key: true, enable: true },
         { id: "ailiyun", type: "openai_chat_completion", provider_type: "chat_completion", provider: "阿里云百炼", api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1", has_key: true, enable: true },
-        { id: "siliconflow", type: "openai_chat_completion", provider_type: "chat_completion", provider: "硅基流动", api_base: "https://api.siliconflow.cn/v1", has_key: false, enable: false },
-        { id: "openrouter", type: "openai_chat_completion", provider_type: "chat_completion", provider: "OpenRouter", api_base: "https://openrouter.ai/api/v1", has_key: true, enable: true }
+        { id: "siliconflow", type: "openai_chat_completion", provider_type: "chat_completion", provider: "硅基流动", api_base: "https://api.siliconflow.cn/v1", has_key: false, enable: false }
       ],
       ttsProviders: [
         { id: "edge_tts_default", model: "zh-CN-XiaoxiaoNeural", type: "edge_tts", enable: true },
