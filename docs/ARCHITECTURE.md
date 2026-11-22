@@ -399,7 +399,7 @@ SQLite `souls` 表（`soul_id / persona_hash / profile_json / updated_at / revis
 
 - `chat`（默认）：普通聊天模型接收读空气 Prompt，输出 `{"decision":"REPLY|IGNORE","confidence":…}`。
 - `judge`：走 OpenRouter Decisions API（`https://openrouter.ai/api/alpha/decisions`），用 `choice` 型问题（`REPLY` / `IGNORE`）返回概率，不生成文本；`decision.threshold`（0~1，默认 0.5）为 REPLY 概率门槛。Jev（`~typesafe/jev-latest` / `typesafe/jev-1.14`）与 OpenRouter 上其他 decisions 模型共用该协议。
-- 判断模型的 API Key 优先取所选提供商源（`api_base` 指向 openrouter.ai 时），否则读取环境变量 `OPENROUTER_API_KEY`；`decision.endpoint` 可覆盖接口地址（自定义网关）。密钥不会出现在 Web API 状态里。
+- 判断模型与普通模型一样必须选择提供商源，使用该源的 API Key；源 / 模型留空即未配置，不回退环境变量。`decision.endpoint` 可覆盖接口地址（自定义网关）。密钥不会出现在 Web API 状态里。
 
 ### 9.2 Provider 与主模型
 

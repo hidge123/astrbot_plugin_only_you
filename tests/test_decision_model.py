@@ -7,8 +7,7 @@ Covers the new role layout:
 * ``get_main_provider_id`` only uses the dialogue role;
 * the decision role supports both ``mode="chat"`` (JSON verdict) and
   ``mode="judge"`` (OpenRouter Decisions API, Jev-style typed probabilities);
-* credentials come from the selected OpenRouter provider source or the
-  ``OPENROUTER_API_KEY`` environment variable (never leaked by status);
+* credentials come from the selected provider source (never leaked by status);
 * the atmosphere reader routes through ``judge_choice`` when available.
 """
 
@@ -238,7 +237,7 @@ class JudgeTestBase(DatabaseAsyncTestCase):
         decision.update(decision_overrides)
         return await self.hub.save_model_config(
             {
-                "dialogue": {"source_id": "deepseek", "model": "deepseek-chat"},
+                "main": {"source_id": "deepseek", "model": "deepseek-chat"},
                 "decision": decision,
             }
         )
@@ -253,30 +252,19 @@ class TestDecisionCredentials(JudgeTestBase):
         assert credentials["key_source"] == "source"
         assert credentials["endpoint"] == mods.model_hub.DEFAULT_DECISIONS_ENDPOINT
 
-    def test_env_fallback_when_no_openrouter_source(self):
+    def test_empty_source_has_no_credentials(self):
         credentials = self.hub._decision_credentials(
             {"source_id": "", "model": "~typesafe/jev-latest"}
         )
         assert credentials["api_key"] == ""
-        with mock.patch.dict(
-            os.environ, {"OPENROUTER_API_KEY": "sk-or-env"}, clear=False
-        ):
-            credentials = self.hub._decision_credentials(
-                {"source_id": "", "model": "~typesafe/jev-latest"}
-            )
-        assert credentials["api_key"] == "sk-or-env"
-        assert credentials["key_source"] == "env"
+        assert credentials["key_source"] == ""
 
-    def test_non_openrouter_source_falls_back_to_env(self):
-        with mock.patch.dict(
-            os.environ, {"OPENROUTER_API_KEY": "sk-or-env"}, clear=False
-        ):
-            credentials = self.hub._decision_credentials(
-                {"source_id": "deepseek", "model": "typesafe/jev-1.14"}
-            )
-        # A DeepSeek key cannot authenticate the OpenRouter Decisions endpoint.
-        assert credentials["api_key"] == "sk-or-env"
-        assert credentials["key_source"] == "env"
+    def test_non_openrouter_source_uses_its_own_key(self):
+        credentials = self.hub._decision_credentials(
+            {"source_id": "deepseek", "model": "typesafe/jev-1.14"}
+        )
+        assert credentials["api_key"] == "sk-deepseek"
+        assert credentials["key_source"] == "source"
 
 
 class TestDecisionJudge(JudgeTestBase):
@@ -329,39 +317,17 @@ class TestDecisionJudge(JudgeTestBase):
         assert result["threshold"] == 0.6
         assert self.hub.verdict_is_reply(result) is False
 
-    async def test_judge_env_only_without_provider_source(self):
+    async def test_judge_without_provider_source_is_unconfigured(self):
         await self.save_judge_config(source_id="", model="~typesafe/jev-latest")
-
-        async def fake_post(url, headers, payload, timeout=45.0):
-            assert headers["Authorization"] == "Bearer sk-or-env"
-            return _judge_payload(reply_probability=0.7)
-
-        with mock.patch.dict(
-            os.environ, {"OPENROUTER_API_KEY": "sk-or-env"}, clear=False
-        ):
-            status = (await self.hub.get_status())["decision"]
-            with mock.patch.object(decision_model, "post_json", fake_post):
-                result = await self.hub.judge_choice(
-                    prompt="",
-                    state={},
-                    instructions="",
-                    criteria={"REPLY": "yes", "IGNORE": "no"},
-                )
-        assert status["configured"] is True
-        assert status["judge_ready"] is True
-        assert status["key_source"] == "env"
-        assert result["decision"] == "REPLY"
-
-    async def test_judge_mode_missing_key_returns_none(self):
-        await self.save_judge_config(source_id="", model="~typesafe/jev-latest")
-        env = {key: value for key, value in os.environ.items() if key != "OPENROUTER_API_KEY"}
-        with mock.patch.dict(os.environ, env, clear=True):
-            result = await self.hub.judge_choice(
-                prompt="",
-                state={},
-                instructions="",
-                criteria={"REPLY": "yes", "IGNORE": "no"},
-            )
+        status = (await self.hub.get_status())["decision"]
+        assert status["configured"] is False
+        assert status["judge_ready"] is False
+        result = await self.hub.judge_choice(
+            prompt="",
+            state={},
+            instructions="",
+            criteria={"REPLY": "yes", "IGNORE": "no"},
+        )
         assert result is None
 
     async def test_chat_mode_still_uses_json_prompt(self):
@@ -401,12 +367,11 @@ class TestDecisionStatusAndTest(JudgeTestBase):
         assert status["key_source"] == "source"
         assert "sk-or-source" not in json.dumps(status, ensure_ascii=False)
 
-    async def test_status_judge_unready_without_credentials(self):
+    async def test_status_judge_unready_without_source(self):
         await self.save_judge_config(source_id="", model="~typesafe/jev-latest")
-        env = {key: value for key, value in os.environ.items() if key != "OPENROUTER_API_KEY"}
-        with mock.patch.dict(os.environ, env, clear=True):
-            status = (await self.hub.get_status())["decision"]
+        status = (await self.hub.get_status())["decision"]
         assert status["decision_mode"] == "judge"
+        assert status["configured"] is False
         assert status["judge_ready"] is False
         assert status["ok"] is False
 

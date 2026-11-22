@@ -9,8 +9,7 @@ The plugin's **decision** role can run in two modes:
   question and returns probabilities, not generated text.
 
 This module contains only the transport for the second mode. It never exposes
-API keys; callers resolve credentials (provider source key or
-``OPENROUTER_API_KEY``) themselves.
+API keys; callers resolve the selected provider source's key themselves.
 """
 
 from typing import Any, Dict, Optional

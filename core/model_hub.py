@@ -34,7 +34,6 @@ import base64
 import copy
 import inspect
 import json
-import os
 import re
 import time
 from typing import Any, Dict, List, Optional
@@ -117,7 +116,6 @@ DECISION_MODES = ("chat", "judge")
 DEFAULT_DECISION_THRESHOLD = 0.5
 #: OpenRouter Decisions API（Jev 等 System-One 判断模型走这里）。
 DEFAULT_DECISIONS_ENDPOINT = "https://openrouter.ai/api/alpha/decisions"
-OPENROUTER_KEY_ENV = "OPENROUTER_API_KEY"
 #: v2.12: RAG 角色（向量检索 / 重排）——三档来源模式，`off` 表示停用。
 VECTOR_ROLES = ("embedding", "rerank")
 VECTOR_MODES = ("off", "provider", "source")
@@ -1030,12 +1028,7 @@ class ModelHub:
     ) -> Optional[Dict[str, str]]:
         """Explicitly configured ``(source_id, model)`` of one chat role, if any."""
         active = cfg if isinstance(cfg, dict) else self._config
-        entry = active.get(role) or {}
-        source_id, model = _pair_of(entry)
-        if role == "decision" and _clean(entry.get("mode")).lower() == "judge":
-            # Judge models may be addressed without a provider source; the API
-            # key then comes from OPENROUTER_API_KEY. A model is still required.
-            return {"source_id": source_id, "model": model} if model else None
+        source_id, model = _pair_of(active.get(role))
         if source_id and model:
             return {"source_id": source_id, "model": model}
         return None
@@ -1645,9 +1638,7 @@ class ModelHub:
                 credentials = self._decision_credentials(pair, entry)
                 if not credentials.get("api_key"):
                     logger.warning(
-                        "[OnlyYou] decision judge model 缺少 API Key"
-                        "（提供商源或 %s）",
-                        OPENROUTER_KEY_ENV,
+                        "[OnlyYou] decision judge model 缺少 API Key（请选择提供商源）"
                     )
                     return None
                 try:
@@ -1988,7 +1979,7 @@ class ModelHub:
                 status["label"] = (
                     f"判断模型 {model} · {credentials.get('endpoint', '')}"
                     if ready
-                    else "判断模型未就绪：缺少 API Key（提供商源或 OPENROUTER_API_KEY）"
+                    else "判断模型未就绪：请选择提供商源并填写判断模型"
                 )
             else:
                 reused = self._find_reusable(source_id, model)
@@ -2022,12 +2013,12 @@ class ModelHub:
     def _decision_credentials(
         self, pair: Optional[Dict[str, str]], entry: Optional[dict] = None
     ) -> Dict[str, str]:
-        """Resolve OpenRouter Decisions API credentials without leaking the key.
+        """Resolve the Decisions API credentials from the selected provider source.
 
-        Priority: the selected provider source's key when the source points at
-        OpenRouter, otherwise ``OPENROUTER_API_KEY`` from the environment. The
-        endpoint can be overridden per Soul (custom gateway), defaulting to the
-        public OpenRouter Decisions API.
+        The judge role follows the same rule as every other model role: a provider
+        source is required and its API key is used; leaving the source empty means
+        "not configured". The endpoint can be overridden per Soul (custom gateway),
+        defaulting to the public OpenRouter Decisions API.
         """
         entry = entry if isinstance(entry, dict) else {}
         source_id = _clean((pair or {}).get("source_id"))
@@ -2043,22 +2034,11 @@ class ModelHub:
                     credentials = {}
                 api_base = _clean(credentials.get("api_base"))
                 api_key = _clean(credentials.get("api_key"))
-        is_openrouter = "openrouter.ai" in api_base.lower()
-        env_key = _clean(os.environ.get(OPENROUTER_KEY_ENV))
-        key_source = ""
-        if is_openrouter and api_key:
-            key_source = "source"
-        elif env_key:
-            api_key = env_key
-            key_source = "env"
-        elif not is_openrouter:
-            # A non-OpenRouter source key cannot authenticate the default endpoint.
-            api_key = ""
         endpoint = _clean(entry.get("endpoint")) or DEFAULT_DECISIONS_ENDPOINT
         return {
             "endpoint": endpoint,
             "api_key": api_key,
-            "key_source": key_source,
+            "key_source": "source" if api_key else "",
             "api_base": api_base,
         }
 

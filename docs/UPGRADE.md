@@ -406,7 +406,7 @@ docker start astrbot
   - 决策模型默认继承主模型，**只**做读空气与是否接话判断，支持通用模型 JSON 判定或判断模型。
 - **自动迁移**：旧 `main`（对话）→ `dialogue`；旧 `decision`（混合）→ `main`（基模），新 `decision` 继承 `main` 以保持原读空气模型；旧 `vision` 保持原有效模型。此前已迁移到「dialogue 为根、main 继承 dialogue」的中间布局也会自动转为「main 为基模」。一次性 flag `model_role_layout_migrated_v2`，全部 Soul 成功才写入，失败下次启动重试，只改写旧布局文件。
 - **判断模型（可选）**：决策卡切「判断模型（Jev / Decisions API）」后走 OpenRouter `POST /api/alpha/decisions`，模型名如 `~typesafe/jev-latest` / `typesafe/jev-1.14`，按 `decision.threshold`（0~1，默认 0.5）对 REPLY 概率裁决。通用模型模式保持旧行为（Prompt → JSON）。
-- **API Key**：优先取所选提供商源（其 `api_base` 指向 openrouter.ai）；未选或非 OpenRouter 源时读取环境变量 **`OPENROUTER_API_KEY`**。Docker 部署需在容器环境注入该变量（`docker run -e` / compose `environment`），或在 AstrBot 里配置 OpenRouter 提供商源后在决策卡选择它。密钥不会出现在 Pages / Web API 返回中。
+- **提供商源**：与其他模型配置一致，判断模型必须选择提供商源并使用该源的 API Key；源 / 模型留空即未配置，不读取环境变量。Jev 需选择 OpenRouter（或兼容 Decisions API 的网关）。密钥不会出现在 Pages / Web API 返回中。
 - **失败降级**：判断模型未配置 / 缺 Key / HTTP 失败时，读空气退回「提到角色名或冲浪偏好」启发式，并记 warning；不会阻塞消息管线。
 - **回滚**：旧版插件只识别 `main`/`decision` 键。回退前请恢复 `/root/astrbot_backups/` 中的插件目录与 `only_you.db` 备份，或至少把旧版可读的模型配置重新写回；直接回退可能让对话模型回落到 AstrBot 平台默认模型。
 
