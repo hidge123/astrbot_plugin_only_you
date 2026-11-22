@@ -852,9 +852,10 @@
 
   OnlyYouConsoleApp.prototype._mainModelUnconfigured = function () {
     var models = this.state.modelStatus || {};
-    var main = models.main;
-    if (main && typeof main === "object") {
-      return main.configured === false || main.mode === "unconfigured";
+    /* 对话模型（dialogue）是原生管线实际使用的角色；主模型只负责后台生成。 */
+    var dialogue = models.dialogue || models.main;
+    if (dialogue && typeof dialogue === "object") {
+      return dialogue.configured === false || dialogue.mode === "unconfigured";
     }
     return false;
   };
@@ -875,7 +876,7 @@
       var dot = "";
       var tip = "";
       if (id === "models" && self._mainModelUnconfigured()) {
-        dot = '<span class="nav-dot" data-tip="主模型未配置"></span>';
+        dot = '<span class="nav-dot" data-tip="对话模型未配置"></span>';
       }
       if (!exists) {
         tip = ' data-tip="' + esc("页面模块未加载：" + (meta.file || "")) + '"';

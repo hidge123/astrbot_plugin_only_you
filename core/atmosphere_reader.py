@@ -46,6 +46,69 @@ def _soul_summary(soul: Any) -> str:
         return ""
 
 
+#: Read-the-air decision prompts for judge-style decision models (Jev 等)。
+ATMOSPHERE_DECISION_INSTRUCTIONS = (
+    "根据角色人设、当前状态与最近群聊上下文，判断角色现在是否应该在群里插话/接话。"
+)
+ATMOSPHERE_DECISION_CRITERIA = {
+    "REPLY": (
+        "★L3 核心用户或 ◆L2 重要熟人发言；话题命中角色冲浪偏好；"
+        "群里在聊搞笑/八卦/日常话题且角色适合插科打诨；"
+        "有人直接叫角色，或话题明显在等角色接。"
+    ),
+    "IGNORE": (
+        "别人正在严肃讨论私事，或两个普通群友在单独对线且没有叫角色；"
+        "只是无意义复读/表情包且角色已接过梗；"
+        "话题与角色人设/兴趣无关，强行接话会打断或显得尴尬。"
+    ),
+}
+
+
+def build_atmosphere_decision_payload(
+    *,
+    soul: Any,
+    current_state: str,
+    current_slot_title: str,
+    window_transcript: str,
+    sender_name: str,
+    sender_id: str,
+    user_tier_label: str,
+    latest_message: str,
+    is_direct_mention: bool = False,
+    surfing_preferences: Any = None,
+    soul_summary: str = "",
+) -> dict:
+    """Build the typed ``state`` + ``questions`` payload for judge models."""
+    preferences = []
+    try:
+        preferences = [str(item) for item in (surfing_preferences or []) if str(item)]
+    except Exception:
+        preferences = []
+    state = {
+        "character": {
+            "name": str(getattr(soul, "name", "") or ""),
+            "archetype": str(getattr(soul, "archetype", "") or ""),
+            "summary": soul_summary or _soul_summary(soul),
+            "surfing_preferences": preferences,
+        },
+        "current_state": str(current_state or ""),
+        "current_slot_title": str(current_slot_title or ""),
+        "recent_group_chat": str(window_transcript or ""),
+        "latest_message": {
+            "sender": str(sender_name or ""),
+            "sender_id": str(sender_id or ""),
+            "user_tier": str(user_tier_label or ""),
+            "content": str(latest_message or ""),
+            "is_direct_mention": bool(is_direct_mention),
+        },
+    }
+    return {
+        "state": state,
+        "instructions": ATMOSPHERE_DECISION_INSTRUCTIONS,
+        "criteria": dict(ATMOSPHERE_DECISION_CRITERIA),
+    }
+
+
 class AtmosphereReader:
     """
     群聊主战场：防抖等待窗口、多人对话“解线团”、五维读空气器 (`core/atmosphere_reader.py`)
@@ -351,14 +414,36 @@ class AtmosphereReader:
             soul_summary=_soul_summary(soul),
         )
 
-        res = await self.model_hub.call_llm_json(
-            prompt=prompt, role="decision", umo=umo, default=None
+        payload = build_atmosphere_decision_payload(
+            soul=soul,
+            current_state=str(getattr(current_slot.state, "value", current_slot.state)),
+            current_slot_title=str(getattr(current_slot, "title", "") or ""),
+            window_transcript=transcript,
+            sender_name=user.display_name,
+            sender_id=user.global_uid,
+            user_tier_label=user.tier.label,
+            latest_message=msg_str,
+            is_direct_mention=is_direct_mention,
+            surfing_preferences=soul.surfing_preferences,
+            soul_summary=_soul_summary(soul),
         )
+        judge = getattr(self.model_hub, "judge_choice", None)
+        if callable(judge):
+            res = await judge(prompt=prompt, umo=umo, **payload)
+        else:  # legacy stub / partial ModelHub
+            res = await self.model_hub.call_llm_json(
+                prompt=prompt, role="decision", umo=umo, default=None
+            )
         if isinstance(res, dict):
             decision = str(res.get("decision", "IGNORE")).upper()
             logger.debug(
-                f"[OnlyYou] AtmosphereReader decision={decision} ({res.get('reason', '')})"
+                f"[OnlyYou] AtmosphereReader decision={decision} "
+                f"(mode={res.get('mode', 'chat')}, "
+                f"confidence={res.get('confidence')}, {res.get('reason', '')})"
             )
+            verdict = getattr(self.model_hub, "verdict_is_reply", None)
+            if callable(verdict):
+                return bool(verdict(res))
             return decision == "REPLY"
 
         # Fallback heuristic if LLM JSON fails: reply if soul's name or surfing preference is mentioned

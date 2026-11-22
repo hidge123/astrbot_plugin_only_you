@@ -145,7 +145,7 @@ except ImportError:
             self.chain.append(Plain(text))
             return self
 
-from .core.atmosphere_reader import AtmosphereReader
+from .core.atmosphere_reader import AtmosphereReader, build_atmosphere_decision_payload
 from .core.config_manager import PluginConfigManager
 from .core.context_budget import ContextBudgetManager, SessionBuffer
 from .core.memory_manager import MemoryManager, MemoryTier
@@ -297,6 +297,24 @@ async def _hub_call_text(
         except TypeError:
             pass
     return await model_hub.call_llm_text(**kwargs)
+
+async def _hub_judge_choice(
+    model_hub: Any,
+    prompt: str,
+    umo: Optional[str] = None,
+    soul: Any = None,
+    **payload: Any,
+) -> Any:
+    """``model_hub.judge_choice`` with an optional per-Soul config (TypeError safe)."""
+    soul_id = str(getattr(soul, "soul_id", "") or "").strip()
+    kwargs: dict[str, Any] = {"prompt": prompt, "umo": umo}
+    kwargs.update(payload)
+    if soul_id:
+        try:
+            return await model_hub.judge_choice(soul_id=soul_id, **kwargs)
+        except TypeError:
+            pass
+    return await model_hub.judge_choice(**kwargs)
 
 
 def _hub_tts_config(model_hub: Any, soul: Any = None) -> dict:
@@ -1544,7 +1562,7 @@ class OnlyYouPlugin(Star):
             )
             try:
                 data = await self.model_hub.call_llm_json(
-                    prompt=prompt, role="decision", default=None
+                    prompt=prompt, role="main", default=None
                 )
             except Exception as exc:  # noqa: BLE001 - fall back to templates
                 logger.warning(f"[OnlyYou] busy completion LLM failed: {exc}")
@@ -1723,15 +1741,46 @@ class OnlyYouPlugin(Star):
                 surfing_preferences="、".join(getattr(soul, "surfing_preferences", []) or [])
                 or "（无）",
             )
-            data = await _hub_call_json(
-                self.model_hub, prompt, role="decision", umo=umo, default=None, soul=soul
+            payload = build_atmosphere_decision_payload(
+                soul=soul,
+                current_state=state_text,
+                current_slot_title=str(
+                    getattr(current_slot, "title", "") or "发呆闲逛"
+                ),
+                window_transcript=window_text,
+                sender_name=str(getattr(last, "sender_name", "") or "群友"),
+                sender_id=str(getattr(last, "sender_id", "") or "unknown"),
+                user_tier_label=str(
+                    getattr(last, "user_tier_label", "") or "L1普通群友"
+                ),
+                latest_message=str(getattr(last, "content", "") or ""),
+                is_direct_mention=False,
+                surfing_preferences=getattr(soul, "surfing_preferences", []) or [],
+                soul_summary=self._render_soul_summary(soul),
             )
+            judge = getattr(self.model_hub, "judge_choice", None)
+            if callable(judge):
+                data = await _hub_judge_choice(
+                    self.model_hub, prompt, umo=umo, soul=soul, **payload
+                )
+            else:  # legacy stub / partial ModelHub
+                data = await _hub_call_json(
+                    self.model_hub,
+                    prompt,
+                    role="decision",
+                    umo=umo,
+                    default=None,
+                    soul=soul,
+                )
         except Exception as exc:  # noqa: BLE001 - never break the heartbeat
             logger.warning(f"[OnlyYou] group unread decision failed: {exc}")
             return False
         if not isinstance(data, dict):
             logger.info("[OnlyYou] group unread decision: no JSON -> degrade to IGNORE")
             return False
+        verdict = getattr(self.model_hub, "verdict_is_reply", None)
+        if callable(verdict):
+            return bool(verdict(data))
         decision = str(data.get("decision") or "").strip().upper()
         return decision == "REPLY"
 
@@ -2072,7 +2121,7 @@ class OnlyYouPlugin(Star):
                     data = await _hub_call_json(
                         self.model_hub,
                         prompt,
-                        role="decision",
+                        role="main",
                         umo=umo,
                         default=None,
                         soul=soul,
@@ -2213,7 +2262,7 @@ class OnlyYouPlugin(Star):
                 roam_mode = "MEMORY_MUSE"
 
             data = await _hub_call_json(
-                self.model_hub, prompt, role="decision", default=None, soul=soul
+                self.model_hub, prompt, role="main", default=None, soul=soul
             )
             target_umo = self._resolve_idle_roam_target(
                 data, group_hint="", allowed_platforms=allowed_platforms
@@ -2393,7 +2442,7 @@ class OnlyYouPlugin(Star):
                     recent_window_text=recent_text,
                 )
                 msg = await _hub_call_text(
-                    self.model_hub, prompt, role="decision", umo=umo, soul=soul
+                    self.model_hub, prompt, role="main", umo=umo, soul=soul
                 )
             except Exception as exc:  # noqa: BLE001 - fall back instead of crashing
                 logger.warning(f"[OnlyYou] private unread catch-up LLM failed: {exc}")
@@ -2671,7 +2720,7 @@ class OnlyYouPlugin(Star):
                 video_text=video_text,
             )
             msg = await _hub_call_text(
-                self.model_hub, prompt, role="decision", umo=target_umo, soul=soul
+                self.model_hub, prompt, role="main", umo=target_umo, soul=soul
             )
             if not msg:
                 return False

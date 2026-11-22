@@ -8,11 +8,11 @@
  *   POST `models/config` { soul_id, model_config } → { soul_id, model_config, status }（保存后热重建该角色实例）
  *   POST `models/test` { role, soul_id? } → { status: "ok"|"error", role, latency_ms, reply | audio_base64 | error }
  *
- * v2.8：模型配置挂在 Soul 上（每个角色一套四角色模型）。页面顶部展示当前角色，
+ * v2.8：模型配置挂在 Soul 上（每个角色一套对话 / 主 / 决策 / 视觉等模型）。页面顶部展示当前角色，
  * 加载 / 自动保存都带 `soul_id`；切换角色后 app.js 会重渲染本页并重新拉取该角色的配置。
  *
  * 页面结构：4 张角色卡片 —— 对话（必填）/ 决策·读空气 / 视频解析 / 语音 TTS。
- * 聊天卡：模型来源模式下拉（独立配置 / 继承自主对话模型 / 继承自轻量决策模型）+「独立配置」时
+ * 聊天卡：模型来源模式下拉（独立配置 / 继承自对话模型 / 继承自主模型）+「独立配置」时
  *   展开自己的提供商源与模型选择器、「继承」时折叠并展示父角色 source_id / model 快照；
  *   状态灯按后端 status.configured / inherited / inherit_from 渲染；每张卡带测试按钮。
  * TTS 卡：来源分段（关闭 / 提供商源 / AstrBot TTS）+ 音源 / 模型 / 音色 + 概率 / 范围 / 双发 + 试听。
@@ -23,25 +23,41 @@
 (function () {
   "use strict";
 
-  var CHAT_ROLES = ["main", "decision", "vision"];
+  var CHAT_ROLES = ["dialogue", "main", "decision", "vision"];
+  var DECISION_MODES = ["chat", "judge"];
+  var DECISION_MODEL_SUGGESTIONS = [
+    "~typesafe/jev-latest",
+    "typesafe/jev-1.14",
+    "openai/gpt-6-luna-decisions",
+    "cloudflare/clef",
+    "liquid/d1",
+    "microsoft/microsoft-decision-1.1",
+    "upstage/solar-decide"
+  ];
   var ROLE_META = {
-    main: {
+    dialogue: {
       name: "对话模型",
-      desc: "主回复 / 角色卡生成（必填）",
+      desc: "只负责聊天回复（必填）",
       icon: "character",
-      help: "插件会把它注册为原生管线的 selected_provider；未配置时回退到 AstrBot 平台默认模型。"
+      help: "插件把它注册为原生管线的 selected_provider；它只生成对话，不承担角色卡 / 记忆 / 主动消息等后台生成。未配置时回退到 AstrBot 平台默认模型。"
+    },
+    main: {
+      name: "主模型",
+      desc: "角色卡 / 记忆 / 主动消息生成",
+      icon: "wand",
+      help: "承担所有后台生成：AI 造卡与补全、行动卡生成、记忆提炼、日程微调文案、繁忙成果、私聊补回与主动分享文案。默认继承对话模型，也可独立配置；留空即停用后台生成（相关功能自动降级）。"
     },
     decision: {
       name: "决策模型",
-      desc: "读空气 / 记忆提炼 / 日程微调",
+      desc: "读空气 / 是否接话",
       icon: "activity",
-      help: "读空气、记忆提炼、日程微调与造卡等后台任务使用；默认继承主模型，也可切「独立配置」（留空即停用该角色）。"
+      help: "只做群聊读空气判断。可用通用聊天模型（输出 JSON 判定），也可切换为判断模型（OpenRouter Decisions API，如 Jev）返回概率结果；默认继承主模型。"
     },
     vision: {
       name: "视频解析模型",
       desc: "冲浪看片 / 多模态评估",
       icon: "video",
-      help: "视频解析与九宫格看片评分使用；默认继承主模型（要求模型支持图片输入），也可独立配置或继承轻量决策模型。"
+      help: "视频解析与九宫格看片评分使用；默认继承主模型（要求模型支持图片输入），也可独立配置或继承对话模型。"
     },
     tts: {
       name: "语音 TTS",
@@ -79,16 +95,21 @@
     { value: "l3", label: "仅L3" },
     { value: "all", label: "全部" }
   ];
-  /* decision / vision 的「模型来源模式」可选值（"" = 独立配置，其余为继承的父角色） */
+  /* main / decision / vision 的「模型来源模式」可选值（"" = 独立配置） */
   var ROLE_INHERIT_OPTIONS = {
+    main: [
+      { value: "", label: "独立配置（不继承）" },
+      { value: "dialogue", label: "继承自对话模型 (dialogue)" }
+    ],
     decision: [
       { value: "", label: "独立配置（不继承）" },
-      { value: "main", label: "继承自主对话模型 (main)" }
+      { value: "main", label: "继承自主模型 (main)" },
+      { value: "dialogue", label: "继承自对话模型 (dialogue)" }
     ],
     vision: [
       { value: "", label: "独立配置（不继承）" },
-      { value: "main", label: "继承自主对话模型 (main)" },
-      { value: "decision", label: "继承自轻量决策模型 (decision)" }
+      { value: "main", label: "继承自主模型 (main)" },
+      { value: "dialogue", label: "继承自对话模型 (dialogue)" }
     ]
   };
 
@@ -203,14 +224,17 @@
   function normalizeInheritFrom(role, raw) {
     raw = raw && typeof raw === "object" ? raw : {};
     var legal = legalInheritValues(role);
+    var defaultParent = role === "main" ? "dialogue" : "main";
     var inheritFrom = "";
     if (hasOwn(raw, "inherit_from") && raw.inherit_from != null) {
       inheritFrom = str(raw.inherit_from).trim();
-      if (legal.indexOf(inheritFrom) < 0) inheritFrom = toBool(raw.inherit, false) ? "main" : "";
+      if (legal.indexOf(inheritFrom) < 0) {
+        inheritFrom = toBool(raw.inherit, false) ? defaultParent : "";
+      }
     } else if (hasOwn(raw, "inherit")) {
-      inheritFrom = toBool(raw.inherit, true) ? "main" : "";
+      inheritFrom = toBool(raw.inherit, true) ? defaultParent : "";
     } else {
-      inheritFrom = "main";
+      inheritFrom = defaultParent;
     }
     if (legal.indexOf(inheritFrom) < 0) inheritFrom = "";
     return { inherit: !!inheritFrom, inherit_from: inheritFrom };
@@ -239,17 +263,39 @@
     };
   }
 
+  function normalizeDecisionFields(raw) {
+    raw = raw && typeof raw === "object" ? raw : {};
+    var mode = str(raw.mode) || "chat";
+    if (DECISION_MODES.indexOf(mode) < 0) mode = "chat";
+    var threshold = clamp(num(raw.threshold, 0.5), 0, 1);
+    var endpoint = str(raw.endpoint);
+    if (endpoint && !/^https?:\/\//i.test(endpoint)) endpoint = "";
+    return { mode: mode, threshold: threshold, endpoint: endpoint };
+  }
+
   function normalizeConfig(raw) {
     raw = raw && typeof raw === "object" ? raw : {};
-    var main = raw.main && typeof raw.main === "object" ? raw.main : {};
+    /* 兼容旧布局：没有 dialogue 时把旧 main 当作对话模型 */
+    var dialogue =
+      raw.dialogue && typeof raw.dialogue === "object"
+        ? raw.dialogue
+        : raw.main && typeof raw.main === "object"
+        ? raw.main
+        : {};
+    var decisionBase = normalizeChatRole("decision", raw.decision);
+    var decisionExtra = normalizeDecisionFields(raw.decision);
+    decisionBase.mode = decisionExtra.mode;
+    decisionBase.threshold = decisionExtra.threshold;
+    decisionBase.endpoint = decisionExtra.endpoint;
     var tts = raw.tts && typeof raw.tts === "object" ? raw.tts : {};
     var ttsMode = str(tts.mode) || "off";
     if (["off", "source", "provider"].indexOf(ttsMode) < 0) ttsMode = "off";
     var ttsScope = str(tts.scope) || "private";
     if (["private", "l3", "all"].indexOf(ttsScope) < 0) ttsScope = "private";
     return {
-      main: { source_id: str(main.source_id), model: str(main.model) },
-      decision: normalizeChatRole("decision", raw.decision),
+      dialogue: { source_id: str(dialogue.source_id), model: str(dialogue.model) },
+      main: normalizeChatRole("main", raw.main),
+      decision: decisionBase,
       vision: normalizeChatRole("vision", raw.vision),
       embedding: normalizeVectorRole(raw.embedding),
       rerank: normalizeVectorRole(raw.rerank),
@@ -324,6 +370,23 @@
         tip: info.label || ""
       };
     }
+    if (role === "decision" && info.decision_mode === "judge") {
+      if (info.judge_ready) {
+        return {
+          cls: "light-ok",
+          text: "判断模型",
+          tip:
+            (info.label || "") +
+            (info.model ? " · " + str(info.model) : "") +
+            (info.endpoint ? " · " + str(info.endpoint) : "")
+        };
+      }
+      return {
+        cls: "light-err",
+        text: "判断模型未就绪",
+        tip: info.label || "请补全判断模型与 API Key（提供商源或 OPENROUTER_API_KEY）"
+      };
+    }
     if (info.configured === false || info.mode === "unconfigured") {
       return { cls: "light-err", text: "未配置", tip: info.label || "未配置" };
     }
@@ -331,13 +394,16 @@
       var cfg = S.cfg && S.cfg[role] ? S.cfg[role] : {};
       var fromRole = str(info.inherit_from) || str(cfg.inherit_from) || "main";
       var pair = pairLabel(info.source_id, info.model);
-      var base = fromRole === "decision" ? "继承自轻量决策模型" : "继承自主对话模型";
-      var text = pair ? base + " · " + pair : base;
+      var base =
+        fromRole === "dialogue"
+          ? "继承自对话模型"
+          : fromRole === "decision"
+          ? "继承自决策模型"
+          : "继承自主模型";
       return {
         cls: info.ok === false ? "light-err" : "light-warn",
-        text: text,
-        tip: info.label || text,
-        wrap: true
+        text: base,
+        tip: (info.label || base) + (pair ? " · " + pair : "")
       };
     }
     return {
@@ -345,6 +411,19 @@
       text: info.mode === "reuse" ? "复用 AstrBot 实例" : info.mode === "plugin" ? "插件自建实例" : "已配置",
       tip: info.label || ""
     };
+  }
+
+  /** 判断模型的默认提供商源：优先 api_base 指向 OpenRouter 的聊天源。 */
+  function judgeSourceId() {
+    for (var i = 0; i < (S.sources || []).length; i++) {
+      var source = S.sources[i] || {};
+      var providerType = str(source.provider_type);
+      if (providerType && providerType !== "chat_completion") continue;
+      if (str(source.api_base).toLowerCase().indexOf("openrouter.ai") >= 0) {
+        return str(source.id);
+      }
+    }
+    return "";
   }
 
   function chatSources() {
@@ -396,11 +475,15 @@
     var helper;
     if (chatSources().length === 0) {
       helper = "还没有可用的提供商源：请先在 AstrBot WebUI → 服务提供商里添加一个聊天模型源。";
+    } else if (role === "dialogue") {
+      helper =
+        "对话模型只负责聊天回复，建议选稳定、响应快的模型；可直接填写模型名，或点「拉取」读取候选模型，修改后自动保存并即时生效。";
     } else if (role === "main") {
-      helper = "可直接填写模型名，或点「拉取」从提供商源读取候选模型；修改后自动保存并即时生效。";
+      helper =
+        "主模型负责 AI 造卡 / 记忆提炼 / 主动消息等后台生成，建议选能力更强的模型；可直接填写模型名，或点「拉取」读取候选模型。";
     } else {
       helper =
-        "独立配置：使用本卡片的提供商源与模型；留空表示停用该角色（不会回退主模型）。可直接填写模型名，或点「拉取」读取候选模型；修改后自动保存并即时生效。";
+        "独立配置：使用本卡片的提供商源与模型；留空表示停用该角色（不会回退）。可直接填写模型名，或点「拉取」读取候选模型；修改后自动保存并即时生效。";
     }
     return (
       '<div class="field"><span class="field-label">提供商源</span>' +
@@ -507,32 +590,31 @@
 
   /**
    * 计算某个角色「保存后会生效」的 (source_id, model)：独立配置取自己的，
-   * 继承则递归取父角色（vision -> decision -> main，最多 2 跳，防环）。
+   * 继承则递归取父角色（vision -> main -> dialogue，最多 2 跳，防环）。
    */
-  function effectivePair(role) {
-    if (!S.cfg) return { source_id: "", model: "" };
-    if (role === "main") return pairOf(S.cfg.main);
+  function effectivePair(role, depth) {
+    depth = depth || 0;
+    if (!S.cfg || depth > 2) return { source_id: "", model: "" };
+    if (role === "dialogue") return pairOf(S.cfg.dialogue);
     var entry = S.cfg[role];
     if (!entry) return { source_id: "", model: "" };
     var fromRole = str(entry.inherit_from);
     if (!fromRole) return pairOf(entry);
-    if (fromRole === "main") return pairOf(S.cfg.main);
-    if (fromRole === "decision") {
-      var decision = S.cfg.decision || {};
-      var decisionFrom = str(decision.inherit_from);
-      if (!decisionFrom) return pairOf(decision);
-      if (decisionFrom === "main") return pairOf(S.cfg.main);
-    }
-    return { source_id: "", model: "" };
+    if (fromRole === "dialogue") return pairOf(S.cfg.dialogue);
+    return effectivePair(fromRole, depth + 1);
   }
 
   function sourceModeHtml(role) {
     var cfg = S.cfg[role] || {};
     var selected = str(cfg.inherit_from);
-    var desc =
-      role === "vision"
-        ? "独立配置：使用本卡片的提供商源与模型，留空即停用该角色；继承：直接复用父角色当前生效的模型。修改后会自动保存并即时生效。"
-        : "独立配置：使用本卡片的提供商源与模型，留空即停用该角色（不再回退主模型）；继承：与主对话模型保持一致。修改后会自动保存并即时生效。";
+    var descMap = {
+      main:
+        "独立配置：让主模型使用专属的更强模型；继承（默认）：与对话模型保持一致。主模型负责所有后台生成，不影响聊天回复。",
+      decision:
+        "独立配置：为读空气单独指定模型；继承（默认）：复用主模型。判断模型建议独立配置，避免把聊天模型名当成 Decisions 模型。",
+      vision:
+        "独立配置：使用本卡片的提供商源与模型，留空即停用该角色；继承：直接复用父角色当前生效的模型（要求模型支持图片输入）。"
+    };
     return (
       '<div class="field"><span class="field-label">模型来源模式</span>' +
       '<select class="select" data-role="inherit-from" data-role-key="' +
@@ -553,7 +635,7 @@
         .join("") +
       "</select>" +
       '<div class="field-help">' +
-      esc(desc) +
+      esc(descMap[role] || "") +
       "</div></div>"
     );
   }
@@ -561,16 +643,20 @@
   function inheritedPreviewHtml(role) {
     var cfg = S.cfg[role] || {};
     var fromRole = str(cfg.inherit_from) || "main";
-    var parentRole = fromRole === "decision" ? "decision" : "main";
-    var parent = effectivePair(parentRole);
+    var parent = effectivePair(fromRole);
     var configured = !!(parent.source_id && parent.model);
-    var parentName = fromRole === "decision" ? "轻量决策模型" : "主对话模型";
+    var parentName =
+      fromRole === "dialogue"
+        ? "对话模型"
+        : fromRole === "decision"
+        ? "决策模型"
+        : "主模型";
     var chainNote = "";
-    if (role === "vision" && fromRole === "decision") {
-      var decisionCfg = S.cfg.decision || {};
-      if (str(decisionCfg.inherit_from) === "main") {
-        chainNote = "（轻量决策模型当前继承自主对话模型）";
-      }
+    var parentCfg = S.cfg[fromRole] || {};
+    if (fromRole !== "dialogue" && str(parentCfg.inherit_from)) {
+      var grand =
+        str(parentCfg.inherit_from) === "dialogue" ? "对话模型" : "主模型";
+      chainNote = "（" + parentName + "当前继承自" + grand + "）";
     }
     return (
       '<div class="field" data-role="inherit-preview-' +
@@ -596,9 +682,97 @@
     );
   }
 
-  function roleDetailsHtml(role) {
-    if (role === "main") return roleControlsHtml(role);
+  function decisionModeOf() {
+    var cfg = (S.cfg && S.cfg.decision) || {};
+    return str(cfg.mode) === "judge" ? "judge" : "chat";
+  }
+
+  function decisionModeHtml() {
+    var mode = decisionModeOf();
+    return (
+      '<div class="field"><span class="field-label">判断方式</span>' +
+      '<div class="segmented" data-role="decision-mode-seg">' +
+      [
+        { value: "chat", label: "通用模型（JSON 判定）" },
+        { value: "judge", label: "判断模型（Jev / Decisions API）" }
+      ]
+        .map(function (item) {
+          return (
+            '<button type="button" class="seg-btn' +
+            (mode === item.value ? " active" : "") +
+            '" data-action="set-decision-mode" data-mode="' +
+            esc(item.value) +
+            '">' +
+            esc(item.label) +
+            "</button>"
+          );
+        })
+        .join("") +
+      '</div><div class="field-help">通用模型：任意聊天模型，读空气 Prompt 输出 JSON；判断模型：OpenRouter Decisions API（Jev 等 System-One 模型）返回概率，不生成文本。</div></div>'
+    );
+  }
+
+  function decisionThresholdHtml(role) {
     var cfg = S.cfg[role] || {};
+    var threshold = clamp(num(cfg.threshold, 0.5), 0, 1);
+    return (
+      '<div class="field mt-12"><span class="field-label">回复阈值（概率）</span>' +
+      '<div class="slider-row">' +
+      '<input class="slider" type="range" min="0" max="1" step="0.05" data-decision-field="threshold" value="' +
+      threshold +
+      '" />' +
+      '<span class="slider-value" data-role="decision-threshold-value">' +
+      Math.round(threshold * 100) +
+      "%</span></div>" +
+      '<div class="field-help">判断模型给出 REPLY 的概率达到该阈值才会接话，默认 50%。调高更克制，调低更活跃。</div></div>'
+    );
+  }
+
+  function decisionJudgeHtml(role) {
+    var cfg = S.cfg[role] || {};
+    if (str(cfg.inherit_from)) {
+      return (
+        inheritedPreviewHtml(role) +
+        '<div class="card mt-12" style="background:var(--warning-soft,var(--surface-2));border:0"><div class="card-body tight">' +
+        '<div class="text-sm">判断模型需要独立指定模型名（继承来的聊天模型通常不是 Decisions 模型）。</div>' +
+        '<button class="btn btn-outline btn-sm mt-8" type="button" data-action="make-decision-independent" data-role-key="' +
+        esc(role) +
+        '">' +
+        icon("link", 13) +
+        "改为独立配置</button></div></div>"
+      );
+    }
+    var datalist = DECISION_MODEL_SUGGESTIONS.map(function (model) {
+      return '<option value="' + esc(model) + '"></option>';
+    }).join("");
+    return (
+      '<div class="field"><span class="field-label">提供商源（用于 API Key）</span>' +
+      '<select class="select" data-model-role="' +
+      esc(role) +
+      '" data-model-field="source_id">' +
+      sourceOptionsHtml(cfg.source_id, true) +
+      "</select>" +
+      '<div class="field-help">优先使用所选源的 API Key；未选择或源不是 OpenRouter 时读取环境变量 <code>OPENROUTER_API_KEY</code>。判断模型不会创建聊天实例。</div></div>' +
+      '<div class="field mt-12"><span class="field-label">判断模型名</span>' +
+      '<input class="input" type="text" list="decision-model-options" data-model-role="' +
+      esc(role) +
+      '" data-model-field="model" value="' +
+      esc(cfg.model) +
+      '" placeholder="~typesafe/jev-latest" />' +
+      '<datalist id="decision-model-options">' +
+      datalist +
+      "</datalist>" +
+      '<div class="field-help">OpenRouter Decisions 模型：<code>~typesafe/jev-latest</code>、<code>typesafe/jev-1.14</code>，或 GPT-6 Luna / Clef / D1 等 decisions 模型。</div></div>' +
+      decisionThresholdHtml(role)
+    );
+  }
+
+  function roleDetailsHtml(role) {
+    if (role === "dialogue") return roleControlsHtml(role);
+    var cfg = S.cfg[role] || {};
+    if (role === "decision" && decisionModeOf() === "judge") {
+      return decisionJudgeHtml(role);
+    }
     if (str(cfg.inherit_from)) return inheritedPreviewHtml(role);
     return roleControlsHtml(role);
   }
@@ -653,7 +827,7 @@
       "</span>" +
       '<div class="model-role-text"><span class="model-role-name">' +
       esc(meta.name) +
-      (role === "main" ? '<span class="tag tag-danger" style="margin-left:6px">必填</span>' : "") +
+      (role === "dialogue" ? '<span class="tag tag-danger" style="margin-left:6px">必填</span>' : "") +
       '</span><span class="model-role-desc">' +
       esc(meta.desc) +
       "</span></div></div>" +
@@ -668,11 +842,14 @@
       esc(info.text) +
       "</span></div></div>" +
       '<div class="card-body">' +
-      (role === "main" ? "" : sourceModeHtml(role)) +
+      (role === "decision" ? decisionModeHtml(role) : "") +
+      (role === "dialogue" || (role === "decision" && decisionModeOf() === "judge")
+        ? ""
+        : sourceModeHtml(role)) +
       '<div data-role="role-controls-' +
       esc(role) +
       '"' +
-      (role === "main" ? "" : ' class="mt-12"') +
+      (role === "dialogue" ? "" : ' class="mt-12"') +
       ">" +
       roleDetailsHtml(role) +
       "</div>" +
@@ -1020,8 +1197,8 @@
   /* ------------------------------------------------------------------ *
    * 页面
    * ------------------------------------------------------------------ */
-  function mainUnconfigured() {
-    var info = statusOf("main");
+  function dialogueUnconfigured() {
+    var info = statusOf("dialogue");
     return info.configured === false || info.mode === "unconfigured" || !info.label;
   }
 
@@ -1038,19 +1215,19 @@
       '<span class="mono text-xs muted">' +
       esc(sid) +
       "</span>" +
-      '<span class="text-xs text-2" style="flex:1;min-width:200px">模型配置按角色独立保存；在顶栏切换角色后会自动加载该角色自己的四角色模型配置。</span>' +
+      '<span class="text-xs text-2" style="flex:1;min-width:200px">模型配置按角色独立保存；在顶栏切换角色后会自动加载该角色自己的对话 / 主 / 决策 / 视觉模型配置。</span>' +
       "</div></div></div>"
     );
   }
 
   function bannerHtml() {
-    if (!mainUnconfigured()) return "";
+    if (!dialogueUnconfigured()) return "";
     return (
       '<div class="card" style="border-color:var(--danger)"><div class="card-body tight">' +
       '<div class="row wrap">' +
       '<span class="status-light light-err"></span>' +
-      '<strong class="text-sm">对话主模型未配置</strong>' +
-      '<span class="text-sm text-2">插件会回退到 AstrBot 平台默认模型；角色卡 AI 生成、读空气、记忆提炼等能力可能不可用。请先在下方「对话模型」卡片选择提供商源与模型（修改即时生效）。</span>' +
+      '<strong class="text-sm">对话模型未配置</strong>' +
+      '<span class="text-sm text-2">插件会回退到 AstrBot 平台默认模型；对话回复仍可用，但按角色绑定对话模型的隔离会失效。请在下方「对话模型」卡片选择提供商源与模型（修改即时生效）。</span>' +
       "</div></div></div>"
     );
   }
@@ -1062,10 +1239,10 @@
       "模型" +
       '<span class="card-sub">当前角色：' +
       esc(currentSoulLabel()) +
-      " · 四角色模型按角色独立配置 · 修改即时生效</span></h1></div>" +
+      " · 对话 / 主 / 决策 / 视觉模型按角色独立配置 · 修改即时生效</span></h1></div>" +
       soulBannerHtml() +
       bannerHtml() +
-      '<div class="model-grid">' +
+      '<div class="model-grid model-grid-chat">' +
       CHAT_ROLES.map(chatCardHtml).join("") +
       "</div>" +
       '<div class="model-grid mt-12">' +
@@ -1093,7 +1270,7 @@
   /** 只刷新四张卡片右上角的状态灯，不重绘表单，避免打断输入。 */
   function refreshStatusBadges() {
     if (!S.container) return;
-    ["main", "decision", "vision", "tts"].concat(VECTOR_ROLES).forEach(function (role) {
+    CHAT_ROLES.concat(["tts"]).concat(VECTOR_ROLES).forEach(function (role) {
       var card = S.container.querySelector('[data-role-card="' + role + '"]');
       if (!card) return;
       var el = card.querySelector(".model-status");
@@ -1130,6 +1307,10 @@
     if (!S.cfg) return "";
     if (CHAT_ROLES.indexOf(role) >= 0) {
       var cfg = S.cfg[role] || {};
+      if (role === "decision" && str(cfg.mode) === "judge") {
+        if (!str(cfg.model)) return "请填写判断模型名称（如 ~typesafe/jev-latest）";
+        return "";
+      }
       if (str(cfg.inherit_from)) return "";
       if (str(cfg.source_id) && !str(cfg.model)) return "请填写或选择模型名称";
       return "";
@@ -1162,7 +1343,7 @@
 
   function refreshSaveBadges() {
     if (!S.container) return;
-    ["main", "decision", "vision", "tts"]
+    CHAT_ROLES.concat(["tts"])
       .concat(VECTOR_ROLES)
       .forEach(function (role) {
         var el = S.container.querySelector('[data-role="model-save-' + role + '"]');
@@ -1216,7 +1397,7 @@
     var payload = clone(S.cfg);
     var payloadJson = JSON.stringify(normalizeConfig(payload));
     S.busy = true;
-    ["main", "decision", "vision", "tts"].concat(VECTOR_ROLES).forEach(function (role) {
+    CHAT_ROLES.concat(["tts"]).concat(VECTOR_ROLES).forEach(function (role) {
       S.saveStates[role] = "saving";
     });
     refreshSaveBadges();
@@ -1243,7 +1424,7 @@
         data && data.status && typeof data.status === "object" ? data.status : S.status;
       if (app.applyModelStatus) app.applyModelStatus(S.status);
       S.autoSaveFailed = false;
-      ["main", "decision", "vision", "tts"].concat(VECTOR_ROLES).forEach(function (role) {
+      CHAT_ROLES.concat(["tts"]).concat(VECTOR_ROLES).forEach(function (role) {
         S.saveStates[role] = "saved";
         delete S.saveErrors[role];
       });
@@ -1252,7 +1433,7 @@
       /* #7：成功不再每次刷屏 toast，状态徽章已经展示「已生效」 */
     } catch (err) {
       S.autoSaveFailed = true;
-      ["main", "decision", "vision", "tts"].concat(VECTOR_ROLES).forEach(function (role) {
+      CHAT_ROLES.concat(["tts"]).concat(VECTOR_ROLES).forEach(function (role) {
         S.saveStates[role] = "error";
       });
       refreshSaveBadges();
@@ -1273,7 +1454,7 @@
   /** 父角色表单值变化后，刷新所有处于继承模式的角色来源快照 */
   function refreshInheritPreviews() {
     if (!S.cfg) return;
-    ["decision", "vision"].forEach(function (role) {
+    ["main", "decision", "vision"].forEach(function (role) {
       var entry = S.cfg[role];
       if (entry && str(entry.inherit_from)) refreshRoleControls(role);
     });
@@ -1423,6 +1604,20 @@
             "</div>"
           : "") +
         "</div>";
+    } else if (role === "decision" && str(data.mode) === "judge") {
+      var judgeConfidence = data.confidence == null ? null : Math.round(num(data.confidence, 0) * 100);
+      var judgeThreshold = data.threshold == null ? null : Math.round(num(data.threshold, 0) * 100);
+      html =
+        '<div class="model-test-result is-ok">' +
+        icon("check", 13) +
+        " 判断模型连通 · 延迟 " +
+        esc(num(data.latency_ms, 0)) +
+        " ms · 结果 " +
+        esc(str(data.decision) || "-") +
+        (judgeConfidence == null ? "" : "（" + esc(judgeConfidence) + "%）") +
+        (judgeThreshold == null ? "" : " · 阈值 " + esc(judgeThreshold) + "%") +
+        (data.model ? '<div class="text-xs mt-4">' + esc(str(data.model)) + (data.provider ? " · " + esc(str(data.provider)) : "") + "</div>" : "") +
+        "</div>";
     } else if (role === "tts") {
       var audio = str(data.audio_base64);
       html =
@@ -1555,6 +1750,42 @@
       S.cfg[vectorRole].mode = vectorMode;
       refreshVectorDetail(vectorRole);
       scheduleAutoSave();
+    } else if (action === "set-decision-mode") {
+      var nextMode = actionEl.getAttribute("data-mode") || "chat";
+      if (DECISION_MODES.indexOf(nextMode) < 0) nextMode = "chat";
+      if (!S.cfg.decision) return;
+      S.cfg.decision.mode = nextMode;
+      if (nextMode === "judge") {
+        if (str(S.cfg.decision.inherit_from)) {
+          var inheritedDecision = effectivePair("decision");
+          S.cfg.decision.inherit = false;
+          S.cfg.decision.inherit_from = "";
+          if (!str(S.cfg.decision.source_id) && str(inheritedDecision.source_id)) {
+            S.cfg.decision.source_id = inheritedDecision.source_id;
+          }
+        }
+        var preferredSource = judgeSourceId();
+        if (preferredSource) S.cfg.decision.source_id = preferredSource;
+        if (!str(S.cfg.decision.model)) {
+          S.cfg.decision.model = "~typesafe/jev-latest";
+        }
+      }
+      paint();
+      scheduleAutoSave();
+    } else if (action === "make-decision-independent") {
+      if (!S.cfg.decision) return;
+      var inheritedPair = effectivePair("decision");
+      S.cfg.decision.inherit = false;
+      S.cfg.decision.inherit_from = "";
+      var judgeSource = judgeSourceId();
+      if (judgeSource) {
+        S.cfg.decision.source_id = judgeSource;
+      } else if (str(inheritedPair.source_id)) {
+        S.cfg.decision.source_id = inheritedPair.source_id;
+      }
+      S.cfg.decision.model = "~typesafe/jev-latest";
+      paint();
+      scheduleAutoSave();
     } else if (action === "set-tts-mode") {
       var mode = actionEl.getAttribute("data-mode") || "off";
       if (!S.cfg.tts) S.cfg.tts = normalizeConfig({}).tts;
@@ -1671,6 +1902,18 @@
         }
         commitRole(vectorRole);
         return;
+      }
+      scheduleAutoSave();
+      return;
+    }
+    var decisionField = el.getAttribute("data-decision-field");
+    if (decisionField === "threshold" && S.cfg.decision) {
+      S.cfg.decision.threshold = clamp(el.value, 0, 1);
+      var thresholdEl = S.container
+        ? S.container.querySelector('[data-role="decision-threshold-value"]')
+        : null;
+      if (thresholdEl) {
+        thresholdEl.textContent = Math.round(S.cfg.decision.threshold * 100) + "%";
       }
       scheduleAutoSave();
       return;

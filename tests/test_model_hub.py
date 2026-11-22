@@ -67,7 +67,7 @@ PROVIDERS = [
         "modalities": ["text"],
     },
 ]
-MAIN_CONFIG = {"main": {"source_id": "deepseek", "model": "deepseek-chat"}}
+DIALOGUE_CONFIG = {"dialogue": {"source_id": "deepseek", "model": "deepseek-chat"}}
 
 
 class ModelHubTestBase(DatabaseAsyncTestCase):
@@ -104,9 +104,16 @@ class ModelHubTestBase(DatabaseAsyncTestCase):
 class TestNormalizeModelConfig(unittest.TestCase):
     def test_defaults_are_complete(self):
         cfg = normalize_model_config(None)
-        assert set(cfg) == {"main", "decision", "vision", "tts", "embedding", "rerank"}
-        assert cfg["main"] == {"source_id": "", "model": ""}
+        assert set(cfg) == {
+            "dialogue", "main", "decision", "vision", "tts", "embedding", "rerank",
+        }
+        assert cfg["dialogue"] == {"source_id": "", "model": ""}
+        assert cfg["main"]["inherit"] is True
+        assert cfg["main"]["inherit_from"] == "dialogue"
         assert cfg["decision"]["inherit"] is True
+        assert cfg["decision"]["inherit_from"] == "main"
+        assert cfg["decision"]["mode"] == "chat"
+        assert cfg["decision"]["threshold"] == 0.5
         assert cfg["vision"]["inherit"] is True
         assert cfg["tts"]["mode"] == "off"
         assert cfg["tts"]["scope"] == "private"
@@ -116,7 +123,7 @@ class TestNormalizeModelConfig(unittest.TestCase):
     def test_coerces_bad_values(self):
         cfg = normalize_model_config(
             {
-                "main": {"source_id": "  deepseek  ", "model": 123},
+                "dialogue": {"source_id": "  deepseek  ", "model": 123},
                 "decision": {"inherit": "false", "source_id": "s", "model": "m"},
                 "tts": {
                     "mode": "BOGUS",
@@ -126,8 +133,9 @@ class TestNormalizeModelConfig(unittest.TestCase):
                 },
             }
         )
-        assert cfg["main"] == {"source_id": "deepseek", "model": "123"}
+        assert cfg["dialogue"] == {"source_id": "deepseek", "model": "123"}
         assert cfg["decision"]["inherit"] is False
+        assert cfg["decision"]["inherit_from"] == ""
         assert cfg["tts"]["mode"] == "off"
         assert cfg["tts"]["scope"] == "private"
         assert cfg["tts"]["probability"] == 1.0
@@ -139,21 +147,20 @@ class TestNormalizeModelConfig(unittest.TestCase):
 
 
 class TestRoleInheritance(ModelHubTestBase):
-    async def test_decision_and_vision_inherit_main_by_default(self):
-        hub, _ctx, _factory = await self.make_hub(model_config=MAIN_CONFIG)
-        assert await hub.resolve_role("main") == {
-            "source_id": "deepseek",
-            "model": "deepseek-chat",
-        }
-        assert await hub.resolve_role("decision") == await hub.resolve_role("main")
-        assert await hub.resolve_role("vision") == await hub.resolve_role("main")
-        # legacy alias
-        assert await hub.resolve_role("small") == await hub.resolve_role("main")
+    async def test_all_roles_inherit_dialogue_by_default(self):
+        hub, _ctx, _factory = await self.make_hub(model_config=DIALOGUE_CONFIG)
+        expected = {"source_id": "deepseek", "model": "deepseek-chat"}
+        assert await hub.resolve_role("dialogue") == expected
+        assert await hub.resolve_role("main") == expected
+        assert await hub.resolve_role("decision") == expected
+        assert await hub.resolve_role("vision") == expected
+        # legacy alias: ``small`` used to mean the old decision role -> new main
+        assert await hub.resolve_role("small") == expected
 
     async def test_decision_explicit_override(self):
         hub, _ctx, _factory = await self.make_hub(
             model_config={
-                "main": {"source_id": "deepseek", "model": "deepseek-chat"},
+                "dialogue": {"source_id": "deepseek", "model": "deepseek-chat"},
                 "decision": {
                     "inherit": False,
                     "source_id": "deepseek",
@@ -169,12 +176,13 @@ class TestRoleInheritance(ModelHubTestBase):
         status = await hub.get_status()
         assert status["decision"]["mode"] == "plugin"
         assert status["decision"]["inherited"] is False
-        assert status["main"]["inherited"] is False
+        assert status["main"]["inherited"] is True
+        assert status["main"]["inherit_from"] == "dialogue"
 
     async def test_inherit_true_wins_over_own_values(self):
         hub, _ctx, _factory = await self.make_hub(
             model_config={
-                "main": {"source_id": "deepseek", "model": "deepseek-chat"},
+                "dialogue": {"source_id": "deepseek", "model": "deepseek-chat"},
                 "vision": {
                     "inherit": True,
                     "source_id": "deepseek",
@@ -188,9 +196,7 @@ class TestRoleInheritance(ModelHubTestBase):
         }
 
     async def test_tts_never_inherits_and_off_by_default(self):
-        hub, _ctx, _factory = await self.make_hub(
-            model_config={"main": {"source_id": "deepseek", "model": "deepseek-chat"}}
-        )
+        hub, _ctx, _factory = await self.make_hub(model_config=DIALOGUE_CONFIG)
         assert await hub.resolve_role("tts") is None
         assert await hub.get_provider("tts") is None
         assert await hub.synthesize("你好") is None
@@ -212,7 +218,7 @@ class TestRoleInheritance(ModelHubTestBase):
         }
 
     async def test_invalid_role_returns_none(self):
-        hub, _ctx, _factory = await self.make_hub(model_config=MAIN_CONFIG)
+        hub, _ctx, _factory = await self.make_hub(model_config=DIALOGUE_CONFIG)
         assert await hub.resolve_role("bogus") is None
         assert await hub.resolve_role("") is None
 
@@ -223,7 +229,7 @@ class TestMainProviderId(ModelHubTestBase):
         assert await hub.get_main_provider_id() == ""
 
     async def test_reuse_existing_astrbot_instance_id(self):
-        hub, _ctx, factory = await self.make_hub(model_config=MAIN_CONFIG)
+        hub, _ctx, factory = await self.make_hub(model_config=DIALOGUE_CONFIG)
         loaded = FakeChatProvider(
             {
                 "id": "deepseek/deepseek-chat",
@@ -238,7 +244,7 @@ class TestMainProviderId(ModelHubTestBase):
         assert factory.provider_manager.inst_map.get("onlyyou::main") is None
 
     async def test_self_built_instance_registers_onlyyou_main(self):
-        hub, _ctx, factory = await self.make_hub(model_config=MAIN_CONFIG)
+        hub, _ctx, factory = await self.make_hub(model_config=DIALOGUE_CONFIG)
         main_id = await hub.get_main_provider_id()
         assert main_id == "onlyyou::main"
         instance = factory.provider_manager.inst_map["onlyyou::main"]
@@ -247,7 +253,7 @@ class TestMainProviderId(ModelHubTestBase):
 
     async def test_build_failure_returns_empty_string(self):
         hub, _ctx, factory = await self.make_hub(
-            model_config={"main": {"source_id": "no-such-source", "model": "m"}}
+            model_config={"dialogue": {"source_id": "no-such-source", "model": "m"}}
         )
         assert await hub.get_main_provider_id() == ""
 
@@ -257,7 +263,7 @@ class TestNeverCallsPlatformModelSelection(ModelHubTestBase):
         hub, context, _factory = await self.make_hub(
             plugin_config={"model_hub_config": {"main_llm_provider_id": "x"}},
             model_config={
-                **MAIN_CONFIG,
+                **DIALOGUE_CONFIG,
                 "tts": {
                     "mode": "source",
                     "source_id": "edge-tts-source",
@@ -280,42 +286,47 @@ class TestNeverCallsPlatformModelSelection(ModelHubTestBase):
         await hub.call_llm_json("hi", role="decision", default={})
         await hub.test_role("main")
         await hub.synthesize("你好")
-        await hub.save_model_config(MAIN_CONFIG)
+        await hub.save_model_config(DIALOGUE_CONFIG)
         assert context.forbidden_calls == []
 
 
 class TestPersistenceAndHotRebuild(ModelHubTestBase):
     async def test_save_model_config_persists_and_unregisters_main(self):
-        hub, _ctx, factory = await self.make_hub(model_config=MAIN_CONFIG)
+        hub, _ctx, factory = await self.make_hub(model_config=DIALOGUE_CONFIG)
         first_id = await hub.get_main_provider_id()
         assert first_id == "onlyyou::main"
         assert "onlyyou::main" in factory.provider_manager.inst_map
 
         saved = await hub.save_model_config(
-            {"main": {"source_id": "deepseek", "model": "deepseek-reasoner"}}
+            {"dialogue": {"source_id": "deepseek", "model": "deepseek-reasoner"}}
         )
-        assert saved["main"]["model"] == "deepseek-reasoner"
+        assert saved["dialogue"]["model"] == "deepseek-reasoner"
         # unregister_main executed -> next AstrBot request goes through a fresh instance
         assert "onlyyou::main" not in factory.provider_manager.inst_map
 
         stored = await self.db.get_setting("model_config", None)
         assert stored is not None
-        assert stored["main"] == {"source_id": "deepseek", "model": "deepseek-reasoner"}
-        assert set(stored) == {"main", "decision", "vision", "tts", "embedding", "rerank"}
+        assert stored["dialogue"] == {
+            "source_id": "deepseek",
+            "model": "deepseek-reasoner",
+        }
+        assert set(stored) == {
+            "dialogue", "main", "decision", "vision", "tts", "embedding", "rerank",
+        }
 
         # a brand-new hub instance reading the same DB sees the persisted config
         hub2 = ModelHub(
             context=_ctx, plugin_config={}, db=self.db, provider_factory=factory
         )
         await hub2.load()
-        assert hub2.get_model_config()["main"]["model"] == "deepseek-reasoner"
+        assert hub2.get_model_config()["dialogue"]["model"] == "deepseek-reasoner"
 
     async def test_get_main_provider_id_hot_rebuilds_after_save(self):
-        hub, _ctx, factory = await self.make_hub(model_config=MAIN_CONFIG)
+        hub, _ctx, factory = await self.make_hub(model_config=DIALOGUE_CONFIG)
         await hub.get_main_provider_id()
         old_instance = factory.provider_manager.inst_map["onlyyou::main"]
         await hub.save_model_config(
-            {"main": {"source_id": "deepseek", "model": "deepseek-reasoner"}}
+            {"dialogue": {"source_id": "deepseek", "model": "deepseek-reasoner"}}
         )
         main_id = await hub.get_main_provider_id()
         assert main_id == "onlyyou::main"
@@ -326,7 +337,7 @@ class TestPersistenceAndHotRebuild(ModelHubTestBase):
 
 class TestLlmCalls(ModelHubTestBase):
     async def test_call_llm_text_uses_text_chat(self):
-        hub, _ctx, factory = await self.make_hub(model_config=MAIN_CONFIG)
+        hub, _ctx, factory = await self.make_hub(model_config=DIALOGUE_CONFIG)
         provider = await hub.get_provider("main")
         assert isinstance(provider, FakeChatProvider)
         provider.response_text = "  你好呀  "
@@ -340,7 +351,7 @@ class TestLlmCalls(ModelHubTestBase):
         assert call["image_urls"] == ["http://img"]
 
     async def test_call_llm_text_empty_system_prompt_becomes_none(self):
-        hub, _ctx, _factory = await self.make_hub(model_config=MAIN_CONFIG)
+        hub, _ctx, _factory = await self.make_hub(model_config=DIALOGUE_CONFIG)
         provider = await hub.get_provider("main")
         await hub.call_llm_text("hi", role="main")
         assert provider.text_chat_calls[-1]["system_prompt"] is None
@@ -351,13 +362,13 @@ class TestLlmCalls(ModelHubTestBase):
         assert await hub.call_llm_text("hi") == ""
 
     async def test_call_llm_json_parses_fenced_json(self):
-        hub, _ctx, _factory = await self.make_hub(model_config=MAIN_CONFIG)
+        hub, _ctx, _factory = await self.make_hub(model_config=DIALOGUE_CONFIG)
         provider = await hub.get_provider("main")
         provider.response_text = '```json\n{"a": 1}\n```'
         assert await hub.call_llm_json("hi", role="main") == {"a": 1}
 
     async def test_call_llm_json_returns_default_on_garbage(self):
-        hub, _ctx, _factory = await self.make_hub(model_config=MAIN_CONFIG)
+        hub, _ctx, _factory = await self.make_hub(model_config=DIALOGUE_CONFIG)
         provider = await hub.get_provider("main")
         provider.response_text = "not json at all"
         assert await hub.call_llm_json("hi", role="main", default={"fallback": True}) == {
@@ -373,24 +384,29 @@ class TestLlmCalls(ModelHubTestBase):
 
 
 class TestStatusAndDiagnostics(ModelHubTestBase):
-    async def test_get_status_four_roles(self):
-        hub, _ctx, _factory = await self.make_hub(model_config=MAIN_CONFIG)
+    async def test_get_status_all_roles(self):
+        hub, _ctx, _factory = await self.make_hub(model_config=DIALOGUE_CONFIG)
         status = await hub.get_status()
-        assert set(status) == {"main", "decision", "vision", "tts", "embedding", "rerank"}
-        assert status["main"]["configured"] is True
-        assert status["main"]["mode"] in ("reuse", "plugin")
-        assert status["main"]["ok"] is True
-        assert status["main"]["source_id"] == "deepseek"
-        assert status["main"]["model"] == "deepseek-chat"
+        assert set(status) == {
+            "dialogue", "main", "decision", "vision", "tts", "embedding", "rerank",
+        }
+        assert status["dialogue"]["configured"] is True
+        assert status["dialogue"]["mode"] in ("reuse", "plugin")
+        assert status["dialogue"]["ok"] is True
+        assert status["dialogue"]["source_id"] == "deepseek"
+        assert status["dialogue"]["model"] == "deepseek-chat"
+        assert status["main"]["inherited"] is True
+        assert status["main"]["inherit_from"] == "dialogue"
         assert status["decision"]["inherited"] is True
+        assert status["decision"]["decision_mode"] == "chat"
         assert status["vision"]["inherited"] is True
         assert status["tts"]["role"] == "tts"
 
     async def test_test_role_main_success(self):
-        hub, _ctx, _factory = await self.make_hub(model_config=MAIN_CONFIG)
-        result = await hub.test_role("main")
+        hub, _ctx, _factory = await self.make_hub(model_config=DIALOGUE_CONFIG)
+        result = await hub.test_role("dialogue")
         assert result["status"] == "ok"
-        assert result["role"] == "main"
+        assert result["role"] == "dialogue"
         assert result["model"] == "deepseek-chat"
         assert isinstance(result["latency_ms"], int)
         assert result["reply"] == "pong"
@@ -428,7 +444,7 @@ class TestStatusAndDiagnostics(ModelHubTestBase):
         assert result["audio_base64"]
 
     async def test_dispose_delegates_to_provider_factory(self):
-        hub, _ctx, factory = await self.make_hub(model_config=MAIN_CONFIG)
+        hub, _ctx, factory = await self.make_hub(model_config=DIALOGUE_CONFIG)
         await hub.get_main_provider_id()
         assert "onlyyou::main" in factory.provider_manager.inst_map
         await hub.dispose()
@@ -451,23 +467,24 @@ class TestLegacyMigration(ModelHubTestBase):
         await hub.load()
 
         cfg = hub.get_model_config()
-        assert cfg["main"] == {"source_id": "deepseek", "model": "deepseek-chat"}
-        # v2.6: migrated roles carry the normalized optional-inheritance shape
-        # (``inherit``/``inherit_from`` stay in sync; legacy explicit models do
-        # not inherit, unset roles keep inheriting ``main``).
-        assert cfg["decision"] == {
+        # old main (dialogue model) -> dialogue; old decision -> main + decision.
+        assert cfg["dialogue"] == {"source_id": "deepseek", "model": "deepseek-chat"}
+        assert cfg["main"] == {
             "inherit": False,
             "inherit_from": "",
             "source_id": "deepseek",
             "model": "deepseek-reasoner",
         }
+        assert cfg["decision"]["inherit"] is True
+        assert cfg["decision"]["inherit_from"] == "main"
+        assert cfg["decision"]["mode"] == "chat"
+        # explicit legacy vision model is preserved as an independent role.
         assert cfg["vision"] == {
-            "inherit": True,
-            "inherit_from": "main",
-            "source_id": "",
-            "model": "",
+            "inherit": False,
+            "inherit_from": "",
+            "source_id": "deepseek",
+            "model": "deepseek-chat",
         }
-        assert cfg["vision"]["inherit"] is True
         assert await self.db.get_setting("legacy_model_migrated", False) is True
         assert await self.db.get_setting("model_config", None) is not None
 
@@ -481,7 +498,7 @@ class TestLegacyMigration(ModelHubTestBase):
         )
         await hub.load()
         migrated = hub.get_model_config()
-        assert migrated["main"]["model"] == "deepseek-chat"
+        assert migrated["dialogue"]["model"] == "deepseek-chat"
 
         # even if the old config changes, the one-shot flag stops re-migration
         second_legacy = {
@@ -491,7 +508,7 @@ class TestLegacyMigration(ModelHubTestBase):
             context=context, plugin_config=second_legacy, db=self.db, provider_factory=factory
         )
         await hub2.load()
-        assert hub2.get_model_config()["main"]["model"] == "deepseek-chat"
+        assert hub2.get_model_config()["dialogue"]["model"] == "deepseek-chat"
 
     async def test_migration_unknown_provider_still_sets_flag(self):
         context, factory = self.make_context()
@@ -502,14 +519,14 @@ class TestLegacyMigration(ModelHubTestBase):
             provider_factory=factory,
         )
         await hub.load()
-        assert hub.get_model_config()["main"]["model"] == ""
+        assert hub.get_model_config()["dialogue"]["model"] == ""
         assert await self.db.get_setting("legacy_model_migrated", False) is True
 
     async def test_migration_skipped_when_main_already_configured(self):
         context, factory = self.make_context()
         await self.db.set_setting(
             "model_config",
-            {"main": {"source_id": "deepseek", "model": "deepseek-reasoner"}},
+            {"dialogue": {"source_id": "deepseek", "model": "deepseek-reasoner"}},
         )
         hub = ModelHub(
             context=context,
@@ -520,7 +537,7 @@ class TestLegacyMigration(ModelHubTestBase):
             provider_factory=factory,
         )
         await hub.load()
-        assert hub.get_model_config()["main"]["model"] == "deepseek-reasoner"
+        assert hub.get_model_config()["dialogue"]["model"] == "deepseek-reasoner"
         assert await self.db.get_setting("legacy_model_migrated", False) is True
 
 

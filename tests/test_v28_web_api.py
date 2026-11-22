@@ -751,8 +751,8 @@ class TestModelsPerSoul(WebApiV28TestBase):
     async def test_models_config_per_soul_isolation(self):
         first = await self.first_soul()
         second = await self.create_soul("soul_b", "第二个角色")
-        config_a = {"main": {"source_id": "deepseek", "model": "deepseek-chat"}}
-        config_b = {"main": {"source_id": "deepseek", "model": "deepseek-reasoner"}}
+        config_a = {"dialogue": {"source_id": "deepseek", "model": "deepseek-chat"}}
+        config_b = {"dialogue": {"source_id": "deepseek", "model": "deepseek-reasoner"}}
 
         response_a = await self.call(
             "POST",
@@ -761,7 +761,7 @@ class TestModelsPerSoul(WebApiV28TestBase):
         )
         data_a = self.assert_ok(response_a)
         assert data_a["soul_id"] == first.soul_id
-        assert data_a["model_config"]["main"]["model"] == "deepseek-chat"
+        assert data_a["model_config"]["dialogue"]["model"] == "deepseek-chat"
         assert "热重建" in response_a["message"]
 
         data_b = self.assert_ok(
@@ -771,7 +771,7 @@ class TestModelsPerSoul(WebApiV28TestBase):
                 body={"soul_id": second.soul_id, "model_config": config_b},
             )
         )
-        assert data_b["model_config"]["main"]["model"] == "deepseek-reasoner"
+        assert data_b["model_config"]["dialogue"]["model"] == "deepseek-reasoner"
 
         get_a = self.assert_ok(
             await self.call(
@@ -784,15 +784,17 @@ class TestModelsPerSoul(WebApiV28TestBase):
             )
         )
         assert get_a["soul_id"] == first.soul_id
-        assert get_a["model_config"]["main"]["model"] == "deepseek-chat"
-        assert get_b["model_config"]["main"]["model"] == "deepseek-reasoner"
-        assert set(get_a["status"]) == {"main", "decision", "vision", "tts", "embedding", "rerank"}
+        assert get_a["model_config"]["dialogue"]["model"] == "deepseek-chat"
+        assert get_b["model_config"]["dialogue"]["model"] == "deepseek-reasoner"
+        assert set(get_a["status"]) == {
+            "dialogue", "main", "decision", "vision", "tts", "embedding", "rerank",
+        }
 
         # each Soul persisted its own config in its JSON file
-        assert (await self.read_soul_file(first.soul_id))["model_config"]["main"][
+        assert (await self.read_soul_file(first.soul_id))["model_config"]["dialogue"][
             "model"
         ] == "deepseek-chat"
-        assert (await self.read_soul_file(second.soul_id))["model_config"]["main"][
+        assert (await self.read_soul_file(second.soul_id))["model_config"]["dialogue"][
             "model"
         ] == "deepseek-reasoner"
 
@@ -811,14 +813,14 @@ class TestModelsPerSoul(WebApiV28TestBase):
                 self.api.api_models_config,
                 body={
                     "model_config": {
-                        "main": {"source_id": "deepseek", "model": "deepseek-chat"}
+                        "dialogue": {"source_id": "deepseek", "model": "deepseek-chat"}
                     }
                 },
             )
         )
         data = self.assert_ok(await self.call("GET", self.api.api_models_config))
         assert data["soul_id"] == first.soul_id
-        assert data["model_config"]["main"]["model"] == "deepseek-chat"
+        assert data["model_config"]["dialogue"]["model"] == "deepseek-chat"
 
     async def test_models_test_accepts_soul_id(self):
         soul = await self.first_soul()
@@ -829,7 +831,7 @@ class TestModelsPerSoul(WebApiV28TestBase):
                 body={
                     "soul_id": soul.soul_id,
                     "model_config": {
-                        "main": {"source_id": "deepseek", "model": "deepseek-chat"}
+                        "dialogue": {"source_id": "deepseek", "model": "deepseek-chat"}
                     },
                 },
             )
@@ -888,7 +890,7 @@ class TestModelsPerSoul(WebApiV28TestBase):
                     "soul_id": "soul_p",
                     "card": card,
                     "model_config": {
-                        "main": {"source_id": "deepseek", "model": "deepseek-chat"}
+                        "dialogue": {"source_id": "deepseek", "model": "deepseek-chat"}
                     },
                     "bound_platforms": ["telegram_bot_1", "telegram_bot_1"],
                     "settings": {"surfing_enabled": False},
@@ -897,13 +899,13 @@ class TestModelsPerSoul(WebApiV28TestBase):
         )
         soul_dict = data["soul"]
         assert soul_dict["soul_id"] == "soul_p"
-        assert soul_dict["model_config"]["main"]["model"] == "deepseek-chat"
+        assert soul_dict["model_config"]["dialogue"]["model"] == "deepseek-chat"
         assert soul_dict["bound_platforms"] == ["telegram_bot_1"]
         assert soul_dict["settings"]["surfing_enabled"] is False
 
         profile = await self.plugin.soul_manager.get_soul_by_id("soul_p")
         assert profile is not None
-        assert profile.model_config["main"]["model"] == "deepseek-chat"
+        assert profile.model_config["dialogue"]["model"] == "deepseek-chat"
         assert profile.bound_platforms == ["telegram_bot_1"]
         assert profile.settings["surfing_enabled"] is False
         stored = await self.read_soul_file("soul_p")

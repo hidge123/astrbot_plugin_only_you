@@ -59,7 +59,7 @@ class QueuedHub(StubModelHub):
         self.json_results = list(json_results or [])
 
     async def call_llm_json(
-        self, prompt="", role="decision", umo=None, default=None, soul_id=None, **kwargs
+        self, prompt="", role="main", umo=None, default=None, soul_id=None, **kwargs
     ):
         self.calls.append({"prompt": prompt, "role": role, "umo": umo})
         if self.json_results:

@@ -845,8 +845,17 @@
           bound_platforms: ["telegram"],
           settings: { surfing_enabled: true },
           model_config: {
-            main: { source_id: "ailiyun", model: "qwen-max" },
-            decision: { inherit: true, inherit_from: "main", source_id: "", model: "" },
+            dialogue: { source_id: "ailiyun", model: "qwen-max" },
+            main: { inherit: true, inherit_from: "dialogue", source_id: "", model: "" },
+            decision: {
+              inherit: true,
+              inherit_from: "main",
+              source_id: "",
+              model: "",
+              mode: "chat",
+              threshold: 0.5,
+              endpoint: ""
+            },
             vision: { inherit: true, inherit_from: "main", source_id: "", model: "" },
             tts: {
               mode: "off",
@@ -1028,15 +1037,25 @@
         { persona_name: "毒舌吐槽役", prompt: "你是一个毒舌但心软的吐槽役，习惯用反讽和夸张的比喻……" }
       ],
       modelConfig: {
-        main: { source_id: "deepseek", model: "deepseek-chat" },
-        decision: { inherit: true, inherit_from: "main", source_id: "", model: "" },
+        dialogue: { source_id: "deepseek", model: "deepseek-chat" },
+        main: { inherit: true, inherit_from: "dialogue", source_id: "", model: "" },
+        decision: {
+          inherit: true,
+          inherit_from: "main",
+          source_id: "",
+          model: "",
+          mode: "chat",
+          threshold: 0.5,
+          endpoint: ""
+        },
         vision: { inherit: true, inherit_from: "main", source_id: "", model: "" },
         tts: { mode: "off", source_id: "", model: "", voice: "", provider_id: "", probability: 1.0, scope: "private", dual_output: false }
       },
       sources: [
         { id: "deepseek", type: "openai_chat_completion", provider_type: "chat_completion", provider: "DeepSeek", api_base: "https://api.deepseek.com/v1", has_key: true, enable: true },
         { id: "ailiyun", type: "openai_chat_completion", provider_type: "chat_completion", provider: "阿里云百炼", api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1", has_key: true, enable: true },
-        { id: "siliconflow", type: "openai_chat_completion", provider_type: "chat_completion", provider: "硅基流动", api_base: "https://api.siliconflow.cn/v1", has_key: false, enable: false }
+        { id: "siliconflow", type: "openai_chat_completion", provider_type: "chat_completion", provider: "硅基流动", api_base: "https://api.siliconflow.cn/v1", has_key: false, enable: false },
+        { id: "openrouter", type: "openai_chat_completion", provider_type: "chat_completion", provider: "OpenRouter", api_base: "https://openrouter.ai/api/v1", has_key: true, enable: true }
       ],
       ttsProviders: [
         { id: "edge_tts_default", model: "zh-CN-XiaoxiaoNeural", type: "edge_tts", enable: true },
@@ -1800,14 +1819,14 @@
   function buildModelStatus(cfgOverride) {
     var cfg = normalizeModelConfig(cfgOverride || db.modelConfig || {});
     var status = {};
-    ["main", "decision", "vision"].forEach(function (role) {
+    ["dialogue", "main", "decision", "vision"].forEach(function (role) {
       var entry = cfg[role] || {};
-      var inheritFrom = role === "main" ? "" : String(entry.inherit_from || "");
+      var inheritFrom = role === "dialogue" ? "" : String(entry.inherit_from || "");
       var pair = resolveModelPair(cfg, role);
       var item = {
         role: role,
         configured: !!pair,
-        /* v2.6：仅当开启继承且确实解析到父角色模型时 inherited 才为 true */
+        /* 仅当开启继承且确实解析到父角色模型时 inherited 才为 true */
         inherited: !!(inheritFrom && pair),
         inherit: !!inheritFrom,
         inherit_from: inheritFrom,
@@ -1818,7 +1837,25 @@
         label: "未配置",
         ok: false
       };
+      if (role === "decision") {
+        item.decision_mode = entry.mode === "judge" ? "judge" : "chat";
+        item.threshold = entry.threshold == null ? 0.5 : entry.threshold;
+        item.judge_ready = false;
+      }
       if (!pair) {
+        if (role === "decision" && item.decision_mode === "judge") {
+          item.label = "判断模型未就绪（Mock）";
+        }
+        status[role] = item;
+        return;
+      }
+      if (role === "decision" && item.decision_mode === "judge") {
+        item.mode = "judge";
+        item.provider_id = "";
+        item.judge_ready = true;
+        item.ok = true;
+        item.label =
+          "判断模型 " + pair.model + " · OpenRouter Decisions API（Mock）";
         status[role] = item;
         return;
       }
@@ -1826,7 +1863,7 @@
       item.mode = reuse ? "reuse" : "plugin";
       item.provider_id = reuse
         ? "deepseek/deepseek-chat"
-        : role === "main"
+        : role === "dialogue"
         ? "onlyyou::main"
         : "onlyyou::chat::" + pair.source_id + "::" + pair.model;
       item.ok = true;
@@ -1838,7 +1875,12 @@
         (reuse ? "复用 AstrBot 实例" : "插件自建实例") +
         "）";
       if (item.inherited) {
-        item.label += inheritFrom === "decision" ? " · 继承轻量决策模型" : " · 继承主模型";
+        item.label +=
+          inheritFrom === "dialogue"
+            ? " · 继承对话模型"
+            : inheritFrom === "decision"
+            ? " · 继承决策模型"
+            : " · 继承主模型";
       }
       status[role] = item;
     });
@@ -2191,10 +2233,11 @@
   /* ================================================================== *
    * 7. 默认角色 / UMO 绑定 / 模型配置
    * ================================================================== */
-  /* v2.6 可选继承：decision / vision 的合法 inherit_from 取值 */
+  /* 可选继承：main / decision / vision 的合法 inherit_from 取值 */
   var INHERIT_FROM_OPTIONS = {
-    decision: ["", "main"],
-    vision: ["", "main", "decision"]
+    main: ["", "dialogue"],
+    decision: ["", "main", "dialogue"],
+    vision: ["", "main", "dialogue"]
   };
 
   function toBool(value, fallback) {
@@ -2203,35 +2246,43 @@
     return ["1", "true", "yes", "on", "y"].indexOf(String(value).trim().toLowerCase()) >= 0;
   }
 
-  /** decision / vision 的 inherit_from 归一化（与 core/model_hub.py §1.1 同规则）。 */
+  /** main / decision / vision 的 inherit_from 归一化（与 core/model_hub.py 同规则）。 */
   function normalizeInheritFrom(role, raw) {
     raw = raw && typeof raw === "object" ? raw : {};
     var options = INHERIT_FROM_OPTIONS[role] || ["", "main"];
+    var defaultParent = role === "main" ? "dialogue" : "main";
     var has = Object.prototype.hasOwnProperty;
     var candidate = "";
     if (has.call(raw, "inherit_from") && raw.inherit_from != null) {
       candidate = String(raw.inherit_from).trim().toLowerCase();
-      if (options.indexOf(candidate) < 0) candidate = toBool(raw.inherit, true) ? "main" : "";
+      if (options.indexOf(candidate) < 0) {
+        candidate = toBool(raw.inherit, false) ? defaultParent : "";
+      }
     } else if (has.call(raw, "inherit")) {
-      candidate = toBool(raw.inherit, true) ? "main" : "";
+      candidate = toBool(raw.inherit, true) ? defaultParent : "";
     } else {
-      /* 旧配置（两个键都没有）：向后兼容默认继承主模型 */
-      candidate = "main";
+      candidate = defaultParent;
     }
     return candidate;
   }
 
-  /** 四角色模型配置归一化：decision / vision 恒带 inherit + inherit_from 且两者同步。 */
+  /** 角色模型配置归一化：主 / 决策 / 视觉恒带 inherit + inherit_from 且两者同步。 */
   function normalizeModelConfig(raw) {
     raw = raw && typeof raw === "object" ? raw : {};
-    var main = raw.main && typeof raw.main === "object" ? raw.main : {};
+    /* 兼容旧布局：没有 dialogue 时把旧 main 当作对话模型 */
+    var dialogue =
+      raw.dialogue && typeof raw.dialogue === "object"
+        ? raw.dialogue
+        : raw.main && typeof raw.main === "object"
+        ? raw.main
+        : {};
     var out = {
-      main: {
-        source_id: String(main.source_id == null ? "" : main.source_id).trim(),
-        model: String(main.model == null ? "" : main.model).trim()
+      dialogue: {
+        source_id: String(dialogue.source_id == null ? "" : dialogue.source_id).trim(),
+        model: String(dialogue.model == null ? "" : dialogue.model).trim()
       }
     };
-    ["decision", "vision"].forEach(function (role) {
+    ["main", "decision", "vision"].forEach(function (role) {
       var roleRaw = raw[role] && typeof raw[role] === "object" ? raw[role] : {};
       var inheritFrom = normalizeInheritFrom(role, roleRaw);
       out[role] = {
@@ -2240,6 +2291,14 @@
         source_id: String(roleRaw.source_id == null ? "" : roleRaw.source_id).trim(),
         model: String(roleRaw.model == null ? "" : roleRaw.model).trim()
       };
+      if (role === "decision") {
+        var mode = String(roleRaw.mode == null ? "chat" : roleRaw.mode).trim().toLowerCase();
+        if (["chat", "judge"].indexOf(mode) < 0) mode = "chat";
+        var threshold = Number(roleRaw.threshold);
+        out.decision.mode = mode;
+        out.decision.threshold = isFinite(threshold) ? Math.max(0, Math.min(1, threshold)) : 0.5;
+        out.decision.endpoint = String(roleRaw.endpoint == null ? "" : roleRaw.endpoint).trim();
+      }
     });
     ["embedding", "rerank"].forEach(function (role) {
       var roleRaw = raw[role] && typeof raw[role] === "object" ? raw[role] : {};
@@ -2278,10 +2337,11 @@
   function resolveModelPair(cfg, role, hops) {
     hops = hops || 0;
     cfg = cfg || {};
-    if (role === "main") {
-      var main = cfg.main || {};
-      return main.source_id && main.model
-        ? { source_id: main.source_id, model: main.model }
+    if (hops > 2) return null;
+    if (role === "dialogue") {
+      var dialogue = cfg.dialogue || {};
+      return dialogue.source_id && dialogue.model
+        ? { source_id: dialogue.source_id, model: dialogue.model }
         : null;
     }
     var entry = cfg[role] || {};
@@ -2291,11 +2351,8 @@
         ? { source_id: entry.source_id, model: entry.model }
         : null;
     }
-    if (inheritFrom === "main") return resolveModelPair(cfg, "main", hops + 1);
-    if ((inheritFrom === "decision" || inheritFrom === "vision") && hops < 2) {
-      return resolveModelPair(cfg, inheritFrom, hops + 1);
-    }
-    return null;
+    if (inheritFrom === "dialogue") return resolveModelPair(cfg, "dialogue", hops + 1);
+    return resolveModelPair(cfg, inheritFrom, hops + 1);
   }
 
   function saveSoul(soulId, body) {
@@ -3435,7 +3492,7 @@
         };
       }
       case "models/test": {
-        var role = String(payload.role || "main");
+        var role = String(payload.role || "dialogue");
         var testSoul = findSoul(String(payload.soul_id || "")) || defaultSoul();
         if (testSoul) ensureSoulV28Fields(testSoul);
         var testCfg = normalizeModelConfig(testSoul ? testSoul.model_config : db.modelConfig);
@@ -3448,6 +3505,20 @@
             latency_ms: 420,
             audio_path: "/tmp/onlyyou_mock_tts.mp3",
             audio_base64: mockSilentWavBase64(400)
+          };
+        }
+        if (role === "decision" && testCfg.decision.mode === "judge") {
+          return {
+            status: "ok",
+            role: "decision",
+            mode: "judge",
+            soul_id: testSoul ? testSoul.soul_id : "",
+            model: testCfg.decision.model,
+            provider: "TypeSafe (Mock)",
+            decision: "REPLY",
+            confidence: 0.93,
+            threshold: testCfg.decision.threshold,
+            latency_ms: 180 + Math.round(Math.random() * 160)
           };
         }
         return {

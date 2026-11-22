@@ -1855,7 +1855,7 @@ class SoulManager:
                 soul_summary=soul_summary or "（无）",
             )
             data = await self.model_hub.call_llm_json(
-                prompt=prompt, role="decision", default=None
+                prompt=prompt, role="main", default=None
             )
         except Exception as e:  # noqa: BLE001 - AI generation must never crash callers
             logger.warning(f"[OnlyYou] Action deck generation failed: {e}")
@@ -1974,7 +1974,7 @@ class SoulManager:
                         native_persona_prompt=native_prompt[:1500],
                     )
                     data = await self.model_hub.call_llm_json(
-                        prompt=prompt, role="decision", default=None
+                        prompt=prompt, role="main", default=None
                     )
                 except Exception as e:  # noqa: BLE001
                     logger.warning(f"[OnlyYou] Deck seeding failed: {e}")

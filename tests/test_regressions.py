@@ -151,7 +151,7 @@ class SequencedStubModelHub(StubModelHub):
     async def call_llm_json(
         self,
         prompt="",
-        role="decision",
+        role="main",
         umo=None,
         system_prompt="",
         image_urls=None,
@@ -167,7 +167,7 @@ class SequencedStubModelHub(StubModelHub):
     async def call_llm_text(
         self,
         prompt="",
-        role="decision",
+        role="main",
         umo=None,
         system_prompt="",
         image_urls=None,

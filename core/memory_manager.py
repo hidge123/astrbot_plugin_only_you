@@ -1516,7 +1516,7 @@ class MemoryManager:
         )
         kwargs: dict[str, Any] = {
             "prompt": prompt,
-            "role": "decision",
+            "role": "main",
             "umo": umo,
             "default": None,
         }

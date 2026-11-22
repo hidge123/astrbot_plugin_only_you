@@ -186,8 +186,10 @@ class TestInitSummary(WebApiTestBase):
             "IDLE_ROAM",
             "BUSY_TASK",
         }
-        assert set(data["model_status"]) == {"main", "decision", "vision", "tts", "embedding", "rerank"}
-        assert data["model_status"]["main"]["mode"] == "unconfigured"
+        assert set(data["model_status"]) == {
+            "dialogue", "main", "decision", "vision", "tts", "embedding", "rerank",
+        }
+        assert data["model_status"]["dialogue"]["mode"] == "unconfigured"
         assert data["model_status"]["tts"]["mode"] == "off"
         assert isinstance(data["native_personas"], list)
         assert data["native_personas"][0]["persona_name"]
@@ -267,7 +269,9 @@ class TestDashboardOverview(WebApiTestBase):
         assert set(counts["relations"]) == {"l1", "l2", "l3", "total"}
         assert set(counts["memories"]) == {"tier1", "tier2", "tier3", "total"}
         assert isinstance(counts["videos"], int)
-        assert set(data["models"]) == {"main", "decision", "vision", "tts", "embedding", "rerank"}
+        assert set(data["models"]) == {
+            "dialogue", "main", "decision", "vision", "tts", "embedding", "rerank",
+        }
 
     async def test_dashboard_counts_reflect_data(self):
         soul = await self.first_soul()
@@ -462,7 +466,7 @@ class TestCardRoutes(WebApiTestBase):
             self.api.api_models_config,
             body={
                 "model_config": {
-                    "main": {"source_id": "deepseek", "model": "deepseek-chat"}
+                    "dialogue": {"source_id": "deepseek", "model": "deepseek-chat"}
                 }
             },
         )
@@ -532,8 +536,12 @@ class TestModelRoutes(WebApiTestBase):
 
     async def test_models_config_get_defaults(self):
         data = self.assert_ok(await self.call("GET", self.api.api_models_config))
-        assert set(data["model_config"]) == {"main", "decision", "vision", "tts", "embedding", "rerank"}
-        assert set(data["status"]) == {"main", "decision", "vision", "tts", "embedding", "rerank"}
+        assert set(data["model_config"]) == {
+            "dialogue", "main", "decision", "vision", "tts", "embedding", "rerank",
+        }
+        assert set(data["status"]) == {
+            "dialogue", "main", "decision", "vision", "tts", "embedding", "rerank",
+        }
         assert data["model_config"]["tts"]["mode"] == "off"
 
     async def test_models_config_post_persists_and_hot_rebuilds(self):
@@ -543,7 +551,7 @@ class TestModelRoutes(WebApiTestBase):
             self.api.api_models_config,
             body={
                 "model_config": {
-                    "main": {"source_id": "deepseek", "model": "deepseek-chat"}
+                    "dialogue": {"source_id": "deepseek", "model": "deepseek-chat"}
                 }
             },
         )
@@ -556,18 +564,18 @@ class TestModelRoutes(WebApiTestBase):
             self.api.api_models_config,
             body={
                 "model_config": {
-                    "main": {"source_id": "deepseek", "model": "deepseek-reasoner"},
+                    "dialogue": {"source_id": "deepseek", "model": "deepseek-reasoner"},
                     "decision": {"inherit": True},
                 }
             },
         )
         data = self.assert_ok(response)
         assert "热重建" in response["message"]
-        assert data["model_config"]["main"]["model"] == "deepseek-reasoner"
+        assert data["model_config"]["dialogue"]["model"] == "deepseek-reasoner"
         assert "onlyyou::main" not in self.plugin.context.provider_manager.inst_map
 
         stored = await self.db.get_setting("model_config", None)
-        assert stored["main"]["model"] == "deepseek-reasoner"
+        assert stored["dialogue"]["model"] == "deepseek-reasoner"
 
     async def test_models_config_post_rejects_missing_payload(self):
         response = self.assert_error(
@@ -581,7 +589,7 @@ class TestModelRoutes(WebApiTestBase):
             self.api.api_models_config,
             body={
                 "model_config": {
-                    "main": {"source_id": "deepseek", "model": "deepseek-chat"}
+                    "dialogue": {"source_id": "deepseek", "model": "deepseek-chat"}
                 }
             },
         )

@@ -214,8 +214,8 @@ class TestV27ToV28Upgrade(V27ToV28UpgradeBase):
         assert await hub.db.get_setting(SOUL_MODEL_FLAG, False) is True
         soul = await sm.get_soul_by_id("legacy_soul")
         assert soul is not None
-        assert soul.model_config["main"]["source_id"] == "source_a"
-        assert soul.model_config["main"]["model"] == "model_a"
+        assert soul.model_config["dialogue"]["source_id"] == "source_a"
+        assert soul.model_config["dialogue"]["model"] == "model_a"
         # The global key is intentionally kept for rollback purposes.
         assert await hub.db.get_setting("model_config", None) is not None
 

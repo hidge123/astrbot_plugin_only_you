@@ -210,7 +210,7 @@ class UserTier(int, Enum):   L1_NORMAL=1 | L2_IMPORTANT=2 | L3_CORE=3
 
 微调成功后统一重排 `slot_key`、重写固定护甲、保持 24h 连续无缝。任何异常都被模块吞掉并记日志，绝不让消息钩子崩溃。
 
-**繁忙结算契约**：`main.settle_busy_block()` 调决策模型生成一句当天专属完成结果 → 写块字段 → `save_run` → `memory_manager.add_memory(memory_tier=1, importance=4)`；心跳、`/onlyyou status`、Web API 惰性结算三处共用，并用 in-flight 集合防并发重复结算。
+**繁忙结算契约**：`main.settle_busy_block()` 调主模型生成一句当天专属完成结果 → 写块字段 → `save_run` → `memory_manager.add_memory(memory_tier=1, importance=4)`；心跳、`/onlyyou status`、Web API 惰性结算三处共用，并用 in-flight 集合防并发重复结算。
 
 ---
 
@@ -328,7 +328,7 @@ L1 普通用户即使重要度 8 也只能进 T2；`episode` / `state` 永远不
     {"card_id": "evt_1", "title": "赶插画线稿", "action_type": "BUSY_TASK",
      "state": "BUSY", "min_hours": 1.5, "max_hours": 3.0, "base_weight": 60, "armor": 65}
   ],
-  "model_config": {"main": {}, "decision": {}, "vision": {}, "tts": {}},
+  "model_config": {"dialogue": {}, "main": {}, "decision": {}, "vision": {}, "tts": {}},
   "bound_platforms": ["aiocqhttp"],
   "settings": {"surfing_enabled": true, "surfing_sources": ["bilibili", "douyin"]},
   "updated_at": 1762840000,
@@ -378,26 +378,34 @@ SQLite `souls` 表（`soul_id / persona_hash / profile_json / updated_at / revis
 
 ---
 
-## 九、 多角色模型（四对话角色 + Embedding / Rerank）、TTS 与平台协同
+## 九、 多角色模型（对话 / 主 / 决策 / 视觉 + Embedding / Rerank）、TTS 与平台协同
 
-### 9.1 角色与继承
+### 9.1 角色与继承（role layout v2）
 
-v2.12 起共 **6 个角色**：`main` / `decision` / `vision` / `tts` / `embedding` / `rerank`。前四个语义不变；`embedding` / `rerank` 为 RAG 记忆角色，三档 `mode`（off / provider / source），不参与继承，任一关闭或失败都自动降级。
+当前共 **7 个角色**：`dialogue` / `main` / `decision` / `vision` / `tts` / `embedding` / `rerank`。旧布局（`main` = 对话、`decision` = 混合生成/读空气）会在加载时自动迁移：旧 `main` → `dialogue`，旧 `decision` → `main`（生成），新 `decision` 从旧 decision 的有效模型起步。
 
 | 角色 | 用途 | 继承规则 |
 | :--- | :--- | :--- |
-| `main` 对话 | 最终回复（经原生管线） | 必填，无继承 |
-| `decision` 决策 | 读空气 / 记忆提炼 / 微调 / 造卡 | 可继承 `main`，也可独立配置 |
-| `vision` 视觉 | 看片评分 | 可继承 `main` 或 `decision`（最多 2 跳） |
+| `dialogue` 对话 | **只**生成聊天回复（原生管线 `selected_provider`） | 根部角色，必填、无继承 |
+| `main` 主模型 | 后台生成：AI 造卡 / 记忆提炼 / 行动卡 / 繁忙成果 / 主动消息 | 默认继承 `dialogue`，也可独立配置 |
+| `decision` 决策 | **只**做读空气 / 是否接话判断 | 默认继承 `main`；`mode="judge"` 时走判断模型 |
+| `vision` 视觉 | 看片评分 | 默认继承 `main`，也可继承 `dialogue` |
 | `tts` 语音 | 插件 TTS | 不继承；`mode=off` 关闭 |
+| `embedding` / `rerank` | RAG 记忆角色 | 三档 `mode`，不参与继承，关闭/失败自动降级 |
 
-关闭继承且源/模型留空 = **该角色停用**，绝不回退 `main`。配置存于各 Soul JSON 的 `model_config`；旧全局 `plugin_settings["model_config"]` 仅作一次性迁移源保留。
+关闭继承且源/模型留空 = **该角色停用**，绝不回退其他角色。配置存于各 Soul JSON 的 `model_config`；旧全局 `plugin_settings["model_config"]` 仅作一次性迁移源保留。
+
+**决策方式（`decision.mode`）**：
+
+- `chat`（默认）：普通聊天模型接收读空气 Prompt，输出 `{"decision":"REPLY|IGNORE","confidence":…}`。
+- `judge`：走 OpenRouter Decisions API（`https://openrouter.ai/api/alpha/decisions`），用 `choice` 型问题（`REPLY` / `IGNORE`）返回概率，不生成文本；`decision.threshold`（0~1，默认 0.5）为 REPLY 概率门槛。Jev（`~typesafe/jev-latest` / `typesafe/jev-1.14`）与 OpenRouter 上其他 decisions 模型共用该协议。
+- 判断模型的 API Key 优先取所选提供商源（`api_base` 指向 openrouter.ai 时），否则读取环境变量 `OPENROUTER_API_KEY`；`decision.endpoint` 可覆盖接口地址（自定义网关）。密钥不会出现在 Web API 状态里。
 
 ### 9.2 Provider 与主模型
 
 - `provider_factory.py` 是唯一触碰 AstrBot Provider 内部结构的模块：优先复用已启用且同源同模型的实例，否则按 `(source_id, model)` 自建并初始化。
-- 自建实例不进入平台 `provider_insts`；主模型按需注册为 `onlyyou::main::<soul_id>`，换模型 / 删除角色 / 卸载时移除并 `terminate()`。
-- 门禁与读空气放行后执行 `event.set_extra("selected_provider", main_provider_id)`，AstrBot `_select_provider()` 从 `provider_manager.inst_map` 解析该实例，分段 / 流式 / 工具调用能力不变。
+- 自建实例不进入平台 `provider_insts`；**对话模型**按需注册为 `onlyyou::main::<soul_id>`（历史 id 前缀保持不变），换模型 / 删除角色 / 卸载时移除并 `terminate()`。主模型 / 决策模型不会注册为聊天 Provider。
+- 门禁与读空气放行后执行 `event.set_extra("selected_provider", dialogue_provider_id)`，AstrBot `_select_provider()` 从 `provider_manager.inst_map` 解析该实例，分段 / 流式 / 工具调用能力不变。
 
 ### 9.3 TTS 时序
 
@@ -430,7 +438,7 @@ v2.12 起共 **6 个角色**：`main` / `decision` / `vision` / `tts` / `embeddi
 3. `IDLE` 下被直接提及（`@` / 唤醒 / 引用）快速放行，不经过门闸。
 4. **概率 / 预算门闸**（仅非 @ 普通群消息）：`reply_gate_enabled`（默认 `true`）关闭时直接通过；否则先按 `random.random()*100 < reply_gate_probability`（默认 `80`，clamp 0~100）抽样，再按 `reply_gate_hourly_limit`（默认 `0` = 不限）做同一 UMO 的滚动 1 小时上限。未通过则放弃本轮：**不推进防抖 seq、不调决策模型、不进入未读队列**，日志 `[OnlyYou] Reply gate dropped non-@ group message (...)`。
 5. **防抖窗口**：未被 @ 的群消息等待 `debounce_seconds`（默认 4s，最多 6s）；等待期间同群出现更新消息则让新消息处理本轮。
-6. **五维读空气**：调 `decision` 模型输出 `REPLY` / `IGNORE`；JSON 解析失败时退回「提到角色名或冲浪偏好」启发式。
+6. **五维读空气**：调 `decision` 角色输出 `REPLY` / `IGNORE`。`mode=chat` 时解析模型 JSON；`mode=judge` 时把同一上下文作为 `state` 发给 Decisions API 的 `choice` 问题，按 REPLY 概率与 `threshold` 裁决。判定失败时退回「提到角色名或冲浪偏好」启发式。
 
 门闸预算 `_gate_pass_ts` 为内存态，重启或 `clear_gate_budget()`（按 UMO / 平台）清空；平台解绑时同步清理。
 

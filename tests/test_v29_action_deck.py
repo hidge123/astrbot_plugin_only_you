@@ -175,7 +175,7 @@ class TestGenerateActionCards(WebApiTestBase):
             _assert_clean_title(self, card.title)
 
         prompt = str(captured.get("prompt") or "")
-        assert captured.get("role") == "decision"
+        assert captured.get("role") == "main"
         assert soul.name in prompt
         assert "normal" in prompt  # chronotype injected
         assert "base_weight" in prompt

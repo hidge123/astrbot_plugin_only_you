@@ -189,8 +189,10 @@ class TestSoulJsonFileLifecycle(V28IntegrationBase):
         assert data["settings"]["surfing_enabled"] is True
         assert isinstance(data["updated_at"], int) and data["updated_at"] > 0
         assert data["card"]["identity"]["name"] == "酒狐"
-        # the model config is always stored in its normalized four-role shape
-        assert set(data["model_config"]) == {"main", "decision", "vision", "tts", "embedding", "rerank"}
+        # the model config is always stored in its normalized role shape
+        assert set(data["model_config"]) == {
+            "dialogue", "main", "decision", "vision", "tts", "embedding", "rerank",
+        }
 
         # SQLite keeps the index row in sync
         rows = await self.soul_rows()
@@ -200,7 +202,7 @@ class TestSoulJsonFileLifecycle(V28IntegrationBase):
 
     async def test_save_and_reload_roundtrips_v28_fields(self):
         model_config = {
-            "main": {"source_id": "deepseek", "model": "deepseek-chat"},
+            "dialogue": {"source_id": "deepseek", "model": "deepseek-chat"},
             "decision": {
                 "inherit": False,
                 "inherit_from": "",
@@ -482,10 +484,10 @@ if __name__ == "__main__":
 # ===========================================================================
 # 3. ModelHub per-Soul model config + provider registration (contract §2)
 # ===========================================================================
-MAIN_A = {"main": {"source_id": "deepseek", "model": "deepseek-chat"}}
-MAIN_B = {"main": {"source_id": "deepseek", "model": "deepseek-reasoner"}}
+MAIN_A = {"dialogue": {"source_id": "deepseek", "model": "deepseek-chat"}}
+MAIN_B = {"dialogue": {"source_id": "deepseek", "model": "deepseek-reasoner"}}
 DECISION_ONLY = {
-    "main": {"source_id": "deepseek", "model": "deepseek-chat"},
+    "dialogue": {"source_id": "deepseek", "model": "deepseek-chat"},
     "decision": {
         "inherit": False,
         "inherit_from": "",
@@ -508,12 +510,12 @@ class TestModelHubPerSoul(V28IntegrationBase):
     async def test_save_config_writes_soul_json_and_isolates(self):
         await self.make_pair()
         saved = await self.hub.save_config(MAIN_A, soul_id="soul_a")
-        assert saved["main"] == {"source_id": "deepseek", "model": "deepseek-chat"}
-        assert self.hub.get_config_sync("soul_a")["main"] == saved["main"]
-        assert (await self.hub.get_config("soul_a"))["main"] == saved["main"]
+        assert saved["dialogue"] == {"source_id": "deepseek", "model": "deepseek-chat"}
+        assert self.hub.get_config_sync("soul_a")["dialogue"] == saved["dialogue"]
+        assert (await self.hub.get_config("soul_a"))["dialogue"] == saved["dialogue"]
         # per-Soul persistence goes to the Soul JSON, never the legacy global KV
-        assert read_json(self.soul_path("soul_a"))["model_config"]["main"] == saved["main"]
-        assert read_json(self.soul_path("soul_b"))["model_config"]["main"] == {
+        assert read_json(self.soul_path("soul_a"))["model_config"]["dialogue"] == saved["dialogue"]
+        assert read_json(self.soul_path("soul_b"))["model_config"]["dialogue"] == {
             "source_id": "",
             "model": "",
         }
@@ -530,13 +532,13 @@ class TestModelHubPerSoul(V28IntegrationBase):
         await self.sm.set_default_soul_id("soul_b")
 
         default_cfg = await self.hub.get_config()
-        assert default_cfg["main"] == DECISION_ONLY["main"]
+        assert default_cfg["dialogue"] == DECISION_ONLY["dialogue"]
         assert default_cfg["decision"]["model"] == "deepseek-reasoner"
         assert (
             await self.hub.get_config("soul_a")
-        )["main"] == {"source_id": "", "model": ""}
+        )["dialogue"] == {"source_id": "", "model": ""}
         # an explicit soul_id overrides the default routing
-        assert (await self.hub.get_config("soul_a"))["main"]["model"] == ""
+        assert (await self.hub.get_config("soul_a"))["dialogue"]["model"] == ""
 
     async def test_provider_routing_by_umo_uses_bound_soul(self):
         await self.make_pair()
@@ -605,7 +607,7 @@ class TestModelHubPerSoul(V28IntegrationBase):
     async def test_tts_and_status_read_per_soul(self):
         await self.make_pair()
         tts_cfg = {
-            "main": {"source_id": "deepseek", "model": "deepseek-chat"},
+            "dialogue": {"source_id": "deepseek", "model": "deepseek-chat"},
             "tts": {
                 "mode": "source",
                 "source_id": "edge-tts-source",
@@ -639,8 +641,10 @@ class TestModelHubPerSoul(V28IntegrationBase):
         await legacy_hub.load()
         await legacy_hub.save_model_config(MAIN_A)
         stored = await self.db.get_setting("model_config", None)
-        assert stored is not None and stored["main"] == MAIN_A["main"]
-        assert set(stored) == {"main", "decision", "vision", "tts", "embedding", "rerank"}
+        assert stored is not None and stored["dialogue"] == MAIN_A["dialogue"]
+        assert set(stored) == {
+            "dialogue", "main", "decision", "vision", "tts", "embedding", "rerank",
+        }
 
         main_id = await legacy_hub.get_main_provider_id()
         assert main_id == "onlyyou::main"
@@ -672,17 +676,22 @@ class TestModelHubPerSoul(V28IntegrationBase):
 
         for soul_id in ("soul_a", "soul_b"):
             data = read_json(self.soul_path(soul_id))
-            assert data["model_config"]["main"] == DECISION_ONLY["main"]
+            assert data["model_config"]["dialogue"] == DECISION_ONLY["dialogue"]
             assert data["model_config"]["decision"]["model"] == "deepseek-reasoner"
         # legacy global key survives, and the one-shot flag is persisted
-        assert (await self.db.get_setting("model_config", None))["main"] == DECISION_ONLY["main"]
+        assert (
+            await self.db.get_setting("model_config", None)
+        )["dialogue"] == DECISION_ONLY["dialogue"]
         assert (
             await self.db.get_setting("model_config_migrated_to_souls", False)
         ) is True
         # a meaningful per-Soul config is never overwritten by a later load
         await self.hub.save_config(MAIN_B, soul_id="soul_a")
         await fresh_hub.load()
-        assert read_json(self.soul_path("soul_a"))["model_config"]["main"] == MAIN_B["main"]
+        assert (
+            read_json(self.soul_path("soul_a"))["model_config"]["dialogue"]
+            == MAIN_B["dialogue"]
+        )
 
 
 # ===========================================================================

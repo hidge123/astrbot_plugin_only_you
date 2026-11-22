@@ -46,6 +46,7 @@ def load_plugin_modules():
 
     import OnlyYou.core.character_card as character_card
     import OnlyYou.core.config_manager as config_manager
+    import OnlyYou.core.decision_model as decision_model
     import OnlyYou.core.atmosphere_reader as atmosphere_reader
     import OnlyYou.core.context_budget as context_budget
     import OnlyYou.core.memory_manager as memory_manager
@@ -67,6 +68,7 @@ def load_plugin_modules():
     _MODULES = SimpleNamespace(
         character_card=character_card,
         config_manager=config_manager,
+        decision_model=decision_model,
         atmosphere_reader=atmosphere_reader,
         context_budget=context_budget,
         memory_manager=memory_manager,
@@ -877,12 +879,12 @@ class StubModelHub:
         self.text_result = text_result
         self.calls = []
 
-    async def call_llm_json(self, prompt="", role="decision", umo=None, system_prompt="",
+    async def call_llm_json(self, prompt="", role="main", umo=None, system_prompt="",
                             image_urls=None, default=None):
         self.calls.append({"prompt": prompt, "role": role, "umo": umo, "default": default})
         return self.json_result if self.json_result is not None else default
 
-    async def call_llm_text(self, prompt="", role="decision", umo=None, system_prompt="",
+    async def call_llm_text(self, prompt="", role="main", umo=None, system_prompt="",
                             image_urls=None):
         self.calls.append({"prompt": prompt, "role": role, "umo": umo})
         return self.text_result

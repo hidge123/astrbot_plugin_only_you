@@ -166,7 +166,13 @@
 
   function roleLabel(role) {
     return (
-      { main: "对话", decision: "决策", vision: "视频解析", tts: "语音" }[role] || role
+      {
+        dialogue: "对话",
+        main: "主模型",
+        decision: "决策",
+        vision: "视频解析",
+        tts: "语音"
+      }[role] || role
     );
   }
 
@@ -182,13 +188,28 @@
         tag: info.mode === "provider" ? "AstrBot TTS" : "自建 TTS"
       };
     }
-    if (info.configured === false || info.mode === "unconfigured") {
-      return { cls: "light-err", text: "未配置", tag: role === "main" ? "必填" : "" };
+    if (role === "decision" && info.decision_mode === "judge") {
+      return {
+        cls: info.judge_ready ? "light-ok" : "light-err",
+        text: info.judge_ready
+          ? "判断模型" + (info.model ? " · " + info.model : "")
+          : "判断模型未就绪",
+        tag: "Jev / Decisions"
+      };
     }
+    if (info.configured === false || info.mode === "unconfigured") {
+      return { cls: "light-err", text: "未配置", tag: role === "dialogue" ? "必填" : "" };
+    }
+    var inheritTag =
+      info.inherit_from === "dialogue"
+        ? "继承对话模型"
+        : info.inherit_from === "decision"
+        ? "继承决策模型"
+        : "继承主模型";
     return {
       cls: info.ok === false ? "light-err" : info.inherited ? "light-warn" : "light-ok",
       text: info.label || [info.source_id, info.model].filter(Boolean).join(" / ") || "已配置",
-      tag: info.inherited ? "继承主模型" : info.mode === "plugin" ? "插件自建" : "复用实例"
+      tag: info.inherited ? inheritTag : info.mode === "plugin" ? "插件自建" : "复用实例"
     };
   }
 
@@ -384,7 +405,7 @@
 
   function modelsBlock(models) {
     models = models || {};
-    var roles = ["main", "decision", "vision", "tts"];
+    var roles = ["dialogue", "main", "decision", "vision", "tts"];
     var rows = roles
       .map(function (role) {
         var info = modelHealthInfo(role, models[role]);

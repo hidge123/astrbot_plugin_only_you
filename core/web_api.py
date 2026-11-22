@@ -3399,7 +3399,8 @@ class OnlyYouWebAPI:
                 if not isinstance(raw_cfg, dict):
                     # Tolerate raw config bodies: {"main": {...}, "decision": {...}, ...}
                     role_keys = (
-                        "main", "decision", "vision", "tts", "embedding", "rerank",
+                        "dialogue", "main", "decision", "vision", "tts",
+                        "embedding", "rerank",
                     )
                     if any(key in body for key in role_keys):
                         raw_cfg = {
@@ -3445,12 +3446,18 @@ class OnlyYouWebAPI:
             if hub is None:
                 return err_response("ModelHub 未初始化")
 
-            roles = getattr(hub, "ROLES", ("main", "decision", "vision", "tts"))
+            roles = getattr(
+                hub,
+                "ROLES",
+                ("dialogue", "main", "decision", "vision", "tts", "embedding", "rerank"),
+            )
             allowed = {str(item).strip().lower() for item in roles}
-            allowed.add("small")  # legacy alias of `decision`
+            # Legacy aliases kept for old Pages / scripts.
+            allowed.update(("small", "aux", "atmosphere"))
             if role not in allowed:
                 return err_response(
-                    f"未知模型角色: {role}（可选 main/decision/vision/tts/embedding/rerank）"
+                    "未知模型角色: "
+                    f"{role}（可选 dialogue/main/decision/vision/tts/embedding/rerank）"
                 )
 
             tester = getattr(hub, "test_role", None)

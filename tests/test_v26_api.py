@@ -429,7 +429,7 @@ class TestCardsFixedArmor(WebApiTestBase):
             )
 
         prompt = str(captured.get("prompt") or "")
-        assert captured.get("role") == "decision"
+        assert captured.get("role") == "main"
         assert "armor" not in prompt.lower()
         assert "护甲" not in prompt
         assert "base_weight" in prompt

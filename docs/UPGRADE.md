@@ -27,6 +27,7 @@
 | 12 | 旧 `memories.user_id` 裸平台 uid / 曾用名归并到 `global_uid`（v2.12） | 存在可唯一归属的裸 ID | `legacy_memory_user_ids_migrated_v1`（全部成功才写入；歧义行保持原样） |
 | 13 | `memories` 补 `tier1_since`（v2.12，纯加法） | 旧库缺列 | 无（幂等 `ALTER TABLE`，默认 `0`；旧 T1 回退 `created_at`） |
 | 14 | 旧 AstrBotConfig 非默认值 → `plugin_settings["runtime_config"]`（v3.0） | 首次启动且标记缺失 | `legacy_astrbot_config_migrated`（成功后写入；已由 Pages 保存的新值优先） |
+| 15 | 模型角色布局：旧 `main`→`dialogue`、旧 `decision`→`main`+`decision` | 旧配置缺 `dialogue` | `model_role_layout_migrated_v1`（每个 Soul 全部成功才写入） |
 
 **关键原则**：一次性 flag 只有在**全部条目迁移成功**后才写入；失败保留未写入状态并记 warning「下次启动重试」，迁移逻辑本身幂等（已迁移项跳过，不会重复插入）。
 
@@ -396,6 +397,18 @@ docker start astrbot
   - `memories/list` 与 `/onlyyou memory list` 在读取前先跑一次 `cleanup_tier1()`，过期项不必再等心跳；前端对真正过期的行显示「待回收（≤15 分钟）」而不是「剩余 0h」。
 - **验证**：降级后 47h 仍保留、49h 删除；旧库 T1 过期即删；重复编辑已是 T1 的记忆不重置 48h；上限淘汰按新的保留期起点排序。离线回归 812 tests 全绿。
 - **回滚**：回退到不含该修复的旧版插件时 `tier1_since` 被忽略，T1 又按 `created_at` 计时；不丢数据，但降级项会重新表现为「已过期」，属预期。
+
+### 11.10 模型角色拆分与判断模型
+
+- **角色重排**：模型页由「对话 / 决策 / 视觉 / TTS」变为「对话 `dialogue` / 主模型 `main` / 决策 `decision` / 视觉 `vision` / TTS」。
+  - 对话模型**只**负责聊天回复（原生管线 `selected_provider`）。
+  - 主模型承接所有后台生成：AI 造卡与补全、行动卡生成、记忆提炼、日程微调文案、繁忙成果、私聊补回 / 翻群 / 分享文案。
+  - 决策模型**只**做读空气与是否接话判断，支持通用模型 JSON 判定或判断模型。
+- **自动迁移**：旧 `main`（对话）→ `dialogue`；旧 `decision`（混合）→ `main`，新 `decision` 继承 `main` 以保持原读空气模型；旧 `vision` 保持原父角色。一次性 flag `model_role_layout_migrated_v1`，全部 Soul 成功才写入，失败下次启动重试，只改写旧布局文件。
+- **判断模型（可选）**：决策卡切「判断模型（Jev / Decisions API）」后走 OpenRouter `POST /api/alpha/decisions`，模型名如 `~typesafe/jev-latest` / `typesafe/jev-1.14`，按 `decision.threshold`（0~1，默认 0.5）对 REPLY 概率裁决。通用模型模式保持旧行为（Prompt → JSON）。
+- **API Key**：优先取所选提供商源（其 `api_base` 指向 openrouter.ai）；未选或非 OpenRouter 源时读取环境变量 **`OPENROUTER_API_KEY`**。Docker 部署需在容器环境注入该变量（`docker run -e` / compose `environment`），或在 AstrBot 里配置 OpenRouter 提供商源后在决策卡选择它。密钥不会出现在 Pages / Web API 返回中。
+- **失败降级**：判断模型未配置 / 缺 Key / HTTP 失败时，读空气退回「提到角色名或冲浪偏好」启发式，并记 warning；不会阻塞消息管线。
+- **回滚**：旧版插件只识别 `main`/`decision` 键。回退前请恢复 `/root/astrbot_backups/` 中的插件目录与 `only_you.db` 备份，或至少把旧版可读的模型配置重新写回；直接回退可能让对话模型回落到 AstrBot 平台默认模型。
 
 ---
 

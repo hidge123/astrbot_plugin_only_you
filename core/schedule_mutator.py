@@ -619,7 +619,7 @@ class BoundedScheduleMutator:
                 soul, current_slot, next_slot, input_type, input_detail
             )
             llm_res = await self.model_hub.call_llm_json(
-                prompt=prompt, role="decision", umo=umo, default=None
+                prompt=prompt, role="main", umo=umo, default=None
             )
             new_title, monologue = self._parse_llm_response(llm_res, action, current_slot)
 

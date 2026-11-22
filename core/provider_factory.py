@@ -354,6 +354,22 @@ class ProviderFactory:
             return []
         return sources
 
+    def get_source_credentials(self, source_id: str) -> Dict[str, str]:
+        """Internal: resolve one provider source's ``api_base`` / API key.
+
+        Never exposed to the Web UI (``list_sources`` only reports ``has_key``);
+        used by the Decisions API transport of the judge-style decision role.
+        """
+        source = self._find_source(source_id)
+        if not isinstance(source, dict):
+            return {"api_base": "", "api_key": "", "type": "", "provider": ""}
+        return {
+            "api_base": _clean(source.get("api_base")),
+            "api_key": self._resolve_single_key(source.get("key")),
+            "type": _clean(source.get("type")),
+            "provider": _clean(source.get("provider")),
+        }
+
     def _is_chat_source(self, source: dict) -> bool:
         provider_type = _clean(source.get("provider_type"))
         return provider_type in ("", "chat_completion")
