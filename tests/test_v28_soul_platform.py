@@ -66,8 +66,10 @@ class TestSoulProfileV28(unittest.TestCase):
         assert soul.bound_platforms == []
         assert soul.settings == {"surfing_enabled": True}
         assert soul.surfing_enabled is True
-        assert soul.model_config["dialogue"] == {"source_id": "", "model": ""}
-        assert soul.model_config["main"]["inherit_from"] == "dialogue"
+        assert soul.model_config["main"]["inherit_from"] == ""
+        assert soul.model_config["dialogue"]["inherit_from"] == "main"
+        assert soul.model_config["dialogue"]["source_id"] == ""
+        assert soul.model_config["dialogue"]["model"] == ""
         assert soul.model_config["tts"]["mode"] == "off"
         assert soul.updated_at == 0
         assert soul.tts_config["mode"] == "off"
@@ -355,19 +357,19 @@ class TestModelHubPerSoul(SoulStoreTestBase):
         soul_a = await self.soul_manager.resolve_soul(allow_llm_seed=False)
         await self.soul_manager.save_soul(make_soul("soul_b"))
         cfg_a = {
-            "dialogue": {"source_id": "deepseek", "model": "deepseek-chat"},
+            "main": {"source_id": "deepseek", "model": "deepseek-chat"},
             "tts": {"mode": "off"},
         }
         cfg_b = {
-            "dialogue": {"source_id": "ailiyun", "model": "kimi-k2.5"},
+            "main": {"source_id": "ailiyun", "model": "kimi-k2.5"},
             "tts": {"mode": "provider", "provider_id": "edge-tts"},
         }
         await self.hub.save_config(cfg_a, soul_id=soul_a.soul_id)
         await self.hub.save_config(cfg_b, soul_id="soul_b")
         config_a = await self.hub.get_config(soul_a.soul_id)
         config_b = await self.hub.get_config("soul_b")
-        assert config_a["dialogue"]["model"] == "deepseek-chat"
-        assert config_b["dialogue"]["model"] == "kimi-k2.5"
+        assert config_a["main"]["model"] == "deepseek-chat"
+        assert config_b["main"]["model"] == "kimi-k2.5"
         assert config_a["tts"]["mode"] == "off"
         assert config_b["tts"]["mode"] == "provider"
         assert await self.hub.resolve_role("main", soul_id="soul_b") == {
@@ -377,7 +379,7 @@ class TestModelHubPerSoul(SoulStoreTestBase):
         # persisted inside the Soul's own JSON file
         fresh = SoulManager(self.context, self.db, self.hub)
         loaded = await fresh.get_soul_by_id("soul_b")
-        assert loaded.model_config["dialogue"]["model"] == "kimi-k2.5"
+        assert loaded.model_config["main"]["model"] == "kimi-k2.5"
         # legacy global key is untouched when a SoulManager is attached
         assert await self.db.get_setting("model_config", None) in (None, {})
 
@@ -421,7 +423,7 @@ class TestModelHubPerSoul(SoulStoreTestBase):
         soul_a = await self.soul_manager.resolve_soul(allow_llm_seed=False)
         await self.soul_manager.save_soul(make_soul("soul_b"))
         await self.hub.save_config(
-            {"dialogue": {"source_id": "deepseek", "model": "deepseek-chat"}},
+            {"main": {"source_id": "deepseek", "model": "deepseek-chat"}},
             soul_id=soul_a.soul_id,
         )
         status_a = await self.hub.get_status(soul_a.soul_id)
@@ -429,8 +431,11 @@ class TestModelHubPerSoul(SoulStoreTestBase):
         assert set(status_a) == {
             "dialogue", "main", "decision", "vision", "tts", "embedding", "rerank",
         }
+        assert status_a["main"]["configured"] is True
         assert status_a["dialogue"]["configured"] is True
+        assert status_a["dialogue"]["inherited"] is True
         assert status_a["dialogue"]["provider_id"] == f"onlyyou::main::{soul_a.soul_id}"
+        assert status_b["main"]["configured"] is False
         assert status_b["dialogue"]["configured"] is False
 
     async def test_legacy_global_config_migrated_into_empty_souls(self):
@@ -447,9 +452,10 @@ class TestModelHubPerSoul(SoulStoreTestBase):
         fresh_hub.attach_soul_manager(self.soul_manager)
         await fresh_hub.load()
         config = await fresh_hub.get_config(DEFAULT_SOUL_ID)
-        assert config["dialogue"]["model"] == "deepseek-chat"
+        assert config["main"]["model"] == "deepseek-chat"
+        assert config["dialogue"]["inherit_from"] == "main"
         migrated = await self.soul_manager.get_soul_by_id(DEFAULT_SOUL_ID)
-        assert migrated.model_config["dialogue"]["model"] == "deepseek-chat"
+        assert migrated.model_config["main"]["model"] == "deepseek-chat"
         # a non-empty Soul config is never overwritten by the migration
         await self.soul_manager.save_soul(
             make_soul("own_config"), persona_hash="webui_custom"
@@ -460,7 +466,7 @@ class TestModelHubPerSoul(SoulStoreTestBase):
         await self.db.set_setting("model_config_migrated_to_souls", False)
         await fresh_hub.load()
         kept = await self.soul_manager.get_soul_by_id("own_config")
-        assert kept.model_config["dialogue"]["model"] == "kimi-k2.5"
+        assert kept.model_config["main"]["model"] == "kimi-k2.5"
 
     async def test_unattached_hub_keeps_legacy_global_behaviour(self):
         legacy_hub = mods.model_hub.ModelHub(

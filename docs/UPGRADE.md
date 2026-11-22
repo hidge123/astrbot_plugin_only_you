@@ -400,11 +400,11 @@ docker start astrbot
 
 ### 11.10 模型角色拆分与判断模型
 
-- **角色重排**：模型页由「对话 / 决策 / 视觉 / TTS」变为「对话 `dialogue` / 主模型 `main` / 决策 `decision` / 视觉 `vision` / TTS」。
-  - 对话模型**只**负责聊天回复（原生管线 `selected_provider`）。
-  - 主模型承接所有后台生成：AI 造卡与补全、行动卡生成、记忆提炼、日程微调文案、繁忙成果、私聊补回 / 翻群 / 分享文案。
-  - 决策模型**只**做读空气与是否接话判断，支持通用模型 JSON 判定或判断模型。
-- **自动迁移**：旧 `main`（对话）→ `dialogue`；旧 `decision`（混合）→ `main`，新 `decision` 继承 `main` 以保持原读空气模型；旧 `vision` 保持原父角色。一次性 flag `model_role_layout_migrated_v1`，全部 Soul 成功才写入，失败下次启动重试，只改写旧布局文件。
+- **角色重排**：模型页由「对话 / 决策 / 视觉 / TTS」变为「主模型 `main`（基模）/ 对话 `dialogue` / 决策 `decision` / 视觉 `vision` / TTS」。
+  - **主模型是基模**：对话 / 决策 / 视觉默认继承它；同时承接所有后台生成：AI 造卡与补全、行动卡生成、记忆提炼、日程微调文案、繁忙成果、私聊补回 / 翻群 / 分享文案。
+  - 对话模型默认继承主模型，也可独立配置；它**只**负责聊天回复（原生管线 `selected_provider`）。
+  - 决策模型默认继承主模型，**只**做读空气与是否接话判断，支持通用模型 JSON 判定或判断模型。
+- **自动迁移**：旧 `main`（对话）→ `dialogue`；旧 `decision`（混合）→ `main`（基模），新 `decision` 继承 `main` 以保持原读空气模型；旧 `vision` 保持原有效模型。此前已迁移到「dialogue 为根、main 继承 dialogue」的中间布局也会自动转为「main 为基模」。一次性 flag `model_role_layout_migrated_v2`，全部 Soul 成功才写入，失败下次启动重试，只改写旧布局文件。
 - **判断模型（可选）**：决策卡切「判断模型（Jev / Decisions API）」后走 OpenRouter `POST /api/alpha/decisions`，模型名如 `~typesafe/jev-latest` / `typesafe/jev-1.14`，按 `decision.threshold`（0~1，默认 0.5）对 REPLY 概率裁决。通用模型模式保持旧行为（Prompt → JSON）。
 - **API Key**：优先取所选提供商源（其 `api_base` 指向 openrouter.ai）；未选或非 OpenRouter 源时读取环境变量 **`OPENROUTER_API_KEY`**。Docker 部署需在容器环境注入该变量（`docker run -e` / compose `environment`），或在 AstrBot 里配置 OpenRouter 提供商源后在决策卡选择它。密钥不会出现在 Pages / Web API 返回中。
 - **失败降级**：判断模型未配置 / 缺 Key / HTTP 失败时，读空气退回「提到角色名或冲浪偏好」启发式，并记 warning；不会阻塞消息管线。

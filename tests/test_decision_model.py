@@ -102,31 +102,82 @@ class TestRoleLayoutMigration(unittest.TestCase):
                 },
             }
         )
-        assert cfg["dialogue"] == {"source_id": "s1", "model": "chat"}
         assert cfg["main"] == {
             "inherit": False,
             "inherit_from": "",
             "source_id": "s2",
             "model": "reasoner",
         }
+        # old main chat model is preserved as an independent dialogue config
+        assert cfg["dialogue"]["inherit"] is False
+        assert cfg["dialogue"]["source_id"] == "s1"
+        assert cfg["dialogue"]["model"] == "chat"
         # read-the-air starts from the old decision's effective model
         assert cfg["decision"]["inherit_from"] == "main"
         assert cfg["decision"]["mode"] == "chat"
         assert cfg["decision"]["threshold"] == 0.5
-        # old vision default followed the old chat model -> dialogue
-        assert cfg["vision"]["inherit_from"] == "dialogue"
+        # old vision followed the old chat model, which differs from the base
+        assert cfg["vision"]["inherit"] is False
+        assert cfg["vision"]["model"] == "chat"
 
     def test_legacy_inherited_decision_keeps_following_dialogue(self):
         cfg = normalize_model_config(
             {"main": {"source_id": "s1", "model": "chat"}}
         )
-        assert cfg["dialogue"] == {"source_id": "s1", "model": "chat"}
-        assert cfg["main"]["inherit_from"] == "dialogue"
+        assert cfg["main"]["source_id"] == "s1"
+        assert cfg["main"]["model"] == "chat"
+        assert cfg["dialogue"]["inherit_from"] == "main"
         assert cfg["decision"]["inherit_from"] == "main"
+
+    def test_dialogue_root_layout_migrates_to_main_base(self):
+        cfg = normalize_model_config(
+            {
+                # interim layout: main inherited dialogue, dialogue was the root
+                "dialogue": {"source_id": "chat_src", "model": "chat_model"},
+                "main": {
+                    "inherit": True,
+                    "inherit_from": "dialogue",
+                    "source_id": "",
+                    "model": "",
+                },
+                "decision": {"inherit": True, "inherit_from": "main"},
+                "vision": {"inherit": True, "inherit_from": "dialogue"},
+            }
+        )
+        # effective models are preserved; main becomes the base.
+        assert cfg["main"]["source_id"] == "chat_src"
+        assert cfg["main"]["model"] == "chat_model"
+        assert cfg["main"]["inherit_from"] == ""
+        assert cfg["dialogue"]["inherit_from"] == "main"
+        assert cfg["dialogue"]["model"] == ""
+        assert cfg["decision"]["inherit_from"] == "main"
+        assert cfg["vision"]["inherit_from"] == "main"
+
+    def test_interim_layout_with_different_pairs_keeps_independent_roles(self):
+        cfg = normalize_model_config(
+            {
+                "dialogue": {"source_id": "chat_src", "model": "chat_model"},
+                "main": {
+                    "inherit": False,
+                    "inherit_from": "",
+                    "source_id": "gen_src",
+                    "model": "gen_model",
+                },
+                "decision": {"inherit": True, "inherit_from": "main"},
+                "vision": {"inherit": True, "inherit_from": "dialogue"},
+            }
+        )
+        assert cfg["main"]["model"] == "gen_model"
+        # dialogue / vision point at a different model, so they stay independent
+        assert cfg["dialogue"]["inherit"] is False
+        assert cfg["dialogue"]["model"] == "chat_model"
+        assert cfg["decision"]["inherit_from"] == "main"
+        assert cfg["vision"]["inherit"] is False
+        assert cfg["vision"]["model"] == "chat_model"
 
     def test_new_layout_is_not_migrated(self):
         raw = {
-            "dialogue": {"source_id": "s1", "model": "chat"},
+            "dialogue": {"inherit": False, "source_id": "s1", "model": "chat"},
             "main": {"inherit_from": "", "source_id": "s2", "model": "gen"},
             "decision": {
                 "inherit_from": "",
@@ -148,7 +199,9 @@ class TestRoleLayoutMigration(unittest.TestCase):
             {"decision": {"mode": "judge", "model": "~typesafe/jev-latest"}}
         )
         # no dialogue key, but the judge marker prevents legacy migration
-        assert cfg["dialogue"] == {"source_id": "", "model": ""}
+        assert cfg["dialogue"]["inherit_from"] == "main"
+        assert cfg["dialogue"]["source_id"] == ""
+        assert cfg["dialogue"]["model"] == ""
         assert cfg["decision"]["model"] == "~typesafe/jev-latest"
         assert cfg["decision"]["mode"] == "judge"
 
@@ -372,36 +425,46 @@ class TestDecisionStatusAndTest(JudgeTestBase):
 
 
 class TestDialogueRoleSeparation(JudgeTestBase):
-    async def test_get_main_provider_id_uses_dialogue_not_main(self):
-        # A new-layout config where only ``main`` (generation) is configured:
-        # the native chat pipeline must stay unconfigured.
-        await self.hub.save_model_config(
-            {
-                "main": {
-                    "inherit": False,
-                    "inherit_from": "",
-                    "source_id": "deepseek",
-                    "model": "deepseek-chat",
-                },
-                "decision": {"mode": "chat"},
-            }
-        )
-        assert await self.hub.get_main_provider_id() == ""
-
-        # Configuring dialogue makes the native pipeline work again.
-        await self.hub.save_model_config(
-            {
-                "dialogue": {"source_id": "deepseek", "model": "deepseek-chat"},
-                "decision": {"mode": "chat"},
-            }
-        )
-        first = await self.hub.get_main_provider_id()
-        assert first
-        # ``main`` resolves through inheritance but is never registered as chat.
-        assert await self.hub.resolve_role("main") == {
+    async def test_dialogue_inherits_main_but_can_override_or_disable(self):
+        main_cfg = {
+            "main": {
+                "inherit": False,
+                "inherit_from": "",
+                "source_id": "deepseek",
+                "model": "deepseek-chat",
+            },
+            "decision": {"mode": "chat"},
+        }
+        # Default: dialogue inherits the base model.
+        await self.hub.save_model_config(main_cfg)
+        assert await self.hub.get_main_provider_id() == "onlyyou::main"
+        assert await self.hub.resolve_role("dialogue") == {
             "source_id": "deepseek",
             "model": "deepseek-chat",
         }
+
+        # Independently configured dialogue overrides the base.
+        await self.hub.save_model_config(
+            {
+                **main_cfg,
+                "dialogue": {
+                    "inherit": False,
+                    "source_id": "deepseek",
+                    "model": "deepseek-reasoner",
+                },
+            }
+        )
+        assert await self.hub.resolve_role("dialogue") == {
+            "source_id": "deepseek",
+            "model": "deepseek-reasoner",
+        }
+        assert await self.hub.get_main_provider_id() == "onlyyou::main"
+
+        # Explicitly disabled dialogue never falls back to main.
+        await self.hub.save_model_config(
+            {**main_cfg, "dialogue": {"inherit": False}}
+        )
+        assert await self.hub.get_main_provider_id() == ""
 
 
 class _GroupEvent:

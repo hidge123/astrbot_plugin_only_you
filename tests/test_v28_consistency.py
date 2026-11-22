@@ -448,8 +448,8 @@ class TestLegacySchemaAndFlags(DualWriteBase):
         self.hub.attach_soul_manager(self.sm)
         self.hub._config = mods.model_hub.normalize_model_config(
             {
-                "dialogue": {"source_id": "source_a", "model": "model_a"},
-                "main": {"inherit": True, "inherit_from": "dialogue"},
+                "main": {"source_id": "source_a", "model": "model_a"},
+                "dialogue": {"inherit": True, "inherit_from": "main"},
                 "decision": {"inherit": True, "inherit_from": "main"},
                 "vision": {"inherit": True, "inherit_from": "main"},
                 "tts": {"mode": "off"},
@@ -467,11 +467,11 @@ class TestLegacySchemaAndFlags(DualWriteBase):
         assert await self.db.get_setting(SOUL_MODEL_FLAG, False) is True
         fresh = self.fresh_manager()
         soul = await fresh.get_soul_by_id("model_soul")
-        assert soul.model_config["dialogue"]["source_id"] == "source_a"
-        assert soul.model_config["dialogue"]["model"] == "model_a"
+        assert soul.model_config["main"]["source_id"] == "source_a"
+        assert soul.model_config["main"]["model"] == "model_a"
         # The per-Soul config is persisted inside the JSON file, not only in SQLite.
         file_data = read_json(self.soul_path("model_soul"))
-        assert file_data["model_config"]["dialogue"]["model"] == "model_a"
+        assert file_data["model_config"]["main"]["model"] == "model_a"
 
 
 if __name__ == "__main__":

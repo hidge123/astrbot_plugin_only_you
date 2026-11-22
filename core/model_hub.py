@@ -50,10 +50,17 @@ from . import decision_model
 
 
 DEFAULT_MODEL_CONFIG: Dict[str, dict] = {
-    "dialogue": {"source_id": "", "model": ""},
+    # 主模型 = 基模：唯一不继承其他角色的根配置。
     "main": {
+        "inherit": False,
+        "inherit_from": "",
+        "source_id": "",
+        "model": "",
+    },
+    # 对话模型默认继承主模型，也可独立配置。
+    "dialogue": {
         "inherit": True,
-        "inherit_from": "dialogue",
+        "inherit_from": "main",
         "source_id": "",
         "model": "",
     },
@@ -100,9 +107,11 @@ DEFAULT_MODEL_CONFIG: Dict[str, dict] = {
 
 TTS_MODES = ("off", "source", "provider")
 TTS_SCOPES = ("private", "l3", "all")
-CHAT_ROLES = ("dialogue", "main", "decision", "vision")
-#: 支持「独立配置 / 继承父角色」的角色；``dialogue`` 是继承链的根。
-INHERITABLE_ROLES = ("main", "decision", "vision")
+CHAT_ROLES = ("main", "dialogue", "decision", "vision")
+#: 基模：唯一不继承其他角色的根配置。
+BASE_ROLE = "main"
+#: 支持「独立配置 / 继承父角色」的角色；默认都继承 ``main``（基模）。
+INHERITABLE_ROLES = ("dialogue", "decision", "vision")
 #: 决策模型的两种工作方式：普通聊天模型 / Decisions API 判断模型。
 DECISION_MODES = ("chat", "judge")
 DEFAULT_DECISION_THRESHOLD = 0.5
@@ -119,14 +128,15 @@ VECTOR_ROLE_LABELS = {
 
 #: Legal ``inherit_from`` values per inheritable chat role.
 INHERIT_FROM_OPTIONS: Dict[str, tuple] = {
-    "main": ("", "dialogue"),
+    # 对话模型默认继承主模型；也可独立配置以使用更轻的聊天模型。
+    "dialogue": ("", "main"),
     "decision": ("", "main", "dialogue"),
-    # Vision must not inherit the decision role anymore: that role may be a
+    # Vision must not inherit the decision role: that role may be a
     # judge/Decisions model which cannot see images.
     "vision": ("", "main", "dialogue"),
 }
 
-#: Maximum inheritance hops (``vision -> main -> dialogue`` is exactly 2 hops).
+#: Maximum inheritance hops (``vision -> dialogue -> main`` = 2 hops).
 MAX_INHERIT_HOPS = 2
 
 
@@ -193,16 +203,113 @@ def _legacy_inherit_from(entry: Any, options: tuple) -> str:
     return "main"
 
 
+def _looks_like_dialogue_root_layout(raw: Any) -> bool:
+    """True for the interim layout where ``main`` inherited ``dialogue``.
+
+    That layout was persisted by an earlier build; ``dialogue`` had no
+    inheritance keys while ``main`` did. The new layout is the opposite:
+    ``main`` is the base and ``dialogue`` inherits it.
+    """
+    if not isinstance(raw, dict):
+        return False
+    dialogue = raw.get("dialogue")
+    main = raw.get("main")
+    if not isinstance(dialogue, dict) or not isinstance(main, dict):
+        return False
+    if "inherit" in dialogue or "inherit_from" in dialogue:
+        return False
+    return "inherit" in main or "inherit_from" in main
+
+
+def _effective_pair_v1(cfg: Dict[str, Any], role: str, hops: int = 0) -> tuple:
+    """Resolve one role's effective pair under the interim (dialogue-root) layout."""
+    if hops > 3:
+        return ("", "")
+    entry = cfg.get(role) if isinstance(cfg.get(role), dict) else {}
+    pair = _pair_of(entry)
+    inherit_from = _clean(entry.get("inherit_from")).lower()
+    if inherit_from in ("main", "dialogue"):
+        return _effective_pair_v1(cfg, inherit_from, hops + 1)
+    if not inherit_from and _to_bool(entry.get("inherit"), False):
+        default_parent = "dialogue" if role == "main" else "main"
+        return _effective_pair_v1(cfg, default_parent, hops + 1)
+    return pair
+
+
+def _v2_role_entry(
+    pair: tuple,
+    main_pair: tuple,
+    *,
+    decision: bool = False,
+    decision_entry: Optional[dict] = None,
+) -> Dict[str, Any]:
+    """Build one non-base role: inherit ``main`` when its pair matches, else own."""
+    if _has_pair(pair) and pair != main_pair:
+        entry: Dict[str, Any] = {
+            "inherit": False,
+            "inherit_from": "",
+            "source_id": pair[0],
+            "model": pair[1],
+        }
+    else:
+        entry = {
+            "inherit": True,
+            "inherit_from": "main",
+            "source_id": "",
+            "model": "",
+        }
+    if decision:
+        mode, threshold, endpoint = _normalize_decision_fields(decision_entry or {})
+        entry.update({"mode": mode, "threshold": threshold, "endpoint": endpoint})
+    return entry
+
+
+def migrate_dialogue_root_layout(raw: Any) -> Dict[str, dict]:
+    """Convert the interim ``main -> dialogue`` layout into ``main``-as-base.
+
+    Effective models are preserved: the old ``main`` pair becomes the base,
+    ``dialogue`` keeps its own chat pair unless it matches the base (then it
+    inherits), and decision/vision are independent only when they pointed at a
+    different model.
+    """
+    cfg = raw if isinstance(raw, dict) else {}
+    main_pair = _effective_pair_v1(cfg, "main")
+    dialogue_pair = _pair_of(cfg.get("dialogue"))
+    decision_entry = cfg.get("decision") if isinstance(cfg.get("decision"), dict) else {}
+    decision_pair = _effective_pair_v1(cfg, "decision")
+    vision_pair = _effective_pair_v1(cfg, "vision")
+
+    migrated = {
+        "main": {
+            "inherit": False,
+            "inherit_from": "",
+            "source_id": main_pair[0],
+            "model": main_pair[1],
+        },
+        "dialogue": _v2_role_entry(dialogue_pair, main_pair),
+        "decision": _v2_role_entry(
+            decision_pair, main_pair, decision=True, decision_entry=decision_entry
+        ),
+        "vision": _v2_role_entry(vision_pair, main_pair),
+        "tts": copy.deepcopy(cfg.get("tts") if isinstance(cfg.get("tts"), dict) else {}),
+        "embedding": copy.deepcopy(
+            cfg.get("embedding") if isinstance(cfg.get("embedding"), dict) else {}
+        ),
+        "rerank": copy.deepcopy(
+            cfg.get("rerank") if isinstance(cfg.get("rerank"), dict) else {}
+        ),
+    }
+    return normalize_model_config(migrated)
+
+
 def migrate_legacy_model_config(raw: Any) -> Dict[str, dict]:
-    """Convert the pre-split model config into the new role layout.
+    """Convert the pre-split model config into the ``main``-as-base layout.
 
-    * old ``main`` (dialogue model)          -> ``dialogue``
-    * old ``decision`` (mixed generation)    -> ``main``
-    * old ``decision`` effective model       -> new ``decision`` (inherits ``main``)
-
-    ``vision`` keeps its old effective parent (old main -> ``dialogue``, old
-    decision -> ``main``), so upgrading does not silently change which model sees
-    videos. TTS / RAG entries are carried over untouched.
+    * old ``main`` (dialogue model)       -> ``dialogue``
+    * old ``decision`` (mixed generation) -> ``main`` (base)
+    * new ``decision`` starts inheriting the base
+    * ``vision`` keeps its old effective model, inheriting the base only when
+      that is the same pair
     """
     source = raw if isinstance(raw, dict) else {}
     old_main = source.get("main") if isinstance(source.get("main"), dict) else {}
@@ -216,55 +323,34 @@ def migrate_legacy_model_config(raw: Any) -> Dict[str, dict]:
     decision_inherit = _legacy_inherit_from(old_decision, ("main",))
     if not decision_inherit and not _has_pair(decision_own):
         decision_inherit = "main"
-
-    if decision_inherit:
-        main = {
-            "inherit": True,
-            "inherit_from": "dialogue",
-            "source_id": "",
-            "model": "",
-        }
-    else:
-        main = {
-            "inherit": False,
-            "inherit_from": "",
-            "source_id": decision_own[0],
-            "model": decision_own[1],
-        }
+    main_pair = dialogue_pair if decision_inherit else decision_own
 
     vision_own = _pair_of(old_vision)
     vision_inherit = _legacy_inherit_from(old_vision, ("main", "decision"))
     if not vision_inherit and not _has_pair(vision_own):
         vision_inherit = "main"
-    if vision_inherit:
-        # Old default followed the old chat model: keep that via dialogue.
-        vision = {
-            "inherit": True,
-            "inherit_from": "dialogue" if vision_inherit == "main" else "main",
-            "source_id": "",
-            "model": "",
-        }
+    if vision_inherit == "main":
+        vision_pair = dialogue_pair
+    elif vision_inherit == "decision":
+        vision_pair = main_pair
     else:
-        vision = {
-            "inherit": False,
-            "inherit_from": "",
-            "source_id": vision_own[0],
-            "model": vision_own[1],
-        }
+        vision_pair = vision_own
 
     migrated = {
-        "dialogue": {"source_id": dialogue_pair[0], "model": dialogue_pair[1]},
-        "main": main,
-        "decision": {
-            "inherit": True,
-            "inherit_from": "main",
-            "source_id": "",
-            "model": "",
-            "mode": "chat",
-            "threshold": DEFAULT_DECISION_THRESHOLD,
-            "endpoint": "",
+        "main": {
+            "inherit": False,
+            "inherit_from": "",
+            "source_id": main_pair[0],
+            "model": main_pair[1],
         },
-        "vision": vision,
+        "dialogue": _v2_role_entry(dialogue_pair, main_pair),
+        "decision": _v2_role_entry(
+            main_pair,
+            main_pair,
+            decision=True,
+            decision_entry={"mode": "chat"},
+        ),
+        "vision": _v2_role_entry(vision_pair, main_pair),
         "tts": copy.deepcopy(
             source.get("tts") if isinstance(source.get("tts"), dict) else {}
         ),
@@ -280,8 +366,8 @@ def migrate_legacy_model_config(raw: Any) -> Dict[str, dict]:
 
 def _normalize_inherit_from(role: str, role_raw: dict) -> str:
     """Normalize a role's inheritance target (``""`` == independent config)."""
-    options = INHERIT_FROM_OPTIONS.get(role, ("", "dialogue"))
-    default_parent = "dialogue" if role == "main" else "main"
+    options = INHERIT_FROM_OPTIONS.get(role, ("",))
+    default_parent = "main" if "main" in options else ""
     if "inherit_from" in role_raw and role_raw.get("inherit_from") is not None:
         candidate = _clean(role_raw.get("inherit_from")).lower()
         if candidate in options:
@@ -289,7 +375,7 @@ def _normalize_inherit_from(role: str, role_raw: dict) -> str:
         return default_parent if _to_bool(role_raw.get("inherit"), True) else ""
     if "inherit" in role_raw:
         return default_parent if _to_bool(role_raw.get("inherit"), True) else ""
-    # Legacy entries without either key keep the documented default.
+    # Entries without either key keep the documented default (inherit base).
     return default_parent
 
 
@@ -314,16 +400,25 @@ def _normalize_decision_fields(role_raw: dict) -> tuple:
 def normalize_model_config(raw: Any) -> Dict[str, dict]:
     """Coerce arbitrary stored/requested model config into the canonical shape.
 
-    Configs stored by an older version (no ``dialogue`` key) are migrated on the
-    fly through :func:`migrate_legacy_model_config`.
+    Configs stored by an older version (no ``dialogue`` key, or the interim
+    ``main -> dialogue`` hierarchy) are migrated on the fly.
     """
     if _looks_like_legacy_model_layout(raw):
         raw = migrate_legacy_model_config(raw)
+    elif _looks_like_dialogue_root_layout(raw):
+        raw = migrate_dialogue_root_layout(raw)
     raw = raw if isinstance(raw, dict) else {}
 
-    dialogue_pair = _pair_of(raw.get("dialogue"))
+    main_raw = raw.get("main") if isinstance(raw.get("main"), dict) else {}
+    main_pair = _pair_of(main_raw)
     normalized: Dict[str, dict] = {
-        "dialogue": {"source_id": dialogue_pair[0], "model": dialogue_pair[1]}
+        "main": {
+            # ``main`` is the base: it never inherits another role.
+            "inherit": False,
+            "inherit_from": "",
+            "source_id": main_pair[0],
+            "model": main_pair[1],
+        }
     }
 
     for role in INHERITABLE_ROLES:
@@ -383,11 +478,11 @@ def normalize_model_config(raw: Any) -> Dict[str, dict]:
 class ModelHub:
     """Model scheduling gateway (dialogue / main / decision / vision / tts / RAG)."""
 
-    ROLES = ("dialogue", "main", "decision", "vision", "tts", "embedding", "rerank")
+    ROLES = ("main", "dialogue", "decision", "vision", "tts", "embedding", "rerank")
     CONFIG_SETTING_KEY = "model_config"
     MIGRATION_FLAG_KEY = "legacy_model_migrated"
     #: One-shot migration of the pre-split (main/decision) layout.
-    ROLE_LAYOUT_MIGRATION_KEY = "model_role_layout_migrated_v1"
+    ROLE_LAYOUT_MIGRATION_KEY = "model_role_layout_migrated_v2"
     #: AstrBot ``inst_map`` key of the plugin-owned **dialogue** provider. The id
     #: keeps the historical ``onlyyou::main`` prefix for backward compatibility
     #: (it is an opaque registration key, not a role name).
@@ -559,9 +654,7 @@ class ModelHub:
     @staticmethod
     def _config_is_meaningful(cfg: Dict[str, dict]) -> bool:
         """Whether a normalized model config carries any explicit configuration."""
-        if _has_pair(_pair_of(cfg.get("dialogue"))):
-            return True
-        for role in INHERITABLE_ROLES:
+        for role in (BASE_ROLE,) + INHERITABLE_ROLES:
             if _has_pair(_pair_of(cfg.get(role))):
                 return True
         tts = cfg.get("tts") or {}
@@ -642,7 +735,7 @@ class ModelHub:
             logger.debug(f"[OnlyYou] persist soul model migration flag failed: {exc}")
 
     async def _migrate_role_layout_once(self) -> None:
-        """Persist the dialogue / main / decision layout once for old configs.
+        """Persist the ``main``-as-base layout once for old configs.
 
         ``SoulProfile`` normalizes ``model_config`` while loading, so by the time
         this runs every Soul already carries the migrated layout in memory; saving
@@ -666,7 +759,10 @@ class ModelHub:
             raw_global = await self.db.get_setting(self.CONFIG_SETTING_KEY, None)
         except Exception:  # noqa: BLE001 - migration is best effort
             raw_global = None
-        if isinstance(raw_global, dict) and _looks_like_legacy_model_layout(raw_global):
+        if isinstance(raw_global, dict) and (
+            _looks_like_legacy_model_layout(raw_global)
+            or _looks_like_dialogue_root_layout(raw_global)
+        ):
             try:
                 await self.db.set_setting(
                     self.CONFIG_SETTING_KEY, normalize_model_config(raw_global)
@@ -688,7 +784,10 @@ class ModelHub:
                     logger.warning(f"[OnlyYou] list souls for model migration failed: {exc}")
                 for soul in souls:
                     raw_soul = self._raw_soul_model_config(soul)
-                    if not _looks_like_legacy_model_layout(raw_soul):
+                    if not (
+                        _looks_like_legacy_model_layout(raw_soul)
+                        or _looks_like_dialogue_root_layout(raw_soul)
+                    ):
                         # Already new layout / unreadable: never rewrite the file.
                         continue
                     try:
@@ -752,55 +851,49 @@ class ModelHub:
             legacy = {}
 
         new_config = copy.deepcopy(self._config)
-        dialogue_pair = await self._resolve_legacy_provider_id(
+        chat_pair = await self._resolve_legacy_provider_id(
             legacy.get("main_llm_provider_id")
         )
-        if dialogue_pair is not None:
-            new_config["dialogue"] = {
-                "source_id": dialogue_pair[0],
-                "model": dialogue_pair[1],
-            }
-            decision_pair = await self._resolve_legacy_provider_id(
-                legacy.get("small_llm_provider_id")
+        if chat_pair is not None:
+            # Old ``main`` = chat model; old ``small`` = generation model. The new
+            # base (主模型) takes the generation model, falling back to the chat
+            # model when the old config had no separate lightweight model.
+            base_pair = (
+                await self._resolve_legacy_provider_id(
+                    legacy.get("small_llm_provider_id")
+                )
+                or chat_pair
             )
-            if decision_pair is not None:
-                # Generation role (主模型) keeps the old lightweight model; the new
-                # read-the-air role (决策模型) starts from the same effective model.
-                new_config["main"] = {
-                    "inherit": False,
-                    "inherit_from": "",
-                    "source_id": decision_pair[0],
-                    "model": decision_pair[1],
-                }
-                new_config["decision"] = {
-                    "inherit": True,
-                    "inherit_from": "main",
-                    "source_id": "",
-                    "model": "",
-                    "mode": "chat",
-                    "threshold": DEFAULT_DECISION_THRESHOLD,
-                    "endpoint": "",
-                }
+            new_config["main"] = {
+                "inherit": False,
+                "inherit_from": "",
+                "source_id": base_pair[0],
+                "model": base_pair[1],
+            }
+            new_config["dialogue"] = _v2_role_entry(chat_pair, base_pair)
+            new_config["decision"] = {
+                "inherit": True,
+                "inherit_from": "main",
+                "source_id": "",
+                "model": "",
+                "mode": "chat",
+                "threshold": DEFAULT_DECISION_THRESHOLD,
+                "endpoint": "",
+            }
             vision_pair = await self._resolve_legacy_provider_id(
                 legacy.get("vision_llm_provider_id")
             )
-            if vision_pair is not None and vision_pair != (decision_pair or dialogue_pair):
-                new_config["vision"] = {
-                    "inherit": False,
-                    "inherit_from": "",
-                    "source_id": vision_pair[0],
-                    "model": vision_pair[1],
-                }
+            if vision_pair is not None:
+                new_config["vision"] = _v2_role_entry(vision_pair, base_pair)
 
-        has_current_dialogue = _has_pair(_pair_of(self._config.get("dialogue")))
-        if dialogue_pair is not None and not has_current_dialogue:
+        if chat_pair is not None and not self._config_is_meaningful(self._config):
             self._config = normalize_model_config(new_config)
             try:
                 await self.db.set_setting(self.CONFIG_SETTING_KEY, self._config)
                 logger.info(
                     "[OnlyYou] migrated legacy model_hub_config -> model_config "
-                    f"({self._config['dialogue'].get('source_id')}/"
-                    f"{self._config['dialogue'].get('model')})"
+                    f"(main={self._config['main'].get('model')}, "
+                    f"dialogue={self._config['dialogue'].get('model') or 'inherit main'})"
                 )
             except Exception as exc:
                 logger.warning(f"[OnlyYou] persist migrated model_config failed: {exc}")
@@ -950,8 +1043,8 @@ class ModelHub:
     def _dialogue_pair(
         self, cfg: Optional[Dict[str, dict]] = None
     ) -> Optional[Dict[str, str]]:
-        """Explicit ``(source_id, model)`` of the dialogue role (inheritance root)."""
-        return self._own_chat_role("dialogue", cfg=cfg)
+        """Effective ``(source_id, model)`` of the dialogue role (may inherit main)."""
+        return self._resolve_chat_role("dialogue", cfg=cfg)
 
     def _inherit_from(
         self, role: str, cfg: Optional[Dict[str, dict]] = None
@@ -968,19 +1061,21 @@ class ModelHub:
         hops: int = 0,
         cfg: Optional[Dict[str, dict]] = None,
     ) -> Optional[Dict[str, str]]:
-        """Resolve ``main`` / ``decision`` / ``vision`` through optional inheritance.
+        """Resolve a chat role through optional inheritance.
 
-        * inheritance disabled (``inherit_from=""``) -> own config only; an
-          incomplete own config returns ``None`` (**never** silently falls back);
-        * ``inherit_from="dialogue"`` -> the dialogue pair (inheritance root);
-        * otherwise recurse, at most ``MAX_INHERIT_HOPS`` hops and cycle-safe
-          (``vision -> main -> dialogue`` is exactly 2 hops).
+        ``main`` is the base (own pair only). ``dialogue`` / ``decision`` /
+        ``vision`` default to ``inherit_from="main"``; inheritance disabled
+        (``inherit_from=""``) means own config only, and an incomplete own
+        config returns ``None`` (**never** silently falls back). Recursion is
+        limited to ``MAX_INHERIT_HOPS`` and cycle-safe.
         """
+        if role == BASE_ROLE:
+            return self._own_chat_role(role, cfg=cfg)
         inherit_from = self._inherit_from(role, cfg=cfg)
         if not inherit_from:
             return self._own_chat_role(role, cfg=cfg)
-        if inherit_from == "dialogue":
-            return self._dialogue_pair(cfg=cfg)
+        if inherit_from == BASE_ROLE:
+            return self._own_chat_role(BASE_ROLE, cfg=cfg)
         if inherit_from in INHERIT_FROM_OPTIONS and hops < MAX_INHERIT_HOPS:
             return self._resolve_chat_role(inherit_from, hops + 1, cfg=cfg)
         # >2 hops / self-cycle / unknown parent role -> disabled (no fallback).
@@ -1024,10 +1119,7 @@ class ModelHub:
 
         cfg = await self._active_config(soul_id)
 
-        if name == "dialogue":
-            return self._dialogue_pair(cfg=cfg)
-
-        if name in INHERITABLE_ROLES:
+        if name in CHAT_ROLES:
             return self._resolve_chat_role(name, cfg=cfg)
 
         # v2.12: embedding / rerank never inherit; ``off`` disables the role.
@@ -1845,20 +1937,16 @@ class ModelHub:
         soul_id: str = "",
     ) -> dict:
         active = cfg if isinstance(cfg, dict) else self._config
-        inherit_from = ""
+        inherit_from = self._inherit_from(role, cfg=active)
         inherited = False
-        if role == "dialogue":
-            configured_pair = self._dialogue_pair(cfg=active)
+        if inherit_from:
+            configured_pair = self._resolve_chat_role(role, cfg=active)
+            # ``inherited`` is True only when enabled inheritance actually
+            # resolved through the parent role (an unconfigured parent means
+            # this role is simply disabled, not "inherited").
+            inherited = configured_pair is not None
         else:
-            inherit_from = self._inherit_from(role, cfg=active)
-            if inherit_from:
-                configured_pair = self._resolve_chat_role(role, cfg=active)
-                # ``inherited`` is True only when enabled inheritance actually
-                # resolved through the parent role (an unconfigured parent means
-                # this role is simply disabled, not "inherited").
-                inherited = configured_pair is not None
-            else:
-                configured_pair = self._own_chat_role(role, cfg=active)
+            configured_pair = self._own_chat_role(role, cfg=active)
 
         configured = configured_pair is not None
         status: Dict[str, Any] = {
@@ -1923,8 +2011,8 @@ class ModelHub:
                 status["ok"] = True
         if inherited:
             parent_label = {
-                "dialogue": "继承自对话模型",
                 "main": "继承自主模型",
+                "dialogue": "继承自对话模型",
                 "decision": "继承自决策模型",
             }.get(inherit_from, "")
             if parent_label:

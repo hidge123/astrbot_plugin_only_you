@@ -61,11 +61,11 @@
 - **渲染预算**：`render_persona_prompt(card, max_chars=2000)` 只渲染非空字段，优先保留身份 / 说话方式 / 性格 / 社交，超预算时按优先级丢弃低价值分区，硬保证不超预算；图片头像（Data URL 等）**绝不注入** Persona / System Prompt。
 
 ### ⑦ 插件自治多角色模型（v2.8：按 Soul 独立配置；v2.12 扩为 6 角色）
-- **角色拆分**：**对话（`dialogue`，必填，只生成聊天回复）**、**主模型（`main`，AI 造卡 / 记忆提炼 / 日程微调文案 / 繁忙成果 / 主动消息等后台生成）**、**决策（`decision`，只做读空气 / 是否接话判断）**、**视频解析（`vision`）**、**语音（`tts`）**；v2.12 另增 **向量（`embedding`）** 与 **重排（`rerank`）** 两个 RAG 角色（`off | provider | source` 三档，不参与继承，关闭即自动降级）。`main` 默认继承 `dialogue`，`decision` / `vision` 默认继承 `main`（也可独立配置或继承 `dialogue`）；关闭继承且留空即停用该角色（不回退其他模型）；`tts` 不继承，`mode="off"` 即关闭。
+- **角色拆分**：**主模型（`main`，基模 / 必填；承担 AI 造卡 / 记忆提炼 / 日程微调文案 / 繁忙成果 / 主动消息等后台生成）**、**对话（`dialogue`，只生成聊天回复，默认继承主模型）**、**决策（`decision`，只做读空气 / 是否接话判断，默认继承主模型）**、**视频解析（`vision`，默认继承主模型）**、**语音（`tts`）**；v2.12 另增 **向量（`embedding`）** 与 **重排（`rerank`）** 两个 RAG 角色（`off | provider | source` 三档，不参与继承，关闭即自动降级）。`dialogue` / `decision` / `vision` 均可改为独立配置；关闭继承且留空即停用该角色（不回退基模）；`tts` 不继承，`mode="off"` 即关闭。
 - **决策双模式（`decision.mode`）**：`chat` = 普通聊天模型输出 JSON 判定；`judge` = OpenRouter Decisions API 的 Jev 等 System-One 判断模型，返回 `REPLY` / `IGNORE` 概率，按 `decision.threshold`（默认 0.5）裁决。判断模型 API Key 取所选 OpenRouter 提供商源，未选时读环境变量 `OPENROUTER_API_KEY`。
 - **按角色而不是按平台**：模型配置存放在**每个 Soul 自己的 JSON** 的 `model_config` 字段中；`ModelHub` 在 `main.py` 接线 `attach_soul_manager()` 后，读写 / 解析 / 测试 / TTS 接口全部支持可选 `soul_id`（缺省 = 默认角色，传 `umo` 时先按 UMO 路由出角色）。
 - **不重复配置密钥**：`core/provider_factory.py` 从 AstrBot 提供商源 + 模型名构建实例；平台已有同源同模型且启用的实例则直接复用。
-- **主模型仍走原生管线**：门禁放行后执行 `event.set_extra("selected_provider", main_provider_id)`，AstrBot `_select_provider()` 会解析该 extra（`provider_manager.inst_map`），分段回复、流式输出、工具调用全部保留；插件自建主模型注册为 **`onlyyou::main::<soul_id>`**（旧全局路径 `onlyyou::main` 保留兼容），不出现在平台模型列表，换模型 / 卸载时注销对应实例。
+- **对话模型仍走原生管线**：门禁放行后执行 `event.set_extra("selected_provider", dialogue_provider_id)`，AstrBot `_select_provider()` 会解析该 extra（`provider_manager.inst_map`），分段回复、流式输出、工具调用全部保留；插件自建主模型注册为 **`onlyyou::main::<soul_id>`**（旧全局路径 `onlyyou::main` 保留兼容），不出现在平台模型列表，换模型 / 卸载时注销对应实例。
 - **TTS 插件自治**：三种来源（关闭 / 提供商源自建 / AstrBot TTS）、触发概率、生效范围（私聊 / L3 / 全部）、语音 + 文字双发；`on_decorating_result` 钩子**先于原生分段回复与原生 TTS** 执行，不会重复播报。
 - **不重造轮子、不与平台配置打架**：黑白名单 100% 遵循平台；被动消息通过 `event.should_call_llm(True/False)` 协同原生管线；后台主动消息复用平台 `segmented_reply` 参数；用户发图走平台原生多模态/识图管线。
 
@@ -87,8 +87,8 @@
 - **心跳按 Soul 驱动**：每 15 分钟对「有绑定的 Soul + 默认兜底 Soul」各自独立执行时间轴结算与行动分发；有绑定的 Soul 只处理自身平台范围内的未读 / 群聊，默认兜底 Soul 处理未被任何角色绑定的机器人接口（未设置默认角色时，聊天路由按优先级落到最近更新的角色；心跳层无任何绑定时退化为单角色处理全部会话）。解绑时同步清理该平台的内存滑窗 / 未读 / 冷却缓存（**不删持久化记忆**；「清理 vs 保留」完整语义见 [docs/UPGRADE.md](docs/UPGRADE.md) 第 9 节）。
 
 ### ⑪ 模型多角色按 Soul 独立配置
-- 每个角色一套 `dialogue / main / decision / vision / tts`（另含 RAG 角色），存于 Soul JSON 的 `model_config`；对话模型的 `onlyyou::main::<soul_id>` 实例化与释放按角色进行。
-- 旧版全局 `plugin_settings["model_config"]` 保留兼容：首次启动一次性迁移到「对话模型为空」的角色（flag `model_config_migrated_to_souls`，不删旧键）；`ModelHub` 未接线 SoulManager 时保持旧全局行为。旧角色布局（main=对话、decision=混合）由 `model_role_layout_migrated_v1` 一次性迁移为新布局。
+- 每个角色一套 `main / dialogue / decision / vision / tts`（另含 RAG 角色），存于 Soul JSON 的 `model_config`；对话模型的 `onlyyou::main::<soul_id>` 实例化与释放按角色进行。
+- 旧版全局 `plugin_settings["model_config"]` 保留兼容：首次启动一次性迁移到「基模为空」的角色（flag `model_config_migrated_to_souls`，不删旧键）；`ModelHub` 未接线 SoulManager 时保持旧全局行为。旧角色布局（main=对话、decision=混合）由 `model_role_layout_migrated_v2` 一次性迁移为「主模型基模」布局。
 - Pages「模型」页顶部展示当前角色，读取 / 保存均带 `?soul_id=` / `{soul_id, model_config}`，切换角色即重新加载该角色的模型状态；决策卡可切换「通用模型（JSON）/ 判断模型（Jev / Decisions API）」。
 
 ### ⑫ 赛博冲浪分享五道门禁 + 按角色总开关（v2.8）
@@ -185,8 +185,8 @@
     { "card_id": "evt_1001", "title": "赶插画线稿", "action_type": "BUSY_TASK", "state": "BUSY", "min_hours": 1.5, "max_hours": 3.0, "base_weight": 60, "armor": 65 }
   ],
   "model_config": {
-    "dialogue": { "source_id": "openai", "model": "gpt-4.1" },
-    "main":     { "inherit": true, "inherit_from": "dialogue", "source_id": "", "model": "" },
+    "main":     { "source_id": "openai", "model": "gpt-4.1" },
+    "dialogue": { "inherit": true, "inherit_from": "main", "source_id": "", "model": "" },
     "decision": { "inherit": true, "inherit_from": "main", "source_id": "", "model": "", "mode": "chat", "threshold": 0.5, "endpoint": "" },
     "vision":   { "inherit": true, "inherit_from": "main", "source_id": "", "model": "" },
     "tts":      { "mode": "off", "source_id": "", "model": "", "voice": "", "provider_id": "", "probability": 1.0, "scope": "private", "dual_output": false }
@@ -286,7 +286,7 @@ OnlyYou/
 1. **安装**：将插件目录放入 AstrBot 的 `data/plugins/astrbot_plugin_only_you`，安装 `requirements.txt` 依赖，重启 / 热重载插件（要求 AstrBot `>= v4.5.7`）。
 2. **配置**：
    - 在 Pages「设置」页统一调整 Roguelite / 主动搭话 / 读空气 / 记忆与 RAG / 关系成长 / 冲浪抓取（保存后热更新即时生效；角色总开关、后台视频源、用户等级名单仍由各业务页 / Soul JSON 管理）；
-   - 打开插件 Pages 控制台，在「模型」页为**当前角色**配置 **对话（必填）/ 主 / 决策 / 视频解析 / TTS**（配置写入该角色 `souls/<soul_id>.json` 的 `model_config`）；
+   - 打开插件 Pages 控制台，在「模型」页为**当前角色**配置 **主模型（基模 · 必填）/ 对话 / 决策 / 视频解析 / TTS**（配置写入该角色 `souls/<soul_id>.json` 的 `model_config`）；
    - 在「角色卡」页手填或 AI 生成角色卡；在「会话 / 机器人接口」页把机器人接口绑定到角色并设置默认角色兜底。
 3. **从旧版本升级到 v3.0**：**先备份 `only_you.db`（以及整个插件数据目录），再阅读 [docs/UPGRADE.md](docs/UPGRADE.md) 执行升级与迁移校验**。首次启动会自动把旧 SQLite 角色数据落盘为 `souls/*.json`、迁移旧 UMO 绑定与全局模型配置，并把 `users` 关系列按角色拆分到 `user_relations`；v2.11 另会幂等补充 `proactive_enabled` 列（一次性 flag 全部成功才写入，失败下次启动自动重试）。
 4. **本地离线测试（零网络、无需安装 AstrBot / pytest）**：

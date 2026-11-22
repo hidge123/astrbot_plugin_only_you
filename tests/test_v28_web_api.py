@@ -831,7 +831,7 @@ class TestModelsPerSoul(WebApiV28TestBase):
                 body={
                     "soul_id": soul.soul_id,
                     "model_config": {
-                        "dialogue": {"source_id": "deepseek", "model": "deepseek-chat"}
+                        "main": {"source_id": "deepseek", "model": "deepseek-chat"}
                     },
                 },
             )

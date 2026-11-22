@@ -55,7 +55,10 @@ DEFAULT_STATE_EVENT_CARDS = mods.roguelite_deck.DEFAULT_STATE_EVENT_CARDS
 DailyScheduleRun = mods.roguelite_deck.DailyScheduleRun
 BoundedScheduleMutator = mods.schedule_mutator.BoundedScheduleMutator
 
-MAIN_CFG = {"dialogue": {"source_id": "deepseek", "model": "deepseek-chat"}}
+MAIN_CFG = {
+    "main": {"source_id": "deepseek", "model": "deepseek-chat"},
+    "dialogue": {"inherit": True, "inherit_from": "main"},
+}
 MAIN_PAIR = {"source_id": "deepseek", "model": "deepseek-chat"}
 
 URGENT_MSG = "醒醒！！快看，出大事了救命！！"
@@ -79,26 +82,29 @@ def core_user():
 class TestNormalizeInheritFrom(unittest.TestCase):
     def test_default_config_declares_inherit_from(self):
         assert DEFAULT_MODEL_CONFIG["main"] == {
-            "inherit": True,
-            "inherit_from": "dialogue",
+            "inherit": False,
+            "inherit_from": "",
             "source_id": "",
             "model": "",
         }
+        assert DEFAULT_MODEL_CONFIG["dialogue"]["inherit_from"] == "main"
         assert DEFAULT_MODEL_CONFIG["decision"]["inherit_from"] == "main"
         assert DEFAULT_MODEL_CONFIG["decision"]["mode"] == "chat"
         assert DEFAULT_MODEL_CONFIG["decision"]["threshold"] == 0.5
         assert DEFAULT_MODEL_CONFIG["vision"]["inherit_from"] == "main"
         cfg = normalize_model_config(None)
-        assert cfg["main"]["inherit_from"] == "dialogue"
-        for role in ("decision", "vision"):
+        assert cfg["main"]["inherit_from"] == ""
+        assert cfg["dialogue"]["inherit_from"] == "main"
+        for role in ("dialogue", "decision", "vision"):
             assert cfg[role]["inherit"] is True
             assert cfg[role]["inherit_from"] == "main"
             assert cfg[role]["source_id"] == "" and cfg[role]["model"] == ""
 
     def test_legacy_config_without_inherit_keys_defaults_to_main(self):
         cfg = normalize_model_config(MAIN_CFG)
-        assert cfg["main"]["inherit_from"] == "dialogue"
-        assert cfg["main"]["inherit"] is True
+        assert cfg["main"]["inherit_from"] == ""
+        assert cfg["main"]["inherit"] is False
+        assert cfg["dialogue"]["inherit_from"] == "main"
         assert cfg["decision"]["inherit_from"] == "main"
         assert cfg["decision"]["inherit"] is True
         assert cfg["vision"]["inherit_from"] == "main"
@@ -185,13 +191,15 @@ class TestNormalizeInheritFrom(unittest.TestCase):
 # 2. ModelHub role resolution (§1.2)
 # ===========================================================================
 class TestResolveRoleInheritance(unittest.IsolatedAsyncioTestCase):
-    async def test_dialogue_resolves_own_pair(self):
-        hub = make_hub(MAIN_CFG)
-        assert await hub.resolve_role("dialogue") == MAIN_PAIR
-
-    async def test_default_roles_inherit_dialogue(self):
+    async def test_dialogue_inherits_main(self):
         hub = make_hub(MAIN_CFG)
         assert await hub.resolve_role("main") == MAIN_PAIR
+        assert await hub.resolve_role("dialogue") == MAIN_PAIR
+
+    async def test_default_roles_inherit_main(self):
+        hub = make_hub(MAIN_CFG)
+        assert await hub.resolve_role("main") == MAIN_PAIR
+        assert await hub.resolve_role("dialogue") == MAIN_PAIR
         assert await hub.resolve_role("decision") == MAIN_PAIR
         assert await hub.resolve_role("vision") == MAIN_PAIR
         # legacy alias
@@ -235,11 +243,10 @@ class TestResolveRoleInheritance(unittest.IsolatedAsyncioTestCase):
         )
         assert await hub.resolve_role("decision") is None
 
-    async def test_vision_inherits_main_then_dialogue(self):
+    async def test_vision_inherits_main(self):
         hub = make_hub(
             {
                 **MAIN_CFG,
-                "main": {"inherit_from": "dialogue"},
                 "vision": {"inherit_from": "main"},
             }
         )
@@ -276,18 +283,18 @@ class TestResolveRoleInheritance(unittest.IsolatedAsyncioTestCase):
 
     async def test_unconfigured_main_returns_none_for_everyone(self):
         hub = make_hub({})
-        for role in ("main", "decision", "vision"):
+        for role in ("main", "dialogue", "decision", "vision"):
             assert await hub.resolve_role(role) is None, role
 
     async def test_hop_budget_and_cycle_guard(self):
         hub = make_hub(
             {
                 **MAIN_CFG,
-                "main": {"inherit_from": "dialogue"},
-                "vision": {"inherit_from": "main"},
+                "dialogue": {"inherit_from": "main"},
+                "vision": {"inherit_from": "dialogue"},
             }
         )
-        # exactly 2 hops is the ceiling (vision -> main -> dialogue)
+        # exactly 2 hops is the ceiling (vision -> dialogue -> main)
         assert hub._resolve_chat_role("vision", hops=2) is None
         assert hub._resolve_chat_role("vision", hops=0) == MAIN_PAIR
         # pathological hand-written cycle: decision -> vision is not a legal
@@ -329,13 +336,13 @@ class TestModelHubStatus(unittest.IsolatedAsyncioTestCase):
         }
         for role in ("dialogue", "main", "decision", "vision"):
             assert required <= set(status[role]), role
-        assert status["dialogue"]["inherit"] is False
-        assert status["dialogue"]["inherit_from"] == ""
-        assert status["dialogue"]["inherited"] is False
-        assert status["main"]["inherit"] is True
-        assert status["main"]["inherit_from"] == "dialogue"
-        assert status["main"]["inherited"] is True
-        assert "继承自对话模型" in status["main"]["label"]
+        assert status["main"]["inherit"] is False
+        assert status["main"]["inherit_from"] == ""
+        assert status["main"]["inherited"] is False
+        assert status["dialogue"]["inherit"] is True
+        assert status["dialogue"]["inherit_from"] == "main"
+        assert status["dialogue"]["inherited"] is True
+        assert "继承自主模型" in status["dialogue"]["label"]
         assert status["decision"]["inherit"] is True
         assert status["decision"]["inherit_from"] == "main"
         assert status["decision"]["inherited"] is True
@@ -381,7 +388,6 @@ class TestModelHubStatus(unittest.IsolatedAsyncioTestCase):
         hub = make_hub(
             {
                 **MAIN_CFG,
-                "main": {"inherit_from": "dialogue"},
                 "vision": {"inherit_from": "main"},
             }
         )
@@ -419,12 +425,13 @@ class TestModelConfigPersistence(DatabaseAsyncTestCase):
         saved = await hub.save_model_config(
             {
                 **MAIN_CFG,
-                "main": {"inherit_from": "dialogue"},
+                "dialogue": {"inherit_from": "main"},
                 "decision": {"inherit_from": "main"},
                 "vision": {"inherit_from": "main"},
             }
         )
-        assert saved["main"]["inherit_from"] == "dialogue"
+        assert saved["main"]["inherit_from"] == ""
+        assert saved["dialogue"]["inherit_from"] == "main"
         assert saved["decision"]["inherit"] is True
         assert saved["decision"]["inherit_from"] == "main"
         assert saved["vision"]["inherit"] is True

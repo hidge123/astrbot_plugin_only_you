@@ -845,8 +845,8 @@
           bound_platforms: ["telegram"],
           settings: { surfing_enabled: true },
           model_config: {
-            dialogue: { source_id: "ailiyun", model: "qwen-max" },
-            main: { inherit: true, inherit_from: "dialogue", source_id: "", model: "" },
+            main: { source_id: "ailiyun", model: "qwen-max" },
+            dialogue: { inherit: true, inherit_from: "main", source_id: "", model: "" },
             decision: {
               inherit: true,
               inherit_from: "main",
@@ -1037,8 +1037,8 @@
         { persona_name: "毒舌吐槽役", prompt: "你是一个毒舌但心软的吐槽役，习惯用反讽和夸张的比喻……" }
       ],
       modelConfig: {
-        dialogue: { source_id: "deepseek", model: "deepseek-chat" },
-        main: { inherit: true, inherit_from: "dialogue", source_id: "", model: "" },
+        main: { source_id: "deepseek", model: "deepseek-chat" },
+        dialogue: { inherit: true, inherit_from: "main", source_id: "", model: "" },
         decision: {
           inherit: true,
           inherit_from: "main",
@@ -1818,9 +1818,9 @@
   function buildModelStatus(cfgOverride) {
     var cfg = normalizeModelConfig(cfgOverride || db.modelConfig || {});
     var status = {};
-    ["dialogue", "main", "decision", "vision"].forEach(function (role) {
+    ["main", "dialogue", "decision", "vision"].forEach(function (role) {
       var entry = cfg[role] || {};
-      var inheritFrom = role === "dialogue" ? "" : String(entry.inherit_from || "");
+      var inheritFrom = role === "main" ? "" : String(entry.inherit_from || "");
       var pair = resolveModelPair(cfg, role);
       var item = {
         role: role,
@@ -2232,9 +2232,9 @@
   /* ================================================================== *
    * 7. 默认角色 / UMO 绑定 / 模型配置
    * ================================================================== */
-  /* 可选继承：main / decision / vision 的合法 inherit_from 取值 */
+  /* 可选继承：dialogue / decision / vision 的合法 inherit_from 取值 */
   var INHERIT_FROM_OPTIONS = {
-    main: ["", "dialogue"],
+    dialogue: ["", "main"],
     decision: ["", "main", "dialogue"],
     vision: ["", "main", "dialogue"]
   };
@@ -2245,11 +2245,11 @@
     return ["1", "true", "yes", "on", "y"].indexOf(String(value).trim().toLowerCase()) >= 0;
   }
 
-  /** main / decision / vision 的 inherit_from 归一化（与 core/model_hub.py 同规则）。 */
+  /** dialogue / decision / vision 的 inherit_from 归一化（与 core/model_hub.py 同规则）。 */
   function normalizeInheritFrom(role, raw) {
     raw = raw && typeof raw === "object" ? raw : {};
-    var options = INHERIT_FROM_OPTIONS[role] || ["", "main"];
-    var defaultParent = role === "main" ? "dialogue" : "main";
+    var options = INHERIT_FROM_OPTIONS[role] || [""];
+    var defaultParent = options.indexOf("main") >= 0 ? "main" : "";
     var has = Object.prototype.hasOwnProperty;
     var candidate = "";
     if (has.call(raw, "inherit_from") && raw.inherit_from != null) {
@@ -2262,26 +2262,23 @@
     } else {
       candidate = defaultParent;
     }
+    if (role === "main") candidate = "";
     return candidate;
   }
 
-  /** 角色模型配置归一化：主 / 决策 / 视觉恒带 inherit + inherit_from 且两者同步。 */
+  /** 角色模型配置归一化：main 为基模，dialogue / decision / vision 默认继承 main。 */
   function normalizeModelConfig(raw) {
     raw = raw && typeof raw === "object" ? raw : {};
-    /* 兼容旧布局：没有 dialogue 时把旧 main 当作对话模型 */
-    var dialogue =
-      raw.dialogue && typeof raw.dialogue === "object"
-        ? raw.dialogue
-        : raw.main && typeof raw.main === "object"
-        ? raw.main
-        : {};
+    var main = raw.main && typeof raw.main === "object" ? raw.main : {};
     var out = {
-      dialogue: {
-        source_id: String(dialogue.source_id == null ? "" : dialogue.source_id).trim(),
-        model: String(dialogue.model == null ? "" : dialogue.model).trim()
+      main: {
+        inherit: false,
+        inherit_from: "",
+        source_id: String(main.source_id == null ? "" : main.source_id).trim(),
+        model: String(main.model == null ? "" : main.model).trim()
       }
     };
-    ["main", "decision", "vision"].forEach(function (role) {
+    ["dialogue", "decision", "vision"].forEach(function (role) {
       var roleRaw = raw[role] && typeof raw[role] === "object" ? raw[role] : {};
       var inheritFrom = normalizeInheritFrom(role, roleRaw);
       out[role] = {
@@ -2337,10 +2334,10 @@
     hops = hops || 0;
     cfg = cfg || {};
     if (hops > 2) return null;
-    if (role === "dialogue") {
-      var dialogue = cfg.dialogue || {};
-      return dialogue.source_id && dialogue.model
-        ? { source_id: dialogue.source_id, model: dialogue.model }
+    if (role === "main") {
+      var main = cfg.main || {};
+      return main.source_id && main.model
+        ? { source_id: main.source_id, model: main.model }
         : null;
     }
     var entry = cfg[role] || {};
@@ -2350,7 +2347,7 @@
         ? { source_id: entry.source_id, model: entry.model }
         : null;
     }
-    if (inheritFrom === "dialogue") return resolveModelPair(cfg, "dialogue", hops + 1);
+    if (inheritFrom === "main") return resolveModelPair(cfg, "main", hops + 1);
     return resolveModelPair(cfg, inheritFrom, hops + 1);
   }
 

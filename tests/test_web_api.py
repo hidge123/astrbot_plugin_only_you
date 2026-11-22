@@ -466,7 +466,7 @@ class TestCardRoutes(WebApiTestBase):
             self.api.api_models_config,
             body={
                 "model_config": {
-                    "dialogue": {"source_id": "deepseek", "model": "deepseek-chat"}
+                    "main": {"source_id": "deepseek", "model": "deepseek-chat"}
                 }
             },
         )
@@ -551,7 +551,7 @@ class TestModelRoutes(WebApiTestBase):
             self.api.api_models_config,
             body={
                 "model_config": {
-                    "dialogue": {"source_id": "deepseek", "model": "deepseek-chat"}
+                    "main": {"source_id": "deepseek", "model": "deepseek-chat"}
                 }
             },
         )
@@ -564,18 +564,18 @@ class TestModelRoutes(WebApiTestBase):
             self.api.api_models_config,
             body={
                 "model_config": {
-                    "dialogue": {"source_id": "deepseek", "model": "deepseek-reasoner"},
+                    "main": {"source_id": "deepseek", "model": "deepseek-reasoner"},
                     "decision": {"inherit": True},
                 }
             },
         )
         data = self.assert_ok(response)
         assert "热重建" in response["message"]
-        assert data["model_config"]["dialogue"]["model"] == "deepseek-reasoner"
+        assert data["model_config"]["main"]["model"] == "deepseek-reasoner"
         assert "onlyyou::main" not in self.plugin.context.provider_manager.inst_map
 
         stored = await self.db.get_setting("model_config", None)
-        assert stored["dialogue"]["model"] == "deepseek-reasoner"
+        assert stored["main"]["model"] == "deepseek-reasoner"
 
     async def test_models_config_post_rejects_missing_payload(self):
         response = self.assert_error(
@@ -589,7 +589,7 @@ class TestModelRoutes(WebApiTestBase):
             self.api.api_models_config,
             body={
                 "model_config": {
-                    "dialogue": {"source_id": "deepseek", "model": "deepseek-chat"}
+                    "main": {"source_id": "deepseek", "model": "deepseek-chat"}
                 }
             },
         )

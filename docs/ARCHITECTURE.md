@@ -328,7 +328,7 @@ L1 普通用户即使重要度 8 也只能进 T2；`episode` / `state` 永远不
     {"card_id": "evt_1", "title": "赶插画线稿", "action_type": "BUSY_TASK",
      "state": "BUSY", "min_hours": 1.5, "max_hours": 3.0, "base_weight": 60, "armor": 65}
   ],
-  "model_config": {"dialogue": {}, "main": {}, "decision": {}, "vision": {}, "tts": {}},
+  "model_config": {"main": {}, "dialogue": {}, "decision": {}, "vision": {}, "tts": {}},
   "bound_platforms": ["aiocqhttp"],
   "settings": {"surfing_enabled": true, "surfing_sources": ["bilibili", "douyin"]},
   "updated_at": 1762840000,
@@ -382,12 +382,12 @@ SQLite `souls` 表（`soul_id / persona_hash / profile_json / updated_at / revis
 
 ### 9.1 角色与继承（role layout v2）
 
-当前共 **7 个角色**：`dialogue` / `main` / `decision` / `vision` / `tts` / `embedding` / `rerank`。旧布局（`main` = 对话、`decision` = 混合生成/读空气）会在加载时自动迁移：旧 `main` → `dialogue`，旧 `decision` → `main`（生成），新 `decision` 从旧 decision 的有效模型起步。
+当前共 **7 个角色**：`main` / `dialogue` / `decision` / `vision` / `tts` / `embedding` / `rerank`。`main` 是**基模**（唯一不继承其他角色的根配置）；旧布局（`main` = 对话、`decision` = 混合生成/读空气）会在加载时自动迁移：旧 `main` → `dialogue`，旧 `decision` → `main`（基模），其余角色按原有效模型保留。
 
 | 角色 | 用途 | 继承规则 |
 | :--- | :--- | :--- |
-| `dialogue` 对话 | **只**生成聊天回复（原生管线 `selected_provider`） | 根部角色，必填、无继承 |
-| `main` 主模型 | 后台生成：AI 造卡 / 记忆提炼 / 行动卡 / 繁忙成果 / 主动消息 | 默认继承 `dialogue`，也可独立配置 |
+| `main` 主模型 / 基模 | 后台生成：AI 造卡 / 记忆提炼 / 行动卡 / 繁忙成果 / 主动消息 | 根部角色，必填、无继承 |
+| `dialogue` 对话 | **只**生成聊天回复（原生管线 `selected_provider`） | 默认继承 `main`，也可独立配置 |
 | `decision` 决策 | **只**做读空气 / 是否接话判断 | 默认继承 `main`；`mode="judge"` 时走判断模型 |
 | `vision` 视觉 | 看片评分 | 默认继承 `main`，也可继承 `dialogue` |
 | `tts` 语音 | 插件 TTS | 不继承；`mode=off` 关闭 |

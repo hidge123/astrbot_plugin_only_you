@@ -198,7 +198,7 @@
       };
     }
     if (info.configured === false || info.mode === "unconfigured") {
-      return { cls: "light-err", text: "未配置", tag: role === "dialogue" ? "必填" : "" };
+      return { cls: "light-err", text: "未配置", tag: role === "main" ? "基模" : "" };
     }
     var inheritTag =
       info.inherit_from === "dialogue"

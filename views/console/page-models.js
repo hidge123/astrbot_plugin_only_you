@@ -23,7 +23,7 @@
 (function () {
   "use strict";
 
-  var CHAT_ROLES = ["dialogue", "main", "decision", "vision"];
+  var CHAT_ROLES = ["main", "dialogue", "decision", "vision"];
   var DECISION_MODES = ["chat", "judge"];
   var DECISION_MODEL_SUGGESTIONS = [
     "~typesafe/jev-latest",
@@ -35,17 +35,17 @@
     "upstage/solar-decide"
   ];
   var ROLE_META = {
-    dialogue: {
-      name: "对话模型",
-      desc: "只负责聊天回复（必填）",
-      icon: "character",
-      help: "插件把它注册为原生管线的 selected_provider；它只生成对话，不承担角色卡 / 记忆 / 主动消息等后台生成。未配置时回退到 AstrBot 平台默认模型。"
-    },
     main: {
       name: "主模型",
-      desc: "角色卡 / 记忆 / 主动消息生成",
+      desc: "基模 / 后台生成（必填）",
       icon: "wand",
-      help: "承担所有后台生成：AI 造卡与补全、行动卡生成、记忆提炼、日程微调文案、繁忙成果、私聊补回与主动分享文案。默认继承对话模型，也可独立配置；留空即停用后台生成（相关功能自动降级）。"
+      help: "主模型是基模：对话 / 决策 / 视觉默认继承它。它同时承担所有后台生成：AI 造卡与补全、行动卡生成、记忆提炼、日程微调文案、繁忙成果、私聊补回与主动分享文案；留空即停用后台生成，且默认继承它的角色也会停用。"
+    },
+    dialogue: {
+      name: "对话模型",
+      desc: "聊天回复 / 默认继承主模型",
+      icon: "character",
+      help: "插件把它注册为原生管线的 selected_provider，只生成对话；默认继承主模型，也可独立配置更轻 / 更快的聊天模型。独立配置留空即停用该角色，未配置时回退到 AstrBot 平台默认模型。"
     },
     decision: {
       name: "决策模型",
@@ -95,11 +95,11 @@
     { value: "l3", label: "仅L3" },
     { value: "all", label: "全部" }
   ];
-  /* main / decision / vision 的「模型来源模式」可选值（"" = 独立配置） */
+  /* dialogue / decision / vision 的「模型来源模式」可选值（"" = 独立配置） */
   var ROLE_INHERIT_OPTIONS = {
-    main: [
+    dialogue: [
       { value: "", label: "独立配置（不继承）" },
-      { value: "dialogue", label: "继承自对话模型 (dialogue)" }
+      { value: "main", label: "继承自主模型 (main)" }
     ],
     decision: [
       { value: "", label: "独立配置（不继承）" },
@@ -224,7 +224,7 @@
   function normalizeInheritFrom(role, raw) {
     raw = raw && typeof raw === "object" ? raw : {};
     var legal = legalInheritValues(role);
-    var defaultParent = role === "main" ? "dialogue" : "main";
+    var defaultParent = legal.indexOf("main") >= 0 ? "main" : "";
     var inheritFrom = "";
     if (hasOwn(raw, "inherit_from") && raw.inherit_from != null) {
       inheritFrom = str(raw.inherit_from).trim();
@@ -237,6 +237,7 @@
       inheritFrom = defaultParent;
     }
     if (legal.indexOf(inheritFrom) < 0) inheritFrom = "";
+    if (role === "main") inheritFrom = "";
     return { inherit: !!inheritFrom, inherit_from: inheritFrom };
   }
 
@@ -275,13 +276,8 @@
 
   function normalizeConfig(raw) {
     raw = raw && typeof raw === "object" ? raw : {};
-    /* 兼容旧布局：没有 dialogue 时把旧 main 当作对话模型 */
-    var dialogue =
-      raw.dialogue && typeof raw.dialogue === "object"
-        ? raw.dialogue
-        : raw.main && typeof raw.main === "object"
-        ? raw.main
-        : {};
+    var main = raw.main && typeof raw.main === "object" ? raw.main : {};
+    var dialogueBase = normalizeChatRole("dialogue", raw.dialogue);
     var decisionBase = normalizeChatRole("decision", raw.decision);
     var decisionExtra = normalizeDecisionFields(raw.decision);
     decisionBase.mode = decisionExtra.mode;
@@ -293,8 +289,13 @@
     var ttsScope = str(tts.scope) || "private";
     if (["private", "l3", "all"].indexOf(ttsScope) < 0) ttsScope = "private";
     return {
-      dialogue: { source_id: str(dialogue.source_id), model: str(dialogue.model) },
-      main: normalizeChatRole("main", raw.main),
+      main: {
+        inherit: false,
+        inherit_from: "",
+        source_id: str(main.source_id),
+        model: str(main.model)
+      },
+      dialogue: dialogueBase,
       decision: decisionBase,
       vision: normalizeChatRole("vision", raw.vision),
       embedding: normalizeVectorRole(raw.embedding),
@@ -467,7 +468,7 @@
         "对话模型只负责聊天回复，建议选稳定、响应快的模型；可直接填写模型名，或点「拉取」读取候选模型，修改后自动保存并即时生效。";
     } else if (role === "main") {
       helper =
-        "主模型负责 AI 造卡 / 记忆提炼 / 主动消息等后台生成，建议选能力更强的模型；可直接填写模型名，或点「拉取」读取候选模型。";
+        "主模型是基模：对话 / 决策 / 视觉默认继承它；建议选能力更强的模型，可直接填写模型名，或点「拉取」读取候选模型。";
     } else {
       helper =
         "独立配置：使用本卡片的提供商源与模型；留空表示停用该角色（不会回退）。可直接填写模型名，或点「拉取」读取候选模型；修改后自动保存并即时生效。";
@@ -582,12 +583,12 @@
   function effectivePair(role, depth) {
     depth = depth || 0;
     if (!S.cfg || depth > 2) return { source_id: "", model: "" };
-    if (role === "dialogue") return pairOf(S.cfg.dialogue);
+    if (role === "main") return pairOf(S.cfg.main);
     var entry = S.cfg[role];
     if (!entry) return { source_id: "", model: "" };
     var fromRole = str(entry.inherit_from);
     if (!fromRole) return pairOf(entry);
-    if (fromRole === "dialogue") return pairOf(S.cfg.dialogue);
+    if (fromRole === "main") return pairOf(S.cfg.main);
     return effectivePair(fromRole, depth + 1);
   }
 
@@ -595,8 +596,8 @@
     var cfg = S.cfg[role] || {};
     var selected = str(cfg.inherit_from);
     var descMap = {
-      main:
-        "独立配置：让主模型使用专属的更强模型；继承（默认）：与对话模型保持一致。主模型负责所有后台生成，不影响聊天回复。",
+      dialogue:
+        "继承（默认）：直接使用主模型（基模）；独立配置：为聊天单独指定更轻 / 更快的模型，留空即停用对话角色（不回退主模型）。",
       decision:
         "独立配置：为读空气单独指定模型；继承（默认）：复用主模型。判断模型建议独立配置，避免把聊天模型名当成 Decisions 模型。",
       vision:
@@ -640,7 +641,7 @@
         : "主模型";
     var chainNote = "";
     var parentCfg = S.cfg[fromRole] || {};
-    if (fromRole !== "dialogue" && str(parentCfg.inherit_from)) {
+    if (str(parentCfg.inherit_from)) {
       var grand =
         str(parentCfg.inherit_from) === "dialogue" ? "对话模型" : "主模型";
       chainNote = "（" + parentName + "当前继承自" + grand + "）";
@@ -755,7 +756,9 @@
   }
 
   function roleDetailsHtml(role) {
-    if (role === "dialogue") return roleControlsHtml(role);
+    if (role === "main") {
+      return roleControlsHtml(role);
+    }
     var cfg = S.cfg[role] || {};
     if (role === "decision" && decisionModeOf() === "judge") {
       return decisionJudgeHtml(role);
@@ -814,7 +817,7 @@
       "</span>" +
       '<div class="model-role-text"><span class="model-role-name">' +
       esc(meta.name) +
-      (role === "dialogue" ? '<span class="tag tag-danger" style="margin-left:6px">必填</span>' : "") +
+      (role === "main" ? '<span class="tag tag-danger" style="margin-left:6px">基模 · 必填</span>' : "") +
       '</span><span class="model-role-desc">' +
       esc(meta.desc) +
       "</span></div></div>" +
@@ -830,13 +833,13 @@
       "</span></div></div>" +
       '<div class="card-body">' +
       (role === "decision" ? decisionModeHtml(role) : "") +
-      (role === "dialogue" || (role === "decision" && decisionModeOf() === "judge")
+      (role === "main" || (role === "decision" && decisionModeOf() === "judge")
         ? ""
         : sourceModeHtml(role)) +
       '<div data-role="role-controls-' +
       esc(role) +
       '"' +
-      (role === "dialogue" ? "" : ' class="mt-12"') +
+      (role === "main" ? "" : ' class="mt-12"') +
       ">" +
       roleDetailsHtml(role) +
       "</div>" +
@@ -1184,8 +1187,8 @@
   /* ------------------------------------------------------------------ *
    * 页面
    * ------------------------------------------------------------------ */
-  function dialogueUnconfigured() {
-    var info = statusOf("dialogue");
+  function mainUnconfigured() {
+    var info = statusOf("main");
     return info.configured === false || info.mode === "unconfigured" || !info.label;
   }
 
@@ -1208,13 +1211,13 @@
   }
 
   function bannerHtml() {
-    if (!dialogueUnconfigured()) return "";
+    if (!mainUnconfigured()) return "";
     return (
       '<div class="card" style="border-color:var(--danger)"><div class="card-body tight">' +
       '<div class="row wrap">' +
       '<span class="status-light light-err"></span>' +
-      '<strong class="text-sm">对话模型未配置</strong>' +
-      '<span class="text-sm text-2">插件会回退到 AstrBot 平台默认模型；对话回复仍可用，但按角色绑定对话模型的隔离会失效。请在下方「对话模型」卡片选择提供商源与模型（修改即时生效）。</span>' +
+      '<strong class="text-sm">主模型（基模）未配置</strong>' +
+      '<span class="text-sm text-2">对话 / 决策 / 视觉默认继承主模型；主模型留空时它们也会停用，后台生成自动降级。若对话模型单独配置了提供商源与模型，聊天仍可用；否则回退到 AstrBot 平台默认模型。请在「主模型」卡片配置，或给对话模型选择「独立配置」。</span>' +
       "</div></div></div>"
     );
   }
@@ -1226,7 +1229,7 @@
       "模型" +
       '<span class="card-sub">当前角色：' +
       esc(currentSoulLabel()) +
-      " · 对话 / 主 / 决策 / 视觉模型按角色独立配置 · 修改即时生效</span></h1></div>" +
+      " · 主模型为基模，对话 / 决策 / 视觉默认继承 · 修改即时生效</span></h1></div>" +
       soulBannerHtml() +
       bannerHtml() +
       '<div class="model-grid model-grid-chat">' +
