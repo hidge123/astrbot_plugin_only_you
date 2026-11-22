@@ -1830,6 +1830,7 @@
         /* 切换提供商源后清空旧候选，避免误选到别的源的模型 */
         S.candidates[roleKey] = null;
         rerenderCandidates(roleKey);
+        refreshInheritPreviews();
         scheduleAutoSave();
         return;
       }
