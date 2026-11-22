@@ -276,6 +276,29 @@ class TestDecisionJudge(JudgeTestBase):
         assert result["threshold"] == 0.6
         assert self.hub.verdict_is_reply(result) is False
 
+    async def test_judge_env_only_without_provider_source(self):
+        await self.save_judge_config(source_id="", model="~typesafe/jev-latest")
+
+        async def fake_post(url, headers, payload, timeout=45.0):
+            assert headers["Authorization"] == "Bearer sk-or-env"
+            return _judge_payload(reply_probability=0.7)
+
+        with mock.patch.dict(
+            os.environ, {"OPENROUTER_API_KEY": "sk-or-env"}, clear=False
+        ):
+            status = (await self.hub.get_status())["decision"]
+            with mock.patch.object(decision_model, "post_json", fake_post):
+                result = await self.hub.judge_choice(
+                    prompt="",
+                    state={},
+                    instructions="",
+                    criteria={"REPLY": "yes", "IGNORE": "no"},
+                )
+        assert status["configured"] is True
+        assert status["judge_ready"] is True
+        assert status["key_source"] == "env"
+        assert result["decision"] == "REPLY"
+
     async def test_judge_mode_missing_key_returns_none(self):
         await self.save_judge_config(source_id="", model="~typesafe/jev-latest")
         env = {key: value for key, value in os.environ.items() if key != "OPENROUTER_API_KEY"}

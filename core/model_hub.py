@@ -937,7 +937,12 @@ class ModelHub:
     ) -> Optional[Dict[str, str]]:
         """Explicitly configured ``(source_id, model)`` of one chat role, if any."""
         active = cfg if isinstance(cfg, dict) else self._config
-        source_id, model = _pair_of(active.get(role))
+        entry = active.get(role) or {}
+        source_id, model = _pair_of(entry)
+        if role == "decision" and _clean(entry.get("mode")).lower() == "judge":
+            # Judge models may be addressed without a provider source; the API
+            # key then comes from OPENROUTER_API_KEY. A model is still required.
+            return {"source_id": source_id, "model": model} if model else None
         if source_id and model:
             return {"source_id": source_id, "model": model}
         return None
