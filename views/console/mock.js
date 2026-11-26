@@ -2434,6 +2434,8 @@
 
   function importPersona(body) {
     var personaName = String(body.persona_name || "default_soul").trim();
+    var regenerate =
+      String(body.mode || "").trim() === "regenerate" || body.regenerate_existing === true;
     var targetId = String(body.target_soul_id || personaName).trim();
     var found = null;
     for (var i = 0; i < db.nativePersonas.length; i++) {
@@ -2446,19 +2448,28 @@
     card.identity.avatar = String(body.avatar == null ? "" : body.avatar).trim() || targetId.slice(0, 1);
     card.extra.native_persona_prompt = found ? found.prompt : String(body.native_prompt || "");
     card.rhythm.daily_routine = "白天忙自己的事，晚上刷手机水群。";
-    var soul = { soul_id: targetId, card: card };
     var existed = findSoul(targetId);
+    if (regenerate && !existed) throw new Error("角色不存在：" + targetId);
     if (existed) {
+      /* 重新生成只替换角色卡：未指定新头像时保留原头像，其他 Soul 字段原样保留 */
+      var oldAvatar = cardFilled(existed.card || {}, "identity", "avatar", "");
+      if (regenerate && !String(body.avatar == null ? "" : body.avatar).trim() && oldAvatar) {
+        card.identity.avatar = oldAvatar;
+      }
       existed.card = card;
-      soul = existed;
     } else {
-      db.souls.push(soul);
+      db.souls.push({ soul_id: targetId, card: card });
     }
-    deckOf(targetId);
-    db.schedules[targetId] = buildRun(targetId, true);
+    var soul = findSoul(targetId);
+    /* 重新生成默认不动行动卡池与今日日程；显式要求时才重排 */
+    if (!regenerate || body.auto_generate_cards) {
+      deckOf(targetId);
+      db.schedules[targetId] = buildRun(targetId, true);
+    }
     ensureSoulV28Fields(soul);
     syncLegacyFields(soul);
     return {
+      mode: regenerate ? "regenerate" : "new",
       soul: toSoulDict(soul),
       schedule: buildSchedulePayload(targetId),
       souls: listSoulDicts()

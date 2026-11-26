@@ -556,6 +556,8 @@ SQLite `souls` 表（`soul_id / persona_hash / profile_json / updated_at / revis
 
 `users/*`、`models/*`、`sessions/*`、`cards/*` 的读写均支持 `soul_id`；不传时回退默认角色或旧全局视图。`users/list` 的 `users[]` / `groups[]` 均返回 `proactive_enabled`，`users/update`（默认 action 与 `update_group`）按 body 是否包含该字段决定是否透传。
 
+`souls/import_persona` 支持两种导入模式（`mode`）：`new`（默认）新建一个 Soul；`regenerate` 只重写 `target_soul_id` 对应角色的**角色卡**，该 Soul 的 `model_config`、`bound_platforms`、`settings`、行动卡池与今日时间轴保持不变，未随本次导入上传头像时保留原头像。`regenerate` 模式下 `auto_generate_cards` 默认 `false`，只有显式传 `true` 才重抽卡池并重排今日时间轴；AI 整卡生成失败时返回错误并保留原角色卡，不会静默退回基础卡。两种模式下 `target_soul_id` 已存在时都会保留该 Soul 的 `model_config` / `bound_platforms` / `settings`，只替换角色卡（以及显式要求重抽时的行动卡池）。
+
 控制台 `views/console/` 为无构建 classic script：`index.html` + `style.css` + `app.js`（bridge / hash 路由 / `isDirty` 守卫）+ `icons.js` + `charts.js` + 8 个 `page-*.js` + `mock.js`（`?mock=1` 离线预览）。页面为概览、日程、角色卡、关系与群聊、记忆、冲浪、模型、机器人接口。
 
 ---

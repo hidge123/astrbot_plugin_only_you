@@ -6,7 +6,7 @@
  *   POST `card/save`              → { soul, souls }
  *   POST `card/ai_generate`       → { draft_card, section }（整卡或单分区，不落库）
  *   POST `card/preview_prompt`    → { prompt, chars }
- *   POST `souls/import_persona`   → { soul, schedule, souls }
+ *   POST `souls/import_persona`   → { soul, schedule, souls, mode }（新建 / 重新生成当前角色卡）
  *   POST `souls/save` / `souls/rename` / `souls/delete`
  *
  * 页面结构：
@@ -1470,32 +1470,44 @@
       })
       .join("");
     var first = personas[0] && personas[0].persona_name ? String(personas[0].persona_name) : "";
+    var currentSoulId = String(S.soulId || "").trim();
+    var canRegenerate = !!currentSoulId;
     var avatarState = { value: "", picking: false };
     var body =
+      '<div class="field"><span class="field-label">导入方式</span>' +
+      '<select class="select" data-role="import-mode">' +
+      '<option value="new">新建角色卡（导入为一个新 Soul）</option>' +
+      '<option value="regenerate"' +
+      (canRegenerate ? "" : " disabled") +
+      ">重新生成当前角色卡（" +
+      esc(currentSoulId || "无当前角色") +
+      "）</option>" +
+      "</select>" +
+      '<div class="field-help">新建会另存一个角色卡；重新生成只替换当前角色的角色卡，模型配置、平台绑定、角色设置、行动卡池与今日日程全部保持不变。</div></div>' +
       '<div class="field"><span class="field-label">选择 AstrBot 原生 Persona</span>' +
       '<select class="select" data-role="persona-select">' +
       options +
       "</select>" +
-      '<div class="field-help">导入会新建一个角色卡，并把 Persona 原文记录到「补充设定 → 原生人设原文」。</div></div>' +
+      '<div class="field-help">Persona 原文会记录到「补充设定 → 原生人设原文」，仅供追溯来源，不参与 Prompt 渲染。</div></div>' +
       '<div class="field"><span class="field-label">角色头像（可选）</span>' +
       avatarPickerHtml(
         "import-avatar",
         first,
-        "支持本地图片，自动居中裁剪压缩为 160×160；未上传时显示所选 Persona 名称首字。"
+        "支持本地图片，自动居中裁剪压缩为 160×160；重新生成时不选则保留原头像。"
       ) +
       "</div>" +
       '<div class="field"><span class="field-label">目标 Soul ID</span>' +
       '<input class="input mono" type="text" data-role="target-soul" value="' +
       esc(first) +
       '" placeholder="例如：default_soul" />' +
-      '<div class="field-help">同 ID 会覆盖已有角色的角色卡，请确认后再导入。</div></div>' +
+      '<div class="field-help" data-role="target-help">同 ID 会覆盖该角色的角色卡，模型 / 绑定等配置保留；行动卡池由下方开关决定。</div></div>' +
       '<div class="switch-row"><div class="switch-row-text">' +
       '<span class="switch-row-title">AI 生成完整角色卡</span>' +
-      '<span class="switch-row-desc">用主模型把 Persona 原文扩写成 10 分区角色卡（失败时退回基础卡）</span></div>' +
+      '<span class="switch-row-desc">用主模型把 Persona 原文扩写成 10 分区角色卡（失败时退回基础卡；重新生成失败会保留原卡）</span></div>' +
       '<label class="switch"><input type="checkbox" data-role="ai-card" /><span class="switch-track"></span></label></div>' +
       '<div class="switch-row"><div class="switch-row-text">' +
-      '<span class="switch-row-title">同时生成行动卡 / 奇遇卡</span>' +
-      '<span class="switch-row-desc">用主模型扩写该角色的 Roguelite 卡池</span></div>' +
+      '<span class="switch-row-title">同时重新生成行动卡池</span>' +
+      '<span class="switch-row-desc">会替换该角色的 Roguelite 卡池并重排今日时间轴；重新生成模式默认关闭</span></div>' +
       '<label class="switch"><input type="checkbox" data-role="auto-cards" checked /><span class="switch-track"></span></label></div>';
     app.modal({
       title: "从 AstrBot 导入 Persona",
@@ -1509,17 +1521,34 @@
           onClick: async function (modalApp, bodyEl) {
             var selectEl = bodyEl.querySelector('[data-role="persona-select"]');
             var targetEl = bodyEl.querySelector('[data-role="target-soul"]');
+            var modeEl = bodyEl.querySelector('[data-role="import-mode"]');
             var aiEl = bodyEl.querySelector('[data-role="ai-card"]');
             var autoEl = bodyEl.querySelector('[data-role="auto-cards"]');
             var personaName = selectEl ? String(selectEl.value || "").trim() : "";
             var targetSoulId = targetEl ? String(targetEl.value || "").trim() : "";
+            var regenerate = !!(modeEl && modeEl.value === "regenerate");
             if (!personaName) {
               modalApp.toast("请选择要导入的 Persona", true);
               return false;
             }
+            if (regenerate && !currentSoulId) {
+              modalApp.toast("当前没有选中的角色，无法重新生成角色卡", true);
+              return false;
+            }
+            if (regenerate && (S.dirty || S.draft)) {
+              var proceed = await modalApp.confirm({
+                title: "放弃未保存的角色卡修改？",
+                message: "重新生成会直接用 Persona 覆盖当前角色卡，未保存的修改会丢失。",
+                danger: true,
+                confirmLabel: "继续重新生成",
+                cancelLabel: "取消"
+              });
+              if (!proceed) return false;
+            }
             var data = await modalApp.apiPost("souls/import_persona", {
+              mode: regenerate ? "regenerate" : "new",
               persona_name: personaName,
-              target_soul_id: targetSoulId || personaName,
+              target_soul_id: regenerate ? currentSoulId : targetSoulId || personaName,
               auto_generate_cards: !!(autoEl && autoEl.checked),
               ai_generate_card: !!(aiEl && aiEl.checked),
               avatar: String(avatarState.value || "").trim()
@@ -1528,7 +1557,9 @@
               modalApp.applySouls(data.souls, data.soul || null);
             }
             modalApp.toast(
-              "已导入 Persona：" + personaName + (aiEl && aiEl.checked ? "（AI 整卡生成中）" : "")
+              regenerate
+                ? "已重新生成当前角色卡（其他配置保持不变）"
+                : "已导入 Persona：" + personaName + (aiEl && aiEl.checked ? "（AI 整卡生成中）" : "")
             );
             setTimeout(function () {
               modalApp.refresh({ silent: true });
@@ -1540,15 +1571,44 @@
       onMount: function (bodyEl) {
         var selectEl = bodyEl.querySelector('[data-role="persona-select"]');
         var targetEl = bodyEl.querySelector('[data-role="target-soul"]');
+        var targetHelpEl = bodyEl.querySelector('[data-role="target-help"]');
+        var modeEl = bodyEl.querySelector('[data-role="import-mode"]');
+        var aiEl = bodyEl.querySelector('[data-role="ai-card"]');
+        var autoEl = bodyEl.querySelector('[data-role="auto-cards"]');
+        var modalEl = bodyEl.closest ? bodyEl.closest(".modal") : null;
+        var submitEl = modalEl ? modalEl.querySelector(".modal-foot .btn-primary") : null;
         bindAvatarPicker(bodyEl, "import-avatar", avatarState, function () {
           return selectEl ? String(selectEl.value || "").trim() || first : first;
         });
+        function syncMode() {
+          var regenerate = !!(modeEl && modeEl.value === "regenerate");
+          if (targetEl) {
+            targetEl.readOnly = regenerate;
+            if (regenerate) {
+              targetEl.value = currentSoulId;
+            } else if (!String(targetEl.value || "").trim() || targetEl.value === currentSoulId) {
+              targetEl.value = selectEl ? String(selectEl.value || "").trim() || first : first;
+            }
+          }
+          if (targetHelpEl) {
+            targetHelpEl.textContent = regenerate
+              ? "仅替换该角色的角色卡；模型配置、平台绑定、角色设置、行动卡池与今日日程保持不变。"
+              : "同 ID 会覆盖该角色的角色卡，模型 / 绑定等配置保留；行动卡池由下方开关决定。";
+          }
+          if (aiEl) aiEl.checked = regenerate;
+          if (autoEl) autoEl.checked = !regenerate;
+          if (submitEl) {
+            submitEl.innerHTML = icon("download", 14) + (regenerate ? "重新生成" : "导入");
+          }
+        }
+        if (modeEl) modeEl.addEventListener("change", syncMode);
         if (selectEl && targetEl) {
           selectEl.addEventListener("change", function () {
-            targetEl.value = selectEl.value;
+            if (!targetEl.readOnly) targetEl.value = selectEl.value;
             avatarState.render();
           });
         }
+        syncMode();
       }
     });
   }

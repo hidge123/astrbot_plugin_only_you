@@ -17,7 +17,9 @@ Key concepts after the 2026 refactor:
   (never persisted); ``import_native_persona`` writes the raw native prompt into
   ``card["extra"]["native_persona_prompt"]`` and optionally asks the main model for
   a full AI card, while the four-type action card pool is generated with the
-  **decision** model (encounter cards are no longer generated).
+  **main** model (encounter cards are no longer generated). Importing with
+  ``regenerate_existing=True`` only replaces the card of an existing Soul; its
+  model config / platform bindings / settings / action deck stay untouched.
 """
 
 import hashlib
@@ -1914,23 +1916,37 @@ class SoulManager:
         override_prompt: Optional[str] = None,
         ai_generate_card: bool = False,
         avatar: str = "",
+        regenerate_existing: bool = False,
     ) -> SoulProfile:
         """Import an AstrBot native Persona as a SoulProfile.
 
         - The raw native prompt is always preserved in
           ``card["extra"]["native_persona_prompt"]`` (never rendered).
         - ``ai_generate_card=True``: ask the **main** model for a full card; on
-          failure fall back to the basic card inferred from the raw text.
-        - ``auto_generate_cards=True``: ask the **decision** model for the four-type
+          failure fall back to the basic card inferred from the raw text (or, when
+          regenerating, keep the existing card and raise so nothing is degraded).
+        - ``auto_generate_cards=True``: ask the **main** model for the four-type
           action card pool (8~12 cards, no encounter cards); on failure or an empty
-          result, use ``build_fallback_custom_deck``.
+          result, use ``build_fallback_custom_deck`` for a brand-new Soul, or keep
+          the existing pool when the target Soul already exists.
         - ``avatar`` (optional): emoji / short text / image URL / ``data:image/...``
           Base64 avatar; written into ``card["identity"]["avatar"]`` (normalized)
           after the card is inferred or AI-generated, then persisted with the soul.
+        - ``regenerate_existing=True``: rewrite **only the character card** of the
+          Soul named by ``target_soul_id``; its ``model_config`` / ``bound_platforms``
+          / ``settings`` / action deck / today's schedule stay unchanged. The
+          existing avatar is kept unless ``avatar`` is supplied.
+        - Importing with an already existing ``target_soul_id`` always keeps that
+          Soul's ``model_config`` / ``bound_platforms`` / ``settings``; only the card
+          (and optionally the action deck) is replaced.
         - Encounter cards were removed from the system entirely (v2.9 cleanup).
         """
         pname = _clean_text(persona_name) or DEFAULT_SOUL_ID
         soul_id = _clean_text(target_soul_id or pname) or pname
+
+        existing = await self.get_soul_by_id(soul_id)
+        if regenerate_existing and existing is None:
+            raise ValueError(f"角色 {soul_id} 不存在，无法重新生成角色卡")
 
         native_prompt = _clean_text(override_prompt)
         if not native_prompt:
@@ -1950,11 +1966,18 @@ class SoulManager:
         card = self._build_imported_card(pname, native_prompt)
 
         # Optional: AI-generated full card (main model), fall back to the inferred card.
-        if ai_generate_card and self.model_hub is not None:
-            draft = await self.generate_card(seed_text=native_prompt, base_card=card)
+        if ai_generate_card:
+            draft = None
+            if self.model_hub is not None:
+                draft = await self.generate_card(seed_text=native_prompt, base_card=card)
             if isinstance(draft, dict):
                 card = normalize_card(draft)
                 card["extra"]["native_persona_prompt"] = native_prompt
+            elif regenerate_existing:
+                # Never silently downgrade a rich card to the bare inferred one.
+                raise ValueError(
+                    "主模型生成角色卡失败，原角色卡已保留；请检查主模型配置后重试"
+                )
 
         # The user-supplied avatar (uploaded image / emoji / URL) wins over the
         # inferred or AI-generated one; normalize_card then validates it (§5.1).
@@ -1962,6 +1985,13 @@ class SoulManager:
         if clean_avatar:
             card["identity"]["avatar"] = clean_avatar
             card = normalize_card(card)
+        elif regenerate_existing and existing is not None:
+            # Regenerating the current card keeps its avatar unless a new one is
+            # uploaded together with the import.
+            old_avatar = _clean_text((existing.card.get("identity") or {}).get("avatar"))
+            if old_avatar:
+                card["identity"]["avatar"] = old_avatar
+                card = normalize_card(card)
 
         state_cards: list[StateEventCard] = []
 
@@ -1986,13 +2016,29 @@ class SoulManager:
                     card = self._fill_card_from_seed_data(card, data, pname)
 
             # LLM offline / failure / empty deck -> deterministic tailored fallback
-            # (action cards only; encounter cards are gone from the system).
+            # (action cards only; encounter cards are gone from the system). When
+            # the target Soul already exists, keep its current pool instead.
             if not state_cards:
-                state_cards = self.build_fallback_custom_deck(pname, native_prompt)
-                logger.info(
-                    f"[OnlyYou] Used {len(state_cards)} fallback action cards "
-                    f"for imported persona '{pname}'."
-                )
+                if existing is not None:
+                    logger.warning(
+                        f"[OnlyYou] Deck seeding failed for soul '{soul_id}'; "
+                        "keeping the existing action card pool."
+                    )
+                else:
+                    state_cards = self.build_fallback_custom_deck(pname, native_prompt)
+                    logger.info(
+                        f"[OnlyYou] Used {len(state_cards)} fallback action cards "
+                        f"for imported persona '{pname}'."
+                    )
+
+        if existing is not None:
+            # Start from a copy of the persisted Soul so every non-card field
+            # (model_config / bound_platforms / settings) is preserved verbatim.
+            profile = SoulProfile.from_dict(existing.to_dict())
+            profile.card = normalize_card(card)
+            if state_cards:
+                profile.state_event_cards = state_cards
+            return await self.save_soul(profile)
 
         profile = SoulProfile(
             soul_id=soul_id,

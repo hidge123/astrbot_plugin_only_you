@@ -1865,18 +1865,39 @@ class OnlyYouWebAPI:
             await self.plugin._ensure_initialized()
             body = await self._get_json_body()
             persona_name = str(body.get("persona_name") or "default_soul").strip()
-            target_soul_id = str(body.get("target_soul_id") or persona_name).strip()
-            auto_gen = bool(body.get("auto_generate_cards", True))
             ai_generate_card = bool(body.get("ai_generate_card", False))
             override_prompt = str(body.get("native_prompt") or "").strip() or None
             # v2.6 §5.1: optional character avatar (emoji / image URL / data URL).
             avatar = str(body.get("avatar") or "").strip()
+
+            # Import modes:
+            #   new        -> create a new Soul (default, legacy behaviour)
+            #   regenerate -> rewrite only the character card of an existing Soul
+            mode = str(body.get("mode") or "").strip().lower()
+            regenerate_existing = bool(body.get("regenerate_existing")) or mode in {
+                "regenerate",
+                "regenerate_current",
+                "overwrite_current",
+            }
+            # Regenerating keeps the action deck / today's schedule unless the
+            # caller explicitly asks to rebuild them.
+            auto_gen = bool(body.get("auto_generate_cards", not regenerate_existing))
+            target_soul_id = str(body.get("target_soul_id") or "").strip()
+            if regenerate_existing:
+                if not target_soul_id:
+                    return err_response("缺少要重新生成的角色 ID")
+                if await self.plugin.soul_manager.get_soul_by_id(target_soul_id) is None:
+                    return err_response(f"角色 {target_soul_id} 不存在")
+            else:
+                target_soul_id = target_soul_id or persona_name
 
             importer = self.plugin.soul_manager.import_native_persona
             try:
                 importer_params = inspect.signature(importer).parameters
             except (TypeError, ValueError):
                 importer_params = {}
+            if regenerate_existing and "regenerate_existing" not in importer_params:
+                return err_response("当前版本不支持重新生成角色卡")
             import_kwargs: dict[str, Any] = {
                 "persona_name": persona_name,
                 "target_soul_id": target_soul_id,
@@ -1890,23 +1911,36 @@ class OnlyYouWebAPI:
             # Same tolerant pass-through for the v2.6 `avatar` parameter.
             if "avatar" in importer_params:
                 import_kwargs["avatar"] = avatar
+            if "regenerate_existing" in importer_params:
+                import_kwargs["regenerate_existing"] = regenerate_existing
             profile = await importer(**import_kwargs)
-            # Build fresh schedule run with the newly imported deck
-            await self.plugin.deck_engine.get_or_build_today_run(
-                soul_id=profile.soul_id,
-                custom_cards=profile.state_event_cards,
-                force_reroll=True,
-                chronotype=self._soul_chronotype(profile),
-            )
-            sched_payload = await self._build_schedule_payload(profile)
+            if regenerate_existing and not auto_gen:
+                # Only the card changed: keep today's timeline (and its drawn
+                # blocks) exactly as it was.
+                sched_payload = await self._build_schedule_payload(profile)
+            else:
+                # Build fresh schedule run with the newly imported deck
+                await self.plugin.deck_engine.get_or_build_today_run(
+                    soul_id=profile.soul_id,
+                    custom_cards=profile.state_event_cards,
+                    force_reroll=True,
+                    chronotype=self._soul_chronotype(profile),
+                )
+                sched_payload = await self._build_schedule_payload(profile)
             souls = await self.plugin.soul_manager.list_souls()
+            message = (
+                f"已重新生成角色卡 {profile.name} ({profile.soul_id})，其余配置保持不变"
+                if regenerate_existing
+                else f"已成功导入角色 {profile.name} ({profile.soul_id})"
+            )
             return ok_response(
                 {
                     "soul": profile.to_dict(),
                     "schedule": sched_payload,
                     "souls": [s.to_dict() for s in souls],
+                    "mode": "regenerate" if regenerate_existing else "new",
                 },
-                message=f"已成功导入角色 {profile.name} ({profile.soul_id})",
+                message=message,
             )
         except Exception as e:
             logger.warning(f"[OnlyYou] api_souls_import_persona error: {e}")
