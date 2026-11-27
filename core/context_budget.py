@@ -8,7 +8,12 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Coroutine, Optional
 
-from .character_card import render_persona_prompt
+from .character_card import (
+    DEFAULT_PERSONA_PROMPT_MAX_CHARS,
+    PERSONA_PROMPT_BUDGET_MAX,
+    PERSONA_PROMPT_BUDGET_MIN,
+    render_persona_prompt,
+)
 from .memory_manager import (
     MemoryManager,
     MemoryTier,
@@ -743,6 +748,16 @@ class ContextBudgetManager:
         return max(50, int(self.cfg.get("max_memory_chars_budget", 400)))
 
     @property
+    def persona_prompt_max_chars(self) -> int:
+        """Rendered persona prompt budget (Pages「设置 → 记忆与上下文」, default 4000)."""
+        return self._cfg_int(
+            "persona_prompt_max_chars",
+            DEFAULT_PERSONA_PROMPT_MAX_CHARS,
+            PERSONA_PROMPT_BUDGET_MIN,
+            PERSONA_PROMPT_BUDGET_MAX,
+        )
+
+    @property
     def max_recall_candidates(self) -> int:
         """Coarse-recall pool size entering the rerank stage (default 24)."""
         try:
@@ -964,7 +979,9 @@ class ContextBudgetManager:
         system_prompt = getattr(req, "system_prompt", None) or ""
         card_block = (
             "\n# Persona Instructions\n\n"
-            + render_persona_prompt(soul.card)
+            + render_persona_prompt(
+                soul.card, max_chars=self.persona_prompt_max_chars
+            )
             + "\n"
         )
 

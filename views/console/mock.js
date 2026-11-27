@@ -652,6 +652,7 @@
         ["extract_every_n_messages", "提炼触发条数", "int", 15, false, 5, 60, "条"],
         ["max_injected_memories", "单次注入条数", "int", 6, false, 1, 20, "条"],
         ["max_memory_chars_budget", "单次注入字数", "int", 400, false, 50, 3000, "字"],
+        ["persona_prompt_max_chars", "人设 Prompt 预算", "int", 4000, false, 500, 20000, "字"],
         ["memory_content_max_chars", "单条记忆字数上限", "int", 60, false, 30, 300, "字"],
         ["max_tier1_memories", "T1 数量上限", "int", 30, false, 5, 200, "条"],
         ["tier1_ttl_hours", "T1 存活时长", "int", 48, false, 6, 720, "小时"],
@@ -2138,6 +2139,29 @@
   /* ================================================================== *
    * 6. 角色卡 Prompt 预览 / AI 草稿
    * ================================================================== */
+  /** 模拟运行配置里的「人设 Prompt 预算」（设置页可调，默认 4000）。 */
+  function mockPersonaBudget() {
+    var group =
+      (db.runtimeConfig && db.runtimeConfig.memory_and_context_config) || {};
+    var value = Number(group.persona_prompt_max_chars);
+    if (!isFinite(value) || value <= 0) return 4000;
+    return Math.max(500, Math.min(20000, Math.round(value)));
+  }
+
+  /** 与后端 `_persona_prompt_stats` 对齐的近似统计（mock 预览用）。 */
+  function personaPromptStats(card) {
+    var budget = mockPersonaBudget();
+    var full = renderMockPrompt(card || {}).length;
+    var chars = Math.min(full, budget);
+    return {
+      budget: budget,
+      chars: chars,
+      full_chars: full,
+      over_budget: full > budget,
+      dropped_chars: Math.max(0, full - chars)
+    };
+  }
+
   function renderMockPrompt(card) {
     card = card || {};
     var lines = [];
@@ -3432,15 +3456,18 @@
         return buildOverview(payload.soul_id || "");
       case "card/schema": {
         var schemaSoul = findSoul(payload.soul_id || "") || activeSoul();
+        var schemaCard = schemaSoul ? schemaSoul.card : emptyCard();
         return {
           schema: clone(CARD_SCHEMA),
-          card: clone(schemaSoul ? schemaSoul.card : emptyCard()),
-          soul_id: schemaSoul ? schemaSoul.soul_id : ""
+          card: clone(schemaCard),
+          soul_id: schemaSoul ? schemaSoul.soul_id : "",
+          persona_prompt: personaPromptStats(schemaCard)
         };
       }
       case "card/save": {
         var saved = saveCardModel(String(payload.soul_id || ""), payload);
         saved.souls = listSoulDicts();
+        saved.persona_prompt = personaPromptStats(saved.soul ? saved.soul.card : {});
         return saved;
       }
       case "card/ai_generate": {
@@ -3459,7 +3486,8 @@
             ? promptSoul.card
             : emptyCard();
         var prompt = renderMockPrompt(promptCard);
-        return { prompt: prompt, chars: prompt.length };
+        var stats = personaPromptStats(promptCard);
+        return Object.assign({ prompt: prompt, chars: prompt.length }, stats);
       }
       case "models/sources":
         return {

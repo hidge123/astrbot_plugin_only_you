@@ -3241,6 +3241,66 @@ class OnlyYouWebAPI:
     # ==========================================================================
     # 7. Character Card Studio (`card/*`)
     # ==========================================================================
+    def _persona_prompt_budget(self) -> int:
+        """Configured persona-prompt budget (Pages「设置 → 记忆与上下文」)."""
+        module = _character_card_module()
+        default = int(getattr(module, "DEFAULT_PERSONA_PROMPT_MAX_CHARS", 4000))
+        low = int(getattr(module, "PERSONA_PROMPT_BUDGET_MIN", 500))
+        high = int(getattr(module, "PERSONA_PROMPT_BUDGET_MAX", 20000))
+        value: Any = None
+        manager = getattr(self.plugin, "config_manager", None)
+        getter = getattr(manager, "get", None)
+        if callable(getter):
+            try:
+                value = getter("persona_prompt_max_chars", None)
+            except Exception:  # noqa: BLE001 - config must never break the page
+                value = None
+        if value is None:
+            cfg = getattr(self.plugin, "config", None)
+            if isinstance(cfg, dict):
+                group = cfg.get("memory_and_context_config")
+                if isinstance(group, dict):
+                    value = group.get("persona_prompt_max_chars")
+        try:
+            budget = int(value)
+        except (TypeError, ValueError):
+            budget = default
+        return max(low, min(high, budget))
+
+    def _persona_prompt_stats(
+        self, card: dict[str, Any], budget: Optional[int] = None
+    ) -> dict[str, Any]:
+        """Measure the rendered persona prompt and whether the card exceeds budget."""
+        module = _character_card_module()
+        render = getattr(module, "render_persona_prompt", None) if module is not None else None
+        measure = getattr(module, "measure_persona_prompt", None) if module is not None else None
+        effective = self._persona_prompt_budget() if budget is None else int(budget)
+        if not callable(render):
+            return {
+                "budget": effective,
+                "chars": 0,
+                "full_chars": 0,
+                "over_budget": False,
+                "dropped_chars": 0,
+            }
+        try:
+            prompt = str(render(card, max_chars=effective) or "")
+        except Exception as exc:  # noqa: BLE001 - stats are informational only
+            logger.warning(f"[OnlyYou] render_persona_prompt failed: {exc}")
+            prompt = ""
+        try:
+            full_chars = int(measure(card)) if callable(measure) else len(prompt)
+        except Exception:  # noqa: BLE001
+            full_chars = len(prompt)
+        chars = len(prompt)
+        return {
+            "budget": effective,
+            "chars": chars,
+            "full_chars": full_chars,
+            "over_budget": full_chars > effective,
+            "dropped_chars": max(0, full_chars - chars),
+        }
+
     async def api_card_schema(self) -> dict[str, Any]:
         """Return the character-card form schema plus the current soul card data."""
         try:
@@ -3250,11 +3310,13 @@ class OnlyYouWebAPI:
             schema = getattr(module, "CARD_SCHEMA", None) if module is not None else None
             if not isinstance(schema, list):
                 return err_response("角色卡 schema 不可用：core/character_card.py 尚未就绪")
+            card = self._soul_card(soul)
             return ok_response(
                 {
                     "schema": schema,
-                    "card": self._soul_card(soul),
+                    "card": card,
                     "soul_id": soul.soul_id,
+                    "persona_prompt": self._persona_prompt_stats(card),
                 }
             )
         except Exception as e:
@@ -3291,6 +3353,7 @@ class OnlyYouWebAPI:
                 {
                     "soul": to_dict() if callable(to_dict) else {},
                     "souls": [s.to_dict() for s in souls],
+                    "persona_prompt": self._persona_prompt_stats(self._soul_card(profile)),
                 },
                 message=f"已保存角色卡 {soul_id}",
             )
@@ -3348,17 +3411,22 @@ class OnlyYouWebAPI:
                 soul = await self._resolve_soul(str(body.get("soul_id") or "").strip())
                 card = self._soul_card(soul)
 
-            try:
-                max_chars = int(body.get("max_chars") or 2000)
-            except (TypeError, ValueError):
-                max_chars = 2000
-            max_chars = max(200, min(20000, max_chars))
+            raw_budget = body.get("max_chars")
+            if raw_budget is None:
+                max_chars = self._persona_prompt_budget()
+            else:
+                try:
+                    max_chars = int(raw_budget)
+                except (TypeError, ValueError):
+                    max_chars = self._persona_prompt_budget()
+                max_chars = max(200, min(20000, max_chars))
             try:
                 prompt = render(card, max_chars=max_chars)
             except TypeError:
                 prompt = render(card)
             prompt_text = str(prompt or "")
-            return ok_response({"prompt": prompt_text, "chars": len(prompt_text)})
+            stats = self._persona_prompt_stats(card, budget=max_chars)
+            return ok_response({"prompt": prompt_text, **stats})
         except Exception as e:
             logger.warning(f"[OnlyYou] api_card_preview_prompt error: {e}")
             return err_response(f"预览角色卡 Prompt 失败: {e}")

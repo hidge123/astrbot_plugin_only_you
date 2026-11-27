@@ -37,7 +37,10 @@
     dirty: false,
     draft: null, // { kind: "card"|"section", sections: [id], before: cardSnapshot }
     activeSection: "",
-    busy: false
+    busy: false,
+    // v3.2: { budget, chars, full_chars, over_budget, dropped_chars } from card/schema
+    personaPrompt: null,
+    budgetWarnKey: ""
   };
 
   /* ------------------------------------------------------------------ *
@@ -476,6 +479,48 @@
     );
   }
 
+  /** 人设 Prompt 预算告警：完整渲染超出可配置预算时持续显示在表单顶部。 */
+  function budgetBannerHtml() {
+    var info = S.personaPrompt;
+    if (!info || !info.over_budget) return "";
+    var budget = Math.max(0, Math.round(num(info.budget, 0)));
+    var full = Math.max(0, Math.round(num(info.full_chars, 0)));
+    var over = Math.max(0, full - budget);
+    return (
+      '<div class="card persona-budget-warning"><div class="card-body tight">' +
+      '<div class="row-between wrap">' +
+      '<div class="budget-warning-main">' +
+      '<div class="budget-warning-title">' +
+      icon("alert", 15) +
+      "角色卡超出人设 Prompt 预算</div>" +
+      '<div class="budget-warning-text">完整渲染约 ' +
+      esc(full) +
+      " 字，当前预算 " +
+      esc(budget) +
+      " 字，超出 " +
+      esc(over) +
+      " 字。超出部分会按优先级裁剪（示例对话 / 背景 / 外貌等先被舍弃）；可在「设置 → 记忆与上下文 → 人设 Prompt 预算」调高预算。</div>" +
+      "</div>" +
+      '<button class="btn btn-outline btn-sm" type="button" data-action="open-settings">' +
+      icon("settings", 13) +
+      "去设置调整</button>" +
+      "</div></div></div>"
+    );
+  }
+
+  function announcePersonaBudget(app, info) {
+    if (!app || !info || !info.over_budget) return;
+    var key = String(info.full_chars || 0) + "/" + String(info.budget || 0);
+    if (S.budgetWarnKey === key) return;
+    S.budgetWarnKey = key;
+    app.toast(
+      "角色卡超出人设 Prompt 预算 " +
+        Math.max(0, Math.round(num(info.full_chars, 0) - num(info.budget, 0))) +
+        " 字，超出部分会被裁剪",
+      true
+    );
+  }
+
   function draftSectionTitle() {
     if (!S.draft || !S.draft.sections || !S.draft.sections.length) return "";
     var section = findSection(S.draft.sections[0]);
@@ -910,6 +955,7 @@
       '<div class="char-layout">' +
       asideHtml() +
       '<div class="section-stack">' +
+      budgetBannerHtml() +
       draftBannerHtml() +
       (S.schema.length ? S.schema.map(sectionHtml).join("") : emptySchemaHtml()) +
       savebarHtml() +
@@ -1126,9 +1172,14 @@
     S.dirty = false;
     S.draft = null;
     S.activeSection = schema.length ? schema[0].id : "";
+    S.personaPrompt =
+      data.persona_prompt && typeof data.persona_prompt === "object"
+        ? data.persona_prompt
+        : null;
     if (S.soulId) {
       app.state.currentSoulId = S.soulId;
     }
+    announcePersonaBudget(app, S.personaPrompt);
   }
 
   async function reloadAll(showToast) {
@@ -1302,6 +1353,7 @@
     S.dirty = computeDirty();
     paint();
     if (S.app) S.app.toast("已采用 AI 草稿，别忘了点「保存角色卡」");
+    refreshPersonaPromptStats(S.app);
   }
 
   function discardDraft() {
@@ -1318,6 +1370,7 @@
     S.dirty = computeDirty();
     paint();
     if (S.app) S.app.toast("已放弃 AI 草稿");
+    refreshPersonaPromptStats(S.app);
   }
 
   /* ------------------------------------------------------------------ *
@@ -1370,8 +1423,12 @@
       if (data && Array.isArray(data.souls)) {
         app.applySouls(data.souls, data.soul || null);
       }
+      if (data && data.persona_prompt && typeof data.persona_prompt === "object") {
+        S.personaPrompt = data.persona_prompt;
+      }
       paint();
       app.toast("角色卡已保存");
+      announcePersonaBudget(app, S.personaPrompt);
     } catch (err) {
       app.toast("保存角色卡失败：" + (err.message || err), true);
     } finally {
@@ -1381,6 +1438,29 @@
     }
   }
 
+  /** 拉取当前工作卡（含未保存草稿）的精确 Prompt 长度，用于实时预算告警。 */
+  function refreshPersonaPromptStats(app) {
+    if (!app || !S.card) return;
+    app
+      .apiPost("card/preview_prompt", { soul_id: S.soulId, card: S.card })
+      .then(function (data) {
+        if (!data) return;
+        S.personaPrompt = {
+          budget: data.budget,
+          chars: data.chars,
+          full_chars: data.full_chars,
+          over_budget: !!data.over_budget,
+          dropped_chars: data.dropped_chars
+        };
+        if (S.destroyed || !S.app || S.app.route !== "character") return;
+        if (S.container) paint();
+        announcePersonaBudget(app, S.personaPrompt);
+      })
+      .catch(function () {
+        /* 预算统计是辅助信息，失败时静默保留上一次结果 */
+      });
+  }
+
   function openPromptPreview() {
     var app = S.app;
     if (!app) return;
@@ -1388,11 +1468,46 @@
       function (data) {
         var prompt = (data && data.prompt) || "";
         var chars = data && data.chars != null ? data.chars : prompt.length;
-        var body =
-          '<div class="row-between mb-8"><span class="text-sm muted">渲染内容（最终注入 System Prompt 的 Persona 段）</span>' +
+        var budget = data && data.budget != null ? Math.round(num(data.budget, 0)) : 0;
+        var full = data && data.full_chars != null ? Math.round(num(data.full_chars, chars)) : chars;
+        var over = !!(data && data.over_budget);
+        var dropped =
+          data && data.dropped_chars != null
+            ? Math.max(0, Math.round(num(data.dropped_chars, 0)))
+            : Math.max(0, full - chars);
+        if (data && budget) {
+          S.personaPrompt = {
+            budget: budget,
+            chars: chars,
+            full_chars: full,
+            over_budget: over,
+            dropped_chars: dropped
+          };
+        }
+        var tags =
           '<span class="tag tag-primary num">' +
           esc(chars) +
-          " 字</span></div>" +
+          " 字</span>" +
+          (budget
+            ? '<span class="tag tag-muted num">预算 ' + esc(budget) + " 字</span>"
+            : "");
+        var warnHtml = over
+          ? '<div class="prompt-budget-warn">' +
+            icon("alert", 14) +
+            "<span>完整渲染约 " +
+            esc(full) +
+            " 字，超出预算 " +
+            esc(Math.max(0, full - budget)) +
+            " 字，已按优先级裁剪 " +
+            esc(dropped) +
+            " 字。可在「设置 → 记忆与上下文 → 人设 Prompt 预算」调高预算。</span></div>"
+          : "";
+        var body =
+          '<div class="row-between mb-8"><span class="text-sm muted">渲染内容（最终注入 System Prompt 的 Persona 段）</span>' +
+          '<span class="row">' +
+          tags +
+          "</span></div>" +
+          warnHtml +
           '<div class="code-block prompt-preview"><div class="code-head"><span>render_persona_prompt(card)</span>' +
           '<button class="btn btn-ghost btn-xs" type="button" data-action="copy-prompt">' +
           icon("copy", 12) +
@@ -1405,6 +1520,10 @@
           wide: true,
           body: body,
           actions: [{ label: "关闭" }],
+          onClose: function () {
+            if (S.container && !S.destroyed) paint();
+            announcePersonaBudget(app, S.personaPrompt);
+          },
           onMount: function (bodyEl, modalApp) {
             var copyBtn = bodyEl.querySelector('[data-action="copy-prompt"]');
             if (!copyBtn) return;
@@ -2136,6 +2255,9 @@
       openImportModal();
     } else if (action === "preview-prompt") {
       openPromptPreview();
+    } else if (action === "open-settings") {
+      if (app.openSettings) app.openSettings("memory");
+      else app.navigate("settings");
     } else if (action === "more-menu") {
       openMoreMenu();
     } else if (action === "save-card") {

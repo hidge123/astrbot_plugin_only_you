@@ -42,6 +42,12 @@ except ImportError:  # pragma: no cover - offline unit tests / no AstrBot contai
 
     logger = logging.getLogger("onlyyou.config_manager")
 
+from .character_card import (
+    DEFAULT_PERSONA_PROMPT_MAX_CHARS,
+    PERSONA_PROMPT_BUDGET_MAX,
+    PERSONA_PROMPT_BUDGET_MIN,
+)
+
 
 #: ``plugin_settings`` 键：全量运行配置。
 RUNTIME_CONFIG_KEY = "runtime_config"
@@ -283,6 +289,10 @@ def build_sections() -> tuple[ConfigSection, ...]:
                "每次对话最多注入的记忆条数。", 1, 20, "条"),
             _f("max_memory_chars_budget", "单次注入字数", "int", 400,
                "每次对话注入记忆的总字数预算，用于控制 Token 费用。", 50, 3000, "字"),
+            _f("persona_prompt_max_chars", "人设 Prompt 预算", "int",
+               DEFAULT_PERSONA_PROMPT_MAX_CHARS,
+               "角色卡渲染为 Persona Prompt 的最大字数；超出时按优先级裁剪低价值分区。",
+               PERSONA_PROMPT_BUDGET_MIN, PERSONA_PROMPT_BUDGET_MAX, "字"),
             _f("memory_content_max_chars", "单条记忆字数上限", "int", 60,
                "单条记忆正文的最大字数上限（新建 / 编辑记忆时前后端联动校验）。",
                30, 300, "字"),

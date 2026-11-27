@@ -176,6 +176,7 @@ class UserTier(int, Enum):   L1_NORMAL=1 | L2_IMPORTANT=2 | L3_CORE=3
 ### 4.3 卡池与重抽（v2.9 语义）
 
 - 卡池由 `SoulProfile.state_event_cards` 持有；重抽 / 卡片页 AI 生成按 **SLEEP 2 / BUSY_TASK 3 / SURF 2 / IDLE_ROAM 2 = 9 张** 的比例生成，缺失类型用兜底卡补齐，保证四类行动始终可抽。原生 Persona 导入时的一次性种子卡池可以是 8~12 张，排轴时缺类同样由默认卡补齐。
+- 通用兜底卡池 `DEFAULT_STATE_EVENT_CARDS` 只保留四类行动**各 1 张中性卡**；`_normalize_pool` 对自定义池只按**缺失的行动类型各补 1 张**，不会把整套默认卡并入卡池，避免稀释自定义卡的加权抽中概率。
 - `regenerate_action_cards()` **清空旧池**后重抽；调用方（`schedule/reroll`、`/onlyyou reroll`、`cards/ai_generate`）会先物化今日时间轴，所以**今日已排好的块保持不变，新卡池从明天 00:00 生效**。三处入口语义一致。
 - 无有效 `action_type` 的旧卡片在解析时直接丢弃并记 warning，不再按标题关键词猜测类型。
 - 卡池若缺少某一行动类型，`_normalize_pool()` 会用内置默认卡补齐，不会排不出完整一天。
@@ -250,7 +251,7 @@ L1 普通用户即使重要度 8 也只能进 T2；`episode` / `state` 永远不
 
 `ContextBudgetManager.apply_context_and_memory_budget()` 的执行顺序固定：
 
-1. **Persona 接管**：用角色卡渲染结果替换 `req.system_prompt` 中的 `# Persona Instructions` 段（精确替换 → 正则兜底 → 前置三分支）；头像与原生人设原文永不注入。
+1. **Persona 接管**：用角色卡渲染结果替换 `req.system_prompt` 中的 `# Persona Instructions` 段（精确替换 → 正则兜底 → 前置三分支）；头像与原生人设原文永不注入。渲染预算由 `memory_and_context_config.persona_prompt_max_chars` 控制（默认 4000 字，Pages「设置 → 记忆与上下文」可调 500~20000）；超预算时按 `examples > background > appearance > extra/rhythm > interests` 顺序整段丢弃低价值分区，角色卡页据此显示「完整渲染字数 / 预算 / 超出」告警。
 2. **清空原生历史**：`req.contexts.clear()`，注入插件 `SessionBuffer` 滑窗（默认 15 条，剔除与当前 prompt 重复的最新用户消息）。
 3. **上下文感知 Query**：当前消息 + 滑窗内该用户最近 2 条发言；有 `embedding` 角色时同时取 Query 向量。
 4. **三路粗排候选池（Top-24）**：仅 `superseded_by IS NULL`；Dense（向量余弦）+ Sparse（`content + keywords` BM25）+ T3/T2/T1 分桶保底，防止高 tier 吃满候选名额。

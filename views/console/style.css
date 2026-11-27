@@ -2640,6 +2640,46 @@ html.dark .sched-seg.is-clickable:hover {
   gap: 14px;
 }
 
+/* v3.2 人设 Prompt 预算告警（角色卡页 / Prompt 预览） */
+.persona-budget-warning {
+  border-color: color-mix(in srgb, var(--warning) 55%, var(--border));
+  background: color-mix(in srgb, var(--warning) 7%, var(--surface));
+}
+
+.persona-budget-warning .budget-warning-main {
+  min-width: 0;
+}
+
+.persona-budget-warning .budget-warning-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--warning);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.persona-budget-warning .budget-warning-text {
+  margin-top: 5px;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.prompt-budget-warn {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin-bottom: 10px;
+  padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--warning) 9%, transparent);
+  color: var(--warning);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
 .card-section {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);

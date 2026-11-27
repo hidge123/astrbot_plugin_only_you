@@ -436,6 +436,13 @@ _KEEP_FIRST_SECTIONS = ("identity", "speech", "personality", "social")
 _DROP_ORDER = ("examples", "background", "appearance", "extra", "rhythm", "interests")
 _BASE_DROP_ORDER = ("social", "personality", "speech")  # identity is always kept (opening line)
 
+# v3.2: the persona prompt budget is adjustable from Pages「设置 → 记忆与上下文」.
+DEFAULT_PERSONA_PROMPT_MAX_CHARS = 4000
+PERSONA_PROMPT_BUDGET_MIN = 500
+PERSONA_PROMPT_BUDGET_MAX = 20000
+#: Practical ceiling used to measure the full (unbudgeted) prompt length.
+_PERSONA_PROMPT_MEASURE_CAP = 10_000_000
+
 _TAGS_SPLIT_RE = re.compile(r"[,，、/;；|\n\r]+")
 
 
@@ -843,7 +850,10 @@ def _assemble_prompt(
     return header + "\n\n" + "\n\n".join(ordered)
 
 
-def render_persona_prompt(card: Optional[dict[str, Any]], max_chars: int = 2000) -> str:
+def render_persona_prompt(
+    card: Optional[dict[str, Any]],
+    max_chars: int = DEFAULT_PERSONA_PROMPT_MAX_CHARS,
+) -> str:
     """Render the character card as the persona prompt replacing AstrBot's Persona block.
 
     Rules (CONTRACTS.md §3.1):
@@ -858,7 +868,7 @@ def render_persona_prompt(card: Optional[dict[str, Any]], max_chars: int = 2000)
     try:
         budget = int(max_chars)
     except (TypeError, ValueError):
-        budget = 2000
+        budget = DEFAULT_PERSONA_PROMPT_MAX_CHARS
     if budget <= 0:
         return ""
 
@@ -902,6 +912,16 @@ def render_persona_prompt(card: Optional[dict[str, Any]], max_chars: int = 2000)
     if len(result) > budget:
         result = result[:budget]
     return result
+
+
+def measure_persona_prompt(card: Optional[dict[str, Any]]) -> int:
+    """Return the full persona-prompt length before budget-driven section drops.
+
+    ``render_persona_prompt`` silently drops low-priority sections to honour its
+    budget; the console uses this measurement to warn when the card itself is
+    over budget (and by how much).
+    """
+    return len(render_persona_prompt(card, max_chars=_PERSONA_PROMPT_MEASURE_CAP))
 
 
 def render_card_summary(card: Optional[dict[str, Any]], max_chars: int = 200) -> str:
