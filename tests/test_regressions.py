@@ -334,6 +334,61 @@ class TestRogueliteDeck(unittest.IsolatedAsyncioTestCase):
                 drawn_custom = True
         assert drawn_custom
 
+    def test_default_pool_is_minimal_and_neutral(self):
+        cards = mods.roguelite_deck.DEFAULT_STATE_EVENT_CARDS
+        assert len(cards) == 4
+        assert {card.action for card in cards} == set(ActionType)
+        for card in cards:
+            assert card.title == mods.roguelite_deck.DEFAULT_ACTION_TITLES[card.action]
+            assert not card.synergy_tags, card.card_id
+        titles = "".join(card.title for card in cards)
+        for word in ("排位", "开黑", "通勤", "被窝", "沙发", "搞笑", "下饭", "窗边", "摸鱼"):
+            assert word not in titles
+
+    def test_custom_pool_pads_one_filler_per_missing_type(self):
+        custom = [
+            StateEventCard(
+                card_id="custom_surf",
+                title="瘫在懒人沙发上刷B站",
+                state=BotState.IDLE,
+                action_type=ActionType.SURF,
+                min_hours=0.5,
+                max_hours=1.5,
+            ),
+            StateEventCard(
+                card_id="custom_roam",
+                title="在群里潜水窥屏",
+                state=BotState.IDLE,
+                action_type=ActionType.IDLE_ROAM,
+                min_hours=0.5,
+                max_hours=1.5,
+            ),
+        ]
+        pool = self.engine._normalize_pool(custom)
+        assert len(pool) == 4
+        assert [card.card_id for card in pool[:2]] == ["custom_surf", "custom_roam"]
+        assert sum(1 for card in pool if card.action == ActionType.SLEEP) == 1
+        assert sum(1 for card in pool if card.action == ActionType.BUSY_TASK) == 1
+
+    def test_complete_custom_pool_is_not_padded(self):
+        custom = [
+            StateEventCard(
+                card_id=f"custom_{action.value}",
+                title=mods.roguelite_deck.DEFAULT_ACTION_TITLES[action],
+                state=action.bound_state,
+                action_type=action,
+                min_hours=0.5,
+                max_hours=2.0,
+            )
+            for action in ActionType
+        ]
+        pool = self.engine._normalize_pool(custom)
+        assert len(pool) == 4
+        assert all(card.card_id.startswith("custom_") for card in pool)
+
+    def test_empty_pool_uses_only_the_four_fallbacks(self):
+        assert len(self.engine._normalize_pool([])) == 4
+
     async def test_chronotype_weight_curves_differ(self):
         early_1am = self.engine.get_chronotype_weights("early", 1.0)
         owl_1am = self.engine.get_chronotype_weights("night_owl", 1.0)

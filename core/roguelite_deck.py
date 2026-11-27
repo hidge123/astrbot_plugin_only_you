@@ -487,12 +487,17 @@ DEFAULT_VIGOR_CARDS: list[DayVigorCard] = [
     ),
 ]
 
-# Built-in general four-action-type card pool (used when a Soul has no custom pool).
+# Built-in general four-action-type card pool (fallback only).
+#
+# Deliberately minimal: exactly one neutral card per action type. A Soul's
+# custom pool is only padded with the missing action type (never with a whole
+# second generic pool), so these cards can never drown out custom cards in the
+# weighted draw. Persona-tailored fallback decks are built by
+# ``SoulManager.build_fallback_custom_deck`` instead.
 DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
-    # ---- SLEEP ----
     StateEventCard(
-        card_id="gen_sleep_night",
-        title="夜间关灯沉睡休息",
+        card_id="gen_default_sleep",
+        title="闭眼安静睡一会儿",
         state=BotState.RESTING,
         action_type=ActionType.SLEEP,
         min_hours=4.0,
@@ -500,115 +505,31 @@ DEFAULT_STATE_EVENT_CARDS: list[StateEventCard] = [
         base_weight=75,
     ),
     StateEventCard(
-        card_id="gen_sleep_nap",
-        title="午后戴眼罩趴桌小憩",
-        state=BotState.RESTING,
-        action_type=ActionType.SLEEP,
-        min_hours=1.0,
-        max_hours=2.0,
-        base_weight=35,
-        synergy_tags={"deadline": 1.3},
-    ),
-    # ---- BUSY_TASK ----
-    StateEventCard(
-        card_id="gen_busy_focus",
+        card_id="gen_default_busy",
         title="专注处理手头正事",
         state=BotState.BUSY,
         action_type=ActionType.BUSY_TASK,
-        min_hours=1.5,
+        min_hours=1.0,
         max_hours=3.0,
-        base_weight=65,
-        synergy_tags={"deadline": 1.7},
+        base_weight=60,
     ),
     StateEventCard(
-        card_id="gen_busy_afternoon",
-        title="推进日常工作任务",
-        state=BotState.BUSY,
-        action_type=ActionType.BUSY_TASK,
-        min_hours=1.0,
-        max_hours=2.5,
-        base_weight=55,
-        synergy_tags={"deadline": 1.8},
-    ),
-    StateEventCard(
-        card_id="gen_busy_rank",
-        title="开黑打排位冲分",
-        state=BotState.BUSY,
-        action_type=ActionType.BUSY_TASK,
-        min_hours=1.0,
-        max_hours=2.0,
-        base_weight=30,
-    ),
-    # ---- SURF ----
-    StateEventCard(
-        card_id="gen_surf_evening",
-        title="窝在沙发刷搞笑视频",
+        card_id="gen_default_surf",
+        title="窝着刷会儿视频",
         state=BotState.IDLE,
         action_type=ActionType.SURF,
         min_hours=0.5,
         max_hours=2.0,
-        base_weight=80,
-        synergy_tags={"energetic": 1.5, "slacker": 1.5, "night_owl": 1.5},
-    ),
-    StateEventCard(
-        card_id="gen_surf_meal",
-        title="吃饭顺便刷下饭视频",
-        state=BotState.IDLE,
-        action_type=ActionType.SURF,
-        min_hours=0.5,
-        max_hours=1.5,
         base_weight=55,
-        synergy_tags={"energetic": 1.4, "slacker": 1.4},
     ),
     StateEventCard(
-        card_id="gen_surf_night",
-        title="躲被窝熬夜刷手机",
-        state=BotState.IDLE,
-        action_type=ActionType.SURF,
-        min_hours=0.5,
-        max_hours=1.5,
-        base_weight=30,
-        synergy_tags={"night_owl": 2.2},
-    ),
-    # ---- IDLE_ROAM ----
-    StateEventCard(
-        card_id="gen_roam_commute",
-        title="通勤路上随手看消息",
+        card_id="gen_default_roam",
+        title="闲下来发会儿呆",
         state=BotState.IDLE,
         action_type=ActionType.IDLE_ROAM,
         min_hours=0.5,
         max_hours=1.5,
-        base_weight=45,
-        synergy_tags={"energetic": 1.5},
-    ),
-    StateEventCard(
-        card_id="gen_roam_slack",
-        title="假装干活偷偷摸鱼",
-        state=BotState.IDLE,
-        action_type=ActionType.IDLE_ROAM,
-        min_hours=0.5,
-        max_hours=1.5,
-        base_weight=45,
-        synergy_tags={"slacker": 1.7, "energetic": 1.3},
-    ),
-    StateEventCard(
-        card_id="gen_roam_tea",
-        title="泡杯热茶靠窗发呆",
-        state=BotState.IDLE,
-        action_type=ActionType.IDLE_ROAM,
-        min_hours=0.5,
-        max_hours=2.0,
-        base_weight=55,
-        synergy_tags={"slacker": 1.6, "energetic": 1.4},
-    ),
-    StateEventCard(
-        card_id="gen_roam_emo",
-        title="趴在窗边发呆放空",
-        state=BotState.IDLE,
-        action_type=ActionType.IDLE_ROAM,
-        min_hours=0.5,
-        max_hours=1.5,
-        base_weight=35,
+        base_weight=50,
     ),
 ]
 
@@ -815,12 +736,20 @@ class RogueliteDeckEngine:
         if not pool:
             return list(DEFAULT_STATE_EVENT_CARDS)
         # Guarantee that all four action types stay drawable even if the Soul's
-        # custom pool happens to miss one.
+        # custom pool happens to miss one. Pad **one** neutral fallback card per
+        # missing type only: appending a whole generic pool would dilute the
+        # custom cards' weighted draw probability.
         available = {card.action for card in pool}
-        for default_card in DEFAULT_STATE_EVENT_CARDS:
-            if default_card.action not in available:
-                pool.append(default_card)
-                available.add(default_card.action)
+        for action in ActionType:
+            if action in available:
+                continue
+            filler = next(
+                (card for card in DEFAULT_STATE_EVENT_CARDS if card.action == action),
+                None,
+            )
+            if filler is not None:
+                pool.append(filler)
+                available.add(action)
         return pool
 
     @staticmethod

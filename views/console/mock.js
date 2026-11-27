@@ -221,16 +221,12 @@
     { vigor_id: "vigor_night_owl", title: "夜猫修仙日", desc: "早上困得睁不开眼，越到晚上越精神。" }
   ];
 
-  /* 默认内置卡池：每个 action_type 至少 2 张（顺序即展示顺序） */
+  /* 内置兜底卡：四类各一张中性卡，避免稀释角色自定义卡池的抽中概率 */
   var GENERAL_CARDS = [
-    { card_id: "evt_general_sleep_1", title: "关灯睡觉", action_type: "SLEEP", min_hours: 4.0, max_hours: 7.5, base_weight: 80, synergy_tags: {} },
-    { card_id: "evt_general_sleep_2", title: "趴着补个回笼觉", action_type: "SLEEP", min_hours: 1.0, max_hours: 2.0, base_weight: 50, synergy_tags: {} },
-    { card_id: "evt_general_surf_1", title: "窝在沙发里刷短视频", action_type: "SURF", min_hours: 0.5, max_hours: 2.0, base_weight: 70, synergy_tags: { lazy: 1.2 } },
-    { card_id: "evt_general_surf_2", title: "深夜刷 B 站鬼畜区", action_type: "SURF", min_hours: 0.5, max_hours: 2.0, base_weight: 60, synergy_tags: {} },
-    { card_id: "evt_general_roam_1", title: "在群里潜水窥屏", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 2.0, base_weight: 60, synergy_tags: {} },
-    { card_id: "evt_general_roam_2", title: "泡杯茶发呆", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.5, base_weight: 45, synergy_tags: {} },
-    { card_id: "evt_general_busy_1", title: "埋头赶工作进度", action_type: "BUSY_TASK", min_hours: 1.0, max_hours: 3.0, base_weight: 65, synergy_tags: { focus: 1.4 } },
-    { card_id: "evt_general_busy_2", title: "被临时拉去开会", action_type: "BUSY_TASK", min_hours: 1.0, max_hours: 2.5, base_weight: 45, synergy_tags: {} }
+    { card_id: "evt_general_sleep", title: "闭眼安静睡一会儿", action_type: "SLEEP", min_hours: 4.0, max_hours: 7.5, base_weight: 75, synergy_tags: {} },
+    { card_id: "evt_general_busy", title: "专注处理手头正事", action_type: "BUSY_TASK", min_hours: 1.0, max_hours: 3.0, base_weight: 60, synergy_tags: {} },
+    { card_id: "evt_general_surf", title: "窝着刷会儿视频", action_type: "SURF", min_hours: 0.5, max_hours: 2.0, base_weight: 55, synergy_tags: {} },
+    { card_id: "evt_general_roam", title: "闲下来发会儿呆", action_type: "IDLE_ROAM", min_hours: 0.5, max_hours: 1.5, base_weight: 50, synergy_tags: {} }
   ].map(normalizeCard);
 
   /* 角色专属行动卡（酒狐：夜猫子插画师） */
