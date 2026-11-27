@@ -284,7 +284,7 @@
       '<div class="action-duration">' +
       '<span class="duration-pill" data-tip="该卡在日程中随机抽取的时长区间">' +
       esc(fmtHours(minHours) + " ~ " + fmtHours(maxHours)) +
-      '</span><span class="tag tag-muted">时长</span></div>' +
+      "</span></div>" +
       "</div>"
     );
   }
